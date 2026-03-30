@@ -7,6 +7,7 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
 const SELF_UPDATE_SKIP_ENV: &str = "LORE_SKIP_SELF_UPDATE";
@@ -107,43 +108,42 @@ fn prompt_initial_admin_if_needed(data_root: &str) {
     eprintln!("No admin account exists yet. Let's create one.");
     eprintln!();
 
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-
-    let username = loop {
-        eprint!("Admin username: ");
-        io::stderr().flush().ok();
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            eprintln!("aborted");
-            std::process::exit(1);
+    let username = {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        loop {
+            eprint!("Admin username: ");
+            io::stderr().flush().ok();
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                eprintln!("aborted");
+                std::process::exit(1);
+            }
+            let trimmed = line.trim().to_string();
+            if !trimmed.is_empty() {
+                break trimmed;
+            }
+            eprintln!("username cannot be empty");
         }
-        let trimmed = line.trim().to_string();
-        if !trimmed.is_empty() {
-            break trimmed;
-        }
-        eprintln!("username cannot be empty");
     };
 
     let password = loop {
         eprint!("Admin password: ");
         io::stderr().flush().ok();
-        let pass = rpassword::read_password().unwrap_or_else(|err| {
-            eprintln!("error reading password: {err}");
+        let pass = read_password_no_echo();
+        if pass.is_empty() {
+            eprintln!("aborted");
             std::process::exit(1);
-        });
-        if pass.len() < 8 {
-            eprintln!("password must be at least 8 characters");
+        }
+        if pass.len() < 12 {
+            eprintln!("password must be at least 12 characters");
             continue;
         }
         eprint!("Confirm password: ");
         io::stderr().flush().ok();
-        let confirm = rpassword::read_password().unwrap_or_else(|err| {
-            eprintln!("error reading password: {err}");
-            std::process::exit(1);
-        });
+        let confirm = read_password_no_echo();
         if pass != confirm {
-            eprintln!("passwords do not match");
+            eprintln!("passwords do not match — try again");
             continue;
         }
         break pass;
@@ -156,6 +156,36 @@ fn prompt_initial_admin_if_needed(data_root: &str) {
             std::process::exit(1);
         }
     }
+}
+
+fn read_password_no_echo() -> String {
+    let stdin_fd = io::stdin().as_raw_fd();
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    let has_termios = unsafe { libc::tcgetattr(stdin_fd, termios.as_mut_ptr()) } == 0;
+    let original = if has_termios {
+        let t = unsafe { termios.assume_init() };
+        let mut noecho = t;
+        noecho.c_lflag &= !libc::ECHO;
+        unsafe {
+            libc::tcsetattr(stdin_fd, libc::TCSANOW, &noecho);
+        }
+        Some(t)
+    } else {
+        None
+    };
+
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
+
+    if let Some(orig) = original {
+        unsafe {
+            libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig);
+        }
+    }
+    eprintln!();
+    line.trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string()
 }
 
 async fn run_server(data_root: String, bind: String) {
