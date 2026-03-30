@@ -1105,14 +1105,14 @@ pub fn render_settings_page(
           <h2>Theme</h2>
           <p>Select a theme to preview it. Click Save to keep it.</p>
         </div>
-        <div class="theme-selector padded">
-          {theme_selector_cards}
-        </div>
         <form method="post" action="/ui/settings/theme" id="theme-form">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
           <input type="hidden" name="theme" id="theme-input" value="{current_theme_value}">
-          <button type="submit">Save theme</button>
+          <button type="submit" id="save-theme-btn" disabled>Save theme</button>
         </form>
+        <div class="theme-selector padded">
+          {theme_selector_cards}
+        </div>
       </section>
       <section class="panel">
         <div class="panel-header">
@@ -1128,13 +1128,21 @@ pub fn render_settings_page(
     (function() {{
       var cards = document.querySelectorAll('.theme-card[data-theme]');
       var input = document.getElementById('theme-input');
+      var btn = document.getElementById('save-theme-btn');
+      var saved = '{current_theme_value}';
+      var params = new URLSearchParams(window.location.search);
+      var preview = params.get('preview');
+      if (preview && preview !== saved) {{
+        btn.disabled = false;
+        input.value = preview;
+      }}
       cards.forEach(function(card) {{
         card.addEventListener('click', function() {{
           cards.forEach(function(c) {{ c.classList.remove('selected'); }});
           card.classList.add('selected');
-          input.value = card.getAttribute('data-theme');
-          // build full CSS URL to preview the theme
           var theme = card.getAttribute('data-theme');
+          input.value = theme;
+          btn.disabled = (theme === saved);
           window.location.href = '/ui/settings?preview=' + encodeURIComponent(theme);
         }});
       }});
@@ -2728,7 +2736,12 @@ fn flash_message(flash: Option<&str>) -> String {
             } else {
                 "flash"
             };
-            format!(r#"<p class="{class}">{}</p>"#, escape_text(message))
+            format!(
+                r#"<p class="{class}" id="flash-msg">{msg}</p>
+<script>(function(){{ var f=document.getElementById('flash-msg'); if(f){{ setTimeout(function(){{ f.classList.add('fade-out'); }}, 2000); setTimeout(function(){{ f.remove(); }}, 2500); }} }})()</script>"#,
+                class = class,
+                msg = escape_text(message),
+            )
         })
         .unwrap_or_default()
 }
@@ -3155,13 +3168,25 @@ fn shared_styles(theme: UiTheme) -> String {
     }
 
     .flash {
-      margin: var(--s-4) 0 0;
-      padding: var(--s-3) var(--s-4);
+      position: fixed;
+      top: 80px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 200;
+      padding: var(--s-3) var(--s-5);
       border-radius: var(--s-3);
       background: var(--flash-bg);
       color: var(--flash-ink);
       border: 1px solid var(--flash-line);
       font-weight: 600;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+      opacity: 1;
+      transition: opacity 0.4s ease;
+      pointer-events: none;
+    }
+
+    .flash.fade-out {
+      opacity: 0;
     }
 
     .flash-error {
@@ -3325,6 +3350,15 @@ fn shared_styles(theme: UiTheme) -> String {
 
     button:hover {
       opacity: 0.9;
+    }
+
+    button:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
+    button:disabled:hover {
+      opacity: 0.4;
     }
 
     .callout {

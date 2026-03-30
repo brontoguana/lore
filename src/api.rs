@@ -381,7 +381,7 @@ async fn add_security_headers(mut response: Response) -> Response {
     headers.insert(
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
-            "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
         ),
     );
     headers.insert(
@@ -9697,7 +9697,7 @@ mod tests {
             .expect("CSP header should be present")
             .to_str()
             .unwrap();
-        assert!(csp.contains("script-src 'none'"));
+        assert!(csp.contains("script-src 'unsafe-inline'"));
         assert!(csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("img-src 'self' data:"));
 
