@@ -17,6 +17,79 @@ use pulldown_cmark::{Options, Parser, html};
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 
+pub struct PageShell<'a> {
+    pub title: &'a str,
+    pub username: Option<&'a str>,
+    pub is_admin: bool,
+    pub theme: UiTheme,
+    pub csrf_token: Option<&'a str>,
+    pub flash: Option<&'a str>,
+}
+
+pub fn render_shell(shell: PageShell, content: String) -> String {
+    let flash_html = flash_message(shell.flash);
+    let nav_html = if let Some(username) = shell.username {
+        let admin_link = if shell.is_admin {
+            r#"<a href="/ui/admin">Admin</a>"#.to_string()
+        } else {
+            String::new()
+        };
+        let csrf_input = shell
+            .csrf_token
+            .map(|t| format!(r#"<input type="hidden" name="csrf_token" value="{}">"#, t))
+            .unwrap_or_default();
+
+        format!(
+            r#"<nav class="top-nav">
+  <div class="top-nav-inner">
+    <div style="display:flex; align-items:center; gap:var(--s-4);">
+      <a href="/ui" class="logo">Lore</a>
+      <span class="eyebrow" style="margin-top:2px;">{username}</span>
+    </div>
+    <div class="top-nav-links">
+      <a href="/ui">Projects</a>
+      {admin_link}
+      <a href="/ui/settings">Settings</a>
+      <form method="post" action="/logout">
+        {csrf_input}
+        <button type="submit">Sign out</button>
+      </form>
+    </div>
+  </div>
+</nav>"#,
+            username = escape_text(username),
+            admin_link = admin_link,
+            csrf_input = csrf_input,
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>{styles}</style>
+</head>
+<body>
+  {nav_html}
+  <main class="shell">
+    {flash_html}
+    {content}
+  </main>
+</body>
+</html>"#,
+        title = escape_text(shell.title),
+        styles = shared_styles(shell.theme),
+        nav_html = nav_html,
+        flash_html = flash_html,
+        content = content,
+    )
+}
+
 pub struct ProjectListEntry {
     pub project: ProjectName,
     pub can_write: bool,
@@ -153,7 +226,6 @@ pub fn render_login_page(
         "/login/bootstrap"
     };
     let button = if has_users { "Sign in" } else { "Create admin" };
-    let flash_html = flash_message(flash);
     let external_auth_html = if has_users && external_auth_enabled {
         r#"<form method="post" action="/login/external">
         <button type="submit">Sign in with external auth</button>
@@ -173,22 +245,11 @@ pub fn render_login_page(
         String::new()
     };
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{title}</title>
-  <style>{styles}</style>
-</head>
-<body>
-  <main class="shell auth-shell">
-    <section class="panel auth-panel">
+    let content = format!(
+        r#"<section class="panel auth-panel">
       <p class="eyebrow">Lore</p>
       <h1>{title}</h1>
       <p class="subtitle">{subtitle}</p>
-      {flash_html}
       <form method="post" action="{action}">
         <label>
           Username
@@ -202,10 +263,7 @@ pub fn render_login_page(
       </form>
       {oidc_html}
       {external_auth_html}
-    </section>
-  </main>
-</body>
-</html>"#,
+    </section>"#,
         title = escape_text(title),
         subtitle = escape_text(subtitle),
         action = action,
@@ -215,10 +273,20 @@ pub fn render_login_page(
         } else {
             "new-password"
         },
-        flash_html = flash_html,
         oidc_html = oidc_html,
         external_auth_html = external_auth_html,
-        styles = shared_styles(theme),
+    );
+
+    render_shell(
+        PageShell {
+            title,
+            username: None,
+            is_admin: false,
+            theme,
+            csrf_token: None,
+            flash,
+        },
+        content,
     )
 }
 
@@ -230,12 +298,6 @@ pub fn render_projects_page(
     csrf_token: &str,
     flash: Option<&str>,
 ) -> String {
-    let flash_html = flash_message(flash);
-    let admin_link = if is_admin {
-        r#"<a href="/ui/admin">Admin</a>"#.to_string()
-    } else {
-        String::new()
-    };
     let project_cards = if projects.is_empty() {
         r#"<section class="empty-state"><h2>No visible projects</h2><p>You do not currently have access to any projects, or no project data exists yet.</p></section>"#.to_string()
     } else {
@@ -264,41 +326,27 @@ pub fn render_projects_page(
             .join("")
     };
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lore projects</title>
-  <style>{styles}</style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
+    let content = format!(
+        r#"<section class="hero">
       <p class="eyebrow">Lore workspace</p>
       <h1>Projects</h1>
-      <p class="subtitle">Signed in as {username}. Open a project document, or move to admin if you manage access.</p>
-      <div class="hero-actions">
-        <a href="/ui/settings">Settings</a>
-        {admin_link}
-        <form method="post" action="/logout">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Sign out</button>
-        </form>
-      </div>
-      {flash_html}
+      <p class="subtitle">Signed in as {username}. Open a project document to get started.</p>
     </section>
-    <section class="project-grid">{project_cards}</section>
-  </main>
-</body>
-</html>"#,
-        styles = shared_styles(theme),
+    <section class="project-grid">{project_cards}</section>"#,
         username = escape_text(username),
-        admin_link = admin_link,
-        csrf_token = escape_attribute(csrf_token),
-        flash_html = flash_html,
         project_cards = project_cards,
+    );
+
+    render_shell(
+        PageShell {
+            title: "Lore projects",
+            username: Some(username),
+            is_admin,
+            theme,
+            csrf_token: Some(csrf_token),
+            flash,
+        },
+        content,
     )
 }
 
@@ -325,7 +373,6 @@ pub fn render_admin_page(
     latest_agent_token: Option<&UiAdminTokenDisplay>,
     flash: Option<&str>,
 ) -> String {
-    let flash_html = flash_message(flash);
     let roles_html = if roles.is_empty() {
         "<p class=\"hint padded\">No roles exist yet.</p>".to_string()
     } else {
@@ -433,37 +480,107 @@ pub fn render_admin_page(
         })
         .unwrap_or_else(|| "<p><strong>Last check</strong><br>Not run yet.</p>".to_string());
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lore admin</title>
-  <style>{styles}</style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
+    let content = format!(
+        r#"<section class="hero">
       <p class="eyebrow">Lore admin</p>
       <h1>Users and roles</h1>
       <p class="subtitle">Signed in as {username}. Local browser sessions use a server-side token store, and role grants apply at whole-project scope for human users.</p>
-      <div class="hero-actions">
-        <a class="primary" href="/ui">Projects</a>
-        <a href="/ui/settings">Settings</a>
-        <form method="post" action="/logout">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Sign out</button>
-        </form>
-      </div>
-      {flash_html}
     </section>
+
+    <div class="layout admin-layout">
+      <div class="stack">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Create user</h2>
+            <p>Assign comma-separated role names. Admins can see everything and manage access.</p>
+          </div>
+          <form method="post" action="/ui/admin/users">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <label>
+              Username
+              <input type="text" name="username" autocomplete="username" required>
+            </label>
+            <label>
+              Password
+              <input type="password" name="password" autocomplete="new-password" required>
+            </label>
+            <label>
+              Roles
+              <input type="text" name="roles" placeholder="engineering-writers,product-readers">
+            </label>
+            <label class="toggle">
+              <input type="checkbox" name="is_admin" value="true">
+              <span>Grant full admin access</span>
+            </label>
+            <button type="submit">Create user</button>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Users</h2>
+            <p>Passwords are stored as Argon2 hashes on disk, never as plaintext.</p>
+          </div>
+          <div class="timeline">{users_html}</div>
+        </section>
+      </div>
+
+      <div class="stack">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Create role</h2>
+            <p>Enter one grant per line using project:permission where permission is read or read_write.</p>
+          </div>
+          <form method="post" action="/ui/admin/roles">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <label>
+              Role name
+              <input type="text" name="name" placeholder="engineering-writers" required>
+            </label>
+            <label>
+              Grants
+              <textarea name="grants" placeholder="alpha.docs:read_write&#10;beta.docs:read"></textarea>
+            </label>
+            <button type="submit">Create role</button>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Roles</h2>
+            <p>These grants define project-level visibility and editing for human users.</p>
+          </div>
+          <div class="timeline">{roles_html}</div>
+        </section>
+      </div>
+    </div>
 
     <section class="layout admin-layout">
       <section class="panel">
         <div class="panel-header">
+          <h2>Agent tokens</h2>
+          <p>Create scoped agent tokens with per-project read or read_write access. Raw tokens are shown once and then only their hashes remain on disk.</p>
+        </div>
+        {latest_agent_token_html}
+        <form method="post" action="/ui/admin/agent-tokens">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>
+            Token name
+            <input type="text" name="name" placeholder="worker-alpha" required>
+          </label>
+          <label>
+            Grants
+            <textarea name="grants" placeholder="alpha.docs:read_write&#10;beta.docs:read"></textarea>
+          </label>
+          <button type="submit">Create agent token</button>
+        </form>
+        <div class="timeline">{agent_tokens_html}</div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
           <h2>Agent setup</h2>
-          <p>Set the externally reachable Lore address once, then hand agents the generated setup URL instead of writing custom instructions yourself.</p>
+          <p>Set the externally reachable Lore address once, then hand agents the generated setup URL.</p>
         </div>
         <form method="post" action="/ui/admin/setup">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -490,20 +607,24 @@ pub fn render_admin_page(
           </label>
           <button type="submit">Save setup address</button>
         </form>
-        <div class="meta-stack">
+        <div class="meta-stack padded">
           <p><strong>Setup page</strong><br>{setup_url}</p>
           <p><strong>Plain text page</strong><br>{setup_text_url}</p>
         </div>
-        <label>
-          Copy-paste for an agent
-          <textarea readonly>{setup_instruction}</textarea>
-        </label>
+        <div class="padded">
+          <label>
+            Copy-paste for an agent
+            <textarea readonly style="min-height: 6rem;">{setup_instruction}</textarea>
+          </label>
+        </div>
       </section>
+    </section>
 
+    <section class="layout admin-layout">
       <section class="panel">
         <div class="panel-header">
           <h2>Answer librarian</h2>
-          <p>Configure one OpenAI-compatible chat completions endpoint for the read-only answer librarian and the narrow project librarian. The secret is stored on disk with the same restricted file permissions as other Lore server secrets and is never shown again after save.</p>
+          <p>Configure one OpenAI-compatible chat completions endpoint for the read-only answer librarian and the narrow project librarian.</p>
         </div>
         <form method="post" action="/ui/admin/librarian">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -529,30 +650,12 @@ pub fn render_admin_page(
           </label>
           <label class="toggle">
             <input type="checkbox" name="action_requires_approval" value="true"{action_requires_approval_checked}>
-            <span>Require admin or project-writer approval before executing project librarian actions</span>
-          </label>
-          <label class="toggle">
-            <input type="checkbox" name="clear_api_key" value="true">
-            <span>Clear saved API key</span>
+            <span>Require approval before project librarian actions</span>
           </label>
           <button type="submit">Save librarian config</button>
         </form>
-        <form method="post" action="/ui/admin/librarian/test" class="inline-form">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Test saved provider config</button>
-        </form>
-        <form method="post" action="/ui/admin/librarian/rotate-key">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label>
-            Rotate API key
-            <input type="password" name="api_key" placeholder="Paste new provider secret" required>
-          </label>
-          <button type="submit">Rotate saved API key</button>
-        </form>
-        <div class="meta-stack">
+        <div class="meta-stack padded">
           <p><strong>Status</strong><br>{librarian_status}</p>
-          <p><strong>Scope</strong><br>Read-only, one project per request, Lore-native context only.</p>
-          <p><strong>Limits</strong><br>{request_timeout_secs}s timeout, {max_concurrent_runs} concurrent runs max.</p>
           {provider_status_html}
         </div>
       </section>
@@ -560,7 +663,7 @@ pub fn render_admin_page(
       <section class="panel">
         <div class="panel-header">
           <h2>Git export</h2>
-          <p>Export Lore’s native project files and recorded project history into a Git branch. This gives you off-server history and familiar recovery workflows without making Git the live storage engine.</p>
+          <p>Export Lore’s native project files and recorded project history into a Git branch.</p>
         </div>
         <form method="post" action="/ui/admin/git-export">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -592,49 +695,20 @@ pub fn render_admin_page(
             <input type="checkbox" name="auto_export" value="true"{git_export_auto_checked}>
             <span>Automatically export after project mutations</span>
           </label>
-          <label class="toggle">
-            <input type="checkbox" name="clear_token" value="true">
-            <span>Clear saved token</span>
-          </label>
           <button type="submit">Save Git export</button>
         </form>
-        <form method="post" action="/ui/admin/git-export/sync" class="inline-form">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Run export now</button>
-        </form>
-        <div class="meta-stack">
+        <div class="meta-stack padded">
           <p><strong>Status</strong><br>{git_export_state}</p>
-          <p><strong>Mode</strong><br>{git_export_mode}</p>
-          <p><strong>Remote</strong><br>{git_export_remote_label}</p>
           {git_export_status_html}
         </div>
       </section>
+    </section>
 
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Agent tokens</h2>
-          <p>Create scoped agent tokens with per-project read or read_write access. Raw tokens are shown once and then only their hashes remain on disk.</p>
-        </div>
-        {latest_agent_token_html}
-        <form method="post" action="/ui/admin/agent-tokens">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label>
-            Token name
-            <input type="text" name="name" placeholder="worker-alpha" required>
-          </label>
-          <label>
-            Grants
-            <textarea name="grants" placeholder="alpha.docs:read_write&#10;beta.docs:read"></textarea>
-          </label>
-          <button type="submit">Create agent token</button>
-        </form>
-        <div class="timeline">{agent_tokens_html}</div>
-      </section>
-
+    <section class="layout admin-layout">
       <section class="panel">
         <div class="panel-header">
           <h2>OIDC</h2>
-          <p>Configure an OpenID Connect login flow that redirects the browser to your identity provider and then maps the returned identity onto an existing Lore user. Roles and admin flags still come from Lore.</p>
+          <p>Configure an OpenID Connect login flow that redirects the browser to your identity provider.</p>
         </div>
         <form method="post" action="/ui/admin/oidc">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -654,66 +728,18 @@ pub fn render_admin_page(
             Client secret
             <input type="password" name="client_secret" placeholder="{oidc_secret_placeholder}">
           </label>
-          <label>
-            Callback path
-            <input type="text" name="callback_path" value="{oidc_callback_path}" placeholder="/login/oidc/callback">
-          </label>
-          <label>
-            Username claim
-            <select name="username_claim">
-              <option value="preferred_username"{oidc_preferred_username_selected}>preferred_username</option>
-              <option value="email"{oidc_email_selected}>email</option>
-              <option value="sub"{oidc_subject_selected}>sub</option>
-            </select>
-          </label>
-          <label class="toggle">
-            <input type="checkbox" name="clear_client_secret" value="true">
-            <span>Clear saved OIDC client secret</span>
-          </label>
           <button type="submit">Save OIDC config</button>
         </form>
-        <div class="meta-stack">
+        <div class="meta-stack padded">
           <p><strong>Status</strong><br>{oidc_status}</p>
           <p><strong>Redirect URI</strong><br>{oidc_redirect_uri}</p>
         </div>
-      </section>
+        </section>
 
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Server updates</h2>
-          <p>Check for new Lore server releases and apply updates. When automatic updates are enabled, Lore also checks on startup. You can always check and apply manually from here.</p>
-        </div>
-        <form method="post" action="/ui/admin/auto-update">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label class="toggle">
-            <input type="checkbox" name="enabled" value="true"{auto_update_enabled_checked}>
-            <span>Enable automatic server self-update on restart</span>
-          </label>
-          <label>
-            GitHub repo
-            <input type="text" name="github_repo" value="{auto_update_repo}" placeholder="{default_update_repo}" required>
-          </label>
-          <label>
-            Confirm password (required when changing repo)
-            <input type="password" name="confirm_password" autocomplete="current-password">
-          </label>
-          <button type="submit">Save auto update</button>
-        </form>
-        <form method="post" action="/ui/admin/auto-update/check" class="inline-form">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Check latest release now</button>
-        </form>
-        <div class="meta-stack">
-          <p><strong>Status</strong><br>{auto_update_state}</p>
-          <p><strong>Mode</strong><br>Updates replace the server binary and restart automatically. Can be applied here or on startup when enabled.</p>
-          {auto_update_status_html}
-        </div>
-      </section>
-
-      <section class="panel">
+        <section class="panel">
         <div class="panel-header">
           <h2>External auth</h2>
-          <p>Enable trusted reverse-proxy header auth to map an upstream authenticated username onto an existing local Lore user and role set. Keep this behind a proxy that strips and rewrites these headers.</p>
+          <p>Enable trusted reverse-proxy header auth to map an upstream authenticated username onto a local user.</p>
         </div>
         <form method="post" action="/ui/admin/external-auth">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -733,82 +759,35 @@ pub fn render_admin_page(
             Shared secret value
             <input type="password" name="secret_value" placeholder="{external_auth_secret_placeholder}">
           </label>
-          <label class="toggle">
-            <input type="checkbox" name="clear_secret" value="true">
-            <span>Clear saved external auth secret</span>
-          </label>
           <button type="submit">Save external auth</button>
         </form>
-        <div class="meta-stack">
+        <div class="meta-stack padded">
           <p><strong>Status</strong><br>{external_auth_status}</p>
-          <p><strong>Scope</strong><br>Maps a trusted proxy username onto an existing local Lore user. Roles and admin flags still come from Lore.</p>
         </div>
-      </section>
-    </section>
-
-    <section class="layout admin-layout">
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Create role</h2>
-          <p>Enter one grant per line using project:permission where permission is read or read_write.</p>
-        </div>
-        <form method="post" action="/ui/admin/roles">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label>
-            Role name
-            <input type="text" name="name" placeholder="engineering-writers" required>
-          </label>
-          <label>
-            Grants
-            <textarea name="grants" placeholder="alpha.docs:read_write&#10;beta.docs:read"></textarea>
-          </label>
-          <button type="submit">Create role</button>
-        </form>
-      </section>
+        </section>
+        </section>
 
       <section class="panel">
         <div class="panel-header">
-          <h2>Create user</h2>
-          <p>Assign comma-separated role names. Admins can see everything and manage access.</p>
+          <h2>Server updates</h2>
+          <p>Check for new Lore server releases and apply updates.</p>
         </div>
-        <form method="post" action="/ui/admin/users">
+        <form method="post" action="/ui/admin/auto-update">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label>
-            Username
-            <input type="text" name="username" autocomplete="username" required>
-          </label>
-          <label>
-            Password
-            <input type="password" name="password" autocomplete="new-password" required>
-          </label>
-          <label>
-            Roles
-            <input type="text" name="roles" placeholder="engineering-writers,product-readers">
-          </label>
           <label class="toggle">
-            <input type="checkbox" name="is_admin" value="true">
-            <span>Grant full admin access</span>
+            <input type="checkbox" name="enabled" value="true"{auto_update_enabled_checked}>
+            <span>Enable automatic server self-update on restart</span>
           </label>
-          <button type="submit">Create user</button>
+          <label>
+            GitHub repo
+            <input type="text" name="github_repo" value="{auto_update_repo}" placeholder="{default_update_repo}" required>
+          </label>
+          <button type="submit">Save auto update</button>
         </form>
-      </section>
-    </section>
-
-    <section class="layout admin-layout">
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Roles</h2>
-          <p>These grants define project-level visibility and editing for human users.</p>
+        <div class="meta-stack padded">
+          <p><strong>Status</strong><br>{auto_update_state}</p>
+          {auto_update_status_html}
         </div>
-        <div class="timeline">{roles_html}</div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Users</h2>
-          <p>Passwords are stored as Argon2 hashes on disk, never as plaintext.</p>
-        </div>
-        <div class="timeline">{users_html}</div>
       </section>
     </section>
 
@@ -816,7 +795,7 @@ pub fn render_admin_page(
       <section class="panel">
         <div class="panel-header">
           <h2>Librarian audit</h2>
-          <p>Recent grounded runs across projects, including actor, status, source blocks, and pending approvals. <a href="/ui/admin/audit">Open full audit</a>.</p>
+          <p>Recent runs across projects. <a href="/ui/admin/audit">Open full audit</a>.</p>
         </div>
         <div class="timeline">{pending_actions_html}</div>
         <div class="timeline">{audit_html}</div>
@@ -824,19 +803,14 @@ pub fn render_admin_page(
 
       <section class="panel">
         <div class="panel-header">
-          <h2>Auth and admin audit</h2>
-          <p>Recent sign-in, sign-out, configuration, and access-management changes. <a href="/ui/admin/audit">Open full audit</a>.</p>
+          <h2>Auth audit</h2>
+          <p>Recent sign-in and admin events. <a href="/ui/admin/audit">Open full audit</a>.</p>
         </div>
         <div class="timeline">{auth_audit_html}</div>
       </section>
-    </section>
-  </main>
-</body>
-</html>"#,
-        styles = shared_styles(theme),
+    </section>"#,
         username = escape_text(username),
         csrf_token = escape_attribute(csrf_token),
-        flash_html = flash_html,
         http_selected = if matches!(server_config.external_scheme, ExternalScheme::Http) {
             " selected"
         } else {
@@ -898,60 +872,14 @@ pub fn render_admin_page(
         } else {
             "Disabled"
         },
-        git_export_mode = if git_export_config.auto_export {
-            "Automatic after writes, plus manual sync"
-        } else {
-            "Manual sync only"
-        },
-        git_export_remote_label = if git_export_config.remote_url.trim().is_empty() {
-            "Not configured".to_string()
-        } else {
-            escape_text(&git_export_config.remote_url)
-        },
         git_export_status_html = git_export_status_html,
-        external_auth_enabled_checked = if external_auth_config.enabled {
-            " checked"
-        } else {
-            ""
-        },
-        external_auth_username_header = escape_attribute(&external_auth_config.username_header),
-        external_auth_secret_header = escape_attribute(&external_auth_config.secret_header),
-        external_auth_secret_placeholder = if external_auth_config.has_secret() {
-            "Stored. Leave blank to preserve."
-        } else {
-            "Paste proxy shared secret"
-        },
-        external_auth_status = if external_auth_config.is_configured() {
-            "Configured"
-        } else if external_auth_config.enabled {
-            "Enabled but incomplete"
-        } else {
-            "Disabled"
-        },
         oidc_enabled_checked = if oidc_config.enabled { " checked" } else { "" },
         oidc_issuer_url = escape_attribute(&oidc_config.issuer_url),
         oidc_client_id = escape_attribute(&oidc_config.client_id),
-        oidc_callback_path = escape_attribute(&oidc_config.callback_path),
         oidc_secret_placeholder = if oidc_config.has_client_secret() {
             "Stored. Leave blank to preserve."
         } else {
             "Paste OIDC client secret"
-        },
-        oidc_preferred_username_selected =
-            if oidc_config.username_claim.as_str() == "preferred_username" {
-                " selected"
-            } else {
-                ""
-            },
-        oidc_email_selected = if oidc_config.username_claim.as_str() == "email" {
-            " selected"
-        } else {
-            ""
-        },
-        oidc_subject_selected = if oidc_config.username_claim.as_str() == "sub" {
-            " selected"
-        } else {
-            ""
         },
         oidc_status = if oidc_config.is_configured() {
             "Configured"
@@ -978,6 +906,25 @@ pub fn render_admin_page(
             "Disabled"
         },
         auto_update_status_html = auto_update_status_html,
+        external_auth_enabled_checked = if external_auth_config.enabled {
+            " checked"
+        } else {
+            ""
+        },
+        external_auth_username_header = escape_attribute(&external_auth_config.username_header),
+        external_auth_secret_header = escape_attribute(&external_auth_config.secret_header),
+        external_auth_secret_placeholder = if external_auth_config.has_secret() {
+            "Stored. Leave blank to preserve."
+        } else {
+            "Paste proxy shared secret"
+        },
+        external_auth_status = if external_auth_config.is_configured() {
+            "Configured"
+        } else if external_auth_config.enabled {
+            "Enabled but incomplete"
+        } else {
+            "Disabled"
+        },
         provider_status_html = provider_status_html,
         latest_agent_token_html = latest_agent_token_html,
         agent_tokens_html = agent_tokens_html,
@@ -986,6 +933,18 @@ pub fn render_admin_page(
         pending_actions_html = pending_actions_html,
         audit_html = audit_html,
         auth_audit_html = auth_audit_html,
+    );
+
+    render_shell(
+        PageShell {
+            title: "Lore admin",
+            username: Some(username),
+            is_admin: true,
+            theme,
+            csrf_token: Some(csrf_token),
+            flash,
+        },
+        content,
     )
 }
 
@@ -993,24 +952,14 @@ pub fn render_setup_page(config: &ServerConfig, setup_instruction: &str) -> Stri
     let base_url = config.base_url();
     let setup_text_url = config.setup_text_url();
     let mcp_url = config.mcp_url();
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lore setup</title>
-  <style>{styles}</style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
+    let content = format!(
+        r#"<section class="hero">
       <p class="eyebrow">Lore setup</p>
-      <h1>Agent integration instructions</h1>
-      <p class="subtitle">This page is generated by Lore using the external address configured by the administrator. Use it to decide whether your agent should integrate over HTTP or Lore's native MCP endpoint for this runtime.</p>
+      <h1>Agent setup</h1>
+      <p class="subtitle">This page is generated by Lore using the external address configured by the administrator. Use it to decide whether your agent should integrate over HTTP or Lore's native MCP endpoint.</p>
     </section>
 
-    <section class="layout">
+    <div class="layout">
       <section class="panel">
         <div class="panel-header">
           <h2>Server address</h2>
@@ -1042,33 +991,43 @@ pub fn render_setup_page(config: &ServerConfig, setup_instruction: &str) -> Stri
         <section class="panel">
           <div class="panel-header">
             <h2>When to use HTTP</h2>
-            <p>Choose HTTP if the agent runs as a command, shell wrapper, CI task, cron job, or any runtime that can make ordinary web requests but does not mount MCP servers cleanly.</p>
+            <p>Choose HTTP if the agent runs as a command, shell wrapper, CI task, or any runtime that can make web requests but does not mount MCP servers.</p>
           </div>
         </section>
         <section class="panel">
           <div class="panel-header">
             <h2>When to use MCP</h2>
-            <p>Choose MCP when the host runtime natively supports MCP tool servers and you want Lore to appear as a discoverable tool server. Lore exposes familiar grep, read, edit, move, and delete tools over the MCP endpoint.</p>
+            <p>Choose MCP when the host runtime natively supports MCP tool servers and you want Lore to appear as a discoverable tool server.</p>
           </div>
         </section>
       </aside>
-    </section>
+    </div>
 
-    <section class="panel">
+    <section class="panel" style="margin-top: var(--s-6);">
       <div class="panel-header">
         <h2>Copy-paste for your agent</h2>
         <p>Give the block below to the agent, or tell it to open the plain-text setup URL directly.</p>
       </div>
-      <textarea readonly>{setup_instruction}</textarea>
-    </section>
-  </main>
-</body>
-</html>"#,
-        styles = shared_styles(config.default_theme),
+      <div class="padded">
+        <textarea readonly style="min-height: 12rem;">{setup_instruction}</textarea>
+      </div>
+    </section>"#,
         base_url = escape_text(&base_url),
         setup_text_url = escape_text(&setup_text_url),
         mcp_url = escape_text(&mcp_url),
         setup_instruction = escape_text(setup_instruction),
+    );
+
+    render_shell(
+        PageShell {
+            title: "Lore setup",
+            username: None,
+            is_admin: false,
+            theme: config.default_theme,
+            csrf_token: None,
+            flash: None,
+        },
+        content,
     )
 }
 
@@ -1081,45 +1040,21 @@ pub fn render_settings_page(
     is_admin: bool,
     flash: Option<&str>,
 ) -> String {
-    let flash_html = flash_message(flash);
-    let admin_link = if is_admin {
-        r#"<a href="/ui/admin">Admin</a>"#.to_string()
-    } else {
-        String::new()
-    };
     let current_label = selected_theme
         .unwrap_or(server_default_theme)
         .display_name();
     let preference_label = selected_theme
         .map(UiTheme::display_name)
         .unwrap_or("Use server default");
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lore settings</title>
-  <style>{styles}</style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
+
+    let content = format!(
+        r#"<section class="hero">
       <p class="eyebrow">Lore settings</p>
       <h1>Appearance</h1>
       <p class="subtitle">Signed in as {username}. Choose a personal theme override, or fall back to the server default for shared pages like login and setup.</p>
-      <div class="hero-actions">
-        <a class="primary" href="/ui">Projects</a>
-        {admin_link}
-        <form method="post" action="/logout">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Sign out</button>
-        </form>
-      </div>
-      {flash_html}
     </section>
 
-    <section class="layout">
+    <div class="layout">
       <section class="panel">
         <div class="panel-header">
           <h2>Theme preference</h2>
@@ -1135,7 +1070,7 @@ pub fn render_settings_page(
           </label>
           <button type="submit">Save theme</button>
         </form>
-        <div class="meta-stack">
+        <div class="meta-stack padded">
           <p><strong>Saved preference</strong><br>{preference_label}</p>
           <p><strong>Server default</strong><br>{server_default_label}</p>
         </div>
@@ -1149,20 +1084,26 @@ pub fn render_settings_page(
           {theme_preview_cards}
         </div>
       </section>
-    </section>
-  </main>
-</body>
-</html>"#,
-        styles = shared_styles(theme),
+    </div>"#,
         username = escape_text(username),
-        admin_link = admin_link,
         csrf_token = escape_attribute(csrf_token),
-        flash_html = flash_html,
         current_label = escape_text(current_label),
         preference_label = escape_text(preference_label),
         server_default_label = escape_text(server_default_theme.display_name()),
         theme_options = render_theme_options(selected_theme, true),
         theme_preview_cards = render_theme_preview_cards(selected_theme, server_default_theme),
+    );
+
+    render_shell(
+        PageShell {
+            title: "Lore settings",
+            username: Some(username),
+            is_admin,
+            theme,
+            csrf_token: Some(csrf_token),
+            flash,
+        },
+        content,
     )
 }
 
@@ -1200,32 +1141,14 @@ pub fn render_admin_audit_page(
             .collect::<Vec<_>>()
             .join("")
     };
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lore admin audit</title>
-  <style>{styles}</style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
+
+    let content = format!(
+        r#"<section class="hero">
       <p class="eyebrow">Lore admin audit</p>
       <h1>Librarian audit</h1>
       <p class="subtitle">Signed in as {username}. Review pending actions, completed runs, errors, and approval chains across projects.</p>
-      <div class="hero-actions">
-        <a class="primary" href="/ui/admin">Admin</a>
-        <a href="/ui">Projects</a>
-        <a href="/ui/settings">Settings</a>
-        <form method="post" action="/logout">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Sign out</button>
-        </form>
-      </div>
     </section>
-    <section class="layout admin-layout">
+    <div class="layout admin-layout">
       <section class="panel">
         <div class="panel-header">
           <h2>Pending actions</h2>
@@ -1247,16 +1170,23 @@ pub fn render_admin_audit_page(
         </div>
         <div class="timeline">{auth_html}</div>
       </section>
-    </section>
-  </main>
-</body>
-</html>"#,
-        styles = shared_styles(theme),
+    </div>"#,
         username = escape_text(username),
-        csrf_token = escape_attribute(csrf_token),
         pending_html = pending_html,
         runs_html = runs_html,
         auth_html = auth_html,
+    );
+
+    render_shell(
+        PageShell {
+            title: "Lore admin audit",
+            username: Some(username),
+            is_admin: true,
+            theme,
+            csrf_token: Some(csrf_token),
+            flash: None,
+        },
+        content,
     )
 }
 
@@ -1270,11 +1200,6 @@ pub fn render_project_audit_page(
     runs: &[UiLibrarianAnswer],
     pending_actions: &[UiPendingLibrarianAction],
 ) -> String {
-    let admin_link = if is_admin {
-        r#"<a href="/ui/admin">Admin</a>"#.to_string()
-    } else {
-        String::new()
-    };
     let runs_html = if runs.is_empty() {
         "<p class=\"hint padded\">No librarian runs recorded for this project yet.</p>".to_string()
     } else {
@@ -1294,32 +1219,17 @@ pub fn render_project_audit_page(
             .collect::<Vec<_>>()
             .join("")
     };
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lore audit · {project}</title>
-  <style>{styles}</style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
+
+    let content = format!(
+        r#"<section class="hero">
       <p class="eyebrow">Lore project audit</p>
       <h1>{project}</h1>
       <p class="subtitle">Signed in as {username}. Review grounded answer runs, project-action chains, and pending approvals for this project.</p>
       <div class="hero-actions">
         <a class="primary" href="/ui/{project}">Back to project</a>
-        <a href="/ui/settings">Settings</a>
-        {admin_link}
-        <form method="post" action="/logout">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Sign out</button>
-        </form>
       </div>
     </section>
-    <section class="layout">
+    <div class="layout">
       <section class="panel">
         <div class="panel-header">
           <h2>Pending actions</h2>
@@ -1334,17 +1244,23 @@ pub fn render_project_audit_page(
         </div>
         <div class="timeline">{runs_html}</div>
       </section>
-    </section>
-  </main>
-</body>
-</html>"#,
-        styles = shared_styles(theme),
+    </div>"#,
         project = escape_text(project.as_str()),
         username = escape_text(username),
-        admin_link = admin_link,
-        csrf_token = escape_attribute(csrf_token),
         pending_html = pending_html,
         runs_html = runs_html,
+    );
+
+    render_shell(
+        PageShell {
+            title: &format!("Lore audit · {}", project),
+            username: Some(username),
+            is_admin,
+            theme,
+            csrf_token: Some(csrf_token),
+            flash: None,
+        },
+        content,
     )
 }
 
@@ -1357,11 +1273,6 @@ pub fn render_project_history_page(
     csrf_token: &str,
     versions: &[UiProjectVersion],
 ) -> String {
-    let admin_link = if is_admin {
-        r#"<a href="/ui/admin">Admin</a>"#.to_string()
-    } else {
-        String::new()
-    };
     let history_html = if versions.is_empty() {
         "<p class=\"hint padded\">No project versions recorded yet.</p>".to_string()
     } else {
@@ -1371,30 +1282,15 @@ pub fn render_project_history_page(
             .collect::<Vec<_>>()
             .join("")
     };
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lore history · {project}</title>
-  <style>{styles}</style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
+
+    let content = format!(
+        r#"<section class="hero">
       <p class="eyebrow">Lore project history</p>
       <h1>{project}</h1>
       <p class="subtitle">Signed in as {username}. Review reversible project mutations, including librarian edits and API writes, in the order they were recorded.</p>
       <div class="hero-actions">
         <a class="primary" href="/ui/{project}">Back to project</a>
         <a href="/ui/{project}/audit">Audit</a>
-        <a href="/ui/settings">Settings</a>
-        {admin_link}
-        <form method="post" action="/logout">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Sign out</button>
-        </form>
       </div>
     </section>
     <section class="panel">
@@ -1403,16 +1299,22 @@ pub fn render_project_history_page(
         <p>Each recorded version captures exact before/after block snapshots. Revert creates a new version rather than silently deleting history.</p>
       </div>
       <div class="timeline">{history_html}</div>
-    </section>
-  </main>
-</body>
-</html>"#,
-        styles = shared_styles(theme),
+    </section>"#,
         project = escape_text(project.as_str()),
         username = escape_text(username),
-        admin_link = admin_link,
-        csrf_token = escape_attribute(csrf_token),
         history_html = history_html,
+    );
+
+    render_shell(
+        PageShell {
+            title: &format!("Lore history · {}", project),
+            username: Some(username),
+            is_admin,
+            theme,
+            csrf_token: Some(csrf_token),
+            flash: None,
+        },
+        content,
     )
 }
 
@@ -1434,7 +1336,6 @@ pub fn render_project_page(
     librarian_history: &[UiLibrarianAnswer],
     pending_actions: &[UiPendingLibrarianAction],
 ) -> String {
-    let flash_html = flash_message(flash);
     let search_value = search.unwrap_or_default();
     let results_label = if search_value.is_empty() {
         format!(
@@ -1460,11 +1361,6 @@ pub fn render_project_page(
             .collect::<Vec<_>>()
             .join("")
     };
-    let admin_link = if is_admin {
-        r#"<a href="/ui/admin">Admin</a>"#.to_string()
-    } else {
-        String::new()
-    };
     let librarian_panel = render_librarian_panel(
         project,
         csrf_token,
@@ -1478,7 +1374,7 @@ pub fn render_project_page(
             r#"<section class="panel composer" id="composer">
   <div class="panel-header">
     <h2>Add block</h2>
-    <p>You can write anywhere in this project because your role grants project-level write access.</p>
+    <p>You can write anywhere in this project.</p>
   </div>
   <form method="post" action="/ui/{project}/blocks" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -1507,44 +1403,26 @@ pub fn render_project_page(
     </label>
     <button type="submit">Add block</button>
   </form>
-  <p class="hint">HTML is displayed as escaped source for now. Uploaded images are stored on disk and served from Lore only to authenticated users with project access.</p>
 </section>"#,
             project = escape_attribute(project.as_str()),
             csrf_token = escape_attribute(csrf_token),
             placement_options = placement_options,
         )
     } else {
-        r#"<section class="panel composer"><div class="panel-header"><h2>Read-only access</h2><p>Your role allows viewing this project but not creating, editing, moving, or deleting blocks.</p></div></section>"#.to_string()
+        r#"<section class="panel composer"><div class="panel-header"><h2>Read-only access</h2><p>Viewing only.</p></div></section>"#.to_string()
     };
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lore · {project}</title>
-  <style>{styles}</style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
+    let content = format!(
+        r#"<section class="hero">
       <p class="eyebrow">Lore project</p>
       <h1>{project}</h1>
-      <p class="subtitle">Signed in as {username}. Human access is project-scoped; agent ownership remains a separate rule at the API layer.</p>
+      <p class="subtitle">Signed in as {username}. Review and edit the shared project state.</p>
       <div class="hero-actions">
-        <a class="primary" href="/ui">Projects</a>
-        <a href="/ui/settings">Settings</a>
-        {admin_link}
         <a href="/ui/{project}/audit">Audit</a>
         <a href="/ui/{project}/history">History</a>
-        <form method="post" action="/logout">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit">Sign out</button>
-        </form>
       </div>
       <form class="searchbar" method="get" action="/ui/{project}">
-        <input type="search" name="q" value="{search_value}" placeholder="Search content, author, type, or order">
+        <input type="search" name="q" value="{search_value}" placeholder="Search content...">
         <select name="block_type">
           <option value=""{search_any_type}>Any type</option>
           <option value="markdown"{search_markdown}>Markdown</option>
@@ -1552,14 +1430,13 @@ pub fn render_project_page(
           <option value="html"{search_html}>HTML</option>
           <option value="image"{search_image}>Image</option>
         </select>
-        <input type="search" name="author" value="{search_author}" placeholder="Author contains">
+        <input type="search" name="author" value="{search_author}" placeholder="Author...">
         <input type="number" name="since_days" min="1" value="{search_since_days}" placeholder="Days">
         <button type="submit">Search</button>
       </form>
-      {flash_html}
     </section>
 
-    <section class="layout">
+    <div class="layout">
       <section class="panel" id="document">
         <div class="panel-header">
           <h2>Document</h2>
@@ -1568,15 +1445,9 @@ pub fn render_project_page(
         <div class="timeline">{blocks_html}</div>
       </section>
       <aside class="stack">{librarian_panel}{composer}</aside>
-    </section>
-  </main>
-</body>
-</html>"#,
-        styles = shared_styles(theme),
+    </div>"#,
         project = escape_text(project.as_str()),
         username = escape_text(username),
-        admin_link = admin_link,
-        csrf_token = escape_attribute(csrf_token),
         search_value = escape_attribute(search_value),
         search_any_type = if search_block_type.is_none() {
             " selected"
@@ -1589,11 +1460,22 @@ pub fn render_project_page(
         search_image = selected(search_block_type, "image"),
         search_author = escape_attribute(search_author.unwrap_or_default()),
         search_since_days = search_since_days.map(|v| v.to_string()).unwrap_or_default(),
-        flash_html = flash_html,
         results_label = results_label,
         blocks_html = blocks_html,
         librarian_panel = librarian_panel,
         composer = composer,
+    );
+
+    render_shell(
+        PageShell {
+            title: &format!("Lore · {}", project),
+            username: Some(username),
+            is_admin,
+            theme,
+            csrf_token: Some(csrf_token),
+            flash,
+        },
+        content,
     )
 }
 
@@ -2799,7 +2681,17 @@ fn format_timestamp(value: time::OffsetDateTime) -> String {
 
 fn flash_message(flash: Option<&str>) -> String {
     flash
-        .map(|message| format!(r#"<p class="flash">{}</p>"#, escape_text(message)))
+        .map(|message| {
+            let class = if message.starts_with("Incorrect")
+                || message.starts_with("Error")
+                || message.starts_with("too many")
+            {
+                "flash flash-error"
+            } else {
+                "flash"
+            };
+            format!(r#"<p class="{class}">{}</p>"#, escape_text(message))
+        })
         .unwrap_or_default()
 }
 
@@ -2856,7 +2748,7 @@ fn theme_palette(theme: UiTheme) -> ThemePalette {
             accent_soft: "rgba(181, 82, 51, 0.12)",
             shadow: "0 20px 60px rgba(71, 46, 31, 0.12)",
             radius: "22px",
-            font_sans: "\"Iowan Old Style\", \"Palatino Linotype\", \"Book Antiqua\", Georgia, serif",
+            font_sans: "Inter, -apple-system, system-ui, sans-serif",
             font_mono: "\"SFMono-Regular\", \"Cascadia Mono\", \"Liberation Mono\", monospace",
             body_background: "radial-gradient(circle at top left, rgba(214, 139, 96, 0.24), transparent 28rem), radial-gradient(circle at top right, rgba(96, 138, 173, 0.14), transparent 22rem), linear-gradient(180deg, #f7f2ea 0%, var(--bg) 100%)",
             button_background: "linear-gradient(135deg, #1f1a17, #7b3622)",
@@ -2916,7 +2808,7 @@ fn theme_palette(theme: UiTheme) -> ThemePalette {
             accent_soft: "rgba(15, 143, 111, 0.14)",
             shadow: "0 18px 54px rgba(18, 74, 63, 0.16)",
             radius: "18px",
-            font_sans: "\"Gill Sans\", \"Avenir Next Condensed\", \"Trebuchet MS\", sans-serif",
+            font_sans: "Inter, -apple-system, system-ui, sans-serif",
             font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
             body_background: "radial-gradient(circle at top left, rgba(15, 143, 111, 0.18), transparent 28rem), radial-gradient(circle at top right, rgba(244, 114, 182, 0.12), transparent 22rem), linear-gradient(180deg, #f2f8f5 0%, var(--bg) 100%)",
             button_background: "linear-gradient(135deg, #0f8f6f, #1768ac)",
@@ -3029,6 +2921,15 @@ fn shared_styles(theme: UiTheme) -> String {
       --media-image-bg: {};
       --empty-bg: {};
       --details-bg: {};
+
+      --s-1: 4px;
+      --s-2: 8px;
+      --s-3: 12px;
+      --s-4: 16px;
+      --s-5: 24px;
+      --s-6: 32px;
+      --s-7: 48px;
+      --s-8: 64px;
     }}
 
     * {{ box-sizing: border-box; }}
@@ -3039,6 +2940,7 @@ fn shared_styles(theme: UiTheme) -> String {
       color: var(--ink);
       background: {};
       min-height: 100vh;
+      line-height: 1.5;
     }}
 "#,
         palette.color_scheme,
@@ -3071,11 +2973,74 @@ fn shared_styles(theme: UiTheme) -> String {
         palette.body_background,
     );
     let rest = r#"
-
     .shell {
-      width: min(1080px, calc(100vw - 24px));
+      width: min(1080px, calc(100vw - var(--s-6)));
       margin: 0 auto;
-      padding: 20px 0 48px;
+      padding: var(--s-5) 0 var(--s-8);
+    }
+
+    .top-nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: var(--panel);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--line);
+      margin-bottom: var(--s-6);
+    }
+
+    .top-nav-inner {
+      width: min(1080px, calc(100vw - var(--s-6)));
+      margin: 0 auto;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .top-nav .logo {
+      font-weight: 800;
+      font-size: 1.25rem;
+      text-decoration: none;
+      color: var(--ink);
+      letter-spacing: -0.02em;
+    }
+
+    .top-nav-links {
+      display: flex;
+      align-items: center;
+      gap: var(--s-4);
+    }
+
+    .top-nav-links a {
+      text-decoration: none;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.95rem;
+      transition: color 0.2s;
+    }
+
+    .top-nav-links a:hover,
+    .top-nav-links a.active {
+      color: var(--ink);
+    }
+
+    .top-nav-links form {
+      padding: 0;
+      margin: 0;
+    }
+
+    .top-nav-links button {
+      background: none;
+      color: var(--muted);
+      padding: 0;
+      font-size: 0.95rem;
+      min-height: auto;
+      width: auto;
+    }
+
+    .top-nav-links button:hover {
+      color: var(--ink);
     }
 
     .auth-shell {
@@ -3088,69 +3053,75 @@ fn shared_styles(theme: UiTheme) -> String {
     .panel {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 28px;
+      border-radius: var(--radius);
       box-shadow: var(--shadow);
       backdrop-filter: blur(8px);
     }
 
     .hero {
-      padding: 22px;
+      padding: var(--s-6);
       display: grid;
-      gap: 10px;
+      gap: var(--s-2);
     }
 
     .auth-panel {
       max-width: 32rem;
       margin: 0 auto;
-      padding: 22px;
+      padding: var(--s-6);
     }
 
     .eyebrow {
       margin: 0;
       color: var(--muted);
-      font-size: 0.88rem;
-      letter-spacing: 0.08em;
+      font-size: 0.85rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
       text-transform: uppercase;
     }
 
-    h1,
-    h2 {
-      margin: 0;
-    }
+    h1, h2, h3 { margin: 0; }
 
     h1 {
-      font-size: clamp(1.9rem, 5vw, 3.2rem);
-      line-height: 0.95;
+      font-size: clamp(2.2rem, 5vw, 3.6rem);
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      font-weight: 800;
     }
 
-    .subtitle,
-    .hint,
-    .danger-panel p {
+    h2 {
+      font-size: 1.5rem;
+      letter-spacing: -0.02em;
+      font-weight: 700;
+    }
+
+    .subtitle, .hint, .danger-panel p {
       margin: 0;
       color: var(--muted);
-      line-height: 1.5;
+      line-height: 1.6;
     }
 
-    .flash {{
-      margin: 6px 0 0;
-      padding: 12px 14px;
-      border-radius: 14px;
+    .flash {
+      margin: var(--s-4) 0 0;
+      padding: var(--s-3) var(--s-4);
+      border-radius: var(--s-3);
       background: var(--flash-bg);
       color: var(--flash-ink);
       border: 1px solid var(--flash-line);
-    }}
+      font-weight: 600;
+    }
+
+    .flash-error {
+      background: rgba(220, 38, 38, 0.10);
+      color: #991b1b;
+      border-color: rgba(220, 38, 38, 0.25);
+    }
 
     .hero-actions {
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 6px;
+      gap: var(--s-3);
+      margin-top: var(--s-4);
       align-items: center;
-    }
-
-    .hero-actions form {
-      padding: 0;
-      display: block;
     }
 
     .hero-actions a,
@@ -3159,13 +3130,21 @@ fn shared_styles(theme: UiTheme) -> String {
       align-items: center;
       justify-content: center;
       min-height: 44px;
-      padding: 10px 14px;
+      padding: 0 var(--s-5);
       border-radius: 999px;
       text-decoration: none;
       border: 1px solid var(--line);
       color: var(--ink);
       background: rgba(255,255,255,0.68);
       font-weight: 700;
+      font-size: 0.95rem;
+      transition: all 0.2s;
+    }
+
+    .hero-actions a:hover,
+    .button-link:hover {
+      background: rgba(255,255,255,0.9);
+      transform: translateY(-1px);
     }
 
     .hero-actions a.primary,
@@ -3175,112 +3154,110 @@ fn shared_styles(theme: UiTheme) -> String {
       color: var(--hero-button-ink);
     }
 
+    .hero-actions a.primary:hover,
+    .button-link:hover {
+      opacity: 0.9;
+    }
+
     .layout {
       display: grid;
-      gap: 18px;
-      margin-top: 18px;
-      grid-template-columns: minmax(0, 1.6fr) minmax(280px, 0.95fr);
+      gap: var(--s-5);
+      margin-top: var(--s-6);
+      grid-template-columns: minmax(0, 1.6fr) minmax(300px, 0.95fr);
       align-items: start;
+    }
+
+    @media (max-width: 800px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
     }
 
     .admin-layout {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .project-grid,
-    .stack,
-    .timeline {
+    .project-grid, .stack, .timeline {
       display: grid;
-      gap: 14px;
-      margin-top: 18px;
+      gap: var(--s-4);
+    }
+
+    .project-grid {
+      margin-top: var(--s-6);
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
     }
 
     .timeline {
-      padding: 16px;
-      margin-top: 0;
+      padding: var(--s-5);
     }
 
-    .project-card,
-    .block {
-      padding: 16px;
+    .project-card, .block {
+      padding: var(--s-5);
       border: 1px solid var(--line);
-      border-radius: 18px;
-      background: linear-gradient(180deg, var(--panel-strong), rgba(255,255,255,0.76));
+      border-radius: var(--s-5);
+      background: var(--panel-strong);
+      transition: border-color 0.2s;
+    }
+
+    .project-card:hover {
+      border-color: var(--accent);
     }
 
     .project-card {
       display: flex;
+      flex-direction: column;
       justify-content: space-between;
-      gap: 16px;
-      align-items: center;
+      gap: var(--s-4);
+      align-items: flex-start;
     }
 
     .panel-header {
-      padding: 16px 18px 0;
+      padding: var(--s-5) var(--s-5) 0;
       display: grid;
-      gap: 6px;
+      gap: var(--s-2);
     }
 
     .composer {
       position: sticky;
-      top: 14px;
+      top: 84px;
     }
 
     form {
       display: grid;
-      gap: 12px;
-      padding: 16px;
+      gap: var(--s-4);
+      padding: var(--s-5);
     }
 
     label {
       display: grid;
-      gap: 6px;
+      gap: var(--s-2);
       color: var(--muted);
-      font-size: 0.92rem;
+      font-size: 0.9rem;
+      font-weight: 600;
     }
 
-    .toggle {
-      grid-template-columns: auto 1fr;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .toggle input {
-      width: auto;
-      margin: 0;
-    }
-
-    input,
-    select,
-    textarea,
-    button {
+    input, select, textarea, button {
       width: 100%;
       border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px 13px;
+      border-radius: var(--s-3);
+      padding: var(--s-3) var(--s-4);
       font-size: 16px;
       background: rgba(255,255,255,0.92);
       color: var(--ink);
-      font-family: var(--font-mono);
+      font-family: inherit;
+    }
+
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
     }
 
     textarea {
-      min-height: 13rem;
+      min-height: 10rem;
       resize: vertical;
-    }
-
-    .callout {
-      display: grid;
-      gap: 12px;
-      margin: 16px;
-      padding: 16px;
-      border-radius: 18px;
-      border: 1px solid var(--line);
-      background: var(--callout-bg);
-    }
-
-    .callout p {
-      margin: 0;
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
     }
 
     button {
@@ -3288,23 +3265,47 @@ fn shared_styles(theme: UiTheme) -> String {
       background: var(--button-bg);
       color: var(--button-ink);
       font-weight: 700;
-      letter-spacing: 0.01em;
       cursor: pointer;
+      min-height: 48px;
+    }
+
+    button:hover {
+      opacity: 0.9;
+    }
+
+    .callout {
+      display: grid;
+      gap: var(--s-3);
+      margin: var(--s-5);
+      padding: var(--s-5);
+      border-radius: var(--s-4);
+      border: 1px solid var(--line);
+      background: var(--callout-bg);
     }
 
     .searchbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 10px;
-      margin-top: 6px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--s-2);
+      margin-top: var(--s-4);
+    }
+
+    .searchbar input, .searchbar select {
+      flex: 1;
+      min-width: 120px;
+    }
+
+    .searchbar button {
+      width: auto;
+      padding: 0 var(--s-6);
     }
 
     .block-meta {
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
+      gap: var(--s-2);
       align-items: center;
-      margin-bottom: 12px;
+      margin-bottom: var(--s-4);
       color: var(--muted);
       font-size: 0.85rem;
     }
@@ -3312,56 +3313,34 @@ fn shared_styles(theme: UiTheme) -> String {
     .pill {
       display: inline-flex;
       align-items: center;
-      padding: 5px 9px;
+      padding: 4px 10px;
       border-radius: 999px;
       background: var(--accent-soft);
       color: var(--accent);
       font-weight: 700;
-      letter-spacing: 0.01em;
-    }
-
-    .pill.small {
-      padding: 3px 7px;
       font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
     }
 
     .meta-code {
       font-family: var(--font-mono);
       font-size: 0.8rem;
-      word-break: break-all;
-    }
-
-    .meta-separator {
-      color: rgba(109, 98, 88, 0.6);
+      background: var(--code-bg);
+      color: var(--code-ink);
+      padding: 2px 6px;
+      border-radius: 6px;
     }
 
     .block-body {
-      font-size: 1rem;
-      line-height: 1.65;
-      overflow-wrap: anywhere;
+      font-size: 1.05rem;
+      line-height: 1.7;
     }
 
-    .block-body > :first-child,
-    .grant-list > :first-child {
-      margin-top: 0;
-    }
-
-    .block-body > :last-child,
-    .grant-list > :last-child {
-      margin-bottom: 0;
-    }
-
-    .block-body pre,
-    .block-body code,
-    .raw-content {
-      font-family: var(--font-mono);
-    }
-
-    .block-body pre,
-    .raw-content {
-      margin: 0;
-      padding: 14px;
-      border-radius: 14px;
+    .block-body pre {
+      margin: var(--s-4) 0;
+      padding: var(--s-4);
+      border-radius: var(--s-3);
       background: var(--code-bg);
       color: var(--code-ink);
       overflow-x: auto;
@@ -3369,9 +3348,9 @@ fn shared_styles(theme: UiTheme) -> String {
     }
 
     .media-frame {
-      margin: 0;
+      margin: var(--s-4) 0;
       border: 1px solid var(--line);
-      border-radius: 16px;
+      border-radius: var(--radius);
       overflow: hidden;
       background: var(--media-bg);
     }
@@ -3380,69 +3359,40 @@ fn shared_styles(theme: UiTheme) -> String {
       display: block;
       width: 100%;
       height: auto;
-      max-height: 26rem;
+      max-height: 40rem;
       object-fit: contain;
-      background: var(--media-image-bg);
     }
 
     .block-actions {
-      display: grid;
-      gap: 10px;
-      margin-top: 14px;
-      padding-top: 14px;
+      display: flex;
+      gap: var(--s-3);
+      margin-top: var(--s-5);
+      padding-top: var(--s-5);
       border-top: 1px solid var(--line);
     }
 
-    details {
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      background: var(--details-bg);
-      overflow: hidden;
-    }
-
-    summary {
-      list-style: none;
-      cursor: pointer;
-      padding: 12px 14px;
-      font-weight: 700;
-    }
-
-    summary::-webkit-details-marker {
-      display: none;
-    }
-
-    .danger {
-      background: linear-gradient(135deg, #6f1f19, #a5332a);
-    }
-
-    .danger-panel {
-      padding: 16px;
-      display: grid;
-      gap: 12px;
-    }
-
-    .empty-state,
-    .padded {
-      padding: 24px;
+    .block-actions button, .block-actions a {
+      flex: 1;
     }
 
     .empty-state {
-      border: 1px dashed rgba(78, 55, 36, 0.22);
-      border-radius: 18px;
-      background: var(--empty-bg);
+      padding: var(--s-8) var(--s-5);
+      border: 2px dashed var(--line);
+      border-radius: var(--radius);
       text-align: center;
+      color: var(--muted);
     }
 
     .theme-preview {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      gap: 10px;
+      gap: var(--s-3);
       min-height: 72px;
-      margin-top: 8px;
+      margin-top: var(--s-2);
     }
 
     .theme-preview span {
-      border-radius: 14px;
+      border-radius: var(--s-3);
       border: 1px solid var(--line);
     }
 
@@ -3458,35 +3408,26 @@ fn shared_styles(theme: UiTheme) -> String {
 
     .grant-list {
       margin: 0;
-      padding-left: 18px;
+      padding-left: var(--s-5);
       color: var(--muted);
-    }
-
-    .version-op {
-      margin: 0;
     }
 
     .version-meta {
       display: grid;
-      gap: 6px;
-      margin: 12px 0;
-      padding: 12px 14px;
-      border-radius: 14px;
+      gap: var(--s-2);
+      margin: var(--s-4) 0;
+      padding: var(--s-4);
+      border-radius: var(--s-4);
       background: rgba(255, 255, 255, 0.5);
       border: 1px solid var(--line);
-    }
-
-    .version-meta p,
-    .diff-list p {
-      margin: 0;
     }
 
     .diff-list {
       display: grid;
       gap: 1px;
-      margin-top: 12px;
+      margin-top: var(--s-3);
       border: 1px solid var(--line);
-      border-radius: 14px;
+      border-radius: var(--s-4);
       overflow: hidden;
       background: var(--line);
     }
@@ -3494,8 +3435,8 @@ fn shared_styles(theme: UiTheme) -> String {
     .diff-line {
       display: grid;
       grid-template-columns: auto 1fr;
-      gap: 10px;
-      padding: 10px 12px;
+      gap: var(--s-3);
+      padding: var(--s-2) var(--s-3);
       font-family: var(--font-mono);
       font-size: 0.88rem;
       background: rgba(255, 255, 255, 0.9);
@@ -3508,28 +3449,14 @@ fn shared_styles(theme: UiTheme) -> String {
       color: var(--muted);
     }
 
-    .diff-added {
-      background: rgba(47, 122, 97, 0.12);
-    }
-
-    .diff-added .diff-prefix {
-      color: #1d7257;
-    }
-
-    .diff-removed {
-      background: rgba(181, 82, 51, 0.12);
-    }
-
-    .diff-removed .diff-prefix {
-      color: #a33a1d;
-    }
-
-    .diff-context {
-      background: rgba(255, 255, 255, 0.94);
-    }
+    .diff-added { background: rgba(47, 122, 97, 0.12); }
+    .diff-added .diff-prefix { color: #1d7257; }
+    .diff-removed { background: rgba(181, 82, 51, 0.12); }
+    .diff-removed .diff-prefix { color: #a33a1d; }
+    .diff-context { background: rgba(255, 255, 255, 0.94); }
 
     .inline-form {
-      margin-top: 14px;
+      margin-top: var(--s-4);
       padding: 0;
     }
 

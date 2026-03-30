@@ -31,21 +31,28 @@ Docker is not the primary install path today. Lore currently prioritizes direct 
 
 Run
 
-After installing the server:
+After installing the server binary, run the full setup:
 
 ```sh
-LORE_DATA_ROOT=$HOME/.local/share/lore \
-LORE_BIND=127.0.0.1:7043 \
-lore-server
+lore-server install
 ```
 
-Then open:
+This will:
+1. Create an admin account (interactive prompt)
+2. Ask for your domain name
+3. Download and configure Caddy as an HTTPS reverse proxy
+4. Start both services as systemd daemons (requires sudo)
 
-```text
-http://127.0.0.1:7043/setup
+Then open `https://yourdomain.com/setup` — that setup flow explains when to use HTTP vs MCP and gives agent-oriented instructions.
+
+Other commands:
+
+```sh
+lore-server status       # check if everything is running
+lore-server update       # update to the latest release
+lore-server uninstall    # remove services (keeps data)
+lore-server clean        # remove services + binaries (keeps data)
 ```
-
-That setup flow explains when to use HTTP vs MCP and gives agent-oriented instructions for the specific Lore server URL you configure.
 
 Updates
 

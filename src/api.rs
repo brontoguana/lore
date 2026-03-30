@@ -1078,8 +1078,21 @@ async fn login_submit(
     State(state): State<AppState>,
     Form(form): Form<LoginForm>,
 ) -> UiResult<Response> {
-    enforce_login_rate_limit(&state, &form.username)?;
-    let session = state.auth.create_session(&form.username, &form.password)?;
+    if let Err(_) = enforce_login_rate_limit(&state, &form.username) {
+        return Ok(Redirect::to(
+            "/login?flash=too%20many%20login%20attempts%20—%20try%20again%20later",
+        )
+        .into_response());
+    }
+    let session = match state.auth.create_session(&form.username, &form.password) {
+        Ok(s) => s,
+        Err(LoreError::PermissionDenied) => {
+            return Ok(
+                Redirect::to("/login?flash=Incorrect%20username%20or%20password").into_response(),
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
     clear_login_rate_limit(&state, &form.username);
     append_audit_event(
         &state,
@@ -6731,9 +6744,10 @@ impl IntoResponse for UiError {
         };
 
         let body = Html(format!(
-            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Lore error</title><style>body{{margin:0;padding:24px;font-family:Georgia,serif;background:#f4efe7;color:#1f1a17}}main{{max-width:32rem;margin:0 auto;background:#fffaf3;border:1px solid rgba(78,55,36,.14);border-radius:18px;padding:20px;box-shadow:0 20px 60px rgba(71,46,31,.12)}}a{{color:#b55233}}</style></head><body><main><h1>Request failed</h1><p>{}</p><p><a href=\"javascript:history.back()\">Go back</a></p></main></body></html>",
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Lore error</title><style>body{{margin:0;padding:24px;font-family:Inter,-apple-system,system-ui,sans-serif;background:#f4efe7;color:#1f1a17;line-height:1.5}}main{{max-width:32rem;margin:4rem auto;background:#fffaf3;border:1px solid rgba(78,55,36,.14);border-radius:22px;padding:2rem;box-shadow:0 20px 60px rgba(71, 46, 31,0.12)}}h1{{margin:0 0 1rem;font-size:2rem;font-weight:800;letter-spacing:-0.02em}}p{{margin:0 0 1rem}}a{{color:#b55233;font-weight:700;text-decoration:none}}</style></head><body><main><h1>Request failed</h1><p>{}</p><p><a href=\"javascript:history.back()\">Go back</a></p></main></body></html>",
             v_htmlescape::escape(&self.0.to_string())
         ));
+
         (status, body).into_response()
     }
 }
