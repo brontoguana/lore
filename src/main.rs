@@ -36,14 +36,11 @@ enum ServerCommand {
     /// Start the server (default if no command given)
     Start,
     /// Install lore-server as a system daemon (systemd user service)
-    #[command(name = "daemon-install")]
-    DaemonInstall,
+    Install,
     /// Remove the lore-server daemon
-    #[command(name = "daemon-uninstall")]
-    DaemonUninstall,
+    Uninstall,
     /// Show daemon status
-    #[command(name = "daemon-status")]
-    DaemonStatus,
+    Status,
     /// Set up Caddy reverse proxy for HTTPS access
     #[command(name = "caddy-install")]
     CaddyInstall {
@@ -57,6 +54,10 @@ enum ServerCommand {
     /// Show Caddy reverse proxy status
     #[command(name = "caddy-status")]
     CaddyStatus,
+    /// Update lore-server to the latest release
+    Update,
+    /// Remove all services and binaries but keep data (for a fresh reinstall)
+    Clean,
 }
 
 #[tokio::main]
@@ -81,13 +82,13 @@ async fn main() {
             prompt_initial_admin_if_needed(&data_root);
             run_server(data_root, bind).await;
         }
-        ServerCommand::DaemonInstall => {
+        ServerCommand::Install => {
             ensure_data_dir(&data_root);
             prompt_initial_admin_if_needed(&data_root);
             daemon_install(&data_root, &bind);
         }
-        ServerCommand::DaemonUninstall => daemon_uninstall(),
-        ServerCommand::DaemonStatus => daemon_status(),
+        ServerCommand::Uninstall => daemon_uninstall(),
+        ServerCommand::Status => daemon_status(),
         ServerCommand::CaddyInstall { domain } => {
             ensure_data_dir(&data_root);
             let domain = domain.unwrap_or_else(|| prompt_domain());
@@ -97,7 +98,101 @@ async fn main() {
             caddy_uninstall(&data_root);
         }
         ServerCommand::CaddyStatus => caddy_status(&data_root),
+        ServerCommand::Update => run_update(),
+        ServerCommand::Clean => run_clean(&data_root),
     }
+}
+
+fn run_update() {
+    use std::process::Command;
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("curl -fsSL https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-server.sh | sh")
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("error: failed to run update: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_clean(data_root: &str) {
+    eprintln!("cleaning lore-server installation (data in {data_root} will be kept)");
+    eprintln!();
+
+    // Stop and remove caddy service
+    let caddy_unit = caddy_unit_file_path();
+    if caddy_unit.exists() {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", CADDY_SERVICE_NAME])
+            .status();
+        if let Err(err) = fs::remove_file(&caddy_unit) {
+            eprintln!("warning: cannot remove {}: {err}", caddy_unit.display());
+        } else {
+            eprintln!("removed service: {}", caddy_unit.display());
+        }
+    }
+
+    // Stop and remove lore-server service
+    let lore_unit = unit_file_path();
+    if lore_unit.exists() {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", SERVICE_NAME])
+            .status();
+        if let Err(err) = fs::remove_file(&lore_unit) {
+            eprintln!("warning: cannot remove {}: {err}", lore_unit.display());
+        } else {
+            eprintln!("removed service: {}", lore_unit.display());
+        }
+    }
+
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+
+    // Remove Caddyfile and caddy dirs from data root
+    let data_path = PathBuf::from(data_root);
+    for name in ["Caddyfile", "caddy-data", "caddy-config"] {
+        let p = data_path.join(name);
+        if p.is_dir() {
+            if let Err(err) = fs::remove_dir_all(&p) {
+                eprintln!("warning: cannot remove {}: {err}", p.display());
+            } else {
+                eprintln!("removed: {}", p.display());
+            }
+        } else if p.is_file() {
+            if let Err(err) = fs::remove_file(&p) {
+                eprintln!("warning: cannot remove {}: {err}", p.display());
+            } else {
+                eprintln!("removed: {}", p.display());
+            }
+        }
+    }
+
+    // Remove binaries
+    let bin_dir = local_bin_dir();
+    for bin in ["lore-server", "caddy"] {
+        let p = bin_dir.join(bin);
+        if p.exists() {
+            if let Err(err) = fs::remove_file(&p) {
+                eprintln!("warning: cannot remove {}: {err}", p.display());
+            } else {
+                eprintln!("removed: {}", p.display());
+            }
+        }
+    }
+
+    eprintln!();
+    eprintln!("clean complete — all services stopped and binaries removed");
+    eprintln!("data preserved in: {data_root}");
+    eprintln!();
+    eprintln!("to reinstall:");
+    eprintln!(
+        "  curl -fsSL https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-server.sh | sh"
+    );
 }
 
 fn default_data_dir() -> String {
@@ -348,7 +443,7 @@ WantedBy=default.target
             println!("useful commands:");
             println!("  systemctl --user status {SERVICE_NAME}");
             println!("  journalctl --user -u {SERVICE_NAME} -f");
-            println!("  lore-server daemon-uninstall");
+            println!("  lore-server uninstall");
         }
         _ => {
             eprintln!("warning: could not enable the service via systemctl");
@@ -398,7 +493,7 @@ fn daemon_status() {
     let unit_path = unit_file_path();
     if !unit_path.exists() {
         println!("daemon is not installed");
-        println!("run: lore-server daemon-install");
+        println!("run: lore-server install");
         return;
     }
 
@@ -518,9 +613,14 @@ fn download_caddy() -> Result<PathBuf, String> {
 
 fn apply_setcap(caddy_path: &PathBuf) -> bool {
     eprintln!("caddy needs permission to bind ports 80/443 (requires sudo once)");
+    // Find setcap binary - it's often in /usr/sbin which may not be in sudo's PATH
+    let setcap_bin = ["/usr/sbin/setcap", "/sbin/setcap", "setcap"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap_or(&"setcap");
     let status = std::process::Command::new("sudo")
         .args([
-            "setcap",
+            setcap_bin,
             "cap_net_bind_service=+ep",
             &caddy_path.to_string_lossy(),
         ])

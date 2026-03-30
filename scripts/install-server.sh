@@ -159,7 +159,7 @@ else
   echo ""
   echo "quick start:"
   echo "  lore-server                              # start (data in ~/lore)"
-  echo "  lore-server daemon-install               # install as always-on daemon"
+  echo "  lore-server install                      # install as always-on daemon"
   echo "  lore-server caddy-install --domain X     # add HTTPS reverse proxy"
   echo ""
   echo "on first run you will be prompted to create an admin account."
