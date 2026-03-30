@@ -1021,7 +1021,7 @@ fn build_context(cli: &Cli, config: &CliConfig) -> CliResult<CliContext> {
         .clone()
         .or_else(|| env::var("LORE_URL").ok())
         .or_else(|| config.url.clone())
-        .unwrap_or_else(|| "http://127.0.0.1:8080".into());
+        .unwrap_or_else(|| "http://127.0.0.1:7043".into());
     let token = cli
         .token
         .clone()

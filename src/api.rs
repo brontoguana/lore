@@ -4019,7 +4019,7 @@ fn default_external_port() -> u16 {
         .and_then(|value| value.rsplit(':').next().map(str::to_string))
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|port| *port > 0)
-        .unwrap_or(8080)
+        .unwrap_or(7043)
 }
 
 fn build_agent_setup_instruction(config: &ServerConfig, token: Option<&str>) -> String {
@@ -6718,10 +6718,14 @@ impl IntoResponse for ApiError {
 
 impl IntoResponse for UiError {
     fn into_response(self) -> Response {
+        if matches!(self.0, LoreError::PermissionDenied) {
+            return Redirect::to("/login").into_response();
+        }
+
         let status = match self.0 {
             LoreError::Validation(_) | LoreError::InvalidOrderRange => StatusCode::BAD_REQUEST,
             LoreError::BlockNotFound(_) => StatusCode::NOT_FOUND,
-            LoreError::PermissionDenied => StatusCode::FORBIDDEN,
+            LoreError::PermissionDenied => unreachable!(),
             LoreError::ExternalService(_) => StatusCode::BAD_GATEWAY,
             LoreError::Io(_) | LoreError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -7906,7 +7910,7 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded")
             .header("cookie", &session_cookie)
             .body(Body::from(format!(
-                "csrf_token={csrf_token}&external_scheme=http&external_host=localhost&external_port=8080&default_theme=graphite"
+                "csrf_token={csrf_token}&external_scheme=http&external_host=localhost&external_port=7043&default_theme=graphite"
             )))
             .unwrap();
         assert_eq!(
@@ -8614,9 +8618,10 @@ mod tests {
             .header("cookie", session_cookie)
             .body(Body::empty())
             .unwrap();
+        // UI routes redirect to /login when session is invalid
         assert_eq!(
             app.oneshot(request).await.unwrap().status(),
-            StatusCode::FORBIDDEN
+            StatusCode::SEE_OTHER
         );
     }
 

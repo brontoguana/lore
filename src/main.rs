@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 const SELF_UPDATE_SKIP_ENV: &str = "LORE_SKIP_SELF_UPDATE";
 const SERVICE_NAME: &str = "lore-server";
+const CADDY_SERVICE_NAME: &str = "lore-caddy";
 
 #[derive(Parser)]
 #[command(name = "lore-server")]
@@ -22,7 +23,7 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<String>,
 
-    /// Bind address (default: 0.0.0.0:8080)
+    /// Bind address (default: 127.0.0.1:7043)
     #[arg(long, global = true)]
     bind: Option<String>,
 
@@ -43,6 +44,19 @@ enum ServerCommand {
     /// Show daemon status
     #[command(name = "daemon-status")]
     DaemonStatus,
+    /// Set up Caddy reverse proxy for HTTPS access
+    #[command(name = "caddy-install")]
+    CaddyInstall {
+        /// Domain name (e.g. lore.example.com) — prompted if not given
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Remove the Caddy reverse proxy
+    #[command(name = "caddy-uninstall")]
+    CaddyUninstall,
+    /// Show Caddy reverse proxy status
+    #[command(name = "caddy-status")]
+    CaddyStatus,
 }
 
 #[tokio::main]
@@ -59,7 +73,7 @@ async fn main() {
         .bind
         .clone()
         .or_else(|| env::var("LORE_BIND").ok())
-        .unwrap_or_else(|| "0.0.0.0:8080".to_string());
+        .unwrap_or_else(|| "127.0.0.1:7043".to_string());
 
     match cli.command.unwrap_or(ServerCommand::Start) {
         ServerCommand::Start => {
@@ -74,6 +88,15 @@ async fn main() {
         }
         ServerCommand::DaemonUninstall => daemon_uninstall(),
         ServerCommand::DaemonStatus => daemon_status(),
+        ServerCommand::CaddyInstall { domain } => {
+            ensure_data_dir(&data_root);
+            let domain = domain.unwrap_or_else(|| prompt_domain());
+            caddy_install(&data_root, &domain);
+        }
+        ServerCommand::CaddyUninstall => {
+            caddy_uninstall(&data_root);
+        }
+        ServerCommand::CaddyStatus => caddy_status(&data_root),
     }
 }
 
@@ -206,6 +229,11 @@ async fn run_server(data_root: String, bind: String) {
     let addr: SocketAddr = listener.local_addr().expect("listener has local address");
     eprintln!("lore-server listening on http://{addr}");
     eprintln!("data directory: {data_root}");
+    if addr.ip().is_loopback() && !has_caddy_config(&data_root) {
+        eprintln!();
+        eprintln!("tip: for external HTTPS access, run:");
+        eprintln!("  lore-server caddy-install --domain yourdomain.com");
+    }
     axum::serve(listener, app)
         .await
         .expect("server exited with error");
@@ -305,7 +333,18 @@ WantedBy=default.target
             println!("daemon installed and started");
             println!("  data directory: {}", data_root_abs.display());
             println!("  bind address:   {bind}");
+
+            // Also start caddy if it's configured
+            if has_caddy_config(data_root) {
+                start_caddy_service();
+            }
+
             println!();
+            if !has_caddy_config(data_root) {
+                println!("for external HTTPS access:");
+                println!("  lore-server caddy-install --domain yourdomain.com");
+                println!();
+            }
             println!("useful commands:");
             println!("  systemctl --user status {SERVICE_NAME}");
             println!("  journalctl --user -u {SERVICE_NAME} -f");
@@ -319,7 +358,20 @@ WantedBy=default.target
 }
 
 fn daemon_uninstall() {
-    // stop and disable
+    // Stop and remove caddy service too if present
+    let caddy_unit = caddy_unit_file_path();
+    if caddy_unit.exists() {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", CADDY_SERVICE_NAME])
+            .status();
+        if let Err(err) = fs::remove_file(&caddy_unit) {
+            eprintln!("warning: cannot remove {}: {err}", caddy_unit.display());
+        } else {
+            println!("removed {}", caddy_unit.display());
+        }
+    }
+
+    // stop and disable lore-server
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "disable", "--now", SERVICE_NAME])
         .status();
@@ -365,6 +417,330 @@ fn daemon_status() {
         }
         _ => {}
     }
+}
+
+// --- caddy reverse proxy ---
+
+fn caddy_unit_file_path() -> PathBuf {
+    systemd_unit_dir().join(format!("{CADDY_SERVICE_NAME}.service"))
+}
+
+fn has_caddy_config(data_root: &str) -> bool {
+    PathBuf::from(data_root).join("Caddyfile").exists()
+}
+
+fn local_bin_dir() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".local").join("bin")
+}
+
+fn find_caddy_binary() -> Option<PathBuf> {
+    let local = local_bin_dir().join("caddy");
+    if local.exists() {
+        return Some(local);
+    }
+    let output = std::process::Command::new("which")
+        .arg("caddy")
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn download_caddy() -> Result<PathBuf, String> {
+    let caddy_arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => return Err(format!("unsupported architecture: {other}")),
+    };
+    let caddy_os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        other => return Err(format!("unsupported os: {other}")),
+    };
+
+    eprintln!("fetching latest caddy version...");
+    let output = std::process::Command::new("curl")
+        .args([
+            "-fsSLI",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            "https://github.com/caddyserver/caddy/releases/latest",
+        ])
+        .output()
+        .map_err(|e| format!("curl failed: {e}"))?;
+
+    let effective_url = String::from_utf8_lossy(&output.stdout);
+    let tag = effective_url
+        .trim()
+        .rsplit('/')
+        .next()
+        .ok_or("could not determine latest caddy version")?
+        .to_string();
+    let version = tag.trim_start_matches('v');
+
+    let filename = format!("caddy_{version}_{caddy_os}_{caddy_arch}.tar.gz");
+    let url = format!("https://github.com/caddyserver/caddy/releases/download/{tag}/{filename}");
+
+    let dest_dir = local_bin_dir();
+    fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
+    let dest = dest_dir.join("caddy");
+
+    eprintln!("downloading caddy {tag}...");
+    let status = std::process::Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "TMP=$(mktemp -d) && curl -fsSL '{}' | tar xz -C \"$TMP\" caddy && mv \"$TMP/caddy\" '{}' && chmod +x '{}' && rm -rf \"$TMP\"",
+                url,
+                dest.display(),
+                dest.display()
+            ),
+        ])
+        .status()
+        .map_err(|e| format!("download failed: {e}"))?;
+
+    if !status.success() {
+        return Err("failed to download caddy".into());
+    }
+
+    eprintln!("installed caddy {tag} to {}", dest.display());
+    Ok(dest)
+}
+
+fn apply_setcap(caddy_path: &PathBuf) -> bool {
+    eprintln!("caddy needs permission to bind ports 80/443 (requires sudo once)");
+    let status = std::process::Command::new("sudo")
+        .args([
+            "setcap",
+            "cap_net_bind_service=+ep",
+            &caddy_path.to_string_lossy(),
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("port binding capability granted");
+            true
+        }
+        _ => {
+            eprintln!("warning: could not grant port binding capability");
+            eprintln!("caddy may not be able to bind ports 80/443");
+            false
+        }
+    }
+}
+
+fn check_caddy_has_setcap(caddy_path: &PathBuf) -> bool {
+    let output = std::process::Command::new("getcap")
+        .arg(&caddy_path.to_string_lossy().to_string())
+        .output();
+    match output {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.contains("cap_net_bind_service")
+        }
+        Err(_) => false,
+    }
+}
+
+fn write_caddyfile(data_root: &str, domain: &str) -> PathBuf {
+    let caddyfile_path = PathBuf::from(data_root).join("Caddyfile");
+    let content = format!("{domain} {{\n    reverse_proxy 127.0.0.1:7043\n}}\n");
+    fs::write(&caddyfile_path, content).unwrap_or_else(|err| {
+        eprintln!("error: cannot write {}: {err}", caddyfile_path.display());
+        std::process::exit(1);
+    });
+    println!("wrote {}", caddyfile_path.display());
+    caddyfile_path
+}
+
+fn create_caddy_service(data_root: &str, caddy_path: &PathBuf) {
+    let data_root_abs = fs::canonicalize(data_root).unwrap_or_else(|_| PathBuf::from(data_root));
+    let caddyfile = data_root_abs.join("Caddyfile");
+    let caddy_data = data_root_abs.join("caddy-data");
+    let caddy_config = data_root_abs.join("caddy-config");
+
+    let unit_dir = systemd_unit_dir();
+    if let Err(err) = fs::create_dir_all(&unit_dir) {
+        eprintln!("error: cannot create {}: {err}", unit_dir.display());
+        std::process::exit(1);
+    }
+
+    let unit_content = format!(
+        "\
+[Unit]
+Description=Caddy reverse proxy for Lore
+After=network.target {SERVICE_NAME}.service
+BindsTo={SERVICE_NAME}.service
+
+[Service]
+Type=simple
+ExecStart={caddy} run --config {caddyfile}
+Environment=XDG_DATA_HOME={caddy_data}
+Environment=XDG_CONFIG_HOME={caddy_config}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+",
+        caddy = caddy_path.display(),
+        caddyfile = caddyfile.display(),
+        caddy_data = caddy_data.display(),
+        caddy_config = caddy_config.display(),
+    );
+
+    let unit_path = caddy_unit_file_path();
+    fs::write(&unit_path, unit_content).unwrap_or_else(|err| {
+        eprintln!("error: cannot write {}: {err}", unit_path.display());
+        std::process::exit(1);
+    });
+    println!("wrote {}", unit_path.display());
+}
+
+fn start_caddy_service() {
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "--now", CADDY_SERVICE_NAME])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("caddy started"),
+        _ => eprintln!("warning: could not start caddy service"),
+    }
+}
+
+fn prompt_domain() -> String {
+    if !atty::is(atty::Stream::Stdin) {
+        eprintln!("error: --domain is required when stdin is not a terminal");
+        eprintln!("usage: lore-server caddy-install --domain yourdomain.com");
+        std::process::exit(1);
+    }
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    loop {
+        eprint!("Domain name (e.g. lore.example.com): ");
+        io::stderr().flush().ok();
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            eprintln!("aborted");
+            std::process::exit(1);
+        }
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            eprintln!("domain cannot be empty");
+            continue;
+        }
+        if !trimmed.contains('.') {
+            eprintln!("that doesn't look like a domain name — try again");
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+fn caddy_install(data_root: &str, domain: &str) {
+    // Find or download caddy
+    let caddy_path = match find_caddy_binary() {
+        Some(path) => {
+            eprintln!("found caddy at {}", path.display());
+            path
+        }
+        None => {
+            eprintln!("caddy not found, downloading...");
+            download_caddy().unwrap_or_else(|err| {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            })
+        }
+    };
+
+    // Ensure setcap for low-port binding
+    if !check_caddy_has_setcap(&caddy_path) {
+        apply_setcap(&caddy_path);
+    }
+
+    // Write Caddyfile
+    write_caddyfile(data_root, domain);
+
+    // Create caddy data/config dirs
+    let data_root_path = PathBuf::from(data_root);
+    let _ = fs::create_dir_all(data_root_path.join("caddy-data"));
+    let _ = fs::create_dir_all(data_root_path.join("caddy-config"));
+
+    // Create and start systemd service
+    create_caddy_service(data_root, &caddy_path);
+    start_caddy_service();
+
+    println!();
+    println!("caddy reverse proxy configured for https://{domain}");
+    println!("  Caddyfile: {}/Caddyfile", data_root);
+    println!("  TLS certificates are managed automatically");
+    println!();
+    println!("useful commands:");
+    println!("  lore-server caddy-status");
+    println!("  lore-server caddy-uninstall");
+}
+
+fn caddy_uninstall(data_root: &str) {
+    let caddy_unit = caddy_unit_file_path();
+    if caddy_unit.exists() {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", CADDY_SERVICE_NAME])
+            .status();
+        if let Err(err) = fs::remove_file(&caddy_unit) {
+            eprintln!("error: cannot remove {}: {err}", caddy_unit.display());
+        } else {
+            println!("removed {}", caddy_unit.display());
+        }
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+    } else {
+        println!("caddy service is not installed");
+    }
+
+    let caddyfile = PathBuf::from(data_root).join("Caddyfile");
+    if caddyfile.exists() {
+        if let Err(err) = fs::remove_file(&caddyfile) {
+            eprintln!("warning: cannot remove {}: {err}", caddyfile.display());
+        } else {
+            println!("removed {}", caddyfile.display());
+        }
+    }
+
+    println!("caddy uninstalled");
+}
+
+fn caddy_status(data_root: &str) {
+    let caddy_unit = caddy_unit_file_path();
+    if !caddy_unit.exists() {
+        println!("caddy is not installed");
+        println!("run: lore-server caddy-install --domain yourdomain.com");
+        return;
+    }
+
+    let caddyfile = PathBuf::from(data_root).join("Caddyfile");
+    if caddyfile.exists() {
+        if let Ok(content) = fs::read_to_string(&caddyfile) {
+            if let Some(domain) = content.split_whitespace().next() {
+                println!("domain: {domain}");
+            }
+        }
+    }
+
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "status", CADDY_SERVICE_NAME])
+        .status();
 }
 
 // --- self-update ---

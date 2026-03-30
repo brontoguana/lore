@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn persists_updated_config() {
         let dir = tempdir().unwrap();
-        let store = ServerConfigStore::new(dir.path(), 8080);
+        let store = ServerConfigStore::new(dir.path(), 7043);
         store
             .update(
                 ExternalScheme::Https,

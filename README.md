@@ -35,14 +35,14 @@ After installing the server:
 
 ```sh
 LORE_DATA_ROOT=$HOME/.local/share/lore \
-LORE_BIND=127.0.0.1:8080 \
+LORE_BIND=127.0.0.1:7043 \
 lore-server
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:8080/setup
+http://127.0.0.1:7043/setup
 ```
 
 That setup flow explains when to use HTTP vs MCP and gives agent-oriented instructions for the specific Lore server URL you configure.
@@ -65,7 +65,7 @@ CLI usage
 Set defaults once:
 
 ```sh
-lore config set --url http://127.0.0.1:8080 --token YOUR_AGENT_TOKEN --project alpha.docs
+lore config set --url http://127.0.0.1:7043 --token YOUR_AGENT_TOKEN --project alpha.docs
 ```
 
 Examples:
