@@ -4,7 +4,6 @@ set -eu
 REPO="${LORE_GITHUB_REPO:-brontoguana/lore}"
 VERSION="${LORE_VERSION:-latest}"
 INSTALL_DIR="${LORE_INSTALL_DIR:-$HOME/.local/bin}"
-DATA_ROOT="${LORE_DATA_ROOT:-$HOME/.local/share/lore}"
 BINARY_NAME="lore-server"
 
 detect_target() {
@@ -80,12 +79,14 @@ fetch "$BASE_URL/${BINARY_NAME}-${TARGET}.tar.gz" "$ARCHIVE"
 fetch "$BASE_URL/${BINARY_NAME}-${TARGET}.tar.gz.sha256" "$CHECKSUM"
 verify_checksum "$ARCHIVE" "$CHECKSUM"
 
-mkdir -p "$INSTALL_DIR" "$DATA_ROOT"
+mkdir -p "$INSTALL_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
 install "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 
 echo "installed $BINARY_NAME to $INSTALL_DIR/$BINARY_NAME"
-echo "data root prepared at $DATA_ROOT"
-echo "run with:"
-echo "  LORE_DATA_ROOT=$DATA_ROOT LORE_BIND=127.0.0.1:8080 $INSTALL_DIR/$BINARY_NAME"
+echo ""
+echo "quick start:"
+echo "  lore-server                        # start (data in ~/lore)"
+echo "  lore-server daemon-install         # install as always-on daemon"
+echo ""
 echo "then visit http://127.0.0.1:8080/setup"
