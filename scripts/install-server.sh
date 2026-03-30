@@ -135,9 +135,13 @@ install "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 
 if [ "$CURRENT_VERSION" != "not installed" ]; then
   echo "updated $BINARY_NAME to $REMOTE_VERSION (was $CURRENT_VERSION)"
-  echo ""
-  echo "if the daemon is running, restart it:"
-  echo "  systemctl --user restart lore-server"
+
+  # Restart the daemon if it's running
+  if systemctl --user is-active lore-server >/dev/null 2>&1; then
+    echo "restarting lore-server daemon..."
+    systemctl --user restart lore-server
+    echo "daemon restarted with $REMOTE_VERSION"
+  fi
 else
   echo "installed $BINARY_NAME $REMOTE_VERSION to $INSTALL_DIR/$BINARY_NAME"
   echo ""
