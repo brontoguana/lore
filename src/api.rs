@@ -449,6 +449,12 @@ struct ProjectPageQuery {
     since_days: Option<u32>,
 }
 
+#[derive(Deserialize)]
+struct AdminPageQuery {
+    flash: Option<String>,
+    section: Option<String>,
+}
+
 struct CreateBlockForm {
     csrf_token: String,
     block_type: BlockType,
@@ -2429,7 +2435,7 @@ async fn projects_page(
 async fn admin_page(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ProjectPageQuery>,
+    Query(query): Query<AdminPageQuery>,
 ) -> UiResult<Html<String>> {
     let session = require_ui_admin(&state, &headers)?;
     let config = state.config.load()?;
@@ -2474,6 +2480,7 @@ async fn admin_page(
         &ui_auth_audit_events(auth_audit),
         None,
         query.flash.as_deref(),
+        query.section.as_deref().unwrap_or("users"),
     )))
 }
 
@@ -2773,6 +2780,7 @@ async fn create_agent_token_from_ui(
         &ui_auth_audit_events(state.auth_audit.list_recent(12)?),
         Some(&token_display),
         Some("Agent token created. Copy it now; the raw token will not be shown again."),
+        "agent-tokens",
     )))
 }
 
@@ -2840,6 +2848,7 @@ async fn rotate_agent_token_from_ui(
         &ui_auth_audit_events(state.auth_audit.list_recent(12)?),
         Some(&token_display),
         Some("Agent token rotated. Copy the new raw token now."),
+        "agent-tokens",
     )))
 }
 

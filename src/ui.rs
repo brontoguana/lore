@@ -393,6 +393,7 @@ pub fn render_admin_page(
     auth_audit: &[UiAuditEvent],
     latest_agent_token: Option<&UiAdminTokenDisplay>,
     flash: Option<&str>,
+    active_section: &str,
 ) -> String {
     let roles_html = if roles.is_empty() {
         "<p class=\"hint padded\">No roles exist yet.</p>".to_string()
@@ -525,7 +526,11 @@ pub fn render_admin_page(
         "Updates",
         "Audit",
     ];
-    let active = "users";
+    let active = if sections.contains(&active_section) {
+        active_section
+    } else {
+        "users"
+    };
     let nav_items: String = sections
         .iter()
         .zip(section_labels.iter())
@@ -539,6 +544,13 @@ pub fn render_admin_page(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let hidden = |id: &str| -> &str {
+        if id == active {
+            ""
+        } else {
+            r#" style="display:none""#
+        }
+    };
 
     let content = format!(
         r#"<h1 class="page-title">Admin</h1>
@@ -549,7 +561,7 @@ pub fn render_admin_page(
       </nav>
       <div id="admin-panels">
 
-      <section class="panel" data-panel="users">
+      <section class="panel" data-panel="users"{users_display}>
         <div class="panel-header">
           <h2>Create user</h2>
           <p>Assign comma-separated role names. Admins can see everything and manage access.</p>
@@ -578,7 +590,7 @@ pub fn render_admin_page(
         <div class="timeline">{users_html}</div>
       </section>
 
-      <section class="panel" data-panel="roles" style="display:none">
+      <section class="panel" data-panel="roles"{roles_display}>
         <div class="panel-header">
           <h2>Create role</h2>
           <p>Enter one grant per line using project:permission where permission is read or read_write.</p>
@@ -599,7 +611,7 @@ pub fn render_admin_page(
         <div class="timeline">{roles_html}</div>
       </section>
 
-      <section class="panel" data-panel="agent-tokens" style="display:none">
+      <section class="panel" data-panel="agent-tokens"{agent_tokens_display}>
         <div class="panel-header">
           <h2>Agent tokens</h2>
           <p>Create scoped agent tokens with per-project read or read_write access.</p>
@@ -620,7 +632,7 @@ pub fn render_admin_page(
         <div class="timeline">{agent_tokens_html}</div>
       </section>
 
-      <section class="panel" data-panel="agent-setup" style="display:none">
+      <section class="panel" data-panel="agent-setup"{agent_setup_display}>
         <div class="panel-header">
           <h2>Agent setup</h2>
           <p>Set the externally reachable Lore address.</p>
@@ -662,7 +674,7 @@ pub fn render_admin_page(
         </div>
       </section>
 
-      <section class="panel" data-panel="librarian" style="display:none">
+      <section class="panel" data-panel="librarian"{librarian_display}>
         <div class="panel-header">
           <h2>Answer librarian</h2>
           <p>Configure an OpenAI-compatible chat completions endpoint.</p>
@@ -701,7 +713,7 @@ pub fn render_admin_page(
         </div>
       </section>
 
-      <section class="panel" data-panel="git-export" style="display:none">
+      <section class="panel" data-panel="git-export"{git_export_display}>
         <div class="panel-header">
           <h2>Git export</h2>
           <p>Export project files and history into a Git branch.</p>
@@ -744,7 +756,7 @@ pub fn render_admin_page(
         </div>
       </section>
 
-      <section class="panel" data-panel="oidc" style="display:none">
+      <section class="panel" data-panel="oidc"{oidc_display}>
         <div class="panel-header">
           <h2>OIDC</h2>
           <p>Configure an OpenID Connect login flow.</p>
@@ -775,7 +787,7 @@ pub fn render_admin_page(
         </div>
       </section>
 
-      <section class="panel" data-panel="external-auth" style="display:none">
+      <section class="panel" data-panel="external-auth"{external_auth_display}>
         <div class="panel-header">
           <h2>External auth</h2>
           <p>Enable trusted reverse-proxy header auth.</p>
@@ -805,7 +817,7 @@ pub fn render_admin_page(
         </div>
       </section>
 
-      <section class="panel" data-panel="updates" style="display:none">
+      <section class="panel" data-panel="updates"{updates_display}>
         <div class="panel-header">
           <h2>Server updates</h2>
           <p>Check for new Lore server releases and apply updates.</p>
@@ -828,7 +840,7 @@ pub fn render_admin_page(
         </div>
       </section>
 
-      <section class="panel" data-panel="audit" style="display:none">
+      <section class="panel" data-panel="audit"{audit_display}>
         <div class="panel-header">
           <h2>Audit</h2>
           <p>Recent runs and events. <a href="/ui/admin/audit">Open full audit</a>.</p>
@@ -989,6 +1001,16 @@ pub fn render_admin_page(
         pending_actions_html = pending_actions_html,
         audit_html = audit_html,
         auth_audit_html = auth_audit_html,
+        users_display = hidden("users"),
+        roles_display = hidden("roles"),
+        agent_tokens_display = hidden("agent-tokens"),
+        agent_setup_display = hidden("agent-setup"),
+        librarian_display = hidden("librarian"),
+        git_export_display = hidden("git-export"),
+        oidc_display = hidden("oidc"),
+        external_auth_display = hidden("external-auth"),
+        updates_display = hidden("updates"),
+        audit_display = hidden("audit"),
     );
 
     render_shell(
