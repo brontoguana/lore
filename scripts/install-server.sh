@@ -137,14 +137,14 @@ if [ "$CURRENT_VERSION" != "not installed" ]; then
   echo "updated $BINARY_NAME to $REMOTE_VERSION (was $CURRENT_VERSION)"
 
   # Restart the daemon if it's running
-  if systemctl --user is-active lore-server >/dev/null 2>&1; then
+  if systemctl is-active lore-server >/dev/null 2>&1; then
     echo "restarting lore-server daemon..."
-    systemctl --user restart lore-server
+    sudo systemctl restart lore-server
     echo "daemon restarted with $REMOTE_VERSION"
   fi
   # Also restart caddy if it's running (picks up any config changes)
-  if systemctl --user is-active lore-caddy >/dev/null 2>&1; then
-    systemctl --user restart lore-caddy
+  if systemctl is-active lore-caddy >/dev/null 2>&1; then
+    sudo systemctl restart lore-caddy
   fi
 else
   echo ""
@@ -158,9 +158,9 @@ else
   echo "installed $BINARY_NAME $REMOTE_VERSION to $INSTALL_DIR/$BINARY_NAME"
   echo ""
   echo "quick start:"
-  echo "  lore-server                              # start (data in ~/lore)"
-  echo "  lore-server install                      # install as always-on daemon"
-  echo "  lore-server caddy-install --domain X     # add HTTPS reverse proxy"
+  echo "  lore-server install        # set up daemon + HTTPS (prompts for domain)"
+  echo "  lore-server status         # check if everything is running"
+  echo "  lore-server uninstall      # remove services (keeps data)"
   echo ""
   echo "on first run you will be prompted to create an admin account."
 fi
