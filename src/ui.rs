@@ -2805,6 +2805,13 @@ struct ThemePalette {
     media_image_background: &'static str,
     empty_background: &'static str,
     details_background: &'static str,
+    input_background: &'static str,
+    surface_hover: &'static str,
+    diff_context_background: &'static str,
+    diff_added_background: &'static str,
+    diff_added_prefix: &'static str,
+    diff_removed_background: &'static str,
+    diff_removed_prefix: &'static str,
 }
 
 fn theme_palette(theme: UiTheme) -> ThemePalette {
@@ -2838,6 +2845,13 @@ fn theme_palette(theme: UiTheme) -> ThemePalette {
             media_image_background: "linear-gradient(180deg, #fffdf9, #f5eee3)",
             empty_background: "rgba(255,255,255,0.62)",
             details_background: "rgba(255,255,255,0.62)",
+            input_background: "rgba(255,255,255,0.92)",
+            surface_hover: "rgba(255,255,255,0.9)",
+            diff_context_background: "rgba(255,255,255,0.94)",
+            diff_added_background: "rgba(47, 122, 97, 0.12)",
+            diff_added_prefix: "#1d7257",
+            diff_removed_background: "rgba(181, 82, 51, 0.12)",
+            diff_removed_prefix: "#a33a1d",
         },
         UiTheme::Graphite => ThemePalette {
             color_scheme: "dark",
@@ -2868,6 +2882,13 @@ fn theme_palette(theme: UiTheme) -> ThemePalette {
             media_image_background: "linear-gradient(180deg, #18222d, #0f1820)",
             empty_background: "rgba(20,27,35,0.68)",
             details_background: "rgba(20,27,35,0.72)",
+            input_background: "rgba(255,255,255,0.08)",
+            surface_hover: "rgba(255,255,255,0.12)",
+            diff_context_background: "rgba(255,255,255,0.04)",
+            diff_added_background: "rgba(45, 212, 191, 0.12)",
+            diff_added_prefix: "#5eead4",
+            diff_removed_background: "rgba(248, 113, 113, 0.14)",
+            diff_removed_prefix: "#fca5a5",
         },
         UiTheme::Signal => ThemePalette {
             color_scheme: "light",
@@ -2898,6 +2919,13 @@ fn theme_palette(theme: UiTheme) -> ThemePalette {
             media_image_background: "linear-gradient(180deg, #fbfffe, #edf7f4)",
             empty_background: "rgba(255,255,255,0.66)",
             details_background: "rgba(255,255,255,0.72)",
+            input_background: "rgba(255,255,255,0.92)",
+            surface_hover: "rgba(255,255,255,0.9)",
+            diff_context_background: "rgba(255,255,255,0.94)",
+            diff_added_background: "rgba(47, 122, 97, 0.12)",
+            diff_added_prefix: "#1d7257",
+            diff_removed_background: "rgba(181, 82, 51, 0.12)",
+            diff_removed_prefix: "#a33a1d",
         },
     }
 }
@@ -3003,6 +3031,13 @@ fn shared_styles(theme: UiTheme) -> String {
       --media-image-bg: {};
       --empty-bg: {};
       --details-bg: {};
+      --input-bg: {};
+      --surface-hover: {};
+      --diff-ctx-bg: {};
+      --diff-add-bg: {};
+      --diff-add-prefix: {};
+      --diff-rm-bg: {};
+      --diff-rm-prefix: {};
 
       --s-1: 4px;
       --s-2: 8px;
@@ -3052,6 +3087,13 @@ fn shared_styles(theme: UiTheme) -> String {
         palette.media_image_background,
         palette.empty_background,
         palette.details_background,
+        palette.input_background,
+        palette.surface_hover,
+        palette.diff_context_background,
+        palette.diff_added_background,
+        palette.diff_added_prefix,
+        palette.diff_removed_background,
+        palette.diff_removed_prefix,
         palette.body_background,
     );
     let rest = r#"
@@ -3236,7 +3278,7 @@ fn shared_styles(theme: UiTheme) -> String {
       text-decoration: none;
       border: 1px solid var(--line);
       color: var(--ink);
-      background: rgba(255,255,255,0.68);
+      background: var(--input-bg);
       font-weight: 700;
       font-size: 0.95rem;
       transition: all 0.2s;
@@ -3244,7 +3286,7 @@ fn shared_styles(theme: UiTheme) -> String {
 
     .hero-actions a:hover,
     .button-link:hover {
-      background: rgba(255,255,255,0.9);
+      background: var(--surface-hover);
       transform: translateY(-1px);
     }
 
@@ -3343,7 +3385,7 @@ fn shared_styles(theme: UiTheme) -> String {
       border-radius: var(--s-3);
       padding: var(--s-3) var(--s-4);
       font-size: 16px;
-      background: rgba(255,255,255,0.92);
+      background: var(--input-bg);
       color: var(--ink);
       font-family: inherit;
     }
@@ -3537,7 +3579,7 @@ fn shared_styles(theme: UiTheme) -> String {
       margin: var(--s-4) 0;
       padding: var(--s-4);
       border-radius: var(--s-4);
-      background: rgba(255, 255, 255, 0.5);
+      background: var(--empty-bg);
       border: 1px solid var(--line);
     }
 
@@ -3558,7 +3600,7 @@ fn shared_styles(theme: UiTheme) -> String {
       padding: var(--s-2) var(--s-3);
       font-family: var(--font-mono);
       font-size: 0.88rem;
-      background: rgba(255, 255, 255, 0.9);
+      background: var(--diff-ctx-bg);
       white-space: pre-wrap;
       overflow-wrap: anywhere;
     }
@@ -3568,11 +3610,11 @@ fn shared_styles(theme: UiTheme) -> String {
       color: var(--muted);
     }
 
-    .diff-added { background: rgba(47, 122, 97, 0.12); }
-    .diff-added .diff-prefix { color: #1d7257; }
-    .diff-removed { background: rgba(181, 82, 51, 0.12); }
-    .diff-removed .diff-prefix { color: #a33a1d; }
-    .diff-context { background: rgba(255, 255, 255, 0.94); }
+    .diff-added { background: var(--diff-add-bg); }
+    .diff-added .diff-prefix { color: var(--diff-add-prefix); }
+    .diff-removed { background: var(--diff-rm-bg); }
+    .diff-removed .diff-prefix { color: var(--diff-rm-prefix); }
+    .diff-context { background: var(--diff-ctx-bg); }
 
     .admin-sidebar-layout {
       display: grid;
