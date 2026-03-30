@@ -514,12 +514,27 @@ impl ServerConfigStore {
         if path.exists() {
             return Ok(serde_json::from_slice(&fs::read(path)?)?);
         }
+        // Auto-detect Caddy domain when no config has been saved yet
+        if let Some(domain) = self.detect_caddy_domain() {
+            return ServerConfig::new(ExternalScheme::Https, domain, 443, UiTheme::Parchment);
+        }
         ServerConfig::new(
             ExternalScheme::Http,
             "localhost".to_string(),
             self.default_port,
             UiTheme::Parchment,
         )
+    }
+
+    fn detect_caddy_domain(&self) -> Option<String> {
+        let caddyfile = self.root.join("Caddyfile");
+        let content = fs::read_to_string(&caddyfile).ok()?;
+        let domain = content.split_whitespace().next()?;
+        if !domain.is_empty() && domain.contains('.') {
+            Some(domain.to_string())
+        } else {
+            None
+        }
     }
 
     pub fn update(

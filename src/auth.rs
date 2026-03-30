@@ -402,6 +402,17 @@ impl LocalAuthStore {
             .iter()
             .position(|existing| &existing.username == username)
             .ok_or(LoreError::PermissionDenied)?;
+        if disabled && users[index].is_admin {
+            let active_admins = users
+                .iter()
+                .filter(|u| u.is_admin && u.disabled_at.is_none())
+                .count();
+            if active_admins <= 1 {
+                return Err(LoreError::Validation(
+                    "cannot disable the last admin user".into(),
+                ));
+            }
+        }
         users[index].disabled_at = if disabled {
             Some(OffsetDateTime::now_utc())
         } else {
@@ -993,5 +1004,40 @@ mod tests {
         let agent = auth.authenticate_agent_token(&created.token).unwrap();
         assert_eq!(agent.name, "worker-alpha");
         assert!(agent.can_write(&ProjectName::new("alpha.docs").unwrap()));
+    }
+
+    #[test]
+    fn cannot_disable_last_admin() {
+        let dir = tempdir().unwrap();
+        let auth = LocalAuthStore::new(dir.path());
+        auth.bootstrap_admin(
+            UserName::new("admin".to_string()).unwrap(),
+            "correct-horse-battery".into(),
+        )
+        .unwrap();
+        let err = auth
+            .set_user_disabled(&UserName::new("admin".to_string()).unwrap(), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("last admin"));
+    }
+
+    #[test]
+    fn can_disable_admin_when_another_exists() {
+        let dir = tempdir().unwrap();
+        let auth = LocalAuthStore::new(dir.path());
+        auth.bootstrap_admin(
+            UserName::new("admin1".to_string()).unwrap(),
+            "correct-horse-battery".into(),
+        )
+        .unwrap();
+        auth.create_user_unchecked(NewUser {
+            username: UserName::new("admin2".to_string()).unwrap(),
+            password: "another-secure-pass".into(),
+            role_names: vec![],
+            is_admin: true,
+        })
+        .unwrap();
+        auth.set_user_disabled(&UserName::new("admin1".to_string()).unwrap(), true)
+            .unwrap();
     }
 }

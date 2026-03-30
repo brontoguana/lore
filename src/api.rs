@@ -2448,6 +2448,7 @@ async fn admin_page(
     let librarian_audit = state.librarian_history.list_recent_all(12)?;
     let pending_actions = state.pending_librarian_actions.list_all(12)?;
     let auth_audit = state.auth_audit.list_recent(12)?;
+    let projects = state.store.list_projects()?;
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
         session.user.username.as_str(),
@@ -2478,6 +2479,7 @@ async fn admin_page(
         &ui_librarian_answers_from_history_all(&state.store, librarian_audit)?,
         &ui_pending_librarian_actions_all(&state.store, pending_actions)?,
         &ui_auth_audit_events(auth_audit),
+        &projects,
         None,
         query.flash.as_deref(),
         query.section.as_deref().unwrap_or("users"),
@@ -2742,6 +2744,7 @@ async fn create_agent_token_from_ui(
     let librarian_config = state.librarian_config.load()?;
     let git_export_config = state.git_export_config.load()?;
     let token_display = build_ui_admin_token_display(&config, created);
+    let projects = state.store.list_projects()?;
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
         session.user.username.as_str(),
@@ -2778,6 +2781,7 @@ async fn create_agent_token_from_ui(
             state.pending_librarian_actions.list_all(12)?,
         )?,
         &ui_auth_audit_events(state.auth_audit.list_recent(12)?),
+        &projects,
         Some(&token_display),
         Some("Agent token created. Copy it now; the raw token will not be shown again."),
         "agent-tokens",
@@ -2810,6 +2814,7 @@ async fn rotate_agent_token_from_ui(
     let librarian_config = state.librarian_config.load()?;
     let git_export_config = state.git_export_config.load()?;
     let token_display = build_ui_admin_token_display(&config, created);
+    let projects = state.store.list_projects()?;
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
         session.user.username.as_str(),
@@ -2846,6 +2851,7 @@ async fn rotate_agent_token_from_ui(
             state.pending_librarian_actions.list_all(12)?,
         )?,
         &ui_auth_audit_events(state.auth_audit.list_recent(12)?),
+        &projects,
         Some(&token_display),
         Some("Agent token rotated. Copy the new raw token now."),
         "agent-tokens",
@@ -2915,6 +2921,21 @@ async fn update_theme_from_ui(
     state
         .auth
         .update_user_theme(&session.user.username, theme)?;
+    // If admin is the only user, also set as server default theme
+    if session.user.is_admin {
+        if let Some(t) = theme {
+            let users = state.auth.list_users()?;
+            if users.len() == 1 {
+                let config = state.config.load()?;
+                let _ = state.config.update(
+                    config.external_scheme,
+                    config.external_host.clone(),
+                    config.external_port,
+                    t,
+                );
+            }
+        }
+    }
     append_audit_event(
         &state,
         AuditActor {

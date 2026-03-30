@@ -391,6 +391,7 @@ pub fn render_admin_page(
     librarian_audit: &[UiLibrarianAnswer],
     pending_actions: &[UiPendingLibrarianAction],
     auth_audit: &[UiAuditEvent],
+    projects: &[ProjectName],
     latest_agent_token: Option<&UiAdminTokenDisplay>,
     flash: Option<&str>,
     active_section: &str,
@@ -425,6 +426,31 @@ pub fn render_admin_page(
     let latest_agent_token_html = latest_agent_token
         .map(|token| render_latest_agent_token(token))
         .unwrap_or_default();
+    let project_grants_html = if projects.is_empty() {
+        "<p class=\"hint\">No projects exist yet. Create a project first, then come back to grant access.</p>".to_string()
+    } else {
+        let rows: Vec<String> = projects
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"<div class="grant-row" data-project-grant="{}">
+                      <span class="grant-project-name">{}</span>
+                      <select>
+                        <option value="">No access</option>
+                        <option value="read">Read</option>
+                        <option value="read_write">Read/Write</option>
+                      </select>
+                    </div>"#,
+                    escape_attribute(p.as_str()),
+                    escape_text(p.as_str()),
+                )
+            })
+            .collect();
+        format!(
+            r#"<fieldset class="grant-fieldset"><legend>Project access</legend>{}</fieldset>"#,
+            rows.join("")
+        )
+    };
     let pending_actions_html = if pending_actions.is_empty() {
         "<p class=\"hint padded\">No pending project librarian actions.</p>".to_string()
     } else {
@@ -614,21 +640,35 @@ pub fn render_admin_page(
       <section class="panel" data-panel="agent-tokens"{agent_tokens_display}>
         <div class="panel-header">
           <h2>Agent tokens</h2>
-          <p>Create scoped agent tokens with per-project read or read_write access.</p>
+          <p>Create scoped agent tokens with per-project read or read/write access.</p>
         </div>
         {latest_agent_token_html}
-        <form method="post" action="/ui/admin/agent-tokens">
+        <form method="post" action="/ui/admin/agent-tokens" id="agent-token-form">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
           <label>
             Token name
             <input type="text" name="name" placeholder="worker-alpha" required>
           </label>
-          <label>
-            Grants
-            <textarea name="grants" placeholder="alpha.docs:read_write&#10;beta.docs:read"></textarea>
-          </label>
+          {project_grants_html}
+          <textarea name="grants" style="display:none" id="agent-grants-field"></textarea>
           <button type="submit">Create agent token</button>
         </form>
+        <script>
+        (function() {{
+          var form = document.getElementById('agent-token-form');
+          form.addEventListener('submit', function() {{
+            var rows = form.querySelectorAll('[data-project-grant]');
+            var lines = [];
+            rows.forEach(function(row) {{
+              var sel = row.querySelector('select');
+              if (sel && sel.value) {{
+                lines.push(row.getAttribute('data-project-grant') + ':' + sel.value);
+              }}
+            }});
+            document.getElementById('agent-grants-field').value = lines.join('\\n');
+          }});
+        }})();
+        </script>
         <div class="timeline">{agent_tokens_html}</div>
       </section>
 
@@ -996,6 +1036,7 @@ pub fn render_admin_page(
         provider_status_html = provider_status_html,
         latest_agent_token_html = latest_agent_token_html,
         agent_tokens_html = agent_tokens_html,
+        project_grants_html = project_grants_html,
         roles_html = roles_html,
         users_html = users_html,
         pending_actions_html = pending_actions_html,
@@ -3379,7 +3420,20 @@ fn shared_styles(theme: UiTheme) -> String {
       font-weight: 600;
     }
 
-    input, select, textarea, button {
+    label.toggle {
+      display: flex;
+      align-items: center;
+      gap: var(--s-3);
+      cursor: pointer;
+    }
+
+    label.toggle input[type="checkbox"] {
+      width: auto;
+      margin: 0;
+      cursor: pointer;
+    }
+
+    input:not([type="checkbox"]), select, textarea, button {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: var(--s-3);
@@ -3390,7 +3444,7 @@ fn shared_styles(theme: UiTheme) -> String {
       font-family: inherit;
     }
 
-    input:focus, select:focus, textarea:focus {
+    input:not([type="checkbox"]):focus, select:focus, textarea:focus {
       outline: none;
       border-color: var(--accent);
       box-shadow: 0 0 0 3px var(--accent-soft);
@@ -3571,6 +3625,36 @@ fn shared_styles(theme: UiTheme) -> String {
       margin: 0;
       padding-left: var(--s-5);
       color: var(--muted);
+    }
+
+    .grant-fieldset {
+      border: 1px solid var(--line);
+      border-radius: var(--s-3);
+      padding: var(--s-3) var(--s-4);
+      margin: var(--s-3) 0;
+    }
+    .grant-fieldset legend {
+      font-weight: 600;
+      font-size: 0.875rem;
+      padding: 0 var(--s-2);
+    }
+    .grant-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: var(--s-2) 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .grant-row:last-child {
+      border-bottom: none;
+    }
+    .grant-project-name {
+      font-family: monospace;
+      font-size: 0.875rem;
+    }
+    .grant-row select {
+      width: auto;
+      min-width: 8rem;
     }
 
     .version-meta {
