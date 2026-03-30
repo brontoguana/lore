@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
 use lore_core::{
     AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore, DEFAULT_UPDATE_REPO,
-    FileBlockStore, build_app, maybe_apply_self_update,
+    FileBlockStore, LocalAuthStore, UserName, build_app, maybe_apply_self_update,
 };
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -21,7 +21,7 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<String>,
 
-    /// Bind address (default: 127.0.0.1:8080)
+    /// Bind address (default: 0.0.0.0:8080)
     #[arg(long, global = true)]
     bind: Option<String>,
 
@@ -58,11 +58,19 @@ async fn main() {
         .bind
         .clone()
         .or_else(|| env::var("LORE_BIND").ok())
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+        .unwrap_or_else(|| "0.0.0.0:8080".to_string());
 
     match cli.command.unwrap_or(ServerCommand::Start) {
-        ServerCommand::Start => run_server(data_root, bind).await,
-        ServerCommand::DaemonInstall => daemon_install(&data_root, &bind),
+        ServerCommand::Start => {
+            ensure_data_dir(&data_root);
+            prompt_initial_admin_if_needed(&data_root);
+            run_server(data_root, bind).await;
+        }
+        ServerCommand::DaemonInstall => {
+            ensure_data_dir(&data_root);
+            prompt_initial_admin_if_needed(&data_root);
+            daemon_install(&data_root, &bind);
+        }
         ServerCommand::DaemonUninstall => daemon_uninstall(),
         ServerCommand::DaemonStatus => daemon_status(),
     }
@@ -74,13 +82,84 @@ fn default_data_dir() -> String {
         .unwrap_or_else(|_| "./lore".to_string())
 }
 
-async fn run_server(data_root: String, bind: String) {
-    let data_root_path = PathBuf::from(&data_root);
-
-    if let Err(err) = fs::create_dir_all(&data_root_path) {
+fn ensure_data_dir(data_root: &str) {
+    if let Err(err) = fs::create_dir_all(data_root) {
         eprintln!("error: cannot create data directory {data_root}: {err}");
         std::process::exit(1);
     }
+}
+
+fn prompt_initial_admin_if_needed(data_root: &str) {
+    let auth = LocalAuthStore::new(PathBuf::from(data_root));
+    match auth.has_users() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(_) => return, // can't check, let the server handle it
+    }
+
+    // Only prompt if we have a tty
+    if !atty::is(atty::Stream::Stdin) {
+        eprintln!("no admin account exists — visit the web UI to create one");
+        return;
+    }
+
+    eprintln!();
+    eprintln!("No admin account exists yet. Let's create one.");
+    eprintln!();
+
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+
+    let username = loop {
+        eprint!("Admin username: ");
+        io::stderr().flush().ok();
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            eprintln!("aborted");
+            std::process::exit(1);
+        }
+        let trimmed = line.trim().to_string();
+        if !trimmed.is_empty() {
+            break trimmed;
+        }
+        eprintln!("username cannot be empty");
+    };
+
+    let password = loop {
+        eprint!("Admin password: ");
+        io::stderr().flush().ok();
+        let pass = rpassword::read_password().unwrap_or_else(|err| {
+            eprintln!("error reading password: {err}");
+            std::process::exit(1);
+        });
+        if pass.len() < 8 {
+            eprintln!("password must be at least 8 characters");
+            continue;
+        }
+        eprint!("Confirm password: ");
+        io::stderr().flush().ok();
+        let confirm = rpassword::read_password().unwrap_or_else(|err| {
+            eprintln!("error reading password: {err}");
+            std::process::exit(1);
+        });
+        if pass != confirm {
+            eprintln!("passwords do not match");
+            continue;
+        }
+        break pass;
+    };
+
+    match auth.bootstrap_admin(UserName::new(username.clone()).unwrap(), password) {
+        Ok(_) => eprintln!("admin account '{}' created\n", username),
+        Err(err) => {
+            eprintln!("error creating admin account: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run_server(data_root: String, bind: String) {
+    let data_root_path = PathBuf::from(&data_root);
 
     if env::var_os(SELF_UPDATE_SKIP_ENV).is_none() {
         if let Err(err) = maybe_update_server(&data_root_path).await {
