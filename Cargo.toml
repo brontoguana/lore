@@ -1,0 +1,39 @@
+[package]
+name = "lore-core"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[[bin]]
+name = "lore"
+path = "src/bin/lore.rs"
+
+[[bin]]
+name = "lore-server"
+path = "src/main.rs"
+
+[dependencies]
+argon2 = "0.5"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json", "multipart"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.1"
+openidconnect = "4.0.1"
+pulldown-cmark = "0.13"
+regex = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread"] }
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde", "serde-well-known"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+v_htmlescape = "0.15"
+
+[dev-dependencies]
+tempfile = "3.20"
+tower = { version = "0.5", features = ["util"] }
