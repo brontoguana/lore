@@ -13,6 +13,7 @@ use std::path::PathBuf;
 const SELF_UPDATE_SKIP_ENV: &str = "LORE_SKIP_SELF_UPDATE";
 const SERVICE_NAME: &str = "lore-server";
 const CADDY_SERVICE_NAME: &str = "lore-caddy";
+const SUDOERS_FILE_NAME: &str = "lore-server-restart";
 
 #[derive(Parser)]
 #[command(name = "lore-server")]
@@ -127,6 +128,7 @@ fn run_clean(data_root: &str) {
         }
     }
 
+    remove_restart_sudoers();
     sudo_systemctl(&["daemon-reload"]);
 
     // Remove Caddyfile and caddy dirs from data root
@@ -313,6 +315,10 @@ fn system_unit_path(name: &str) -> PathBuf {
     PathBuf::from(SYSTEM_UNIT_DIR).join(format!("{name}.service"))
 }
 
+fn sudoers_path() -> PathBuf {
+    PathBuf::from("/etc/sudoers.d").join(SUDOERS_FILE_NAME)
+}
+
 fn sudo_write_file(path: &PathBuf, content: &str) -> bool {
     let mut child = match std::process::Command::new("sudo")
         .args(["tee", &path.to_string_lossy()])
@@ -344,6 +350,40 @@ fn sudo_rm(path: &PathBuf) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+fn find_command_path(command: &str) -> Option<String> {
+    let output = std::process::Command::new("which")
+        .arg(command)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn install_restart_sudoers(user: &str) -> bool {
+    let systemctl = find_command_path("systemctl").unwrap_or_else(|| "/bin/systemctl".to_string());
+    let sudoers = format!(
+        "{user} ALL=(root) NOPASSWD: {systemctl} restart {SERVICE_NAME}, {systemctl} restart {CADDY_SERVICE_NAME}, {systemctl} daemon-reload\n"
+    );
+    let path = sudoers_path();
+    if !sudo_write_file(&path, &sudoers) {
+        return false;
+    }
+    std::process::Command::new("sudo")
+        .args(["chmod", "0440", &path.to_string_lossy()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn remove_restart_sudoers() {
+    let path = sudoers_path();
+    if path.exists() && sudo_rm(&path) {
+        eprintln!("removed {}", path.display());
+    }
 }
 
 fn current_username() -> String {
@@ -506,6 +546,13 @@ WantedBy=multi-user.target
     }
     println!("wrote {}", caddy_unit_path.display());
 
+    if install_restart_sudoers(&user) {
+        println!("wrote {}", sudoers_path().display());
+    } else {
+        eprintln!("warning: could not write {}", sudoers_path().display());
+        eprintln!("future lore-server update runs may still prompt for sudo");
+    }
+
     sudo_systemctl(&["daemon-reload"]);
 
     if sudo_systemctl(&["enable", "--now", SERVICE_NAME]) {
@@ -530,6 +577,8 @@ WantedBy=multi-user.target
     println!("  lore-server status");
     println!("  lore-server uninstall");
     println!("  lore-server update");
+    println!();
+    println!("future lore-server update runs can restart services without another sudo prompt");
 }
 
 fn daemon_uninstall(data_root: &str) {
@@ -572,6 +621,7 @@ fn daemon_uninstall(data_root: &str) {
         println!("no service file found");
     }
 
+    remove_restart_sudoers();
     sudo_systemctl(&["daemon-reload"]);
 
     println!("uninstalled (data preserved in {data_root})");
@@ -710,7 +760,7 @@ fn write_caddyfile(data_root: &str, domain: &str) -> PathBuf {
 fn prompt_domain() -> String {
     if !atty::is(atty::Stream::Stdin) {
         eprintln!("error: --domain is required when stdin is not a terminal");
-        eprintln!("usage: lore-server caddy-install --domain yourdomain.com");
+        eprintln!("usage: lore-server install --domain yourdomain.com");
         std::process::exit(1);
     }
     let stdin = io::stdin();

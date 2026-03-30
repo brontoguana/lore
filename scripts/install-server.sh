@@ -5,6 +5,7 @@ REPO="${LORE_GITHUB_REPO:-brontoguana/lore}"
 VERSION="${LORE_VERSION:-latest}"
 INSTALL_DIR="${LORE_INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="lore-server"
+SUDOERS_FILE="/etc/sudoers.d/lore-server-restart"
 
 detect_target() {
   os="$(uname -s)"
@@ -54,6 +55,28 @@ fetch_text() {
     echo "curl or wget is required" >&2
     exit 1
   fi
+}
+
+setup_restart_sudoers() {
+  systemctl_path="$(command -v systemctl || echo /bin/systemctl)"
+  current_user="$(id -un)"
+  tmp_sudoers="$TMP_DIR/lore-server-restart"
+  cat >"$tmp_sudoers" <<EOF
+$current_user ALL=(root) NOPASSWD: $systemctl_path restart lore-server, $systemctl_path restart lore-caddy, $systemctl_path daemon-reload
+EOF
+  sudo install -m 0440 "$tmp_sudoers" "$SUDOERS_FILE"
+}
+
+restart_service() {
+  service_name="$1"
+  if sudo -n systemctl restart "$service_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "configuring passwordless restart permission for $service_name..."
+  setup_restart_sudoers
+  sudo -n systemctl daemon-reload >/dev/null 2>&1 || sudo systemctl daemon-reload
+  sudo -n systemctl restart "$service_name"
 }
 
 verify_checksum() {
@@ -139,12 +162,12 @@ if [ "$CURRENT_VERSION" != "not installed" ]; then
   # Restart the daemon if it's running
   if systemctl is-active lore-server >/dev/null 2>&1; then
     echo "restarting lore-server daemon..."
-    sudo systemctl restart lore-server
+    restart_service lore-server
     echo "daemon restarted with $REMOTE_VERSION"
   fi
   # Also restart caddy if it's running (picks up any config changes)
   if systemctl is-active lore-caddy >/dev/null 2>&1; then
-    sudo systemctl restart lore-caddy
+    restart_service lore-caddy
   fi
 else
   echo ""

@@ -326,15 +326,36 @@ pub fn render_projects_page(
             .join("")
     };
 
+    let create_form = if is_admin {
+        format!(
+            r#"<section class="panel">
+        <div class="panel-header">
+          <h2>Create project</h2>
+          <p>Name must be lowercase with dots (e.g. engineering.docs).</p>
+        </div>
+        <form method="post" action="/ui/projects">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>
+            Project name
+            <input type="text" name="project_name" placeholder="team.docs" required pattern="[a-z0-9][a-z0-9._-]*[a-z0-9]">
+          </label>
+          <button type="submit">Create project</button>
+        </form>
+      </section>"#,
+            csrf_token = escape_attribute(csrf_token),
+        )
+    } else {
+        String::new()
+    };
+
     let content = format!(
-        r#"<section class="hero">
-      <p class="eyebrow">Lore workspace</p>
-      <h1>Projects</h1>
-      <p class="subtitle">Signed in as {username}. Open a project document to get started.</p>
-    </section>
-    <section class="project-grid">{project_cards}</section>"#,
-        username = escape_text(username),
+        r#"<h1 class="page-title">Projects</h1>
+    <div class="layout">
+      <section class="project-grid">{project_cards}</section>
+      <aside class="stack">{create_form}</aside>
+    </div>"#,
         project_cards = project_cards,
+        create_form = create_form,
     );
 
     render_shell(
@@ -480,86 +501,108 @@ pub fn render_admin_page(
         })
         .unwrap_or_else(|| "<p><strong>Last check</strong><br>Not run yet.</p>".to_string());
 
+    let sections = [
+        "users",
+        "roles",
+        "agent-tokens",
+        "agent-setup",
+        "librarian",
+        "git-export",
+        "oidc",
+        "external-auth",
+        "updates",
+        "audit",
+    ];
+    let section_labels = [
+        "Users",
+        "Roles",
+        "Agent tokens",
+        "Agent setup",
+        "Librarian",
+        "Git export",
+        "OIDC",
+        "External auth",
+        "Updates",
+        "Audit",
+    ];
+    let active = "users";
+    let nav_items: String = sections
+        .iter()
+        .zip(section_labels.iter())
+        .map(|(id, label)| {
+            let cls = if *id == active {
+                r#" class="active""#
+            } else {
+                ""
+            };
+            format!(r#"<a href="/ui/admin?section={id}"{cls} data-section="{id}">{label}</a>"#)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let content = format!(
-        r#"<section class="hero">
-      <p class="eyebrow">Lore admin</p>
-      <h1>Users and roles</h1>
-      <p class="subtitle">Signed in as {username}. Local browser sessions use a server-side token store, and role grants apply at whole-project scope for human users.</p>
-    </section>
+        r#"<h1 class="page-title">Admin</h1>
 
-    <div class="layout admin-layout">
-      <div class="stack">
-        <section class="panel">
-          <div class="panel-header">
-            <h2>Create user</h2>
-            <p>Assign comma-separated role names. Admins can see everything and manage access.</p>
-          </div>
-          <form method="post" action="/ui/admin/users">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <label>
-              Username
-              <input type="text" name="username" autocomplete="username" required>
-            </label>
-            <label>
-              Password
-              <input type="password" name="password" autocomplete="new-password" required>
-            </label>
-            <label>
-              Roles
-              <input type="text" name="roles" placeholder="engineering-writers,product-readers">
-            </label>
-            <label class="toggle">
-              <input type="checkbox" name="is_admin" value="true">
-              <span>Grant full admin access</span>
-            </label>
-            <button type="submit">Create user</button>
-          </form>
-        </section>
+    <div class="admin-sidebar-layout">
+      <nav class="admin-nav" id="admin-nav">
+        {nav_items}
+      </nav>
+      <div id="admin-panels">
 
-        <section class="panel">
-          <div class="panel-header">
-            <h2>Users</h2>
-            <p>Passwords are stored as Argon2 hashes on disk, never as plaintext.</p>
-          </div>
-          <div class="timeline">{users_html}</div>
-        </section>
-      </div>
+      <section class="panel" data-panel="users">
+        <div class="panel-header">
+          <h2>Create user</h2>
+          <p>Assign comma-separated role names. Admins can see everything and manage access.</p>
+        </div>
+        <form method="post" action="/ui/admin/users">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>
+            Username
+            <input type="text" name="username" autocomplete="username" required>
+          </label>
+          <label>
+            Password
+            <input type="password" name="password" autocomplete="new-password" required>
+          </label>
+          <label>
+            Roles
+            <input type="text" name="roles" placeholder="engineering-writers,product-readers">
+          </label>
+          <label class="toggle">
+            <input type="checkbox" name="is_admin" value="true">
+            <span>Grant full admin access</span>
+          </label>
+          <button type="submit">Create user</button>
+        </form>
+        <div class="panel-header"><h2>Users</h2><p>Passwords are stored as Argon2 hashes on disk.</p></div>
+        <div class="timeline">{users_html}</div>
+      </section>
 
-      <div class="stack">
-        <section class="panel">
-          <div class="panel-header">
-            <h2>Create role</h2>
-            <p>Enter one grant per line using project:permission where permission is read or read_write.</p>
-          </div>
-          <form method="post" action="/ui/admin/roles">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <label>
-              Role name
-              <input type="text" name="name" placeholder="engineering-writers" required>
-            </label>
-            <label>
-              Grants
-              <textarea name="grants" placeholder="alpha.docs:read_write&#10;beta.docs:read"></textarea>
-            </label>
-            <button type="submit">Create role</button>
-          </form>
-        </section>
+      <section class="panel" data-panel="roles" style="display:none">
+        <div class="panel-header">
+          <h2>Create role</h2>
+          <p>Enter one grant per line using project:permission where permission is read or read_write.</p>
+        </div>
+        <form method="post" action="/ui/admin/roles">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>
+            Role name
+            <input type="text" name="name" placeholder="engineering-writers" required>
+          </label>
+          <label>
+            Grants
+            <textarea name="grants" placeholder="alpha.docs:read_write&#10;beta.docs:read"></textarea>
+          </label>
+          <button type="submit">Create role</button>
+        </form>
+        <div class="panel-header"><h2>Roles</h2><p>Grants define project-level visibility and editing.</p></div>
+        <div class="timeline">{roles_html}</div>
+      </section>
 
-        <section class="panel">
-          <div class="panel-header">
-            <h2>Roles</h2>
-            <p>These grants define project-level visibility and editing for human users.</p>
-          </div>
-          <div class="timeline">{roles_html}</div>
-        </section>
-      </div>
-    </div>
-
-    <section class="layout admin-layout">
-      <section class="panel">
+      <section class="panel" data-panel="agent-tokens" style="display:none">
         <div class="panel-header">
           <h2>Agent tokens</h2>
-          <p>Create scoped agent tokens with per-project read or read_write access. Raw tokens are shown once and then only their hashes remain on disk.</p>
+          <p>Create scoped agent tokens with per-project read or read_write access.</p>
         </div>
         {latest_agent_token_html}
         <form method="post" action="/ui/admin/agent-tokens">
@@ -577,10 +620,10 @@ pub fn render_admin_page(
         <div class="timeline">{agent_tokens_html}</div>
       </section>
 
-      <section class="panel">
+      <section class="panel" data-panel="agent-setup" style="display:none">
         <div class="panel-header">
           <h2>Agent setup</h2>
-          <p>Set the externally reachable Lore address once, then hand agents the generated setup URL.</p>
+          <p>Set the externally reachable Lore address.</p>
         </div>
         <form method="post" action="/ui/admin/setup">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -618,13 +661,11 @@ pub fn render_admin_page(
           </label>
         </div>
       </section>
-    </section>
 
-    <section class="layout admin-layout">
-      <section class="panel">
+      <section class="panel" data-panel="librarian" style="display:none">
         <div class="panel-header">
           <h2>Answer librarian</h2>
-          <p>Configure one OpenAI-compatible chat completions endpoint for the read-only answer librarian and the narrow project librarian.</p>
+          <p>Configure an OpenAI-compatible chat completions endpoint.</p>
         </div>
         <form method="post" action="/ui/admin/librarian">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -660,10 +701,10 @@ pub fn render_admin_page(
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" data-panel="git-export" style="display:none">
         <div class="panel-header">
           <h2>Git export</h2>
-          <p>Export Lore’s native project files and recorded project history into a Git branch.</p>
+          <p>Export project files and history into a Git branch.</p>
         </div>
         <form method="post" action="/ui/admin/git-export">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -702,13 +743,11 @@ pub fn render_admin_page(
           {git_export_status_html}
         </div>
       </section>
-    </section>
 
-    <section class="layout admin-layout">
-      <section class="panel">
+      <section class="panel" data-panel="oidc" style="display:none">
         <div class="panel-header">
           <h2>OIDC</h2>
-          <p>Configure an OpenID Connect login flow that redirects the browser to your identity provider.</p>
+          <p>Configure an OpenID Connect login flow.</p>
         </div>
         <form method="post" action="/ui/admin/oidc">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -734,12 +773,12 @@ pub fn render_admin_page(
           <p><strong>Status</strong><br>{oidc_status}</p>
           <p><strong>Redirect URI</strong><br>{oidc_redirect_uri}</p>
         </div>
-        </section>
+      </section>
 
-        <section class="panel">
+      <section class="panel" data-panel="external-auth" style="display:none">
         <div class="panel-header">
           <h2>External auth</h2>
-          <p>Enable trusted reverse-proxy header auth to map an upstream authenticated username onto a local user.</p>
+          <p>Enable trusted reverse-proxy header auth.</p>
         </div>
         <form method="post" action="/ui/admin/external-auth">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -764,10 +803,9 @@ pub fn render_admin_page(
         <div class="meta-stack padded">
           <p><strong>Status</strong><br>{external_auth_status}</p>
         </div>
-        </section>
-        </section>
+      </section>
 
-      <section class="panel">
+      <section class="panel" data-panel="updates" style="display:none">
         <div class="panel-header">
           <h2>Server updates</h2>
           <p>Check for new Lore server releases and apply updates.</p>
@@ -789,27 +827,45 @@ pub fn render_admin_page(
           {auto_update_status_html}
         </div>
       </section>
-    </section>
 
-    <section class="layout admin-layout">
-      <section class="panel">
+      <section class="panel" data-panel="audit" style="display:none">
         <div class="panel-header">
-          <h2>Librarian audit</h2>
-          <p>Recent runs across projects. <a href="/ui/admin/audit">Open full audit</a>.</p>
+          <h2>Audit</h2>
+          <p>Recent runs and events. <a href="/ui/admin/audit">Open full audit</a>.</p>
         </div>
         <div class="timeline">{pending_actions_html}</div>
         <div class="timeline">{audit_html}</div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Auth audit</h2>
-          <p>Recent sign-in and admin events. <a href="/ui/admin/audit">Open full audit</a>.</p>
-        </div>
+        <div class="panel-header"><h2>Auth events</h2></div>
         <div class="timeline">{auth_audit_html}</div>
       </section>
-    </section>"#,
-        username = escape_text(username),
+
+      </div>
+    </div>
+
+    <script>
+    (function() {{
+      var nav = document.getElementById(‘admin-nav’);
+      var panels = document.getElementById(‘admin-panels’);
+      var links = nav.querySelectorAll(‘a[data-section]’);
+      var sections = panels.querySelectorAll(‘[data-panel]’);
+      function show(id) {{
+        sections.forEach(function(s) {{ s.style.display = s.getAttribute(‘data-panel’) === id ? ‘’ : ‘none’; }});
+        links.forEach(function(a) {{ a.classList.toggle(‘active’, a.getAttribute(‘data-section’) === id); }});
+      }}
+      var params = new URLSearchParams(window.location.search);
+      var initial = params.get(‘section’) || ‘users’;
+      show(initial);
+      links.forEach(function(a) {{
+        a.addEventListener(‘click’, function(e) {{
+          e.preventDefault();
+          var id = a.getAttribute(‘data-section’);
+          show(id);
+          history.replaceState(null, ‘’, ‘/ui/admin?section=’ + id);
+        }});
+      }});
+    }})();
+    </script>"#,
+        nav_items = nav_items,
         csrf_token = escape_attribute(csrf_token),
         http_selected = if matches!(server_config.external_scheme, ExternalScheme::Http) {
             " selected"
@@ -953,11 +1009,7 @@ pub fn render_setup_page(config: &ServerConfig, setup_instruction: &str) -> Stri
     let setup_text_url = config.setup_text_url();
     let mcp_url = config.mcp_url();
     let content = format!(
-        r#"<section class="hero">
-      <p class="eyebrow">Lore setup</p>
-      <h1>Agent setup</h1>
-      <p class="subtitle">This page is generated by Lore using the external address configured by the administrator. Use it to decide whether your agent should integrate over HTTP or Lore's native MCP endpoint.</p>
-    </section>
+        r#"<h1 class="page-title">Agent setup</h1>
 
     <div class="layout">
       <section class="panel">
@@ -1040,58 +1092,60 @@ pub fn render_settings_page(
     is_admin: bool,
     flash: Option<&str>,
 ) -> String {
-    let current_label = selected_theme
-        .unwrap_or(server_default_theme)
-        .display_name();
     let preference_label = selected_theme
         .map(UiTheme::display_name)
         .unwrap_or("Use server default");
 
     let content = format!(
-        r#"<section class="hero">
-      <p class="eyebrow">Lore settings</p>
-      <h1>Appearance</h1>
-      <p class="subtitle">Signed in as {username}. Choose a personal theme override, or fall back to the server default for shared pages like login and setup.</p>
-    </section>
+        r#"<h1 class="page-title">Settings</h1>
 
     <div class="layout">
       <section class="panel">
         <div class="panel-header">
-          <h2>Theme preference</h2>
-          <p>Your current effective theme is {current_label}. The server default is {server_default_label}.</p>
+          <h2>Theme</h2>
+          <p>Select a theme to preview it. Click Save to keep it.</p>
         </div>
-        <form method="post" action="/ui/settings/theme">
+        <div class="theme-selector padded">
+          {theme_selector_cards}
+        </div>
+        <form method="post" action="/ui/settings/theme" id="theme-form">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label>
-            Theme
-            <select name="theme">
-              {theme_options}
-            </select>
-          </label>
+          <input type="hidden" name="theme" id="theme-input" value="{current_theme_value}">
           <button type="submit">Save theme</button>
         </form>
+      </section>
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Current</h2>
+        </div>
         <div class="meta-stack padded">
           <p><strong>Saved preference</strong><br>{preference_label}</p>
           <p><strong>Server default</strong><br>{server_default_label}</p>
         </div>
       </section>
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Built-in themes</h2>
-          <p>Parchment is warm and editorial. Graphite is low-glare and dense. Signal is crisper and more technical.</p>
-        </div>
-        <div class="timeline">
-          {theme_preview_cards}
-        </div>
-      </section>
-    </div>"#,
-        username = escape_text(username),
+    </div>
+    <script>
+    (function() {{
+      var cards = document.querySelectorAll('.theme-card[data-theme]');
+      var input = document.getElementById('theme-input');
+      cards.forEach(function(card) {{
+        card.addEventListener('click', function() {{
+          cards.forEach(function(c) {{ c.classList.remove('selected'); }});
+          card.classList.add('selected');
+          input.value = card.getAttribute('data-theme');
+          // build full CSS URL to preview the theme
+          var theme = card.getAttribute('data-theme');
+          window.location.href = '/ui/settings?preview=' + encodeURIComponent(theme);
+        }});
+      }});
+    }})();
+    </script>"#,
         csrf_token = escape_attribute(csrf_token),
-        current_label = escape_text(current_label),
+        current_theme_value = escape_attribute(selected_theme.map(|t| t.as_str()).unwrap_or("")),
         preference_label = escape_text(preference_label),
         server_default_label = escape_text(server_default_theme.display_name()),
-        theme_options = render_theme_options(selected_theme, true),
-        theme_preview_cards = render_theme_preview_cards(selected_theme, server_default_theme),
+        theme_selector_cards =
+            render_theme_selector_cards(selected_theme, server_default_theme, theme),
     );
 
     render_shell(
@@ -1143,11 +1197,7 @@ pub fn render_admin_audit_page(
     };
 
     let content = format!(
-        r#"<section class="hero">
-      <p class="eyebrow">Lore admin audit</p>
-      <h1>Librarian audit</h1>
-      <p class="subtitle">Signed in as {username}. Review pending actions, completed runs, errors, and approval chains across projects.</p>
-    </section>
+        r#"<h1 class="page-title">Audit</h1>
     <div class="layout admin-layout">
       <section class="panel">
         <div class="panel-header">
@@ -1171,7 +1221,6 @@ pub fn render_admin_audit_page(
         <div class="timeline">{auth_html}</div>
       </section>
     </div>"#,
-        username = escape_text(username),
         pending_html = pending_html,
         runs_html = runs_html,
         auth_html = auth_html,
@@ -1221,14 +1270,10 @@ pub fn render_project_audit_page(
     };
 
     let content = format!(
-        r#"<section class="hero">
-      <p class="eyebrow">Lore project audit</p>
-      <h1>{project}</h1>
-      <p class="subtitle">Signed in as {username}. Review grounded answer runs, project-action chains, and pending approvals for this project.</p>
-      <div class="hero-actions">
-        <a class="primary" href="/ui/{project}">Back to project</a>
-      </div>
-    </section>
+        r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
+      <h1 class="page-title" style="margin:0;">{project} &mdash; Audit</h1>
+      <a class="button-link" href="/ui/{project}">Back to project</a>
+    </div>
     <div class="layout">
       <section class="panel">
         <div class="panel-header">
@@ -1246,7 +1291,6 @@ pub fn render_project_audit_page(
       </section>
     </div>"#,
         project = escape_text(project.as_str()),
-        username = escape_text(username),
         pending_html = pending_html,
         runs_html = runs_html,
     );
@@ -1284,15 +1328,13 @@ pub fn render_project_history_page(
     };
 
     let content = format!(
-        r#"<section class="hero">
-      <p class="eyebrow">Lore project history</p>
-      <h1>{project}</h1>
-      <p class="subtitle">Signed in as {username}. Review reversible project mutations, including librarian edits and API writes, in the order they were recorded.</p>
-      <div class="hero-actions">
-        <a class="primary" href="/ui/{project}">Back to project</a>
-        <a href="/ui/{project}/audit">Audit</a>
+        r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
+      <h1 class="page-title" style="margin:0;">{project} &mdash; History</h1>
+      <div style="display:flex; gap:var(--s-3);">
+        <a class="button-link" href="/ui/{project}">Back to project</a>
+        <a class="button-link" href="/ui/{project}/audit">Audit</a>
       </div>
-    </section>
+    </div>
     <section class="panel">
       <div class="panel-header">
         <h2>Version history</h2>
@@ -1301,7 +1343,6 @@ pub fn render_project_history_page(
       <div class="timeline">{history_html}</div>
     </section>"#,
         project = escape_text(project.as_str()),
-        username = escape_text(username),
         history_html = history_html,
     );
 
@@ -1413,28 +1454,26 @@ pub fn render_project_page(
     };
 
     let content = format!(
-        r#"<section class="hero">
-      <p class="eyebrow">Lore project</p>
-      <h1>{project}</h1>
-      <p class="subtitle">Signed in as {username}. Review and edit the shared project state.</p>
-      <div class="hero-actions">
-        <a href="/ui/{project}/audit">Audit</a>
-        <a href="/ui/{project}/history">History</a>
+        r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
+      <h1 class="page-title" style="margin:0;">{project}</h1>
+      <div style="display:flex; gap:var(--s-3);">
+        <a class="button-link" href="/ui/{project}/audit">Audit</a>
+        <a class="button-link" href="/ui/{project}/history">History</a>
       </div>
-      <form class="searchbar" method="get" action="/ui/{project}">
-        <input type="search" name="q" value="{search_value}" placeholder="Search content...">
-        <select name="block_type">
-          <option value=""{search_any_type}>Any type</option>
-          <option value="markdown"{search_markdown}>Markdown</option>
-          <option value="svg"{search_svg}>SVG</option>
-          <option value="html"{search_html}>HTML</option>
-          <option value="image"{search_image}>Image</option>
-        </select>
-        <input type="search" name="author" value="{search_author}" placeholder="Author...">
-        <input type="number" name="since_days" min="1" value="{search_since_days}" placeholder="Days">
-        <button type="submit">Search</button>
-      </form>
-    </section>
+    </div>
+    <form class="searchbar" method="get" action="/ui/{project}">
+      <input type="search" name="q" value="{search_value}" placeholder="Search content...">
+      <select name="block_type">
+        <option value=""{search_any_type}>Any type</option>
+        <option value="markdown"{search_markdown}>Markdown</option>
+        <option value="svg"{search_svg}>SVG</option>
+        <option value="html"{search_html}>HTML</option>
+        <option value="image"{search_image}>Image</option>
+      </select>
+      <input type="search" name="author" value="{search_author}" placeholder="Author...">
+      <input type="number" name="since_days" min="1" value="{search_since_days}" placeholder="Days">
+      <button type="submit">Search</button>
+    </form>
 
     <div class="layout">
       <section class="panel" id="document">
@@ -1447,7 +1486,6 @@ pub fn render_project_page(
       <aside class="stack">{librarian_panel}{composer}</aside>
     </div>"#,
         project = escape_text(project.as_str()),
-        username = escape_text(username),
         search_value = escape_attribute(search_value),
         search_any_type = if search_block_type.is_none() {
             " selected"
@@ -2856,32 +2894,41 @@ fn render_theme_options(selected_theme: Option<UiTheme>, allow_default: bool) ->
     options.join("")
 }
 
-fn render_theme_preview_cards(
+fn render_theme_selector_cards(
     selected_theme: Option<UiTheme>,
     server_default_theme: UiTheme,
+    active_preview: UiTheme,
 ) -> String {
     UiTheme::all()
         .into_iter()
         .map(|theme| {
+            let is_selected = theme == active_preview;
             let label = if selected_theme == Some(theme) {
-                "Your preference"
+                "Saved"
             } else if selected_theme.is_none() && server_default_theme == theme {
-                "Server default"
+                "Default"
             } else {
-                "Available"
+                ""
+            };
+            let pill = if !label.is_empty() {
+                format!(r#"<span class="pill">{}</span>"#, label)
+            } else {
+                String::new()
             };
             format!(
-                r#"<article class="block">
-  <div class="block-meta">
-    <span class="pill">{}</span>
-    <span>{}</span>
+                r#"<div class="theme-card{}" data-theme="{}">
+  <div class="theme-card-label">
+    <strong>{}</strong>
+    {}
   </div>
   <div class="theme-preview theme-preview-{}">
     <span></span><span></span><span></span>
   </div>
-</article>"#,
+</div>"#,
+                if is_selected { " selected" } else { "" },
+                escape_attribute(theme.as_str()),
                 escape_text(theme.display_name()),
-                escape_text(label),
+                pill,
                 escape_attribute(theme.as_str()),
             )
         })
@@ -3086,6 +3133,13 @@ fn shared_styles(theme: UiTheme) -> String {
       line-height: 1.1;
       letter-spacing: -0.03em;
       font-weight: 800;
+    }
+
+    .page-title {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin: 0 0 var(--s-5) 0;
     }
 
     h2 {
@@ -3406,6 +3460,15 @@ fn shared_styles(theme: UiTheme) -> String {
     .theme-preview-signal span:nth-child(2) { background: #0f8f6f; }
     .theme-preview-signal span:nth-child(3) { background: #1768ac; }
 
+    .meta-stack {
+      display: grid;
+      gap: var(--s-3);
+    }
+
+    .padded {
+      padding: var(--s-4) var(--s-5);
+    }
+
     .grant-list {
       margin: 0;
       padding-left: var(--s-5);
@@ -3454,6 +3517,88 @@ fn shared_styles(theme: UiTheme) -> String {
     .diff-removed { background: rgba(181, 82, 51, 0.12); }
     .diff-removed .diff-prefix { color: #a33a1d; }
     .diff-context { background: rgba(255, 255, 255, 0.94); }
+
+    .admin-sidebar-layout {
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      gap: var(--s-5);
+      margin-top: var(--s-5);
+      align-items: start;
+    }
+
+    .admin-nav {
+      display: grid;
+      gap: 2px;
+    }
+
+    .admin-nav a {
+      display: block;
+      padding: var(--s-3) var(--s-4);
+      text-decoration: none;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.92rem;
+      border-radius: var(--s-2);
+      transition: background 0.15s, color 0.15s;
+    }
+
+    .admin-nav a:hover {
+      background: var(--accent-soft);
+      color: var(--ink);
+    }
+
+    .admin-nav a.active {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    @media (max-width: 700px) {
+      .admin-sidebar-layout {
+        grid-template-columns: 1fr;
+      }
+      .admin-nav {
+        grid-auto-flow: column;
+        overflow-x: auto;
+      }
+    }
+
+    .theme-selector {
+      display: grid;
+      gap: var(--s-4);
+    }
+
+    .theme-card {
+      padding: var(--s-4);
+      border: 2px solid var(--line);
+      border-radius: var(--s-4);
+      cursor: pointer;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      background: var(--panel-strong);
+    }
+
+    .theme-card:hover {
+      border-color: var(--accent);
+    }
+
+    .theme-card.selected {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+
+    .theme-card-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: var(--s-2);
+    }
+
+    .theme-card-label strong {
+      font-size: 0.95rem;
+    }
+
+    .theme-card-label .pill {
+      font-size: 0.7rem;
+    }
 
     .inline-form {
       margin-top: var(--s-4);

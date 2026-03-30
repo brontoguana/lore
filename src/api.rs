@@ -277,6 +277,7 @@ fn build_app_with_librarian(
             post(revert_project_version),
         )
         .route("/ui", get(projects_page))
+        .route("/ui/projects", post(create_project_from_ui))
         .route("/ui/settings", get(settings_page))
         .route("/ui/settings/theme", post(update_theme_from_ui))
         .route("/ui/admin", get(admin_page))
@@ -434,6 +435,12 @@ struct DeleteBlockQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct SettingsPageQuery {
+    flash: Option<String>,
+    preview: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProjectPageQuery {
     flash: Option<String>,
     q: Option<String>,
@@ -537,6 +544,12 @@ struct LoginForm {
 #[derive(Debug, Deserialize)]
 struct CsrfForm {
     csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateProjectUiForm {
+    csrf_token: String,
+    project_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2467,11 +2480,15 @@ async fn admin_page(
 async fn settings_page(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ProjectPageQuery>,
+    Query(query): Query<SettingsPageQuery>,
 ) -> UiResult<Html<String>> {
     let session = require_ui_session(&state, &headers)?;
     let config = state.config.load()?;
-    let theme = resolved_theme(&session.user, &config);
+    let preview_theme = query
+        .preview
+        .as_deref()
+        .and_then(|s| UiTheme::parse(s).ok());
+    let theme = preview_theme.unwrap_or_else(|| resolved_theme(&session.user, &config));
     Ok(Html(render_settings_page(
         theme,
         session.user.username.as_str(),
@@ -2480,6 +2497,39 @@ async fn settings_page(
         config.default_theme,
         session.user.is_admin,
         query.flash.as_deref(),
+    )))
+}
+
+async fn create_project_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateProjectUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(form.project_name)?;
+    // Creating a block implicitly creates the project directory
+    let (left, right) = state.store.resolve_after_block(&project, None, None)?;
+    let new_block = NewBlock {
+        project: project.clone(),
+        block_type: BlockType::Markdown,
+        content: String::new(),
+        author_key: session.user.username.as_str().to_string(),
+        left,
+        right,
+        image_upload: None,
+    };
+    let block = state.store.create_block_as_project_writer(new_block)?;
+    record_project_version(
+        &state,
+        &project_version_actor_for_user(&session.user),
+        &project,
+        "Create project",
+        vec![create_version_operation(&state, &project, &block.id, None)?],
+    )?;
+    Ok(Redirect::to(&format!(
+        "/ui?flash=Project%20{}%20created",
+        project.as_str()
     )))
 }
 
@@ -7268,7 +7318,7 @@ mod tests {
         assert!(html.contains("Add block"));
         assert!(html.contains("<h1>Hello</h1>"));
         assert!(html.contains("width=device-width, initial-scale=1"));
-        assert!(html.contains("Signed in as admin"));
+        assert!(html.contains(">admin</span>"));
         assert!(html.contains("id=\"document\""));
         assert!(html.contains("Edit block"));
         assert!(html.contains("Delete block"));

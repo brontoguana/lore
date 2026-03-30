@@ -42,6 +42,7 @@ This will:
 2. Ask for your domain name
 3. Download and configure Caddy as an HTTPS reverse proxy
 4. Start both services as systemd daemons (requires sudo)
+5. Install a tightly scoped sudoers rule so future `lore-server update` runs can restart Lore and Caddy without prompting
 
 Then open `https://yourdomain.com/setup` — that setup flow explains when to use HTTP vs MCP and gives agent-oriented instructions.
 
