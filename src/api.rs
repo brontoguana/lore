@@ -32,7 +32,7 @@ use crate::ui::{
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
-    check_for_update,
+    check_for_update, maybe_apply_self_update,
 };
 use crate::versioning::{
     GitExportConfig, GitExportConfigStore, GitExportStatus, GitExportStatusStore,
@@ -232,6 +232,7 @@ fn build_app_with_librarian(
             get(get_auto_update_config).post(update_auto_update_config),
         )
         .route("/v1/admin/auto-update/check", post(check_auto_update))
+        .route("/v1/admin/auto-update/apply", post(apply_auto_update))
         .route("/v1/admin/librarian-runs", get(list_admin_librarian_runs))
         .route("/v1/projects", get(list_projects))
         .route(
@@ -326,6 +327,10 @@ fn build_app_with_librarian(
         .route(
             "/ui/admin/auto-update/check",
             post(check_auto_update_from_ui),
+        )
+        .route(
+            "/ui/admin/auto-update/apply",
+            post(apply_auto_update_from_ui),
         )
         .route("/ui/{project}", axum::routing::get(project_page))
         .route(
@@ -769,6 +774,11 @@ struct UpdateAutoUpdateUiForm {
 
 #[derive(Debug, Deserialize)]
 struct AutoUpdateCheckUiForm {
+    csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoUpdateApplyUiForm {
     csrf_token: String,
 }
 
@@ -2110,6 +2120,34 @@ async fn check_auto_update(
     Ok(Json(auto_update_status_summary(&status)))
 }
 
+async fn apply_auto_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<AutoUpdateStatusSummary>> {
+    let admin = require_admin(&state, &headers)?;
+    let status = run_auto_update_apply(&state).await?;
+    let applied = status.applied;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: admin.username.as_str().to_string(),
+        },
+        if applied {
+            "critical: server update applied"
+        } else {
+            "server update check (already up to date)"
+        },
+        None,
+        Some(status.detail.clone()),
+    )?;
+    let summary = auto_update_status_summary(&status);
+    if applied {
+        schedule_server_restart();
+    }
+    Ok(Json(summary))
+}
+
 async fn list_admin_librarian_runs(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3063,6 +3101,38 @@ async fn check_auto_update_from_ui(
         "Auto%20update%20check%20completed"
     } else {
         "Auto%20update%20check%20failed"
+    };
+    Ok(Redirect::to(&format!("/ui/admin?flash={flash}")))
+}
+
+async fn apply_auto_update_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AutoUpdateApplyUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let status = run_auto_update_apply(&state).await?;
+    let applied = status.applied;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        if applied {
+            "critical: server update applied"
+        } else {
+            "server update check (already up to date)"
+        },
+        None,
+        Some(status.detail.clone()),
+    )?;
+    let flash = if applied {
+        schedule_server_restart();
+        "Update%20applied%20—%20server%20restarting"
+    } else {
+        "Already%20up%20to%20date"
     };
     Ok(Redirect::to(&format!("/ui/admin?flash={flash}")))
 }
@@ -4276,6 +4346,69 @@ async fn run_auto_update_check(state: &AppState) -> Result<AutoUpdateStatus, Lor
     };
     state.auto_update_status.save(&status)?;
     Ok(status)
+}
+
+async fn run_auto_update_apply(state: &AppState) -> Result<AutoUpdateStatus, LoreError> {
+    let config = state.auto_update_config.load()?;
+    let executable_path = std::env::current_exe().map_err(LoreError::Io)?;
+    let client = reqwest::Client::new();
+    match maybe_apply_self_update(
+        &client,
+        "lore-server",
+        env!("CARGO_PKG_VERSION"),
+        &config.github_repo,
+        &executable_path,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let status = match outcome {
+                crate::updater::SelfUpdateOutcome::UpToDate(status) => status,
+                crate::updater::SelfUpdateOutcome::Updated(status) => status,
+            };
+            state.auto_update_status.save(&status)?;
+            Ok(status)
+        }
+        Err(err) => {
+            let status = AutoUpdateStatus {
+                checked_at: OffsetDateTime::now_utc(),
+                current_version: env!("CARGO_PKG_VERSION").to_string(),
+                latest_version: None,
+                detail: format!("update failed: {err}"),
+                applied: false,
+                ok: false,
+            };
+            state.auto_update_status.save(&status)?;
+            Err(err)
+        }
+    }
+}
+
+fn schedule_server_restart() {
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let executable_path = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(_) => std::process::exit(1),
+        };
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        let mut command = std::process::Command::new(&executable_path);
+        command.args(args);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = command.exec();
+            eprintln!("warning: failed to relaunch updated server: {err}");
+            std::process::exit(1);
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(err) = command.spawn() {
+                eprintln!("warning: failed to relaunch updated server: {err}");
+            }
+            std::process::exit(0);
+        }
+    });
 }
 
 fn api_key_update_from_request(api_key: Option<&str>, clear: Option<bool>) -> ApiKeyUpdate<'_> {

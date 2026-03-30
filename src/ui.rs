@@ -406,12 +406,29 @@ pub fn render_admin_page(
     let auto_update_status_html = auto_update_status
         .map(|status| {
             let latest = status.latest_version.as_deref().unwrap_or("unknown");
+            let current = &status.current_version;
+            let update_available = status.ok
+                && !status.applied
+                && status.latest_version.as_deref().is_some_and(|v| v != current);
+            let apply_button = if update_available {
+                format!(
+                    r#"<form method="post" action="/ui/admin/auto-update/apply" class="inline-form" style="margin-top:0.5rem">
+                      <input type="hidden" name="csrf_token" value="{csrf_token}">
+                      <button type="submit">Apply update to {latest}</button>
+                    </form>"#,
+                    csrf_token = csrf_token,
+                    latest = escape_attribute(latest),
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "<p><strong>Last check</strong><br>{}<br>Current {}<br>Latest {}<br>{}</p>",
+                "<p><strong>Last check</strong><br>{}<br>Current {}<br>Latest {}<br>{}</p>{}",
                 escape_text(&format_timestamp(status.checked_at)),
-                escape_text(&status.current_version),
+                escape_text(current),
                 escape_text(latest),
                 escape_text(&status.detail),
+                apply_button,
             )
         })
         .unwrap_or_else(|| "<p><strong>Last check</strong><br>Not run yet.</p>".to_string());
@@ -664,7 +681,7 @@ pub fn render_admin_page(
       <section class="panel">
         <div class="panel-header">
           <h2>Server updates</h2>
-          <p>Optional startup self-update for the Lore server binary. When enabled, Lore checks GitHub releases before it starts listening, installs a newer server binary if one exists, and relaunches itself once.</p>
+          <p>Check for new Lore server releases and apply updates. When automatic updates are enabled, Lore also checks on startup. You can always check and apply manually from here.</p>
         </div>
         <form method="post" action="/ui/admin/auto-update">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -688,7 +705,7 @@ pub fn render_admin_page(
         </form>
         <div class="meta-stack">
           <p><strong>Status</strong><br>{auto_update_state}</p>
-          <p><strong>Mode</strong><br>Checks only on startup. Updates replace the server binary in place and then relaunch the process with the same arguments.</p>
+          <p><strong>Mode</strong><br>Updates replace the server binary and restart automatically. Can be applied here or on startup when enabled.</p>
           {auto_update_status_html}
         </div>
       </section>
