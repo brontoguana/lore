@@ -448,7 +448,7 @@ impl FileBlockStore {
         }
     }
 
-    fn ensure_layout(&self, project: &ProjectName) -> Result<()> {
+    pub fn ensure_layout(&self, project: &ProjectName) -> Result<()> {
         fs::create_dir_all(self.project_dir(project).join("blocks"))?;
         fs::create_dir_all(self.project_dir(project).join("blobs"))?;
         Ok(())

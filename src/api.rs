@@ -2519,25 +2519,10 @@ async fn create_project_from_ui(
     let project = ProjectName::new(form.project_name)?;
     // Creating a block implicitly creates the project directory
     let (left, right) = state.store.resolve_after_block(&project, None, None)?;
-    let new_block = NewBlock {
-        project: project.clone(),
-        block_type: BlockType::Markdown,
-        content: String::new(),
-        author_key: session.user.username.as_str().to_string(),
-        left,
-        right,
-        image_upload: None,
-    };
-    let block = state.store.create_block_as_project_writer(new_block)?;
-    record_project_version(
-        &state,
-        &project_version_actor_for_user(&session.user),
-        &project,
-        "Create project",
-        vec![create_version_operation(&state, &project, &block.id, None)?],
-    )?;
+    state.store.ensure_layout(&project)?;
     Ok(Redirect::to(&format!(
-        "/ui?flash=Project%20{}%20created",
+        "/ui/project/{}?flash=Project%20{}%20created",
+        project.as_str(),
         project.as_str()
     )))
 }
@@ -6824,7 +6809,7 @@ impl IntoResponse for UiError {
         };
 
         let body = Html(format!(
-            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Lore error</title><style>body{{margin:0;padding:24px;font-family:Inter,-apple-system,system-ui,sans-serif;background:#f4efe7;color:#1f1a17;line-height:1.5}}main{{max-width:32rem;margin:4rem auto;background:#fffaf3;border:1px solid rgba(78,55,36,.14);border-radius:22px;padding:2rem;box-shadow:0 20px 60px rgba(71, 46, 31,0.12)}}h1{{margin:0 0 1rem;font-size:2rem;font-weight:800;letter-spacing:-0.02em}}p{{margin:0 0 1rem}}a{{color:#b55233;font-weight:700;text-decoration:none}}</style></head><body><main><h1>Request failed</h1><p>{}</p><p><a href=\"javascript:history.back()\">Go back</a></p></main></body></html>",
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Lore error</title><style>body{{margin:0;padding:24px;font-family:Inter,-apple-system,system-ui,sans-serif;background:#f0f0f0;color:#1a1a1a;line-height:1.5}}main{{max-width:32rem;margin:4rem auto;background:#fff;border:1px solid rgba(0,0,0,.1);border-radius:12px;padding:2rem;box-shadow:0 4px 12px rgba(0,0,0,0.08)}}h1{{margin:0 0 1rem;font-size:1.5rem;font-weight:700}}p{{margin:0 0 1rem}}a{{color:#4a6fa5;font-weight:600;text-decoration:none}}@media(prefers-color-scheme:dark){{body{{background:#1a1a2e;color:#e0e0e0}}main{{background:#252540;border-color:rgba(255,255,255,.1);box-shadow:0 4px 12px rgba(0,0,0,0.3)}}a{{color:#7da1d4}}}}</style></head><body><main><h1>Request failed</h1><p>{}</p><p><a href=\"javascript:history.back()\">Go back</a></p></main></body></html>",
             v_htmlescape::escape(&self.0.to_string())
         ));
 
