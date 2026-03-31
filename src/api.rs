@@ -556,6 +556,8 @@ struct CsrfForm {
 struct CreateProjectUiForm {
     csrf_token: String,
     project_name: String,
+    #[serde(default)]
+    parent: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2414,14 +2416,17 @@ async fn projects_page(
 ) -> UiResult<Html<String>> {
     let session = require_ui_session(&state, &headers)?;
     let server_config = state.config.load()?;
-    let projects = state.store.list_projects()?;
-    let visible = filter_projects_for_user(&session.user, &projects)
+    let infos = state.store.list_project_infos()?;
+    let visible: Vec<ProjectListEntry> = infos
         .into_iter()
-        .map(|project| ProjectListEntry {
-            can_write: session.user.can_write(&project),
-            project,
+        .filter(|info| session.user.is_admin || session.user.can_read(&info.slug))
+        .map(|info| ProjectListEntry {
+            can_write: session.user.can_write(&info.slug),
+            display_name: info.display_name,
+            parent: info.parent,
+            project: info.slug,
         })
-        .collect::<Vec<_>>();
+        .collect();
     Ok(Html(render_projects_page(
         resolved_theme(&session.user, &server_config),
         session.user.username.as_str(),
@@ -2448,7 +2453,7 @@ async fn admin_page(
     let librarian_audit = state.librarian_history.list_recent_all(12)?;
     let pending_actions = state.pending_librarian_actions.list_all(12)?;
     let auth_audit = state.auth_audit.list_recent(12)?;
-    let projects = state.store.list_projects()?;
+    let projects = state.store.list_project_infos()?;
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
         session.user.username.as_str(),
@@ -2516,14 +2521,15 @@ async fn create_project_from_ui(
 ) -> UiResult<Redirect> {
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    let project = ProjectName::new(form.project_name)?;
-    // Creating a block implicitly creates the project directory
-    let (left, right) = state.store.resolve_after_block(&project, None, None)?;
-    state.store.ensure_layout(&project)?;
+    let parent = if form.parent.trim().is_empty() {
+        None
+    } else {
+        Some(form.parent.trim())
+    };
+    let info = state.store.create_project(&form.project_name, parent)?;
     Ok(Redirect::to(&format!(
-        "/ui/project/{}?flash=Project%20{}%20created",
-        project.as_str(),
-        project.as_str()
+        "/ui/{}?flash=Project%20created",
+        info.slug.as_str(),
     )))
 }
 
@@ -2729,7 +2735,7 @@ async fn create_agent_token_from_ui(
     let librarian_config = state.librarian_config.load()?;
     let git_export_config = state.git_export_config.load()?;
     let token_display = build_ui_admin_token_display(&config, created);
-    let projects = state.store.list_projects()?;
+    let projects = state.store.list_project_infos()?;
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
         session.user.username.as_str(),
@@ -2799,7 +2805,7 @@ async fn rotate_agent_token_from_ui(
     let librarian_config = state.librarian_config.load()?;
     let git_export_config = state.git_export_config.load()?;
     let token_display = build_ui_admin_token_display(&config, created);
-    let projects = state.store.list_projects()?;
+    let projects = state.store.list_project_infos()?;
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
         session.user.username.as_str(),
@@ -3224,6 +3230,7 @@ async fn project_page(
     let project = ProjectName::new(project)?;
     let session = require_ui_session(&state, &headers)?;
     state.auth.authorize_read(&session.user, &project)?;
+    let meta = state.store.read_project_meta(&project);
     let all_blocks = state.store.list_blocks(&project)?;
     let filters = block_filters_from_parts(
         query.block_type.as_deref(),
@@ -3250,6 +3257,7 @@ async fn project_page(
     let page = render_project_page(
         resolved_theme(&session.user, &server_config),
         &project,
+        &meta.display_name,
         &blocks,
         &all_blocks,
         query.flash.as_deref(),
@@ -3276,6 +3284,7 @@ async fn project_audit_page(
     let project = ProjectName::new(project)?;
     let session = require_ui_session(&state, &headers)?;
     state.auth.authorize_read(&session.user, &project)?;
+    let meta = state.store.read_project_meta(&project);
     let runs = ui_librarian_answers_from_history(
         &state.store,
         &project,
@@ -3289,6 +3298,7 @@ async fn project_audit_page(
     Ok(Html(render_project_audit_page(
         resolved_theme(&session.user, &state.config.load()?),
         &project,
+        &meta.display_name,
         session.user.username.as_str(),
         session.user.is_admin,
         session.user.can_write(&project),
@@ -3329,10 +3339,12 @@ async fn project_history_page(
     let project = ProjectName::new(project)?;
     let session = require_ui_session(&state, &headers)?;
     state.auth.authorize_read(&session.user, &project)?;
+    let meta = state.store.read_project_meta(&project);
     let versions = ui_project_versions(state.project_history.list_recent_project(&project, 100)?);
     Ok(Html(render_project_history_page(
         resolved_theme(&session.user, &state.config.load()?),
         &project,
+        &meta.display_name,
         session.user.username.as_str(),
         session.user.is_admin,
         session.user.can_write(&project),
@@ -3380,6 +3392,7 @@ async fn answer_librarian_from_ui(
         librarian_actor_for_user(&session.user),
     )
     .await?;
+    let meta = state.store.read_project_meta(&project);
     let all_blocks = state.store.list_blocks(&project)?;
     let librarian_history = state.librarian_history.list_recent_project(&project, 8)?;
     let current_answer = UiLibrarianAnswer::from(librarian_answer);
@@ -3389,6 +3402,7 @@ async fn answer_librarian_from_ui(
     let page = render_project_page(
         resolved_theme(&session.user, &server_config),
         &project,
+        &meta.display_name,
         &all_blocks,
         &all_blocks,
         Some("Answer librarian responded"),
@@ -3448,6 +3462,7 @@ async fn run_project_librarian_action_from_ui(
         &session.user,
     )
     .await?;
+    let meta = state.store.read_project_meta(&project);
     let all_blocks = state.store.list_blocks(&project)?;
     let librarian_history = state.librarian_history.list_recent_project(&project, 8)?;
     let current_answer = UiLibrarianAnswer::from(action);
@@ -3462,6 +3477,7 @@ async fn run_project_librarian_action_from_ui(
     let page = render_project_page(
         resolved_theme(&session.user, &server_config),
         &project,
+        &meta.display_name,
         &all_blocks,
         &all_blocks,
         Some(
@@ -3926,20 +3942,6 @@ fn filter_projects_for_actor(actor: &RequestActor, projects: &[ProjectName]) -> 
             .cloned()
             .collect(),
     }
-}
-
-fn filter_projects_for_user(
-    user: &AuthenticatedUser,
-    projects: &[ProjectName],
-) -> Vec<ProjectName> {
-    if user.is_admin {
-        return projects.to_vec();
-    }
-    projects
-        .iter()
-        .filter(|project| user.can_read(project))
-        .cloned()
-        .collect()
 }
 
 fn actor_author_value(actor: &RequestActor) -> String {

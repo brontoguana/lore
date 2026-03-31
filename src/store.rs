@@ -7,9 +7,24 @@ use crate::order::generate_order_key;
 use crate::versioning::{
     StoredBlockSnapshot, block_matches_snapshot, media_bytes, snapshot_from_stored_block,
 };
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectMeta {
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectInfo {
+    pub slug: ProjectName,
+    pub display_name: String,
+    pub parent: Option<String>,
+}
 
 enum UpdateMode {
     AgentOwner(KeyFingerprint),
@@ -31,12 +46,17 @@ impl FileBlockStore {
     }
 
     pub fn list_projects(&self) -> Result<Vec<ProjectName>> {
+        self.list_project_infos()
+            .map(|infos| infos.into_iter().map(|info| info.slug).collect())
+    }
+
+    pub fn list_project_infos(&self) -> Result<Vec<ProjectInfo>> {
         let projects_dir = self.root.join("projects");
         if !projects_dir.exists() {
             return Ok(Vec::new());
         }
 
-        let mut projects = Vec::new();
+        let mut infos = Vec::new();
         for entry in fs::read_dir(projects_dir)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -45,13 +65,72 @@ impl FileBlockStore {
 
             let name = entry.file_name();
             let name = name.to_string_lossy().into_owned();
-            if let Ok(project) = ProjectName::new(name) {
-                projects.push(project);
+            if let Ok(project) = ProjectName::new(&name) {
+                let meta = self.read_project_meta(&project);
+                infos.push(ProjectInfo {
+                    display_name: meta.display_name,
+                    parent: meta.parent,
+                    slug: project,
+                });
             }
         }
 
-        projects.sort();
-        Ok(projects)
+        infos.sort_by(|a, b| a.slug.cmp(&b.slug));
+        Ok(infos)
+    }
+
+    pub fn read_project_meta(&self, project: &ProjectName) -> ProjectMeta {
+        let meta_path = self.project_dir(project).join("project.json");
+        if let Ok(bytes) = fs::read(&meta_path) {
+            if let Ok(meta) = serde_json::from_slice::<ProjectMeta>(&bytes) {
+                return meta;
+            }
+        }
+        // Fallback: use the slug as the display name
+        ProjectMeta {
+            display_name: project.as_str().to_string(),
+            parent: None,
+        }
+    }
+
+    pub fn write_project_meta(&self, project: &ProjectName, meta: &ProjectMeta) -> Result<()> {
+        self.ensure_layout(project)?;
+        let meta_path = self.project_dir(project).join("project.json");
+        let bytes = serde_json::to_vec_pretty(meta)?;
+        fs::write(meta_path, bytes)?;
+        Ok(())
+    }
+
+    pub fn create_project(&self, display_name: &str, parent: Option<&str>) -> Result<ProjectInfo> {
+        let (slug, display) = ProjectName::from_display_name(display_name)?;
+        // Check if project already exists
+        if self.project_dir(&slug).exists() {
+            return Err(LoreError::Validation(format!(
+                "a project with slug '{}' already exists",
+                slug.as_str()
+            )));
+        }
+        // Verify parent exists if specified
+        if let Some(parent_slug) = parent {
+            let parent_project = ProjectName::new(parent_slug)?;
+            let parent_dir = self.project_dir(&parent_project);
+            if !parent_dir.exists() {
+                return Err(LoreError::Validation(
+                    "parent project does not exist".into(),
+                ));
+            }
+        }
+        self.ensure_layout(&slug)?;
+        let meta = ProjectMeta {
+            display_name: display.clone(),
+            parent: parent.map(|s| s.to_string()),
+        };
+        self.write_project_meta(&slug, &meta)?;
+        Ok(ProjectInfo {
+            display_name: display,
+            parent: parent.map(|s| s.to_string()),
+            slug,
+        })
     }
 
     pub fn create_block(&self, new_block: NewBlock) -> Result<Block> {
@@ -917,5 +996,54 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, LoreError::InvalidOrderRange));
+    }
+
+    #[test]
+    fn slugify_free_form_names() {
+        use crate::model::slugify;
+        assert_eq!(slugify("My Cool Project"), "my-cool-project");
+        assert_eq!(slugify("API Docs v2"), "api-docs-v2");
+        assert_eq!(slugify("  Hello  World  "), "hello-world");
+        assert_eq!(slugify("Engineering"), "engineering");
+        assert_eq!(slugify("alpha.docs"), "alpha-docs");
+        assert_eq!(slugify("a--b"), "a-b");
+        assert_eq!(slugify("---"), "");
+    }
+
+    #[test]
+    fn from_display_name_roundtrip() {
+        let (slug, display) = ProjectName::from_display_name("My Test Project").unwrap();
+        assert_eq!(slug.as_str(), "my-test-project");
+        assert_eq!(display, "My Test Project");
+    }
+
+    #[test]
+    fn create_project_writes_metadata() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let info = store.create_project("My Project", None).unwrap();
+        assert_eq!(info.slug.as_str(), "my-project");
+        assert_eq!(info.display_name, "My Project");
+        assert!(info.parent.is_none());
+
+        let meta = store.read_project_meta(&info.slug);
+        assert_eq!(meta.display_name, "My Project");
+
+        // list_project_infos should return it with the display name
+        let infos = store.list_project_infos().unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].display_name, "My Project");
+    }
+
+    #[test]
+    fn create_child_project() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let parent = store.create_project("Engineering", None).unwrap();
+        let child = store
+            .create_project("API Docs", Some(parent.slug.as_str()))
+            .unwrap();
+        assert_eq!(child.slug.as_str(), "api-docs");
+        assert_eq!(child.parent.as_deref(), Some("engineering"));
     }
 }

@@ -6,6 +6,7 @@ use crate::librarian::{
     ProjectLibrarianOperationType, ProviderCheckResult, StoredLibrarianOperation,
 };
 use crate::model::{Block, BlockType, ProjectName};
+use crate::store::ProjectInfo;
 use crate::updater::{AutoUpdateConfig, AutoUpdateStatus, DEFAULT_UPDATE_REPO};
 use crate::versioning::{
     GitExportConfig, GitExportStatus, ProjectVersionActor, ProjectVersionActorKind,
@@ -92,6 +93,8 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
 
 pub struct ProjectListEntry {
     pub project: ProjectName,
+    pub display_name: String,
+    pub parent: Option<String>,
     pub can_write: bool,
 }
 
@@ -298,50 +301,24 @@ pub fn render_projects_page(
     csrf_token: &str,
     flash: Option<&str>,
 ) -> String {
-    let project_cards = if projects.is_empty() {
-        r#"<section class="empty-state"><h2>No visible projects</h2><p>You do not currently have access to any projects, or no project data exists yet.</p></section>"#.to_string()
+    let tree_html = if projects.is_empty() {
+        r#"<div class="empty-state"><p>No projects yet.</p></div>"#.to_string()
     } else {
-        projects
-            .iter()
-            .map(|entry| {
-                format!(
-                    r#"<article class="project-card">
-  <div>
-    <p class="eyebrow">Project</p>
-    <h2>{}</h2>
-    <p class="subtitle">{}</p>
-  </div>
-  <a class="button-link" href="/ui/{}">Open</a>
-</article>"#,
-                    escape_text(entry.project.as_str()),
-                    if entry.can_write {
-                        "Read and write access"
-                    } else {
-                        "Read-only access"
-                    },
-                    escape_attribute(entry.project.as_str())
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
+        render_project_tree(projects, is_admin, csrf_token)
     };
 
-    let create_form = if is_admin {
+    let root_create = if is_admin {
         format!(
-            r#"<section class="panel">
-        <div class="panel-header">
-          <h2>Create project</h2>
-          <p>Name must be lowercase with dots (e.g. engineering.docs).</p>
-        </div>
-        <form method="post" action="/ui/projects">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label>
-            Project name
-            <input type="text" name="project_name" placeholder="team.docs" required pattern="[a-z0-9][a-z0-9._-]*[a-z0-9]">
-          </label>
-          <button type="submit">Create project</button>
-        </form>
-      </section>"#,
+            r#"<div class="tree-create-root">
+  <button type="button" class="tree-add-btn" onclick="toggleCreateForm(this, '')">+ New project</button>
+  <form class="tree-create-form" style="display:none" method="post" action="/ui/projects">
+    <input type="hidden" name="csrf_token" value="{csrf_token}">
+    <input type="hidden" name="parent" value="">
+    <input type="text" name="project_name" placeholder="Project name" required>
+    <button type="submit">Create</button>
+    <button type="button" onclick="this.parentElement.style.display='none'">Cancel</button>
+  </form>
+</div>"#,
             csrf_token = escape_attribute(csrf_token),
         )
     } else {
@@ -350,12 +327,24 @@ pub fn render_projects_page(
 
     let content = format!(
         r#"<h1 class="page-title">Projects</h1>
-    <div class="layout">
-      <section class="project-grid">{project_cards}</section>
-      <aside class="stack">{create_form}</aside>
-    </div>"#,
-        project_cards = project_cards,
-        create_form = create_form,
+    <section class="project-tree-panel panel">
+      {tree_html}
+      {root_create}
+    </section>
+    <script>
+    function toggleCreateForm(btn, parentSlug) {{
+      var form = btn.nextElementSibling;
+      if (form.style.display === 'none') {{
+        document.querySelectorAll('.tree-create-form').forEach(function(f) {{ f.style.display = 'none'; }});
+        form.style.display = 'flex';
+        form.querySelector('input[name="project_name"]').focus();
+      }} else {{
+        form.style.display = 'none';
+      }}
+    }}
+    </script>"#,
+        tree_html = tree_html,
+        root_create = root_create,
     );
 
     render_shell(
@@ -369,6 +358,80 @@ pub fn render_projects_page(
         },
         content,
     )
+}
+
+fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token: &str) -> String {
+    // Build tree structure: root nodes have parent == None
+    // Children have parent == Some(slug)
+    fn render_children(
+        parent: Option<&str>,
+        projects: &[ProjectListEntry],
+        is_admin: bool,
+        csrf_token: &str,
+        depth: usize,
+    ) -> String {
+        let children: Vec<&ProjectListEntry> = projects
+            .iter()
+            .filter(|e| e.parent.as_deref() == parent)
+            .collect();
+
+        if children.is_empty() {
+            return String::new();
+        }
+
+        let items: Vec<String> = children
+            .iter()
+            .map(|entry| {
+                let slug = entry.project.as_str();
+                let display = escape_text(&entry.display_name);
+                let perm = if entry.can_write { "read/write" } else { "read-only" };
+                let sub = render_children(
+                    Some(slug),
+                    projects,
+                    is_admin,
+                    csrf_token,
+                    depth + 1,
+                );
+
+                let add_child_btn = if is_admin {
+                    format!(
+                        r#"<button type="button" class="tree-add-child" onclick="toggleCreateForm(this, '{slug}')">+</button>
+<form class="tree-create-form" style="display:none" method="post" action="/ui/projects">
+  <input type="hidden" name="csrf_token" value="{csrf_token}">
+  <input type="hidden" name="parent" value="{slug}">
+  <input type="text" name="project_name" placeholder="Sub-project name" required>
+  <button type="submit">Create</button>
+  <button type="button" onclick="this.parentElement.style.display='none'">Cancel</button>
+</form>"#,
+                        slug = escape_attribute(slug),
+                        csrf_token = escape_attribute(csrf_token),
+                    )
+                } else {
+                    String::new()
+                };
+
+                format!(
+                    r#"<li class="tree-node">
+  <div class="tree-node-row">
+    <a href="/ui/{slug}" class="tree-link">{display}</a>
+    <span class="tree-perm">{perm}</span>
+    {add_child_btn}
+  </div>
+  {sub}
+</li>"#,
+                    slug = escape_attribute(slug),
+                    display = display,
+                    perm = perm,
+                    add_child_btn = add_child_btn,
+                    sub = sub,
+                )
+            })
+            .collect();
+
+        format!(r#"<ul class="tree-list">{}</ul>"#, items.join(""))
+    }
+
+    render_children(None, projects, is_admin, csrf_token, 0)
 }
 
 pub fn render_admin_page(
@@ -391,7 +454,7 @@ pub fn render_admin_page(
     librarian_audit: &[UiLibrarianAnswer],
     pending_actions: &[UiPendingLibrarianAction],
     auth_audit: &[UiAuditEvent],
-    projects: &[ProjectName],
+    projects: &[ProjectInfo],
     latest_agent_token: Option<&UiAdminTokenDisplay>,
     flash: Option<&str>,
     active_section: &str,
@@ -441,8 +504,8 @@ pub fn render_admin_page(
                         <option value="read_write">Read/Write</option>
                       </select>
                     </div>"#,
-                    escape_attribute(p.as_str()),
-                    escape_text(p.as_str()),
+                    escape_attribute(p.slug.as_str()),
+                    escape_text(&p.display_name),
                 )
             })
             .collect();
@@ -466,8 +529,8 @@ pub fn render_admin_page(
                         <option value="read_write">Read/Write</option>
                       </select>
                     </div>"#,
-                    escape_attribute(p.as_str()),
-                    escape_text(p.as_str()),
+                    escape_attribute(p.slug.as_str()),
+                    escape_text(&p.display_name),
                 )
             })
             .collect();
@@ -1353,6 +1416,7 @@ pub fn render_admin_audit_page(
 pub fn render_project_audit_page(
     theme: UiTheme,
     project: &ProjectName,
+    display_name: &str,
     username: &str,
     is_admin: bool,
     can_write: bool,
@@ -1382,8 +1446,8 @@ pub fn render_project_audit_page(
 
     let content = format!(
         r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
-      <h1 class="page-title" style="margin:0;">{project} &mdash; Audit</h1>
-      <a class="button-link" href="/ui/{project}">Back to project</a>
+      <h1 class="page-title" style="margin:0;">{display_name} &mdash; Audit</h1>
+      <a class="button-link" href="/ui/{project_slug}">Back to project</a>
     </div>
     <div class="layout">
       <section class="panel">
@@ -1401,14 +1465,15 @@ pub fn render_project_audit_page(
         <div class="timeline">{runs_html}</div>
       </section>
     </div>"#,
-        project = escape_text(project.as_str()),
+        display_name = escape_text(display_name),
+        project_slug = escape_attribute(project.as_str()),
         pending_html = pending_html,
         runs_html = runs_html,
     );
 
     render_shell(
         PageShell {
-            title: &format!("Lore audit · {}", project),
+            title: &format!("Lore audit · {}", display_name),
             username: Some(username),
             is_admin,
             theme,
@@ -1422,6 +1487,7 @@ pub fn render_project_audit_page(
 pub fn render_project_history_page(
     theme: UiTheme,
     project: &ProjectName,
+    display_name: &str,
     username: &str,
     is_admin: bool,
     can_write: bool,
@@ -1440,10 +1506,10 @@ pub fn render_project_history_page(
 
     let content = format!(
         r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
-      <h1 class="page-title" style="margin:0;">{project} &mdash; History</h1>
+      <h1 class="page-title" style="margin:0;">{display_name} &mdash; History</h1>
       <div style="display:flex; gap:var(--s-3);">
-        <a class="button-link" href="/ui/{project}">Back to project</a>
-        <a class="button-link" href="/ui/{project}/audit">Audit</a>
+        <a class="button-link" href="/ui/{project_slug}">Back to project</a>
+        <a class="button-link" href="/ui/{project_slug}/audit">Audit</a>
       </div>
     </div>
     <section class="panel">
@@ -1453,13 +1519,14 @@ pub fn render_project_history_page(
       </div>
       <div class="timeline">{history_html}</div>
     </section>"#,
-        project = escape_text(project.as_str()),
+        display_name = escape_text(display_name),
+        project_slug = escape_attribute(project.as_str()),
         history_html = history_html,
     );
 
     render_shell(
         PageShell {
-            title: &format!("Lore history · {}", project),
+            title: &format!("Lore history · {}", display_name),
             username: Some(username),
             is_admin,
             theme,
@@ -1473,6 +1540,7 @@ pub fn render_project_history_page(
 pub fn render_project_page(
     theme: UiTheme,
     project: &ProjectName,
+    display_name: &str,
     blocks: &[Block],
     all_blocks: &[Block],
     flash: Option<&str>,
@@ -1566,13 +1634,13 @@ pub fn render_project_page(
 
     let content = format!(
         r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
-      <h1 class="page-title" style="margin:0;">{project}</h1>
+      <h1 class="page-title" style="margin:0;">{display_name}</h1>
       <div style="display:flex; gap:var(--s-3);">
-        <a class="button-link" href="/ui/{project}/audit">Audit</a>
-        <a class="button-link" href="/ui/{project}/history">History</a>
+        <a class="button-link" href="/ui/{project_slug}/audit">Audit</a>
+        <a class="button-link" href="/ui/{project_slug}/history">History</a>
       </div>
     </div>
-    <form class="searchbar" method="get" action="/ui/{project}">
+    <form class="searchbar" method="get" action="/ui/{project_slug}">
       <input type="search" name="q" value="{search_value}" placeholder="Search content...">
       <select name="block_type">
         <option value=""{search_any_type}>Any type</option>
@@ -1596,7 +1664,8 @@ pub fn render_project_page(
       </section>
       <aside class="stack">{librarian_panel}{composer}</aside>
     </div>"#,
-        project = escape_text(project.as_str()),
+        display_name = escape_text(display_name),
+        project_slug = escape_attribute(project.as_str()),
         search_value = escape_attribute(search_value),
         search_any_type = if search_block_type.is_none() {
             " selected"
@@ -1617,7 +1686,7 @@ pub fn render_project_page(
 
     render_shell(
         PageShell {
-            title: &format!("Lore · {}", project),
+            title: &format!("Lore · {}", display_name),
             username: Some(username),
             is_admin,
             theme,
@@ -2345,14 +2414,19 @@ fn render_librarian_history_item(
     )
 }
 
-fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectName]) -> String {
+fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectInfo]) -> String {
     let grants = role
         .grants
         .iter()
         .map(|grant| {
+            let display = projects
+                .iter()
+                .find(|p| p.slug == grant.project)
+                .map(|p| p.display_name.as_str())
+                .unwrap_or(grant.project.as_str());
             format!(
                 r#"<li><span class="meta-code">{}</span> <span class="pill small">{}</span></li>"#,
-                escape_text(grant.project.as_str()),
+                escape_text(display),
                 escape_text(match grant.permission {
                     ProjectPermission::Read => "read",
                     ProjectPermission::ReadWrite => "read_write",
@@ -2371,7 +2445,7 @@ fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectName
         let rows: Vec<String> = projects
             .iter()
             .map(|p| {
-                let current = role.grants.iter().find(|g| g.project == *p);
+                let current = role.grants.iter().find(|g| g.project == p.slug);
                 let (no_sel, r_sel, rw_sel) = match current {
                     Some(g) => match g.permission {
                         ProjectPermission::Read => ("", " selected", ""),
@@ -2388,8 +2462,8 @@ fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectName
                         <option value="read_write"{}>Read/Write</option>
                       </select>
                     </div>"#,
-                    escape_attribute(p.as_str()),
-                    escape_text(p.as_str()),
+                    escape_attribute(p.slug.as_str()),
+                    escape_text(&p.display_name),
                     no_sel,
                     r_sel,
                     rw_sel,
@@ -3443,38 +3517,112 @@ fn shared_styles(theme: UiTheme) -> String {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .project-grid, .stack, .timeline {
+    .stack, .timeline {
       display: grid;
       gap: var(--s-4);
     }
 
-    .project-grid {
-      margin-top: var(--s-6);
-      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    .project-tree-panel {
+      padding: var(--s-5);
+    }
+
+    .tree-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+
+    .tree-list .tree-list {
+      padding-left: var(--s-5);
+      border-left: 1px solid var(--line);
+      margin-left: var(--s-3);
+    }
+
+    .tree-node {
+      margin: var(--s-2) 0;
+    }
+
+    .tree-node-row {
+      display: flex;
+      align-items: center;
+      gap: var(--s-3);
+      padding: var(--s-2) var(--s-3);
+      border-radius: var(--radius);
+      transition: background 0.15s;
+    }
+
+    .tree-node-row:hover {
+      background: var(--surface-hover);
+    }
+
+    .tree-link {
+      font-weight: 600;
+      font-size: 1rem;
+      color: var(--ink);
+      text-decoration: none;
+      flex: 1;
+    }
+
+    .tree-link:hover {
+      color: var(--accent);
+    }
+
+    .tree-perm {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .tree-add-child,
+    .tree-add-btn {
+      background: none;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 0.85rem;
+      padding: 2px 8px;
+      min-height: auto;
+    }
+
+    .tree-add-child:hover,
+    .tree-add-btn:hover {
+      background: var(--surface-hover);
+      color: var(--ink);
+    }
+
+    .tree-create-root {
+      margin-top: var(--s-4);
+      padding-top: var(--s-4);
+      border-top: 1px solid var(--line);
+    }
+
+    .tree-create-form {
+      display: flex;
+      align-items: center;
+      gap: var(--s-3);
+      padding: var(--s-3) 0;
+    }
+
+    .tree-create-form input[type="text"] {
+      flex: 1;
+      max-width: 300px;
+    }
+
+    .tree-create-form button {
+      min-height: auto;
+      padding: var(--s-2) var(--s-4);
     }
 
     .timeline {
       padding: var(--s-5);
     }
 
-    .project-card, .block {
+    .block {
       padding: var(--s-5);
       border: 1px solid var(--line);
       border-radius: var(--s-5);
       background: var(--panel-strong);
       transition: border-color 0.2s;
-    }
-
-    .project-card:hover {
-      border-color: var(--accent);
-    }
-
-    .project-card {
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      gap: var(--s-4);
-      align-items: flex-start;
     }
 
     .panel-header {
@@ -3884,10 +4032,6 @@ fn shared_styles(theme: UiTheme) -> String {
 
       .composer {
         position: static;
-      }
-
-      .project-card {
-        display: grid;
       }
 
       .block-meta {

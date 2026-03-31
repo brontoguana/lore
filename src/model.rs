@@ -58,8 +58,49 @@ impl ProjectName {
         Ok(Self(value))
     }
 
+    /// Create a ProjectName (slug) from a free-form display name.
+    /// Returns `(slug, display_name)` where display_name is the trimmed input.
+    pub fn from_display_name(display_name: &str) -> Result<(Self, String)> {
+        let display = display_name.trim().to_string();
+        if display.is_empty() {
+            return Err(LoreError::Validation(
+                "project name must not be empty".into(),
+            ));
+        }
+        let slug = slugify(&display);
+        if slug.is_empty() {
+            return Err(LoreError::Validation(
+                "project name must contain at least one letter or digit".into(),
+            ));
+        }
+        Ok((Self::new(slug)?, display))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Convert a free-form name to a filesystem/URL-safe slug.
+pub fn slugify(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            slug.push(ch.to_ascii_lowercase());
+        } else if ch == ' ' || ch == '-' || ch == '.' {
+            if !slug.ends_with('-') {
+                slug.push('-');
+            }
+        }
+        // other characters are dropped
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.len() > MAX_PROJECT_NAME_LEN {
+        slug[..MAX_PROJECT_NAME_LEN]
+            .trim_end_matches('-')
+            .to_string()
+    } else {
+        slug
     }
 }
 
