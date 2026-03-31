@@ -401,7 +401,7 @@ pub fn render_admin_page(
     } else {
         roles
             .iter()
-            .map(|role| render_role_card(role, csrf_token))
+            .map(|role| render_role_card(role, csrf_token, projects))
             .collect::<Vec<_>>()
             .join("")
     };
@@ -426,6 +426,31 @@ pub fn render_admin_page(
     let latest_agent_token_html = latest_agent_token
         .map(|token| render_latest_agent_token(token))
         .unwrap_or_default();
+    let role_grants_html = if projects.is_empty() {
+        "<p class=\"hint\">No projects exist yet. Create a project first, then come back to assign grants.</p>".to_string()
+    } else {
+        let rows: Vec<String> = projects
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"<div class="grant-row" data-project-grant="{}">
+                      <span class="grant-project-name">{}</span>
+                      <select>
+                        <option value="">No access</option>
+                        <option value="read">Read</option>
+                        <option value="read_write">Read/Write</option>
+                      </select>
+                    </div>"#,
+                    escape_attribute(p.as_str()),
+                    escape_text(p.as_str()),
+                )
+            })
+            .collect();
+        format!(
+            r#"<fieldset class="grant-fieldset"><legend>Project access</legend>{}</fieldset>"#,
+            rows.join("")
+        )
+    };
     let project_grants_html = if projects.is_empty() {
         "<p class=\"hint\">No projects exist yet. Create a project first, then come back to grant access.</p>".to_string()
     } else {
@@ -619,20 +644,34 @@ pub fn render_admin_page(
       <section class="panel" data-panel="roles"{roles_display}>
         <div class="panel-header">
           <h2>Create role</h2>
-          <p>Enter one grant per line using project:permission where permission is read or read_write.</p>
+          <p>Select project-level permissions for this role.</p>
         </div>
-        <form method="post" action="/ui/admin/roles">
+        <form method="post" action="/ui/admin/roles" id="create-role-form">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
           <label>
             Role name
             <input type="text" name="name" placeholder="engineering-writers" required>
           </label>
-          <label>
-            Grants
-            <textarea name="grants" placeholder="alpha.docs:read_write&#10;beta.docs:read"></textarea>
-          </label>
+          {role_grants_html}
+          <textarea name="grants" style="display:none" id="role-grants-field"></textarea>
           <button type="submit">Create role</button>
         </form>
+        <script>
+        (function() {{
+          var form = document.getElementById('create-role-form');
+          form.addEventListener('submit', function() {{
+            var rows = form.querySelectorAll('[data-project-grant]');
+            var lines = [];
+            rows.forEach(function(row) {{
+              var sel = row.querySelector('select');
+              if (sel && sel.value) {{
+                lines.push(row.getAttribute('data-project-grant') + ':' + sel.value);
+              }}
+            }});
+            document.getElementById('role-grants-field').value = lines.join('\\n');
+          }});
+        }})();
+        </script>
         <div class="panel-header"><h2>Roles</h2><p>Grants define project-level visibility and editing.</p></div>
         <div class="timeline">{roles_html}</div>
       </section>
@@ -1037,6 +1076,7 @@ pub fn render_admin_page(
         latest_agent_token_html = latest_agent_token_html,
         agent_tokens_html = agent_tokens_html,
         project_grants_html = project_grants_html,
+        role_grants_html = role_grants_html,
         roles_html = roles_html,
         users_html = users_html,
         pending_actions_html = pending_actions_html,
@@ -2305,7 +2345,7 @@ fn render_librarian_history_item(
     )
 }
 
-fn render_role_card(role: &StoredRole, csrf_token: &str) -> String {
+fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectName]) -> String {
     let grants = role
         .grants
         .iter()
@@ -2322,45 +2362,87 @@ fn render_role_card(role: &StoredRole, csrf_token: &str) -> String {
         .collect::<Vec<_>>()
         .join("");
 
+    let form_id = format!("edit-role-{}", role.name.as_str().replace('.', "-"));
+    let grants_field_id = format!("{}-grants", form_id);
+
+    let edit_grants_html = if projects.is_empty() {
+        "<p class=\"hint\">No projects exist yet.</p>".to_string()
+    } else {
+        let rows: Vec<String> = projects
+            .iter()
+            .map(|p| {
+                let current = role.grants.iter().find(|g| g.project == *p);
+                let (no_sel, r_sel, rw_sel) = match current {
+                    Some(g) => match g.permission {
+                        ProjectPermission::Read => ("", " selected", ""),
+                        ProjectPermission::ReadWrite => ("", "", " selected"),
+                    },
+                    None => ("", "", ""),
+                };
+                format!(
+                    r#"<div class="grant-row" data-project-grant="{}">
+                      <span class="grant-project-name">{}</span>
+                      <select>
+                        <option value=""{}>No access</option>
+                        <option value="read"{}>Read</option>
+                        <option value="read_write"{}>Read/Write</option>
+                      </select>
+                    </div>"#,
+                    escape_attribute(p.as_str()),
+                    escape_text(p.as_str()),
+                    no_sel,
+                    r_sel,
+                    rw_sel,
+                )
+            })
+            .collect();
+        format!(
+            r#"<fieldset class="grant-fieldset"><legend>Project access</legend>{}</fieldset>"#,
+            rows.join("")
+        )
+    };
+
     format!(
         r#"<article class="block">
   <div class="block-meta">
-    <span class="pill">{}</span>
-    <span>{}</span>
+    <span class="pill">{name}</span>
+    <span>{created_at}</span>
   </div>
-  <ul class="grant-list">{}</ul>
+  <ul class="grant-list">{grants}</ul>
   <details>
     <summary>Edit role</summary>
-    <form method="post" action="/ui/admin/roles/{}">
-      <input type="hidden" name="csrf_token" value="{}">
-      <label>
-        Grants
-        <textarea name="grants">{}</textarea>
-      </label>
+    <form method="post" action="/ui/admin/roles/{action_name}" id="{form_id}">
+      <input type="hidden" name="csrf_token" value="{csrf_token}">
+      {edit_grants_html}
+      <textarea name="grants" style="display:none" id="{grants_field_id}"></textarea>
       <button type="submit">Update role</button>
     </form>
+    <script>
+    (function() {{
+      var form = document.getElementById('{form_id}');
+      form.addEventListener('submit', function() {{
+        var rows = form.querySelectorAll('[data-project-grant]');
+        var lines = [];
+        rows.forEach(function(row) {{
+          var sel = row.querySelector('select');
+          if (sel && sel.value) {{
+            lines.push(row.getAttribute('data-project-grant') + ':' + sel.value);
+          }}
+        }});
+        document.getElementById('{grants_field_id}').value = lines.join('\\n');
+      }});
+    }})();
+    </script>
   </details>
 </article>"#,
-        escape_text(role.name.as_str()),
-        escape_text(&format_timestamp(role.created_at)),
-        grants,
-        escape_attribute(role.name.as_str()),
-        escape_attribute(csrf_token),
-        escape_text(
-            &role
-                .grants
-                .iter()
-                .map(|grant| format!(
-                    "{}:{}",
-                    grant.project.as_str(),
-                    match grant.permission {
-                        ProjectPermission::Read => "read",
-                        ProjectPermission::ReadWrite => "read_write",
-                    }
-                ))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
+        name = escape_text(role.name.as_str()),
+        created_at = escape_text(&format_timestamp(role.created_at)),
+        grants = grants,
+        action_name = escape_attribute(role.name.as_str()),
+        form_id = form_id,
+        csrf_token = escape_attribute(csrf_token),
+        edit_grants_html = edit_grants_html,
+        grants_field_id = grants_field_id,
     )
 }
 
