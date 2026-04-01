@@ -5,7 +5,7 @@ use crate::librarian::{
     LibrarianActor, LibrarianActorKind, LibrarianConfig, LibrarianRunKind, LibrarianRunStatus,
     ProjectLibrarianOperationType, ProviderCheckResult, StoredLibrarianOperation,
 };
-use crate::model::{Block, BlockType, ProjectName};
+use crate::model::{Block, BlockId, BlockType, ProjectName};
 use crate::store::ProjectInfo;
 use crate::updater::{AutoUpdateConfig, AutoUpdateStatus, DEFAULT_UPDATE_REPO};
 use crate::versioning::{
@@ -81,6 +81,20 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     {flash_html}
     {content}
   </main>
+  <script>
+  function showInserterForm(btn, type) {{
+    var expand = btn.closest('.inserter-expand');
+    var forms = expand.querySelectorAll('.inserter-form');
+    for (var i = 0; i < forms.length; i++) forms[i].style.display = 'none';
+    var btns = expand.querySelectorAll('.inserter-type-btn');
+    for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
+    var target = expand.querySelector('.inserter-form-' + type);
+    if (target) {{ target.style.display = ''; }}
+    btn.classList.add('active');
+    var ta = target && target.querySelector('textarea');
+    if (ta) ta.focus();
+  }}
+  </script>
 </body>
 </html>"#,
         title = escape_text(shell.title),
@@ -310,16 +324,8 @@ pub fn render_projects_page(
     let root_create = if is_admin {
         format!(
             r#"<div class="tree-create-root">
-  <button type="button" class="tree-add-btn" onclick="toggleCreateForm(this, '')">+ New project</button>
-  <form class="tree-create-form" style="display:none" method="post" action="/ui/projects">
-    <input type="hidden" name="csrf_token" value="{csrf_token}">
-    <input type="hidden" name="parent" value="">
-    <input type="text" name="project_name" placeholder="Project name" required>
-    <button type="submit">Create</button>
-    <button type="button" onclick="this.parentElement.style.display='none'">Cancel</button>
-  </form>
+  <button type="button" class="tree-add-btn" onclick="addSiblingRow(this, '')">+ New project</button>
 </div>"#,
-            csrf_token = escape_attribute(csrf_token),
         )
     } else {
         String::new()
@@ -332,19 +338,49 @@ pub fn render_projects_page(
       {root_create}
     </section>
     <script>
-    function toggleCreateForm(btn, parentSlug) {{
-      var form = btn.nextElementSibling;
-      if (form.style.display === 'none') {{
-        document.querySelectorAll('.tree-create-form').forEach(function(f) {{ f.style.display = 'none'; }});
-        form.style.display = 'flex';
-        form.querySelector('input[name="project_name"]').focus();
+    var csrfToken = '{csrf_token}';
+    function addSiblingRow(btn, parentSlug) {{
+      // Remove any existing inline create rows
+      document.querySelectorAll('.tree-inline-create').forEach(function(el) {{ el.remove(); }});
+
+      var li = document.createElement('li');
+      li.className = 'tree-node tree-inline-create';
+      li.innerHTML = '<form class="tree-node-row tree-create-row" method="post" action="/ui/projects">'
+        + '<input type="hidden" name="csrf_token" value="' + csrfToken + '">'
+        + '<input type="hidden" name="parent" value="' + parentSlug + '">'
+        + '<input type="text" name="project_name" class="tree-inline-input" placeholder="Project name" required>'
+        + '<div class="tree-row-right">'
+        + '<span class="tree-perm">read/write</span>'
+        + '<button type="submit" class="tree-add-child">Save</button>'
+        + '<button type="button" class="tree-add-child" onclick="this.closest(\'.tree-inline-create\').remove()">Cancel</button>'
+        + '</div></form>';
+
+      // Insert after the current tree-node (sibling), or at end of the tree list
+      var node = btn.closest('.tree-node');
+      if (node) {{
+        node.after(li);
       }} else {{
-        form.style.display = 'none';
+        // Clicked from root "New project" button
+        var list = document.querySelector('.project-tree-panel .tree-list');
+        if (list) {{
+          list.appendChild(li);
+        }} else {{
+          // No tree-list yet (empty state) -- create one
+          var panel = document.querySelector('.project-tree-panel');
+          var empty = panel.querySelector('.empty-state');
+          if (empty) empty.remove();
+          var ul = document.createElement('ul');
+          ul.className = 'tree-list';
+          ul.appendChild(li);
+          panel.insertBefore(ul, panel.querySelector('.tree-create-root'));
+        }}
       }}
+      li.querySelector('input[name="project_name"]').focus();
     }}
     </script>"#,
         tree_html = tree_html,
         root_create = root_create,
+        csrf_token = escape_attribute(csrf_token),
     );
 
     render_shell(
@@ -379,6 +415,7 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
             return String::new();
         }
 
+        let parent_slug = parent.unwrap_or("");
         let items: Vec<String> = children
             .iter()
             .map(|entry| {
@@ -393,18 +430,10 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
                     depth + 1,
                 );
 
-                let add_child_btn = if is_admin {
+                let add_btn = if is_admin {
                     format!(
-                        r#"<button type="button" class="tree-add-child" onclick="toggleCreateForm(this, '{slug}')">+</button>
-<form class="tree-create-form" style="display:none" method="post" action="/ui/projects">
-  <input type="hidden" name="csrf_token" value="{csrf_token}">
-  <input type="hidden" name="parent" value="{slug}">
-  <input type="text" name="project_name" placeholder="Sub-project name" required>
-  <button type="submit">Create</button>
-  <button type="button" onclick="this.parentElement.style.display='none'">Cancel</button>
-</form>"#,
-                        slug = escape_attribute(slug),
-                        csrf_token = escape_attribute(csrf_token),
+                        r#"<button type="button" class="tree-add-child" onclick="addSiblingRow(this, '{parent}')">+</button>"#,
+                        parent = escape_attribute(parent_slug),
                     )
                 } else {
                     String::new()
@@ -414,15 +443,17 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
                     r#"<li class="tree-node">
   <div class="tree-node-row">
     <a href="/ui/{slug}" class="tree-link">{display}</a>
-    <span class="tree-perm">{perm}</span>
-    {add_child_btn}
+    <div class="tree-row-right">
+      <span class="tree-perm">{perm}</span>
+      {add_btn}
+    </div>
   </div>
   {sub}
 </li>"#,
                     slug = escape_attribute(slug),
                     display = display,
                     perm = perm,
-                    add_child_btn = add_child_btn,
+                    add_btn = add_btn,
                     sub = sub,
                 )
             })
@@ -818,7 +849,7 @@ pub fn render_admin_page(
 
       <section class="panel" data-panel="librarian"{librarian_display}>
         <div class="panel-header">
-          <h2>Answer librarian</h2>
+          <h2>Librarian</h2>
           <p>Configure an OpenAI-compatible chat completions endpoint.</p>
         </div>
         <form method="post" action="/ui/admin/librarian">
@@ -1547,7 +1578,7 @@ pub fn render_project_page(
     search: Option<&str>,
     search_block_type: Option<&str>,
     search_author: Option<&str>,
-    search_since_days: Option<u32>,
+    search_include_history: bool,
     username: &str,
     can_write: bool,
     is_admin: bool,
@@ -1571,15 +1602,27 @@ pub fn render_project_page(
             escape_text(search_value)
         )
     };
-    let placement_options = render_after_options(all_blocks, None, None);
-    let blocks_html = if blocks.is_empty() {
-        r#"<section class="empty-state"><h2>No blocks yet</h2><p>Add the first block below to start the shared document.</p></section>"#.to_string()
+    let blocks_html = if blocks.is_empty() && can_write {
+        format!(
+            r#"<section class="empty-state"><h2>No blocks yet</h2><p>Click the button below to add the first block.</p></section>{}"#,
+            render_block_inserter(project, None, csrf_token),
+        )
+    } else if blocks.is_empty() {
+        r#"<section class="empty-state"><h2>No blocks yet</h2></section>"#.to_string()
     } else {
-        blocks
-            .iter()
-            .map(|block| render_block(project, block, all_blocks, can_write, csrf_token))
-            .collect::<Vec<_>>()
-            .join("")
+        let mut html = String::new();
+        if can_write {
+            html.push_str(&render_block_inserter(project, None, csrf_token));
+        }
+        for block in blocks {
+            html.push_str(&render_block(
+                project, block, all_blocks, can_write, csrf_token,
+            ));
+            if can_write {
+                html.push_str(&render_block_inserter(project, Some(&block.id), csrf_token));
+            }
+        }
+        html
     };
     let librarian_panel = render_librarian_panel(
         project,
@@ -1589,52 +1632,40 @@ pub fn render_project_page(
         librarian_history,
         pending_actions,
     );
-    let composer = if can_write {
+    let read_only_notice = if !can_write {
+        r#"<section class="panel composer"><div class="panel-header"><h2>Read-only access</h2><p>Viewing only.</p></div></section>"#
+    } else {
+        ""
+    };
+
+    let rename_html = if can_write && is_admin {
         format!(
-            r#"<section class="panel composer" id="composer">
-  <div class="panel-header">
-    <h2>Add block</h2>
-    <p>You can write anywhere in this project.</p>
-  </div>
-  <form method="post" action="/ui/{project}/blocks" enctype="multipart/form-data">
-    <input type="hidden" name="csrf_token" value="{csrf_token}">
-    <label>
-      Type
-      <select name="block_type">
-        <option value="markdown">Markdown</option>
-        <option value="svg">SVG</option>
-        <option value="html">HTML</option>
-        <option value="image">Image</option>
-      </select>
-    </label>
-    <label>
-      Place after
-      <select name="after_block_id">
-        {placement_options}
-      </select>
-    </label>
-    <label>
-      Content or note
-      <textarea name="content" placeholder="Write markdown, paste an SVG, provide an image URL, or add a note for an uploaded image."></textarea>
-    </label>
-    <label>
-      Upload image
-      <input type="file" name="image_file" accept="image/*">
-    </label>
-    <button type="submit">Add block</button>
-  </form>
-</section>"#,
-            project = escape_attribute(project.as_str()),
+            r#"<h1 class="page-title editable-title" style="margin:0;" id="project-title"
+                title="Click to rename" onclick="document.getElementById('rename-form').style.display='flex'; this.style.display='none';"
+            >{display_name}</h1>
+            <form id="rename-form" method="post" action="/ui/{project_slug}/rename"
+                  style="display:none; align-items:center; gap:var(--s-3); margin:0;">
+              <input type="hidden" name="csrf_token" value="{csrf_token}">
+              <input type="text" name="display_name" value="{display_name_attr}" class="rename-input"
+                     autofocus onfocus="this.select()">
+              <button type="submit" class="button-link">Save</button>
+              <button type="button" class="button-link" onclick="this.closest('form').style.display='none'; document.getElementById('project-title').style.display='';">Cancel</button>
+            </form>"#,
+            display_name = escape_text(display_name),
+            display_name_attr = escape_attribute(display_name),
+            project_slug = escape_attribute(project.as_str()),
             csrf_token = escape_attribute(csrf_token),
-            placement_options = placement_options,
         )
     } else {
-        r#"<section class="panel composer"><div class="panel-header"><h2>Read-only access</h2><p>Viewing only.</p></div></section>"#.to_string()
+        format!(
+            r#"<h1 class="page-title" style="margin:0;">{display_name}</h1>"#,
+            display_name = escape_text(display_name),
+        )
     };
 
     let content = format!(
         r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
-      <h1 class="page-title" style="margin:0;">{display_name}</h1>
+      {rename_html}
       <div style="display:flex; gap:var(--s-3);">
         <a class="button-link" href="/ui/{project_slug}/audit">Audit</a>
         <a class="button-link" href="/ui/{project_slug}/history">History</a>
@@ -1650,7 +1681,7 @@ pub fn render_project_page(
         <option value="image"{search_image}>Image</option>
       </select>
       <input type="search" name="author" value="{search_author}" placeholder="Author...">
-      <input type="number" name="since_days" min="1" value="{search_since_days}" placeholder="Days">
+      <label class="toggle"><input type="checkbox" name="include_history" value="1"{search_history_checked}> <span>Search document history</span></label>
       <button type="submit">Search</button>
     </form>
 
@@ -1662,9 +1693,9 @@ pub fn render_project_page(
         </div>
         <div class="timeline">{blocks_html}</div>
       </section>
-      <aside class="stack">{librarian_panel}{composer}</aside>
+      <aside class="stack">{librarian_panel}{read_only_notice}</aside>
     </div>"#,
-        display_name = escape_text(display_name),
+        rename_html = rename_html,
         project_slug = escape_attribute(project.as_str()),
         search_value = escape_attribute(search_value),
         search_any_type = if search_block_type.is_none() {
@@ -1677,11 +1708,15 @@ pub fn render_project_page(
         search_html = selected(search_block_type, "html"),
         search_image = selected(search_block_type, "image"),
         search_author = escape_attribute(search_author.unwrap_or_default()),
-        search_since_days = search_since_days.map(|v| v.to_string()).unwrap_or_default(),
+        search_history_checked = if search_include_history {
+            " checked"
+        } else {
+            ""
+        },
         results_label = results_label,
         blocks_html = blocks_html,
         librarian_panel = librarian_panel,
-        composer = composer,
+        read_only_notice = read_only_notice,
     );
 
     render_shell(
@@ -1708,7 +1743,7 @@ fn render_librarian_panel(
     let answer_html = librarian_answer
         .map(render_librarian_answer)
         .unwrap_or_else(|| {
-            "<p class=\"hint\">Ask for a summary, explanation, or grounded answer about this project. Lore sends only this project's retrieved blocks to the configured answer librarian.</p>".to_string()
+            "<p class=\"hint\">Ask for a summary, explanation, or grounded answer about this project.</p>".to_string()
         });
     let question_value = librarian_answer
         .map(|answer| escape_attribute(&answer.question))
@@ -1741,32 +1776,7 @@ fn render_librarian_panel(
       Project action
       <textarea name="instruction" placeholder="Reorganise the release notes into a summary block after the current introduction." required></textarea>
     </label>
-    <label>
-      Limit to block type
-      <select name="block_type">
-        <option value="">Any type</option>
-        <option value="markdown">Markdown</option>
-        <option value="svg">SVG</option>
-        <option value="html">HTML</option>
-        <option value="image">Image</option>
-      </select>
-    </label>
-    <label>
-      Author contains
-      <input type="text" name="author" placeholder="agent-alpha or alice">
-    </label>
-    <label>
-      Only last N days
-      <input type="number" name="since_days" min="1" placeholder="30">
-    </label>
-    <label>
-      Max source blocks
-      <input type="number" name="max_sources" min="1" max="10" placeholder="10">
-    </label>
-    <label>
-      Context radius
-      <input type="number" name="around" min="0" max="4" placeholder="2">
-    </label>
+    <label class="toggle"><input type="checkbox" name="include_history" value="1"> <span>Search document history</span></label>
     <button type="submit">Run project librarian action</button>
   </form>"#,
             project = escape_attribute(project.as_str()),
@@ -1779,8 +1789,7 @@ fn render_librarian_panel(
     format!(
         r#"<section class="panel composer">
   <div class="panel-header">
-    <h2>Answer librarian</h2>
-    <p>Single-project, read-only, and grounded only in Lore blocks from this project.</p>
+    <h2>Librarian</h2>
   </div>
   <form method="post" action="/ui/{project}/librarian">
     <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -1788,32 +1797,7 @@ fn render_librarian_panel(
       Question
       <textarea name="question" placeholder="Summarise the current decisions in this project." required>{question_value}</textarea>
     </label>
-    <label>
-      Limit to block type
-      <select name="block_type">
-        <option value="">Any type</option>
-        <option value="markdown">Markdown</option>
-        <option value="svg">SVG</option>
-        <option value="html">HTML</option>
-        <option value="image">Image</option>
-      </select>
-    </label>
-    <label>
-      Author contains
-      <input type="text" name="author" placeholder="agent-alpha or alice">
-    </label>
-    <label>
-      Only last N days
-      <input type="number" name="since_days" min="1" placeholder="30">
-    </label>
-    <label>
-      Max source blocks
-      <input type="number" name="max_sources" min="1" max="10" placeholder="10">
-    </label>
-    <label>
-      Context radius
-      <input type="number" name="around" min="0" max="4" placeholder="2">
-    </label>
+    <label class="toggle"><input type="checkbox" name="include_history" value="1"> <span>Search document history</span></label>
     <button type="submit">Ask librarian</button>
   </form>
   <div class="stack">
@@ -1842,7 +1826,7 @@ fn render_librarian_panel(
 
 fn render_librarian_answer(answer: &UiLibrarianAnswer) -> String {
     let kind = match answer.kind {
-        LibrarianRunKind::Answer => "Answer librarian",
+        LibrarianRunKind::Answer => "Librarian",
         LibrarianRunKind::ActionRequest => "Action request",
         LibrarianRunKind::ProjectAction => "Project librarian action",
     };
@@ -2699,6 +2683,65 @@ fn selected(current: Option<&str>, value: &str) -> &'static str {
     }
 }
 
+fn render_block_inserter(
+    project: &ProjectName,
+    after_block_id: Option<&BlockId>,
+    csrf_token: &str,
+) -> String {
+    let after_value = after_block_id
+        .map(|id| escape_attribute(id.as_str()).to_string())
+        .unwrap_or_default();
+    let project_attr = escape_attribute(project.as_str());
+    let csrf_attr = escape_attribute(csrf_token);
+    format!(
+        r#"<div class="block-inserter">
+  <button type="button" class="inserter-btn" onclick="
+    var p=this.parentNode;
+    var ex=p.querySelector('.inserter-expand');
+    if(ex.style.display==='none'){{ex.style.display='';this.textContent='\u{{2212}}'}}
+    else{{ex.style.display='none';this.textContent='+'}}
+  ">+</button>
+  <div class="inserter-expand" style="display:none">
+    <div class="inserter-types">
+      <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'md')">Markdown</button>
+      <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'svg')">SVG</button>
+      <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'image')">Image</button>
+    </div>
+    <form class="inserter-form inserter-form-md" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{csrf_attr}">
+      <input type="hidden" name="block_type" value="markdown">
+      <input type="hidden" name="after_block_id" value="{after_value}">
+      <textarea name="content" placeholder="Write markdown..." rows="6"></textarea>
+      <button type="submit">Add markdown</button>
+    </form>
+    <form class="inserter-form inserter-form-svg" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{csrf_attr}">
+      <input type="hidden" name="block_type" value="svg">
+      <input type="hidden" name="after_block_id" value="{after_value}">
+      <textarea name="content" placeholder="Paste SVG markup or describe what you want..." rows="6"></textarea>
+      <label>Or upload an SVG file
+        <input type="file" name="image_file" accept=".svg,image/svg+xml">
+      </label>
+      <button type="submit">Add SVG</button>
+    </form>
+    <form class="inserter-form inserter-form-image" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{csrf_attr}">
+      <input type="hidden" name="block_type" value="image">
+      <input type="hidden" name="after_block_id" value="{after_value}">
+      <label>Upload image
+        <input type="file" name="image_file" accept="image/*">
+      </label>
+      <textarea name="content" placeholder="Optional caption or note..." rows="2"></textarea>
+      <button type="submit">Add image</button>
+    </form>
+  </div>
+</div>"#,
+        project_attr = project_attr,
+        csrf_attr = csrf_attr,
+        after_value = after_value,
+    )
+}
+
 fn render_block(
     project: &ProjectName,
     block: &Block,
@@ -3416,6 +3459,31 @@ fn shared_styles(theme: UiTheme) -> String {
       margin: 0 0 var(--s-5) 0;
     }
 
+    .editable-title {
+      cursor: pointer;
+      border-radius: 4px;
+      padding: 2px 6px;
+      margin-left: -6px;
+      transition: background 0.15s, box-shadow 0.15s;
+    }
+    .editable-title:hover {
+      background: var(--surface-hover);
+      box-shadow: 0 0 0 2px var(--line);
+    }
+
+    .rename-input {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      padding: 2px 6px;
+      border: 2px solid var(--accent);
+      border-radius: 4px;
+      background: var(--input-bg);
+      color: var(--ink);
+      font-family: inherit;
+      min-width: 12rem;
+    }
+
     h2 {
       font-size: 1.5rem;
       letter-spacing: -0.02em;
@@ -3561,15 +3629,25 @@ fn shared_styles(theme: UiTheme) -> String {
       color: var(--ink);
       text-decoration: none;
       flex: 1;
+      min-width: 0;
     }
 
     .tree-link:hover {
       color: var(--accent);
     }
 
+    .tree-row-right {
+      display: flex;
+      align-items: center;
+      gap: var(--s-3);
+      margin-left: auto;
+      flex-shrink: 0;
+    }
+
     .tree-perm {
       font-size: 0.8rem;
       color: var(--muted);
+      white-space: nowrap;
     }
 
     .tree-add-child,
@@ -3596,16 +3674,21 @@ fn shared_styles(theme: UiTheme) -> String {
       border-top: 1px solid var(--line);
     }
 
-    .tree-create-form {
-      display: flex;
-      align-items: center;
-      gap: var(--s-3);
-      padding: var(--s-3) 0;
+    .tree-create-row {
+      margin: 0;
     }
 
-    .tree-create-form input[type="text"] {
+    .tree-inline-input {
       flex: 1;
-      max-width: 300px;
+      min-width: 0;
+      font-size: 1rem;
+      font-weight: 600;
+      padding: var(--s-1) var(--s-2);
+      border: 1px solid var(--accent);
+      border-radius: var(--radius);
+      background: var(--input-bg);
+      color: var(--ink);
+      outline: none;
     }
 
     .tree-create-form button {
@@ -3625,6 +3708,79 @@ fn shared_styles(theme: UiTheme) -> String {
       transition: border-color 0.2s;
     }
 
+    .block-inserter {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: var(--s-2) 0;
+    }
+
+    .inserter-btn {
+      width: 32px;
+      height: 32px;
+      min-height: auto;
+      border-radius: 50%;
+      border: 2px dashed var(--line);
+      background: transparent;
+      color: var(--muted);
+      font-size: 1.2rem;
+      line-height: 1;
+      cursor: pointer;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: border-color 0.2s, color 0.2s, background 0.2s;
+    }
+
+    .inserter-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .inserter-expand {
+      width: 100%;
+      margin-top: var(--s-3);
+    }
+
+    .inserter-types {
+      display: flex;
+      gap: var(--s-2);
+      justify-content: center;
+      margin-bottom: var(--s-3);
+    }
+
+    .inserter-type-btn {
+      min-height: auto;
+      padding: var(--s-2) var(--s-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--input-bg);
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 600;
+      width: auto;
+      transition: border-color 0.2s, color 0.2s;
+    }
+
+    .inserter-type-btn:hover,
+    .inserter-type-btn.active {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .inserter-form {
+      border: 1px solid var(--line);
+      border-radius: var(--s-4);
+      background: var(--panel-strong);
+    }
+
+    .inserter-form textarea {
+      min-height: 6rem;
+    }
+
     .panel-header {
       padding: var(--s-5) var(--s-5) 0;
       display: grid;
@@ -3634,6 +3790,7 @@ fn shared_styles(theme: UiTheme) -> String {
     .composer {
       position: sticky;
       top: 84px;
+      padding: var(--s-5);
     }
 
     form {

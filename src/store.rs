@@ -101,6 +101,18 @@ impl FileBlockStore {
         Ok(())
     }
 
+    pub fn rename_project(&self, project: &ProjectName, new_display_name: &str) -> Result<()> {
+        let trimmed = new_display_name.trim();
+        if trimmed.is_empty() {
+            return Err(LoreError::Validation(
+                "display name must not be empty".into(),
+            ));
+        }
+        let mut meta = self.read_project_meta(project);
+        meta.display_name = trimmed.to_string();
+        self.write_project_meta(project, &meta)
+    }
+
     pub fn create_project(&self, display_name: &str, parent: Option<&str>) -> Result<ProjectInfo> {
         let (slug, display) = ProjectName::from_display_name(display_name)?;
         // Check if project already exists
@@ -1045,5 +1057,20 @@ mod tests {
             .unwrap();
         assert_eq!(child.slug.as_str(), "api-docs");
         assert_eq!(child.parent.as_deref(), Some("engineering"));
+    }
+
+    #[test]
+    fn rename_project_updates_display_name() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let info = store.create_project("Old Name", None).unwrap();
+        assert_eq!(info.display_name, "Old Name");
+
+        store.rename_project(&info.slug, "New Name").unwrap();
+        let meta = store.read_project_meta(&info.slug);
+        assert_eq!(meta.display_name, "New Name");
+
+        // empty name should fail
+        assert!(store.rename_project(&info.slug, "  ").is_err());
     }
 }

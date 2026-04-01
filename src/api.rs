@@ -334,6 +334,7 @@ fn build_app_with_librarian(
             post(apply_auto_update_from_ui),
         )
         .route("/ui/{project}", axum::routing::get(project_page))
+        .route("/ui/{project}/rename", post(rename_project_from_ui))
         .route(
             "/ui/{project}/audit",
             axum::routing::get(project_audit_page),
@@ -447,6 +448,7 @@ struct ProjectPageQuery {
     block_type: Option<String>,
     author: Option<String>,
     since_days: Option<u32>,
+    include_history: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -558,6 +560,12 @@ struct CreateProjectUiForm {
     project_name: String,
     #[serde(default)]
     parent: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameProjectUiForm {
+    csrf_token: String,
+    display_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -693,6 +701,7 @@ struct AskLibrarianForm {
     block_type: Option<String>,
     author: Option<String>,
     since_days: Option<u32>,
+    include_history: Option<String>,
     max_sources: Option<usize>,
     around: Option<usize>,
 }
@@ -836,6 +845,7 @@ struct ProjectLibrarianActionForm {
     block_type: Option<String>,
     author: Option<String>,
     since_days: Option<u32>,
+    include_history: Option<String>,
     max_sources: Option<usize>,
     around: Option<usize>,
 }
@@ -2527,9 +2537,36 @@ async fn create_project_from_ui(
         Some(form.parent.trim())
     };
     let info = state.store.create_project(&form.project_name, parent)?;
+    // Create an initial markdown block so the user can start editing immediately
+    let initial_block = NewBlock {
+        project: info.slug.clone(),
+        block_type: BlockType::Markdown,
+        content: format!("# {}", info.display_name),
+        author_key: session.user.username.to_string(),
+        left: None,
+        right: None,
+        image_upload: None,
+    };
+    state.store.create_block_as_project_writer(initial_block)?;
     Ok(Redirect::to(&format!(
         "/ui/{}?flash=Project%20created",
         info.slug.as_str(),
+    )))
+}
+
+async fn rename_project_from_ui(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<RenameProjectUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    state.store.rename_project(&project, &form.display_name)?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}?flash=Project%20renamed",
+        project.as_str(),
     )))
 }
 
@@ -3264,7 +3301,7 @@ async fn project_page(
         query.q.as_deref(),
         query.block_type.as_deref(),
         query.author.as_deref(),
-        query.since_days,
+        query.include_history.as_deref() == Some("1"),
         session.user.username.as_str(),
         session.user.can_write(&project),
         session.user.is_admin,
@@ -3405,11 +3442,11 @@ async fn answer_librarian_from_ui(
         &meta.display_name,
         &all_blocks,
         &all_blocks,
-        Some("Answer librarian responded"),
+        Some("Librarian responded"),
         None,
         None,
         None,
-        None,
+        false,
         session.user.username.as_str(),
         session.user.can_write(&project),
         session.user.is_admin,
@@ -3490,7 +3527,7 @@ async fn run_project_librarian_action_from_ui(
         None,
         None,
         None,
-        None,
+        false,
         session.user.username.as_str(),
         session.user.can_write(&project),
         session.user.is_admin,
@@ -7332,7 +7369,7 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("alpha.docs"));
-        assert!(html.contains("Add block"));
+        assert!(html.contains("inserter-btn"));
         assert!(html.contains("<h1>Hello</h1>"));
         assert!(html.contains("width=device-width, initial-scale=1"));
         assert!(html.contains(">admin</span>"));
@@ -8214,7 +8251,7 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Answer librarian"));
+        assert!(html.contains("Librarian"));
         assert!(html.contains("Summary from librarian"));
         assert!(html.contains("Grounded with these blocks"));
         assert!(html.contains("UI context block"));
