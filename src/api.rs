@@ -704,6 +704,7 @@ struct AskLibrarianForm {
     include_history: Option<String>,
     max_sources: Option<usize>,
     around: Option<usize>,
+    allow_edits: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3421,18 +3422,37 @@ async fn answer_librarian_from_ui(
     state.auth.authorize_read(&session.user, &project)?;
     verify_csrf(&session, &form.csrf_token)?;
     let options = librarian_options_from_form(&form)?;
-    let librarian_answer = answer_librarian_for_project(
-        &state,
-        &project,
-        form.question,
-        options,
-        librarian_actor_for_user(&session.user),
-    )
-    .await?;
+    let allow_edits = form.allow_edits.as_deref() == Some("1");
+    let (current_answer, flash) = if allow_edits && session.user.can_write(&project) {
+        let result = execute_project_librarian_action(
+            &state,
+            &project,
+            form.question,
+            options,
+            &session.user,
+        )
+        .await?;
+        let answer = UiLibrarianAnswer::from(result);
+        let flash = if answer.status == LibrarianRunStatus::PendingApproval {
+            "Librarian action planned and queued for approval"
+        } else {
+            "Librarian responded"
+        };
+        (answer, flash)
+    } else {
+        let result = answer_librarian_for_project(
+            &state,
+            &project,
+            form.question,
+            options,
+            librarian_actor_for_user(&session.user),
+        )
+        .await?;
+        (UiLibrarianAnswer::from(result), "Librarian responded")
+    };
     let meta = state.store.read_project_meta(&project);
     let all_blocks = state.store.list_blocks(&project)?;
     let librarian_history = state.librarian_history.list_recent_project(&project, 8)?;
-    let current_answer = UiLibrarianAnswer::from(librarian_answer);
     let history_answers =
         ui_librarian_answers_from_history(&state.store, &project, librarian_history)?;
     let server_config = state.config.load()?;
@@ -3442,7 +3462,7 @@ async fn answer_librarian_from_ui(
         &meta.display_name,
         &all_blocks,
         &all_blocks,
-        Some("Librarian responded"),
+        Some(flash),
         None,
         None,
         None,
@@ -3519,9 +3539,9 @@ async fn run_project_librarian_action_from_ui(
         &all_blocks,
         Some(
             if current_answer.status == LibrarianRunStatus::PendingApproval {
-                "Project librarian action planned and queued for approval"
+                "Librarian action planned and queued for approval"
             } else {
-                "Project librarian action completed"
+                "Librarian responded"
             },
         ),
         None,
@@ -7374,8 +7394,8 @@ mod tests {
         assert!(html.contains("width=device-width, initial-scale=1"));
         assert!(html.contains(">admin</span>"));
         assert!(html.contains("id=\"document\""));
-        assert!(html.contains("Edit block"));
-        assert!(html.contains("Delete block"));
+        assert!(html.contains(">Edit</button>"));
+        assert!(html.contains("class=\"block-header-btn danger\""));
     }
 
     #[tokio::test]
@@ -8255,7 +8275,7 @@ mod tests {
         assert!(html.contains("Summary from librarian"));
         assert!(html.contains("Grounded with these blocks"));
         assert!(html.contains("UI context block"));
-        assert!(html.contains("Recent project-only librarian history"));
+        assert!(html.contains("Recent history"));
         assert!(html.contains("Ask again"));
     }
 

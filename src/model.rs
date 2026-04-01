@@ -268,7 +268,10 @@ pub struct NewBlock {
 
 impl NewBlock {
     pub fn validate(&self) -> Result<()> {
-        if self.content.is_empty() && self.image_upload.is_none() {
+        if self.content.is_empty()
+            && self.image_upload.is_none()
+            && self.block_type != BlockType::Markdown
+        {
             return Err(LoreError::Validation("content must not be empty".into()));
         }
         if self.content.len() > MAX_CONTENT_LEN {
@@ -308,7 +311,10 @@ pub struct UpdateBlock {
 
 impl UpdateBlock {
     pub fn validate(&self) -> Result<()> {
-        if self.content.is_empty() && self.image_upload.is_none() {
+        if self.content.is_empty()
+            && self.image_upload.is_none()
+            && self.block_type != BlockType::Markdown
+        {
             return Err(LoreError::Validation("content must not be empty".into()));
         }
         if self.content.len() > MAX_CONTENT_LEN {

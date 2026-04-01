@@ -571,7 +571,7 @@ pub fn render_admin_page(
         )
     };
     let pending_actions_html = if pending_actions.is_empty() {
-        "<p class=\"hint padded\">No pending project librarian actions.</p>".to_string()
+        "<p class=\"hint padded\">No pending librarian actions.</p>".to_string()
     } else {
         pending_actions
             .iter()
@@ -876,7 +876,7 @@ pub fn render_admin_page(
           </label>
           <label class="toggle">
             <input type="checkbox" name="action_requires_approval" value="true"{action_requires_approval_checked}>
-            <span>Require approval before project librarian actions</span>
+            <span>Require approval before librarian edit actions</span>
           </label>
           <button type="submit">Save librarian config</button>
         </form>
@@ -1383,7 +1383,7 @@ pub fn render_admin_audit_page(
             .join("")
     };
     let pending_html = if pending_actions.is_empty() {
-        "<p class=\"hint padded\">No pending project librarian actions.</p>".to_string()
+        "<p class=\"hint padded\">No pending librarian actions.</p>".to_string()
     } else {
         pending_actions
             .iter()
@@ -1456,7 +1456,7 @@ pub fn render_project_audit_page(
     pending_actions: &[UiPendingLibrarianAction],
 ) -> String {
     let runs_html = if runs.is_empty() {
-        "<p class=\"hint padded\">No librarian runs recorded for this project yet.</p>".to_string()
+        "<p class=\"hint padded\">No librarian history for this project yet.</p>".to_string()
     } else {
         runs.iter()
             .map(render_librarian_answer)
@@ -1464,7 +1464,7 @@ pub fn render_project_audit_page(
             .join("")
     };
     let pending_html = if pending_actions.is_empty() {
-        "<p class=\"hint padded\">No pending project librarian actions.</p>".to_string()
+        "<p class=\"hint padded\">No pending librarian actions.</p>".to_string()
     } else {
         pending_actions
             .iter()
@@ -1588,19 +1588,15 @@ pub fn render_project_page(
     pending_actions: &[UiPendingLibrarianAction],
 ) -> String {
     let search_value = search.unwrap_or_default();
-    let results_label = if search_value.is_empty() {
+    let results_label = if !search_value.is_empty() {
         format!(
-            "{} block{} in sorted order.",
-            blocks.len(),
-            if blocks.len() == 1 { "" } else { "s" }
-        )
-    } else {
-        format!(
-            "{} result{} for “{}”.",
+            "<p>{} result{} for \"{}\". </p>",
             blocks.len(),
             if blocks.len() == 1 { "" } else { "s" },
             escape_text(search_value)
         )
+    } else {
+        String::new()
     };
     let blocks_html = if blocks.is_empty() && can_write {
         format!(
@@ -1663,15 +1659,27 @@ pub fn render_project_page(
         )
     };
 
+    let search_active = !search_value.is_empty()
+        || search_block_type.is_some()
+        || !search_author.unwrap_or_default().is_empty()
+        || search_include_history;
+    let search_strip_style = if search_active {
+        ""
+    } else {
+        " style=\"display:none\""
+    };
+    let search_btn_class = if search_active { " active" } else { "" };
+
     let content = format!(
         r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
       {rename_html}
       <div style="display:flex; gap:var(--s-3);">
+        <button type="button" class="button-link{search_btn_class}" onclick="var s=document.getElementById('search-strip'); if(s.style.display==='none'){{s.style.display='';this.classList.add('active');}}else{{s.style.display='none';this.classList.remove('active');}}">Search</button>
         <a class="button-link" href="/ui/{project_slug}/audit">Audit</a>
         <a class="button-link" href="/ui/{project_slug}/history">History</a>
       </div>
     </div>
-    <form class="searchbar" method="get" action="/ui/{project_slug}">
+    <form class="searchbar" id="search-strip" method="get" action="/ui/{project_slug}"{search_strip_style}>
       <input type="search" name="q" value="{search_value}" placeholder="Search content...">
       <select name="block_type">
         <option value=""{search_any_type}>Any type</option>
@@ -1681,16 +1689,16 @@ pub fn render_project_page(
         <option value="image"{search_image}>Image</option>
       </select>
       <input type="search" name="author" value="{search_author}" placeholder="Author...">
-      <label class="toggle"><input type="checkbox" name="include_history" value="1"{search_history_checked}> <span>Search document history</span></label>
+      <select name="include_history">
+        <option value=""{search_history_current}>Current</option>
+        <option value="1"{search_history_history}>History</option>
+      </select>
       <button type="submit">Search</button>
     </form>
 
     <div class="layout">
       <section class="panel" id="document">
-        <div class="panel-header">
-          <h2>Document</h2>
-          <p>{results_label}</p>
-        </div>
+        {results_label}
         <div class="timeline">{blocks_html}</div>
       </section>
       <aside class="stack">{librarian_panel}{read_only_notice}</aside>
@@ -1708,8 +1716,15 @@ pub fn render_project_page(
         search_html = selected(search_block_type, "html"),
         search_image = selected(search_block_type, "image"),
         search_author = escape_attribute(search_author.unwrap_or_default()),
-        search_history_checked = if search_include_history {
-            " checked"
+        search_strip_style = search_strip_style,
+        search_btn_class = search_btn_class,
+        search_history_current = if !search_include_history {
+            " selected"
+        } else {
+            ""
+        },
+        search_history_history = if search_include_history {
+            " selected"
         } else {
             ""
         },
@@ -1758,7 +1773,7 @@ fn render_librarian_panel(
             .join("")
     };
     let pending_html = if pending_actions.is_empty() {
-        "<p class=\"hint\">No pending project librarian actions.</p>".to_string()
+        "<p class=\"hint\">No pending librarian actions.</p>".to_string()
     } else {
         pending_actions
             .iter()
@@ -1768,22 +1783,10 @@ fn render_librarian_panel(
             .collect::<Vec<_>>()
             .join("")
     };
-    let action_form = if can_write {
-        format!(
-            r#"<form method="post" action="/ui/{project}/librarian/action">
-    <input type="hidden" name="csrf_token" value="{csrf_token}">
-    <label>
-      Project action
-      <textarea name="instruction" placeholder="Reorganise the release notes into a summary block after the current introduction." required></textarea>
-    </label>
-    <label class="toggle"><input type="checkbox" name="include_history" value="1"> <span>Search document history</span></label>
-    <button type="submit">Run project librarian action</button>
-  </form>"#,
-            project = escape_attribute(project.as_str()),
-            csrf_token = escape_attribute(csrf_token),
-        )
+    let allow_edits_html = if can_write {
+        r#"<label class="toggle"><input type="checkbox" name="allow_edits" value="1"> <span>Allow edits</span></label>"#
     } else {
-        "<p class=\"hint\">Project librarian actions require project write access.</p>".to_string()
+        ""
     };
 
     format!(
@@ -1798,26 +1801,23 @@ fn render_librarian_panel(
       <textarea name="question" placeholder="Summarise the current decisions in this project." required>{question_value}</textarea>
     </label>
     <label class="toggle"><input type="checkbox" name="include_history" value="1"> <span>Search document history</span></label>
-    <button type="submit">Ask librarian</button>
+    {allow_edits_html}
+    <button type="submit">Ask</button>
   </form>
-  <div class="stack">
-    <p class="hint">Project librarian actions are explicit, single-project, and limited to Lore block operations only.</p>
-    {action_form}
-  </div>
   {answer_html}
   <div class="stack">
-    <p class="hint">Recent project-only librarian history</p>
+    <p class="hint">Recent history</p>
     {history_html}
   </div>
   <div class="stack">
-    <p class="hint">Pending project librarian actions</p>
+    <p class="hint">Pending actions</p>
     {pending_html}
   </div>
 </section>"#,
         project = escape_attribute(project.as_str()),
         csrf_token = escape_attribute(csrf_token),
         question_value = question_value,
-        action_form = action_form,
+        allow_edits_html = allow_edits_html,
         answer_html = answer_html,
         history_html = history_html,
         pending_html = pending_html,
@@ -1828,7 +1828,7 @@ fn render_librarian_answer(answer: &UiLibrarianAnswer) -> String {
     let kind = match answer.kind {
         LibrarianRunKind::Answer => "Librarian",
         LibrarianRunKind::ActionRequest => "Action request",
-        LibrarianRunKind::ProjectAction => "Project librarian action",
+        LibrarianRunKind::ProjectAction => "Librarian action",
     };
     let status = match answer.status {
         LibrarianRunStatus::Success => "success",
@@ -2355,30 +2355,22 @@ fn render_librarian_history_item(
             )
         })
         .unwrap_or_else(|| "unknown actor".to_string());
+    let allow_edits_field = if matches!(answer.kind, LibrarianRunKind::ProjectAction) {
+        r#"<input type="hidden" name="allow_edits" value="1">"#
+    } else {
+        ""
+    };
     let retry_form = format!(
-        r#"<form method="post" action="/ui/{project}/{route}">
+        r#"<form method="post" action="/ui/{project}/librarian">
   <input type="hidden" name="csrf_token" value="{csrf_token}">
-  <input type="hidden" name="{field_name}" value="{question}">
-  <button type="submit">{button_label}</button>
+  <input type="hidden" name="question" value="{question}">
+  {allow_edits_field}
+  <button type="submit">Ask again</button>
 </form>"#,
         project = escape_attribute(project.as_str()),
-        route = if matches!(answer.kind, LibrarianRunKind::ProjectAction) {
-            "librarian/action"
-        } else {
-            "librarian"
-        },
         csrf_token = escape_attribute(csrf_token),
-        field_name = if matches!(answer.kind, LibrarianRunKind::ProjectAction) {
-            "instruction"
-        } else {
-            "question"
-        },
         question = escape_attribute(&answer.question),
-        button_label = if matches!(answer.kind, LibrarianRunKind::ProjectAction) {
-            "Run again"
-        } else {
-            "Ask again"
-        },
+        allow_edits_field = allow_edits_field,
     );
 
     format!(
@@ -2756,56 +2748,57 @@ fn render_block(
         .map(|candidate| candidate.id.as_str());
     let placement_options =
         render_after_options(all_blocks, Some(block.id.as_str()), selected_after_block_id);
-    let actions = if can_write {
+    let block_id = escape_attribute(block.id.as_str());
+    let project_slug = escape_attribute(project.as_str());
+    let csrf = escape_attribute(csrf_token);
+
+    let header_actions = if can_write {
         format!(
-            r#"<div class="block-actions">
-  <details>
-    <summary>Edit block</summary>
-    <form method="post" action="/ui/{}/blocks/{}/edit" enctype="multipart/form-data">
-      <input type="hidden" name="csrf_token" value="{}">
-      <label>
-        Type
-        <select name="block_type">
-          {}
-        </select>
-      </label>
-      <label>
-        Place after
-        <select name="after_block_id">
-          {}
-        </select>
-      </label>
-      <label>
-        Content or note
-        <textarea name="content">{}</textarea>
-      </label>
-      <label>
-        Replace image
-        <input type="file" name="image_file" accept="image/*">
-      </label>
-      <button type="submit">Save changes</button>
-    </form>
-  </details>
-  <details>
-    <summary>Delete block</summary>
-    <div class="danger-panel">
-      <p>Project writers can delete any block in this project. This is permanent.</p>
-      <form method="post" action="/ui/{}/blocks/{}/delete">
-        <input type="hidden" name="csrf_token" value="{}">
-        <button class="danger" type="submit">Delete block</button>
-      </form>
-    </div>
-  </details>
+            r#"<div class="block-header-actions">
+  <button type="button" class="block-header-btn" onclick="var e=document.getElementById('edit-{block_id}'); e.style.display=e.style.display==='none'?'block':'none';">Edit</button>
+  <button type="button" class="block-header-btn danger" onclick="if(confirm('Delete this block? This cannot be undone.')){{document.getElementById('del-{block_id}').submit();}}">&#x2715;</button>
+  <form id="del-{block_id}" method="post" action="/ui/{project_slug}/blocks/{block_id}/delete" style="display:none;">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+  </form>
 </div>"#,
-            escape_attribute(project.as_str()),
-            escape_attribute(block.id.as_str()),
-            escape_attribute(csrf_token),
-            render_block_type_options(block.block_type),
-            placement_options,
-            escape_text(&block.content),
-            escape_attribute(project.as_str()),
-            escape_attribute(block.id.as_str()),
-            escape_attribute(csrf_token),
+            block_id = block_id,
+            project_slug = project_slug,
+            csrf = csrf,
+        )
+    } else {
+        String::new()
+    };
+
+    let edit_panel = if can_write {
+        format!(
+            r#"<div id="edit-{block_id}" class="block-edit-panel" style="display:none;">
+  <form method="post" action="/ui/{project_slug}/blocks/{block_id}/edit" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <label>
+      Type
+      <select name="block_type">{type_opts}</select>
+    </label>
+    <label>
+      Place after
+      <select name="after_block_id">{placement}</select>
+    </label>
+    <label>
+      Content
+      <textarea name="content">{content}</textarea>
+    </label>
+    <label>
+      Replace image
+      <input type="file" name="image_file" accept="image/*">
+    </label>
+    <button type="submit">Save changes</button>
+  </form>
+</div>"#,
+            block_id = block_id,
+            project_slug = project_slug,
+            csrf = csrf,
+            type_opts = render_block_type_options(block.block_type),
+            placement = placement_options,
+            content = escape_text(&block.content),
         )
     } else {
         String::new()
@@ -2814,22 +2807,16 @@ fn render_block(
     format!(
         r#"<article class="block">
   <div class="block-meta">
-    <span class="pill">{}</span>
-    <span>{}</span>
-    <span class="meta-separator">•</span>
-    <span class="meta-code">author {}</span>
-    <span class="meta-separator">•</span>
-    <span class="meta-code">order {}</span>
+    <span class="pill">{type_label}</span>
+    {header_actions}
   </div>
-  <div class="block-body">{}</div>
-  {}
+  <div class="block-body">{body}</div>
+  {edit_panel}
 </article>"#,
-        escape_text(block_type_label(block.block_type)),
-        escape_text(&format_timestamp(block.created_at)),
-        escape_text(short_fingerprint(block.author.as_str())),
-        escape_text(block.order.as_str()),
-        render_block_body(block),
-        actions
+        type_label = escape_text(block_type_label(block.block_type)),
+        header_actions = header_actions,
+        body = render_block_body(block),
+        edit_panel = edit_panel,
     )
 }
 
@@ -3895,12 +3882,48 @@ fn shared_styles(theme: UiTheme) -> String {
 
     .block-meta {
       display: flex;
-      flex-wrap: wrap;
-      gap: var(--s-2);
       align-items: center;
+      justify-content: space-between;
       margin-bottom: var(--s-4);
       color: var(--muted);
       font-size: 0.85rem;
+    }
+
+    .block-header-actions {
+      display: flex;
+      gap: var(--s-2);
+      align-items: center;
+    }
+
+    .block-header-btn {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--input-bg);
+      color: var(--ink);
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .block-header-btn:hover {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .block-header-btn.danger:hover {
+      background: #fef2f2;
+      border-color: #dc2626;
+      color: #dc2626;
+    }
+
+    .block-edit-panel {
+      margin-top: var(--s-4);
+      padding-top: var(--s-4);
+      border-top: 1px solid var(--line);
     }
 
     .pill {
@@ -3956,16 +3979,9 @@ fn shared_styles(theme: UiTheme) -> String {
       object-fit: contain;
     }
 
-    .block-actions {
-      display: flex;
-      gap: var(--s-3);
-      margin-top: var(--s-5);
-      padding-top: var(--s-5);
-      border-top: 1px solid var(--line);
-    }
-
-    .block-actions button, .block-actions a {
-      flex: 1;
+    .block-edit-panel form {
+      display: grid;
+      gap: var(--s-4);
     }
 
     .empty-state {
@@ -4191,15 +4207,9 @@ fn shared_styles(theme: UiTheme) -> String {
         position: static;
       }
 
-      .block-meta {
-        display: grid;
-        grid-template-columns: 1fr;
-        gap: 6px;
-        align-items: start;
-      }
-
-      .meta-separator {
-        display: none;
+      .block-header-btn {
+        padding: 4px 8px;
+        font-size: 0.75rem;
       }
     }
     "#;
