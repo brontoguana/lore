@@ -17,6 +17,8 @@ pub struct ProjectMeta {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    #[serde(default)]
+    pub sort_order: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +26,7 @@ pub struct ProjectInfo {
     pub slug: ProjectName,
     pub display_name: String,
     pub parent: Option<String>,
+    pub sort_order: u64,
 }
 
 enum UpdateMode {
@@ -70,12 +73,13 @@ impl FileBlockStore {
                 infos.push(ProjectInfo {
                     display_name: meta.display_name,
                     parent: meta.parent,
+                    sort_order: meta.sort_order,
                     slug: project,
                 });
             }
         }
 
-        infos.sort_by(|a, b| a.slug.cmp(&b.slug));
+        infos.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.slug.cmp(&b.slug)));
         Ok(infos)
     }
 
@@ -90,6 +94,7 @@ impl FileBlockStore {
         ProjectMeta {
             display_name: project.as_str().to_string(),
             parent: None,
+            sort_order: 0,
         }
     }
 
@@ -131,6 +136,89 @@ impl FileBlockStore {
         Ok(())
     }
 
+    /// Move a project: change its parent and/or reorder it among siblings.
+    /// `new_parent` is the new parent slug (None = root level).
+    /// `after_slug` is the sibling it should be placed after (None = first among siblings).
+    pub fn move_project(
+        &self,
+        project: &ProjectName,
+        new_parent: Option<&str>,
+        after_slug: Option<&str>,
+    ) -> Result<()> {
+        let dir = self.project_dir(project);
+        if !dir.exists() {
+            return Err(LoreError::Validation("project does not exist".into()));
+        }
+        // Prevent making a project its own descendant
+        if let Some(parent_slug) = new_parent {
+            if parent_slug == project.as_str() {
+                return Err(LoreError::Validation(
+                    "cannot move a project under itself".into(),
+                ));
+            }
+            // Walk up the tree to check for cycles
+            let infos = self.list_project_infos()?;
+            let mut current = Some(parent_slug.to_string());
+            while let Some(ref slug) = current {
+                if slug == project.as_str() {
+                    return Err(LoreError::Validation(
+                        "cannot move a project under one of its own descendants".into(),
+                    ));
+                }
+                current = infos
+                    .iter()
+                    .find(|i| i.slug.as_str() == slug)
+                    .and_then(|i| i.parent.clone());
+            }
+        }
+
+        // Get all siblings in the target parent, sorted by sort_order
+        let infos = self.list_project_infos()?;
+        let siblings: Vec<&ProjectInfo> = infos
+            .iter()
+            .filter(|i| i.parent.as_deref() == new_parent && i.slug != *project)
+            .collect();
+
+        // Calculate new sort_order based on position
+        let new_order = if let Some(after) = after_slug {
+            // Place after a specific sibling
+            if let Some(pos) = siblings.iter().position(|s| s.slug.as_str() == after) {
+                let after_order = siblings[pos].sort_order;
+                let before_order = siblings.get(pos + 1).map(|s| s.sort_order);
+                match before_order {
+                    Some(before) if before > after_order + 1 => {
+                        // Slot in between
+                        after_order + (before - after_order) / 2
+                    }
+                    Some(_) | None => {
+                        // No gap; rewrite all sibling orders
+                        after_order + 1000
+                    }
+                }
+            } else {
+                // after_slug not found among siblings, place at end
+                siblings.last().map(|s| s.sort_order + 1000).unwrap_or(1000)
+            }
+        } else {
+            // Place first: before all siblings
+            if let Some(first) = siblings.first() {
+                if first.sort_order > 1 {
+                    first.sort_order / 2
+                } else {
+                    // Need to rewrite; set to 0 and bump others
+                    0
+                }
+            } else {
+                1000
+            }
+        };
+
+        let mut meta = self.read_project_meta(project);
+        meta.parent = new_parent.map(|s| s.to_string());
+        meta.sort_order = new_order;
+        self.write_project_meta(project, &meta)
+    }
+
     pub fn create_project(&self, display_name: &str, parent: Option<&str>) -> Result<ProjectInfo> {
         let (slug, display) = ProjectName::from_display_name(display_name)?;
         // Check if project already exists
@@ -151,14 +239,17 @@ impl FileBlockStore {
             }
         }
         self.ensure_layout(&slug)?;
+        let sort_order = OffsetDateTime::now_utc().unix_timestamp() as u64;
         let meta = ProjectMeta {
             display_name: display.clone(),
             parent: parent.map(|s| s.to_string()),
+            sort_order,
         };
         self.write_project_meta(&slug, &meta)?;
         Ok(ProjectInfo {
             display_name: display,
             parent: parent.map(|s| s.to_string()),
+            sort_order,
             slug,
         })
     }
@@ -1110,5 +1201,66 @@ mod tests {
         assert_eq!(infos[0].slug.as_str(), "child");
         // Child promoted to root
         assert!(infos[0].parent.is_none());
+    }
+
+    #[test]
+    fn move_project_changes_parent() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let a = store.create_project("Alpha", None).unwrap();
+        let b = store.create_project("Beta", None).unwrap();
+
+        // Move Beta under Alpha
+        store
+            .move_project(&b.slug, Some(a.slug.as_str()), None)
+            .unwrap();
+
+        let infos = store.list_project_infos().unwrap();
+        let beta = infos.iter().find(|i| i.slug.as_str() == "beta").unwrap();
+        assert_eq!(beta.parent.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn move_project_prevents_cycle() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let a = store.create_project("Alpha", None).unwrap();
+        let b = store
+            .create_project("Beta", Some(a.slug.as_str()))
+            .unwrap();
+
+        // Moving Alpha under Beta should fail (cycle)
+        let result = store.move_project(&a.slug, Some(b.slug.as_str()), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn projects_sorted_by_creation_order() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        // Create with specific sort orders by writing meta directly
+        let (slug_c, _) = ProjectName::from_display_name("Charlie").unwrap();
+        let (slug_a, _) = ProjectName::from_display_name("Alpha").unwrap();
+        let (slug_b, _) = ProjectName::from_display_name("Beta").unwrap();
+        store.create_project("Charlie", None).unwrap();
+        // Manually set sort orders to test ordering
+        let mut meta_c = store.read_project_meta(&slug_c);
+        meta_c.sort_order = 100;
+        store.write_project_meta(&slug_c, &meta_c).unwrap();
+
+        store.create_project("Alpha", None).unwrap();
+        let mut meta_a = store.read_project_meta(&slug_a);
+        meta_a.sort_order = 200;
+        store.write_project_meta(&slug_a, &meta_a).unwrap();
+
+        store.create_project("Beta", None).unwrap();
+        let mut meta_b = store.read_project_meta(&slug_b);
+        meta_b.sort_order = 300;
+        store.write_project_meta(&slug_b, &meta_b).unwrap();
+
+        let infos = store.list_project_infos().unwrap();
+        assert_eq!(infos[0].slug.as_str(), "charlie");
+        assert_eq!(infos[1].slug.as_str(), "alpha");
+        assert_eq!(infos[2].slug.as_str(), "beta");
     }
 }

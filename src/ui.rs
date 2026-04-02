@@ -109,6 +109,7 @@ pub struct ProjectListEntry {
     pub project: ProjectName,
     pub display_name: String,
     pub parent: Option<String>,
+    pub sort_order: u64,
     pub can_write: bool,
 }
 
@@ -339,6 +340,8 @@ pub fn render_projects_page(
     </section>
     <script>
     var csrfToken = '{csrf_token}';
+    var dragSlug = null;
+
     function createRow(parentSlug) {{
       var li = document.createElement('li');
       li.className = 'tree-node tree-inline-create';
@@ -356,7 +359,6 @@ pub fn render_projects_page(
     function addChildRow(btn, parentSlug) {{
       document.querySelectorAll('.tree-inline-create').forEach(function(el) {{ el.remove(); }});
       var li = createRow(parentSlug);
-      // Find or create the nested tree-list inside the parent node
       var node = btn.closest('.tree-node');
       var childList = node.querySelector(':scope > .tree-list');
       if (!childList) {{
@@ -383,6 +385,83 @@ pub fn render_projects_page(
         panel.insertBefore(ul, panel.querySelector('.tree-create-root'));
       }}
       li.querySelector('input[name="project_name"]').focus();
+    }}
+
+    /* --- Drag and drop --- */
+    function onDragStart(e) {{
+      var node = e.target.closest('.tree-node');
+      dragSlug = node.getAttribute('data-slug');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', dragSlug);
+      node.classList.add('tree-dragging');
+      // Show all drop zones
+      setTimeout(function() {{
+        document.querySelectorAll('.tree-drop-zone').forEach(function(z) {{
+          z.classList.add('tree-drop-visible');
+        }});
+        document.querySelectorAll('.tree-node-row').forEach(function(r) {{
+          r.classList.add('tree-drop-target-ready');
+        }});
+      }}, 0);
+    }}
+    function onDragEnd(e) {{
+      dragSlug = null;
+      document.querySelectorAll('.tree-dragging').forEach(function(el) {{ el.classList.remove('tree-dragging'); }});
+      document.querySelectorAll('.tree-drop-visible').forEach(function(el) {{ el.classList.remove('tree-drop-visible'); }});
+      document.querySelectorAll('.tree-drop-hover').forEach(function(el) {{ el.classList.remove('tree-drop-hover'); }});
+      document.querySelectorAll('.tree-drop-target-ready').forEach(function(el) {{ el.classList.remove('tree-drop-target-ready'); }});
+      document.querySelectorAll('.tree-node-drop-hover').forEach(function(el) {{ el.classList.remove('tree-node-drop-hover'); }});
+    }}
+
+    /* Drop between items (reorder as sibling) */
+    function onDragOver(e) {{
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      e.target.closest('.tree-drop-zone').classList.add('tree-drop-hover');
+    }}
+    function onDragLeave(e) {{
+      e.target.closest('.tree-drop-zone').classList.remove('tree-drop-hover');
+    }}
+    function onDrop(e) {{
+      e.preventDefault();
+      var zone = e.target.closest('.tree-drop-zone');
+      var newParent = zone.getAttribute('data-parent');
+      var after = zone.getAttribute('data-after');
+      submitMove(dragSlug, newParent, after);
+    }}
+
+    /* Drop onto a node (make it a child) */
+    function onNodeDragOver(e) {{
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      var node = e.target.closest('.tree-node');
+      if (node && node.getAttribute('data-slug') !== dragSlug) {{
+        e.target.closest('.tree-node-row').classList.add('tree-node-drop-hover');
+      }}
+    }}
+    function onNodeDragLeave(e) {{
+      e.target.closest('.tree-node-row').classList.remove('tree-node-drop-hover');
+    }}
+    function onNodeDrop(e) {{
+      e.preventDefault();
+      var row = e.target.closest('.tree-node-row');
+      row.classList.remove('tree-node-drop-hover');
+      var node = row.closest('.tree-node');
+      var targetSlug = node.getAttribute('data-slug');
+      if (targetSlug === dragSlug) return;
+      // Make it the last child of the target
+      submitMove(dragSlug, targetSlug, '');
+    }}
+
+    function submitMove(slug, newParent, after) {{
+      var form = document.createElement('form');
+      form.method = 'POST';
+      form.action = '/ui/' + encodeURIComponent(slug) + '/move';
+      form.innerHTML = '<input type="hidden" name="csrf_token" value="' + csrfToken + '">'
+        + '<input type="hidden" name="new_parent" value="' + (newParent || '') + '">'
+        + '<input type="hidden" name="after" value="' + (after || '') + '">';
+      document.body.appendChild(form);
+      form.submit();
     }}
     </script>"#,
         tree_html = tree_html,
@@ -422,13 +501,13 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
             return String::new();
         }
 
-        let parent_slug = parent.unwrap_or("");
         let items: Vec<String> = children
             .iter()
             .map(|entry| {
                 let slug = entry.project.as_str();
                 let display = escape_text(&entry.display_name);
                 let perm = if entry.can_write { "read/write" } else { "read-only" };
+                let parent_attr = entry.parent.as_deref().unwrap_or("");
                 let sub = render_children(
                     Some(slug),
                     projects,
@@ -446,9 +525,27 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
                     String::new()
                 };
 
+                let drag_attrs = if is_admin {
+                    format!(
+                        r#" draggable="true" ondragstart="onDragStart(event)" ondragend="onDragEnd(event)""#
+                    )
+                } else {
+                    String::new()
+                };
+
+                let drop_zone = if is_admin {
+                    format!(
+                        r#"<div class="tree-drop-zone" data-parent="{parent_attr}" data-after="{slug}" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)"></div>"#,
+                        parent_attr = escape_attribute(parent_attr),
+                        slug = escape_attribute(slug),
+                    )
+                } else {
+                    String::new()
+                };
+
                 format!(
-                    r#"<li class="tree-node">
-  <div class="tree-node-row">
+                    r#"<li class="tree-node" data-slug="{slug}" data-parent="{parent_attr}"{drag_attrs}>
+  <div class="tree-node-row" ondragover="onNodeDragOver(event)" ondragleave="onNodeDragLeave(event)" ondrop="onNodeDrop(event)">
     <a href="/ui/{slug}" class="tree-link">{display}</a>
     <div class="tree-row-right">
       <span class="tree-perm">{perm}</span>
@@ -456,17 +553,35 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
     </div>
   </div>
   {sub}
+  {drop_zone}
 </li>"#,
                     slug = escape_attribute(slug),
+                    parent_attr = escape_attribute(parent_attr),
+                    drag_attrs = drag_attrs,
                     display = display,
                     perm = perm,
                     add_btn = add_btn,
                     sub = sub,
+                    drop_zone = drop_zone,
                 )
             })
             .collect();
 
-        format!(r#"<ul class="tree-list">{}</ul>"#, items.join(""))
+        let list_parent = parent.unwrap_or("");
+        let top_drop = if is_admin {
+            format!(
+                r#"<div class="tree-drop-zone tree-drop-zone-top" data-parent="{lp}" data-after="" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)"></div>"#,
+                lp = escape_attribute(list_parent),
+            )
+        } else {
+            String::new()
+        };
+
+        format!(r#"<ul class="tree-list" data-parent="{lp}">{top_drop}{items}</ul>"#,
+            lp = escape_attribute(list_parent),
+            top_drop = top_drop,
+            items = items.join(""),
+        )
     }
 
     render_children(None, projects, is_admin, csrf_token, 0)
@@ -3730,6 +3845,36 @@ fn shared_styles(theme: UiTheme) -> String {
     .tree-create-form button {
       min-height: auto;
       padding: var(--s-2) var(--s-4);
+    }
+
+    /* Drag and drop */
+    .tree-node[draggable="true"] {
+      cursor: grab;
+    }
+    .tree-node[draggable="true"]:active {
+      cursor: grabbing;
+    }
+    .tree-dragging {
+      opacity: 0.4;
+    }
+    .tree-drop-zone {
+      height: 0;
+      transition: height 0.15s, background 0.15s;
+      border-radius: var(--radius);
+      margin: 0 var(--s-3);
+    }
+    .tree-drop-zone.tree-drop-visible {
+      height: 6px;
+    }
+    .tree-drop-zone.tree-drop-hover {
+      height: 6px;
+      background: var(--accent);
+    }
+    .tree-node-row.tree-node-drop-hover {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+      border-radius: var(--radius);
+      background: var(--surface-hover);
     }
 
     .timeline {

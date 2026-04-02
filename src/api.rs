@@ -335,6 +335,7 @@ fn build_app_with_librarian(
         )
         .route("/ui/{project}", axum::routing::get(project_page))
         .route("/ui/{project}/rename", post(rename_project_from_ui))
+        .route("/ui/{project}/move", post(move_project_from_ui))
         .route("/ui/{project}/delete", post(delete_project_from_ui))
         .route(
             "/ui/{project}/audit",
@@ -567,6 +568,15 @@ struct CreateProjectUiForm {
 struct RenameProjectUiForm {
     csrf_token: String,
     display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoveProjectUiForm {
+    csrf_token: String,
+    #[serde(default)]
+    new_parent: String,
+    #[serde(default)]
+    after: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2436,6 +2446,7 @@ async fn projects_page(
             can_write: session.user.can_write(&info.slug),
             display_name: info.display_name,
             parent: info.parent,
+            sort_order: info.sort_order,
             project: info.slug,
         })
         .collect();
@@ -2570,6 +2581,29 @@ async fn rename_project_from_ui(
         "/ui/{}?flash=Project%20renamed",
         project.as_str(),
     )))
+}
+
+async fn move_project_from_ui(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<MoveProjectUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    let new_parent = if form.new_parent.trim().is_empty() {
+        None
+    } else {
+        Some(form.new_parent.trim())
+    };
+    let after = if form.after.trim().is_empty() {
+        None
+    } else {
+        Some(form.after.trim())
+    };
+    state.store.move_project(&project, new_parent, after)?;
+    Ok(Redirect::to("/ui?flash=Project%20moved"))
 }
 
 #[derive(Debug, Deserialize)]
