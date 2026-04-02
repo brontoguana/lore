@@ -94,6 +94,74 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     var ta = target && target.querySelector('textarea');
     if (ta) ta.focus();
   }}
+  function toggleBlockEdit(blockId) {{
+    var body = document.getElementById('body-' + blockId);
+    var edit = document.getElementById('edit-' + blockId);
+    var article = document.getElementById('block-' + blockId);
+    if (!body || !edit) return;
+    if (edit.style.display === 'none') {{
+      body.style.display = 'none';
+      edit.style.display = '';
+      article.setAttribute('draggable', 'false');
+      var ta = edit.querySelector('textarea');
+      if (ta) {{ ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }}
+    }} else {{
+      body.style.display = '';
+      edit.style.display = 'none';
+      article.setAttribute('draggable', 'true');
+    }}
+  }}
+  var _dragBlockId = null;
+  function blockDragStart(e) {{
+    _dragBlockId = e.currentTarget.dataset.blockId;
+    e.currentTarget.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', _dragBlockId);
+    document.querySelectorAll('.block-inserter').forEach(function(ins) {{
+      ins.classList.add('drag-active');
+    }});
+  }}
+  function blockDragEnd(e) {{
+    _dragBlockId = null;
+    e.currentTarget.classList.remove('dragging');
+    document.querySelectorAll('.block-inserter').forEach(function(ins) {{
+      ins.classList.remove('drag-active', 'drag-over');
+    }});
+  }}
+  function blockDragOverInserter(e) {{
+    if (!_dragBlockId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    e.currentTarget.classList.add('drag-over');
+  }}
+  function blockDragLeaveInserter(e) {{
+    e.currentTarget.classList.remove('drag-over');
+  }}
+  function blockDropInserter(e) {{
+    e.preventDefault();
+    var ins = e.currentTarget;
+    ins.classList.remove('drag-over');
+    var afterId = ins.dataset.after || '';
+    var blockId = _dragBlockId;
+    if (!blockId) return;
+    var article = document.getElementById('block-' + blockId);
+    if (!article) return;
+    var project = window.location.pathname.split('/ui/')[1];
+    if (project) project = project.split('?')[0].split('#')[0];
+    if (!project) return;
+    var csrf = document.querySelector('input[name="csrf_token"]');
+    if (!csrf) return;
+    var form = document.createElement('form');
+    form.method = 'POST';
+    form.action = '/ui/' + project + '/blocks/' + blockId + '/move';
+    form.style.display = 'none';
+    var csrfIn = document.createElement('input');
+    csrfIn.name = 'csrf_token'; csrfIn.value = csrf.value; form.appendChild(csrfIn);
+    var afterIn = document.createElement('input');
+    afterIn.name = 'after_block_id'; afterIn.value = afterId; form.appendChild(afterIn);
+    document.body.appendChild(form);
+    form.submit();
+  }}
   </script>
 </body>
 </html>"#,
@@ -2826,13 +2894,16 @@ fn render_block_inserter(
     let project_attr = escape_attribute(project.as_str());
     let csrf_attr = escape_attribute(csrf_token);
     format!(
-        r#"<div class="block-inserter">
-  <button type="button" class="inserter-btn" onclick="
-    var p=this.parentNode;
-    var ex=p.querySelector('.inserter-expand');
-    if(ex.style.display==='none'){{ex.style.display='';this.textContent='\u{{2212}}'}}
-    else{{ex.style.display='none';this.textContent='+'}}
-  ">+</button>
+        r#"<div class="block-inserter" data-after="{after_value}"
+  ondragover="blockDragOverInserter(event)" ondragleave="blockDragLeaveInserter(event)" ondrop="blockDropInserter(event)">
+  <div class="inserter-hover-zone">
+    <button type="button" class="inserter-btn" onclick="
+      var p=this.closest('.block-inserter');
+      var ex=p.querySelector('.inserter-expand');
+      if(ex.style.display==='none'){{ex.style.display='';this.textContent='\u{{2212}}';p.classList.add('expanded')}}
+      else{{ex.style.display='none';this.textContent='+';p.classList.remove('expanded')}}
+    ">+</button>
+  </div>
   <div class="inserter-expand" style="display:none">
     <div class="inserter-types">
       <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'md')">Markdown</button>
@@ -2894,13 +2965,17 @@ fn render_block(
 
     let header_actions = if can_write {
         format!(
-            r#"<div class="block-header-actions">
-  <button type="button" class="block-header-btn" onclick="var e=document.getElementById('edit-{block_id}'); e.style.display=e.style.display==='none'?'block':'none';">Edit</button>
-  <button type="button" class="block-header-btn danger" onclick="if(confirm('Delete this block? This cannot be undone.')){{document.getElementById('del-{block_id}').submit();}}">&#x2715;</button>
+            r##"<div class="block-header-actions">
+  <button type="button" class="block-header-btn" title="Edit" onclick="toggleBlockEdit('{block_id}')">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+  </button>
+  <button type="button" class="block-header-btn danger" title="Delete" onclick="if(confirm('Delete this block? This cannot be undone.')){{document.getElementById('del-{block_id}').submit();}}">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  </button>
   <form id="del-{block_id}" method="post" action="/ui/{project_slug}/blocks/{block_id}/delete" style="display:none;">
     <input type="hidden" name="csrf_token" value="{csrf}">
   </form>
-</div>"#,
+</div>"##,
             block_id = block_id,
             project_slug = project_slug,
             csrf = csrf,
@@ -2909,30 +2984,30 @@ fn render_block(
         String::new()
     };
 
-    let edit_panel = if can_write {
+    let edit_form = if can_write {
         format!(
-            r#"<div id="edit-{block_id}" class="block-edit-panel" style="display:none;">
-  <form method="post" action="/ui/{project_slug}/blocks/{block_id}/edit" enctype="multipart/form-data">
+            r#"<form method="post" action="/ui/{project_slug}/blocks/{block_id}/edit" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{csrf}">
-    <label>
-      Content
-      <textarea name="content">{content}</textarea>
-    </label>
-    <label>
-      Replace image
-      <input type="file" name="image_file" accept="image/*">
-    </label>
-    <label>
-      Type
-      <select name="block_type">{type_opts}</select>
-    </label>
-    <label>
-      Place after
-      <select name="after_block_id">{placement}</select>
-    </label>
-    <button type="submit">Save changes</button>
-  </form>
-</div>"#,
+    <textarea name="content" class="block-edit-textarea">{content}</textarea>
+    <div class="block-edit-extras">
+      <label>
+        Replace image
+        <input type="file" name="image_file" accept="image/*">
+      </label>
+      <label>
+        Type
+        <select name="block_type">{type_opts}</select>
+      </label>
+      <label>
+        Place after
+        <select name="after_block_id">{placement}</select>
+      </label>
+    </div>
+    <div class="block-edit-actions">
+      <button type="submit">Save</button>
+      <button type="button" onclick="toggleBlockEdit('{block_id}')">Cancel</button>
+    </div>
+  </form>"#,
             block_id = block_id,
             project_slug = project_slug,
             csrf = csrf,
@@ -2945,18 +3020,26 @@ fn render_block(
     };
 
     format!(
-        r#"<article class="block">
+        r#"<article class="block" id="block-{block_id}" draggable="{draggable}" data-block-id="{block_id}"
+  {drag_attrs}>
   <div class="block-meta">
     <span class="pill">{type_label}</span>
     {header_actions}
   </div>
-  <div class="block-body">{body}</div>
-  {edit_panel}
+  <div class="block-body" id="body-{block_id}">{body}</div>
+  <div class="block-edit-panel" id="edit-{block_id}" style="display:none;">{edit_form}</div>
 </article>"#,
+        block_id = block_id,
         type_label = escape_text(block_type_label(block.block_type)),
         header_actions = header_actions,
         body = render_block_body(block),
-        edit_panel = edit_panel,
+        edit_form = edit_form,
+        draggable = if can_write { "true" } else { "false" },
+        drag_attrs = if can_write {
+            format!(r#"ondragstart="blockDragStart(event)" ondragend="blockDragEnd(event)""#)
+        } else {
+            String::new()
+        },
     )
 }
 
@@ -3736,9 +3819,14 @@ fn shared_styles(theme: UiTheme) -> String {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .stack, .timeline {
+    .stack {
       display: grid;
       gap: var(--s-4);
+    }
+
+    .timeline {
+      display: grid;
+      gap: 0;
     }
 
     .project-tree-panel {
@@ -3886,32 +3974,70 @@ fn shared_styles(theme: UiTheme) -> String {
       border: 1px solid var(--line);
       border-radius: var(--s-5);
       background: var(--panel-strong);
-      transition: border-color 0.2s;
+      transition: border-color 0.2s, opacity 0.2s, box-shadow 0.2s;
+      margin-bottom: 2px;
+    }
+
+    .block.dragging {
+      opacity: 0.4;
+    }
+
+    .block[draggable="true"] {
+      cursor: grab;
+    }
+
+    .block[draggable="true"]:active {
+      cursor: grabbing;
     }
 
     .block-inserter {
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: var(--s-2) 0;
+      height: 8px;
+      position: relative;
+      transition: height 0.15s;
+    }
+
+    .block-inserter.expanded {
+      height: auto;
+    }
+
+    .inserter-hover-zone {
+      position: absolute;
+      top: -8px;
+      bottom: -8px;
+      left: 0;
+      right: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 2;
     }
 
     .inserter-btn {
-      width: 32px;
-      height: 32px;
+      width: 24px;
+      height: 24px;
       min-height: auto;
       border-radius: 50%;
       border: 2px dashed var(--line);
-      background: transparent;
+      background: var(--panel-strong);
       color: var(--muted);
-      font-size: 1.2rem;
+      font-size: 1rem;
       line-height: 1;
       cursor: pointer;
       padding: 0;
       display: flex;
       align-items: center;
       justify-content: center;
-      transition: border-color 0.2s, color 0.2s, background 0.2s;
+      opacity: 0;
+      transition: opacity 0.15s, border-color 0.2s, color 0.2s, background 0.2s;
+      z-index: 3;
+    }
+
+    .block-inserter:hover .inserter-btn,
+    .block-inserter.expanded .inserter-btn {
+      opacity: 1;
     }
 
     .inserter-btn:hover {
@@ -3920,9 +4046,41 @@ fn shared_styles(theme: UiTheme) -> String {
       background: var(--accent-soft);
     }
 
+    .block-inserter.drag-active {
+      height: 16px;
+    }
+
+    .block-inserter.drag-active .inserter-hover-zone {
+      top: -4px;
+      bottom: -4px;
+    }
+
+    .block-inserter.drag-active::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 10%;
+      right: 10%;
+      height: 3px;
+      background: var(--accent-soft);
+      border-radius: 2px;
+      transform: translateY(-50%);
+      transition: background 0.15s;
+    }
+
+    .block-inserter.drag-over::before {
+      background: var(--accent);
+    }
+
+    .block-inserter.drag-active .inserter-btn {
+      display: none;
+    }
+
     .inserter-expand {
       width: 100%;
       margin-top: var(--s-3);
+      position: relative;
+      z-index: 4;
     }
 
     .inserter-types {
@@ -4078,28 +4236,31 @@ fn shared_styles(theme: UiTheme) -> String {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: var(--s-4);
+      margin-bottom: var(--s-3);
       color: var(--muted);
       font-size: 0.85rem;
     }
 
     .block-header-actions {
       display: flex;
-      gap: var(--s-2);
+      gap: var(--s-1);
       align-items: center;
     }
 
     .block-header-btn {
       display: inline-flex;
       align-items: center;
-      padding: 4px 12px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: var(--input-bg);
-      color: var(--ink);
-      font-size: 0.8rem;
-      font-weight: 600;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      min-height: auto;
+      padding: 0;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
       cursor: pointer;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
     }
 
     .block-header-btn:hover {
@@ -4115,9 +4276,30 @@ fn shared_styles(theme: UiTheme) -> String {
     }
 
     .block-edit-panel {
-      margin-top: var(--s-4);
-      padding-top: var(--s-4);
+    }
+
+    .block-edit-textarea {
+      min-height: 8rem;
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+    }
+
+    .block-edit-extras {
+      display: grid;
+      gap: var(--s-3);
+      padding-top: var(--s-3);
       border-top: 1px solid var(--line);
+      margin-top: var(--s-2);
+    }
+
+    .block-edit-actions {
+      display: flex;
+      gap: var(--s-2);
+    }
+
+    .block-edit-actions button {
+      width: auto;
+      padding: var(--s-2) var(--s-5);
     }
 
     .pill {
@@ -4402,8 +4584,8 @@ fn shared_styles(theme: UiTheme) -> String {
       }
 
       .block-header-btn {
-        padding: 4px 8px;
-        font-size: 0.75rem;
+        width: 28px;
+        height: 28px;
       }
     }
     "#;

@@ -375,6 +375,10 @@ fn build_app_with_librarian(
             "/ui/{project}/blocks/{id}/delete",
             post(delete_block_from_form),
         )
+        .route(
+            "/ui/{project}/blocks/{id}/move",
+            post(move_block_from_form),
+        )
         .layer(axum::middleware::map_response(add_security_headers))
         .with_state(AppState::with_librarian(store, librarian_client))
 }
@@ -3864,6 +3868,51 @@ async fn delete_block_from_form(
         "/ui/{}?flash=Block%20deleted",
         project.as_str()
     )))
+}
+
+#[derive(Deserialize)]
+struct MoveBlockUiForm {
+    csrf_token: String,
+    after_block_id: Option<String>,
+}
+
+async fn move_block_from_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, id)): Path<(String, String)>,
+    Form(form): Form<MoveBlockUiForm>,
+) -> UiResult<Redirect> {
+    let project = ProjectName::new(project)?;
+    let session = require_ui_session(&state, &headers)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let block_id = BlockId::from_string(id)?;
+    let after_block_id = form
+        .after_block_id
+        .filter(|s| !s.is_empty())
+        .map(BlockId::from_string)
+        .transpose()?;
+    let before = state.store.snapshot_block(&project, &block_id)?;
+    state.store.move_block_after_as_project_writer(
+        &project,
+        &block_id,
+        after_block_id.as_ref(),
+        session.user.username.as_str(),
+    )?;
+    record_project_version(
+        &state,
+        &project_version_actor_for_user(&session.user),
+        &project,
+        "Move block",
+        vec![update_version_operation(
+            &state,
+            &project,
+            &block_id,
+            before,
+            ProjectVersionOperationType::MoveBlock,
+        )?],
+    )?;
+    Ok(Redirect::to(&format!("/ui/{}", project.as_str())))
 }
 
 async fn block_media(
@@ -7447,7 +7496,7 @@ mod tests {
         assert!(html.contains("width=device-width, initial-scale=1"));
         assert!(html.contains(">admin</span>"));
         assert!(html.contains("id=\"document\""));
-        assert!(html.contains(">Edit</button>"));
+        assert!(html.contains("title=\"Edit\""));
         assert!(html.contains("class=\"block-header-btn danger\""));
     }
 
