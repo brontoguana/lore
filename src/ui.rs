@@ -3826,7 +3826,7 @@ fn shared_styles(theme: UiTheme) -> String {
 
     .timeline {
       display: grid;
-      gap: 0;
+      gap: 6px;
     }
 
     .project-tree-panel {
@@ -3994,36 +3994,38 @@ fn shared_styles(theme: UiTheme) -> String {
       display: flex;
       flex-direction: column;
       align-items: center;
-      height: 8px;
+      height: 0;
       position: relative;
-      transition: height 0.15s;
+      z-index: 5;
     }
 
     .block-inserter.expanded {
       height: auto;
+      margin: 4px 0;
     }
 
     .inserter-hover-zone {
       position: absolute;
-      top: -8px;
-      bottom: -8px;
+      top: -18px;
+      bottom: -18px;
       left: 0;
       right: 0;
       display: flex;
       align-items: center;
       justify-content: center;
-      z-index: 2;
+      z-index: 5;
     }
 
     .inserter-btn {
-      width: 24px;
-      height: 24px;
+      width: 32px;
+      height: 32px;
       min-height: auto;
       border-radius: 50%;
-      border: 2px dashed var(--line);
+      border: 2px solid var(--line);
       background: var(--panel-strong);
       color: var(--muted);
-      font-size: 1rem;
+      font-size: 1.2rem;
+      font-weight: bold;
       line-height: 1;
       cursor: pointer;
       padding: 0;
@@ -4031,11 +4033,12 @@ fn shared_styles(theme: UiTheme) -> String {
       align-items: center;
       justify-content: center;
       opacity: 0;
-      transition: opacity 0.15s, border-color 0.2s, color 0.2s, background 0.2s;
-      z-index: 3;
+      transition: opacity 0.15s, border-color 0.2s, color 0.2s, background 0.2s, box-shadow 0.2s;
+      z-index: 6;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
     }
 
-    .block-inserter:hover .inserter-btn,
+    .inserter-hover-zone:hover .inserter-btn,
     .block-inserter.expanded .inserter-btn {
       opacity: 1;
     }
@@ -4044,6 +4047,7 @@ fn shared_styles(theme: UiTheme) -> String {
       border-color: var(--accent);
       color: var(--accent);
       background: var(--accent-soft);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
     }
 
     .block-inserter.drag-active {
