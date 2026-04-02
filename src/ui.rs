@@ -339,10 +339,7 @@ pub fn render_projects_page(
     </section>
     <script>
     var csrfToken = '{csrf_token}';
-    function addSiblingRow(btn, parentSlug) {{
-      // Remove any existing inline create rows
-      document.querySelectorAll('.tree-inline-create').forEach(function(el) {{ el.remove(); }});
-
+    function createRow(parentSlug) {{
       var li = document.createElement('li');
       li.className = 'tree-node tree-inline-create';
       li.innerHTML = '<form class="tree-node-row tree-create-row" method="post" action="/ui/projects">'
@@ -354,26 +351,36 @@ pub fn render_projects_page(
         + '<button type="submit" class="tree-add-child">Save</button>'
         + '<button type="button" class="tree-add-child" onclick="this.closest(\'.tree-inline-create\').remove()">Cancel</button>'
         + '</div></form>';
-
-      // Insert after the current tree-node (sibling), or at end of the tree list
+      return li;
+    }}
+    function addChildRow(btn, parentSlug) {{
+      document.querySelectorAll('.tree-inline-create').forEach(function(el) {{ el.remove(); }});
+      var li = createRow(parentSlug);
+      // Find or create the nested tree-list inside the parent node
       var node = btn.closest('.tree-node');
-      if (node) {{
-        node.after(li);
+      var childList = node.querySelector(':scope > .tree-list');
+      if (!childList) {{
+        childList = document.createElement('ul');
+        childList.className = 'tree-list';
+        node.appendChild(childList);
+      }}
+      childList.appendChild(li);
+      li.querySelector('input[name="project_name"]').focus();
+    }}
+    function addSiblingRow(btn, parentSlug) {{
+      document.querySelectorAll('.tree-inline-create').forEach(function(el) {{ el.remove(); }});
+      var li = createRow(parentSlug);
+      var list = document.querySelector('.project-tree-panel .tree-list');
+      if (list) {{
+        list.appendChild(li);
       }} else {{
-        // Clicked from root "New project" button
-        var list = document.querySelector('.project-tree-panel .tree-list');
-        if (list) {{
-          list.appendChild(li);
-        }} else {{
-          // No tree-list yet (empty state) -- create one
-          var panel = document.querySelector('.project-tree-panel');
-          var empty = panel.querySelector('.empty-state');
-          if (empty) empty.remove();
-          var ul = document.createElement('ul');
-          ul.className = 'tree-list';
-          ul.appendChild(li);
-          panel.insertBefore(ul, panel.querySelector('.tree-create-root'));
-        }}
+        var panel = document.querySelector('.project-tree-panel');
+        var empty = panel.querySelector('.empty-state');
+        if (empty) empty.remove();
+        var ul = document.createElement('ul');
+        ul.className = 'tree-list';
+        ul.appendChild(li);
+        panel.insertBefore(ul, panel.querySelector('.tree-create-root'));
       }}
       li.querySelector('input[name="project_name"]').focus();
     }}
@@ -432,8 +439,8 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
 
                 let add_btn = if is_admin {
                     format!(
-                        r#"<button type="button" class="tree-add-child" onclick="addSiblingRow(this, '{parent}')">+</button>"#,
-                        parent = escape_attribute(parent_slug),
+                        r#"<button type="button" class="tree-add-child" onclick="addChildRow(this, '{slug_attr}')">+</button>"#,
+                        slug_attr = escape_attribute(slug),
                     )
                 } else {
                     String::new()
@@ -1634,6 +1641,22 @@ pub fn render_project_page(
         ""
     };
 
+    let delete_project_html = if is_admin {
+        format!(
+            r#"<div class="delete-project-section">
+              <form method="post" action="/ui/{project_slug}/delete"
+                    onsubmit="return confirm('Are you sure you want to delete this project? This cannot be undone.');">
+                <input type="hidden" name="csrf_token" value="{csrf_token}">
+                <button type="submit" class="delete-project-btn">Delete project</button>
+              </form>
+            </div>"#,
+            project_slug = escape_attribute(project.as_str()),
+            csrf_token = escape_attribute(csrf_token),
+        )
+    } else {
+        String::new()
+    };
+
     let rename_html = if can_write && is_admin {
         format!(
             r#"<h1 class="page-title editable-title" style="margin:0;" id="project-title"
@@ -1702,7 +1725,8 @@ pub fn render_project_page(
         <div class="timeline">{blocks_html}</div>
       </section>
       <aside class="stack">{librarian_panel}{read_only_notice}</aside>
-    </div>"#,
+    </div>
+    {delete_project_html}"#,
         rename_html = rename_html,
         project_slug = escape_attribute(project.as_str()),
         search_value = escape_attribute(search_value),
@@ -1732,6 +1756,7 @@ pub fn render_project_page(
         blocks_html = blocks_html,
         librarian_panel = librarian_panel,
         read_only_notice = read_only_notice,
+        delete_project_html = delete_project_html,
     );
 
     render_shell(
@@ -2775,20 +2800,20 @@ fn render_block(
   <form method="post" action="/ui/{project_slug}/blocks/{block_id}/edit" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <label>
-      Type
-      <select name="block_type">{type_opts}</select>
-    </label>
-    <label>
-      Place after
-      <select name="after_block_id">{placement}</select>
-    </label>
-    <label>
       Content
       <textarea name="content">{content}</textarea>
     </label>
     <label>
       Replace image
       <input type="file" name="image_file" accept="image/*">
+    </label>
+    <label>
+      Type
+      <select name="block_type">{type_opts}</select>
+    </label>
+    <label>
+      Place after
+      <select name="after_block_id">{placement}</select>
     </label>
     <button type="submit">Save changes</button>
   </form>
@@ -3456,6 +3481,30 @@ fn shared_styles(theme: UiTheme) -> String {
     .editable-title:hover {
       background: var(--surface-hover);
       box-shadow: 0 0 0 2px var(--line);
+    }
+
+    .delete-project-section {
+      margin-top: var(--s-6);
+      padding-top: var(--s-5);
+      border-top: 1px solid var(--line);
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .delete-project-btn {
+      background: none;
+      border: 1px solid var(--danger, #c53030);
+      color: var(--danger, #c53030);
+      padding: var(--s-2) var(--s-4);
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 0.85rem;
+      min-height: auto;
+    }
+
+    .delete-project-btn:hover {
+      background: var(--danger, #c53030);
+      color: #fff;
     }
 
     .rename-input {

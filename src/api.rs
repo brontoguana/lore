@@ -335,6 +335,7 @@ fn build_app_with_librarian(
         )
         .route("/ui/{project}", axum::routing::get(project_page))
         .route("/ui/{project}/rename", post(rename_project_from_ui))
+        .route("/ui/{project}/delete", post(delete_project_from_ui))
         .route(
             "/ui/{project}/audit",
             axum::routing::get(project_audit_page),
@@ -2542,7 +2543,7 @@ async fn create_project_from_ui(
     let initial_block = NewBlock {
         project: info.slug.clone(),
         block_type: BlockType::Markdown,
-        content: format!("# {}", info.display_name),
+        content: String::new(),
         author_key: session.user.username.to_string(),
         left: None,
         right: None,
@@ -2569,6 +2570,24 @@ async fn rename_project_from_ui(
         "/ui/{}?flash=Project%20renamed",
         project.as_str(),
     )))
+}
+
+#[derive(Debug, Deserialize)]
+struct CsrfOnlyForm {
+    csrf_token: String,
+}
+
+async fn delete_project_from_ui(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfOnlyForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    state.store.delete_project(&project)?;
+    Ok(Redirect::to("/ui?flash=Project%20deleted"))
 }
 
 async fn create_role_from_ui(

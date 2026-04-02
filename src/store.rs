@@ -113,6 +113,24 @@ impl FileBlockStore {
         self.write_project_meta(project, &meta)
     }
 
+    pub fn delete_project(&self, project: &ProjectName) -> Result<()> {
+        let dir = self.project_dir(project);
+        if !dir.exists() {
+            return Err(LoreError::Validation("project does not exist".into()));
+        }
+        // Re-parent any children to have no parent (promote to root)
+        let infos = self.list_project_infos()?;
+        for info in &infos {
+            if info.parent.as_deref() == Some(project.as_str()) {
+                let mut meta = self.read_project_meta(&info.slug);
+                meta.parent = None;
+                self.write_project_meta(&info.slug, &meta)?;
+            }
+        }
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
     pub fn create_project(&self, display_name: &str, parent: Option<&str>) -> Result<ProjectInfo> {
         let (slug, display) = ProjectName::from_display_name(display_name)?;
         // Check if project already exists
@@ -1072,5 +1090,25 @@ mod tests {
 
         // empty name should fail
         assert!(store.rename_project(&info.slug, "  ").is_err());
+    }
+
+    #[test]
+    fn delete_project_removes_dir_and_reparents_children() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let parent = store.create_project("Parent", None).unwrap();
+        let child = store
+            .create_project("Child", Some(parent.slug.as_str()))
+            .unwrap();
+        assert_eq!(child.parent.as_deref(), Some("parent"));
+
+        store.delete_project(&parent.slug).unwrap();
+
+        // Parent gone
+        let infos = store.list_project_infos().unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].slug.as_str(), "child");
+        // Child promoted to root
+        assert!(infos[0].parent.is_none());
     }
 }
