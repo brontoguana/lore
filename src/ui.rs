@@ -1591,15 +1591,15 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
         r##"<h1 class="page-title">Agents</h1>
 
     <section class="panel" style="margin-bottom: var(--s-6);">
-      <div class="panel-header" style="display:flex; justify-content:space-between; align-items:flex-start;">
-        <div>
-          <h2>Setup instructions for your agent</h2>
-          <p>Copy this block and give it to your agent. It explains what Lore is, how to connect, and what commands are available.</p>
-        </div>
-        <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('agent-instruction')">Copy</button>
+      <div class="panel-header">
+        <h2>Setup instructions for your agent</h2>
+        <p>Copy this block and give it to your agent. It explains what Lore is, how to connect, and what commands are available.</p>
       </div>
       <div class="padded">
         <textarea readonly id="agent-instruction" style="min-height: 20rem; font-family: var(--font-mono); font-size: 0.85rem;">{agent_instruction}</textarea>
+        <div style="margin-top: var(--s-3); text-align: right;">
+          <button type="button" class="button-link" onclick="copyField('agent-instruction')">Copy</button>
+        </div>
       </div>
     </section>
 
@@ -1614,16 +1614,10 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
         <div class="padded">
           <h3 style="margin:0 0 var(--s-2);">Install</h3>
           <p style="margin:0 0 var(--s-2);">macOS and Linux:</p>
-          <div style="display:flex; gap:var(--s-3); align-items:flex-start;">
-            <textarea readonly id="cli-install-unix" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem; flex:1;">curl -fsSL {install_script_url} | sh</textarea>
-            <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('cli-install-unix')">Copy</button>
-          </div>
+          <textarea readonly id="cli-install-unix" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">curl -fsSL {install_script_url} | sh</textarea>
           <p style="margin:var(--s-3) 0 var(--s-2);">On Windows, use WSL and run the same command above.</p>
           <h3 style="margin:var(--s-4) 0 var(--s-2);">Configure</h3>
-          <div style="display:flex; gap:var(--s-3); align-items:flex-start;">
-            <textarea readonly id="cli-config" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem; flex:1;">lore config set --url {base_url} --token YOUR_TOKEN</textarea>
-            <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('cli-config')">Copy</button>
-          </div>
+          <textarea readonly id="cli-config" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">lore config set --url {base_url} --token YOUR_TOKEN</textarea>
           <h3 style="margin:var(--s-4) 0 var(--s-2);">Commands</h3>
           <table class="agents-cmd-table">
             <tr><td><code>lore projects</code></td><td>List all projects</td></tr>
@@ -1637,23 +1631,22 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
             <tr><td><code>lore history list &lt;project&gt;</code></td><td>View project history</td></tr>
             <tr><td><code>lore librarian answer &lt;project&gt; -q "question"</code></td><td>Ask the librarian</td></tr>
           </table>
+          <div style="margin-top: var(--s-3); text-align: right;">
+            <button type="button" class="button-link" onclick="copyField('cli-install-unix')">Copy install command</button>
+            <button type="button" class="button-link" style="margin-left: var(--s-2);" onclick="copyField('cli-config')">Copy config command</button>
+          </div>
         </div>
       </section>
 
       <section class="panel">
-        <div class="panel-header" style="display:flex; justify-content:space-between; align-items:flex-start;">
-          <div>
-            <h2>MCP</h2>
-            <p>Best for MCP-native hosts like Claude Desktop, Cursor (MCP mode), or any runtime that supports the Model Context Protocol tool server standard.</p>
-          </div>
+        <div class="panel-header">
+          <h2>MCP</h2>
+          <p>Best for MCP-native hosts like Claude Desktop, Cursor (MCP mode), or any runtime that supports the Model Context Protocol tool server standard.</p>
         </div>
         <div class="padded">
           <h3 style="margin:0 0 var(--s-2);">MCP config</h3>
           <p style="margin:0 0 var(--s-2);">Add this to your MCP client configuration. Replace YOUR_TOKEN with an agent token from the Admin panel.</p>
-          <div style="display:flex; gap:var(--s-3); align-items:flex-start;">
-            <textarea readonly id="mcp-config" style="min-height:10rem; font-family:var(--font-mono); font-size:0.85rem; flex:1;">{mcp_config}</textarea>
-            <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('mcp-config')">Copy</button>
-          </div>
+          <textarea readonly id="mcp-config" style="min-height:10rem; font-family:var(--font-mono); font-size:0.85rem;">{mcp_config}</textarea>
           <h3 style="margin:var(--s-4) 0 var(--s-2);">Available tools</h3>
           <table class="agents-cmd-table">
             <tr><td><code>list_projects</code></td><td>List all accessible projects</td></tr>
@@ -1666,6 +1659,9 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
             <tr><td><code>move_block</code></td><td>Reorder a block within a project</td></tr>
             <tr><td><code>delete_block</code></td><td>Remove a block</td></tr>
           </table>
+          <div style="margin-top: var(--s-3); text-align: right;">
+            <button type="button" class="button-link" onclick="copyField('mcp-config')">Copy MCP config</button>
+          </div>
         </div>
       </section>
     </div>
