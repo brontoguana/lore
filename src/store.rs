@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectMeta {
@@ -19,6 +20,8 @@ pub struct ProjectMeta {
     pub parent: Option<String>,
     #[serde(default)]
     pub sort_order: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +30,16 @@ pub struct ProjectInfo {
     pub display_name: String,
     pub parent: Option<String>,
     pub sort_order: u64,
+    pub id: String,
+}
+
+/// Result of resolving a lore:// link UUID.
+#[derive(Debug, Clone)]
+pub enum LoreLinkTarget {
+    /// Links to a project. Contains (slug, display_name).
+    Project(ProjectName, String),
+    /// Links to a block. Contains (project_slug, block_id, block_type, content_preview).
+    Block(ProjectName, BlockId, BlockType, String),
 }
 
 enum UpdateMode {
@@ -74,6 +87,7 @@ impl FileBlockStore {
                     display_name: meta.display_name,
                     parent: meta.parent,
                     sort_order: meta.sort_order,
+                    id: meta.id.unwrap_or_default(),
                     slug: project,
                 });
             }
@@ -86,7 +100,14 @@ impl FileBlockStore {
     pub fn read_project_meta(&self, project: &ProjectName) -> ProjectMeta {
         let meta_path = self.project_dir(project).join("project.json");
         if let Ok(bytes) = fs::read(&meta_path) {
-            if let Ok(meta) = serde_json::from_slice::<ProjectMeta>(&bytes) {
+            if let Ok(mut meta) = serde_json::from_slice::<ProjectMeta>(&bytes) {
+                // Lazy backfill: assign a UUID if the project doesn't have one yet
+                if meta.id.is_none() {
+                    meta.id = Some(Uuid::new_v4().to_string());
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&meta) {
+                        let _ = fs::write(&meta_path, bytes);
+                    }
+                }
                 return meta;
             }
         }
@@ -95,6 +116,7 @@ impl FileBlockStore {
             display_name: project.as_str().to_string(),
             parent: None,
             sort_order: 0,
+            id: Some(Uuid::new_v4().to_string()),
         }
     }
 
@@ -219,6 +241,38 @@ impl FileBlockStore {
         self.write_project_meta(project, &meta)
     }
 
+    /// Resolve a lore:// link UUID to either a project or a block.
+    /// Checks projects first (by their UUID), then blocks across all projects.
+    pub fn resolve_lore_link(&self, uuid: &str) -> Option<LoreLinkTarget> {
+        // Check projects first
+        let infos = self.list_project_infos().ok()?;
+        for info in &infos {
+            if info.id == uuid {
+                return Some(LoreLinkTarget::Project(
+                    info.slug.clone(),
+                    info.display_name.clone(),
+                ));
+            }
+        }
+        // Check blocks across all projects
+        for info in &infos {
+            if let Ok(blocks) = self.list_blocks(&info.slug) {
+                for block in &blocks {
+                    if block.id.as_str() == uuid {
+                        let preview = truncate_single_line(&block.content, 48);
+                        return Some(LoreLinkTarget::Block(
+                            info.slug.clone(),
+                            block.id.clone(),
+                            block.block_type,
+                            preview,
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn create_project(&self, display_name: &str, parent: Option<&str>) -> Result<ProjectInfo> {
         let (slug, display) = ProjectName::from_display_name(display_name)?;
         // Check if project already exists
@@ -240,16 +294,19 @@ impl FileBlockStore {
         }
         self.ensure_layout(&slug)?;
         let sort_order = OffsetDateTime::now_utc().unix_timestamp() as u64;
+        let project_id = Uuid::new_v4().to_string();
         let meta = ProjectMeta {
             display_name: display.clone(),
             parent: parent.map(|s| s.to_string()),
             sort_order,
+            id: Some(project_id.clone()),
         };
         self.write_project_meta(&slug, &meta)?;
         Ok(ProjectInfo {
             display_name: display,
             parent: parent.map(|s| s.to_string()),
             sort_order,
+            id: project_id,
             slug,
         })
     }
@@ -750,6 +807,15 @@ impl FileBlockStore {
             }
         }
         Ok(())
+    }
+}
+
+fn truncate_single_line(content: &str, max_chars: usize) -> String {
+    let line = content.lines().next().unwrap_or("");
+    if line.len() <= max_chars {
+        line.to_string()
+    } else {
+        format!("{}...", &line[..max_chars])
     }
 }
 
@@ -1262,5 +1328,50 @@ mod tests {
         assert_eq!(infos[0].slug.as_str(), "charlie");
         assert_eq!(infos[1].slug.as_str(), "alpha");
         assert_eq!(infos[2].slug.as_str(), "beta");
+    }
+
+    #[test]
+    fn resolve_lore_link_finds_project_and_block() {
+        use super::LoreLinkTarget;
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let info = store.create_project("My Docs", None).unwrap();
+        let block = store
+            .create_block(NewBlock {
+                project: info.slug.clone(),
+                block_type: BlockType::Markdown,
+                content: "Hello world".into(),
+                author_key: "key-a".into(),
+                left: None,
+                right: None,
+                image_upload: None,
+            })
+            .unwrap();
+
+        // Resolve project by its UUID
+        let result = store.resolve_lore_link(&info.id);
+        assert!(matches!(result, Some(LoreLinkTarget::Project(_, _))));
+
+        // Resolve block by its UUID
+        let result = store.resolve_lore_link(block.id.as_str());
+        assert!(matches!(result, Some(LoreLinkTarget::Block(_, _, _, _))));
+
+        // Unknown UUID returns None
+        assert!(store
+            .resolve_lore_link("00000000-0000-0000-0000-000000000000")
+            .is_none());
+    }
+
+    #[test]
+    fn project_meta_gets_uuid_on_read() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let info = store.create_project("Test", None).unwrap();
+        assert!(!info.id.is_empty());
+
+        // Reading meta should return same UUID
+        let meta = store.read_project_meta(&info.slug);
+        assert!(meta.id.is_some());
+        assert_eq!(meta.id.unwrap(), info.id);
     }
 }

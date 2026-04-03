@@ -6,7 +6,7 @@ use crate::librarian::{
     ProjectLibrarianOperationType, ProviderCheckResult, StoredLibrarianOperation,
 };
 use crate::model::{Block, BlockId, BlockType, ProjectName};
-use crate::store::ProjectInfo;
+use crate::store::{FileBlockStore, ProjectInfo};
 use crate::updater::{AutoUpdateConfig, AutoUpdateStatus, DEFAULT_UPDATE_REPO};
 use crate::versioning::{
     GitExportConfig, GitExportStatus, ProjectVersionActor, ProjectVersionActorKind,
@@ -161,6 +161,45 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     afterIn.name = 'after_block_id'; afterIn.value = afterId; form.appendChild(afterIn);
     document.body.appendChild(form);
     form.submit();
+  }}
+  function insertDocLink(btn) {{
+    var picker = btn.closest('.doc-link-picker');
+    var sel = picker.querySelector('.doc-link-select');
+    if (!sel.value) return;
+    var name = sel.options[sel.selectedIndex].getAttribute('data-name');
+    var md = '[' + name + '](lore://' + sel.value + ')';
+    var form = picker.closest('form');
+    var ta = form.querySelector('textarea[name="content"]');
+    if (!ta) return;
+    var start = ta.selectionStart;
+    var end = ta.selectionEnd;
+    var val = ta.value;
+    ta.value = val.substring(0, start) + md + val.substring(end);
+    ta.selectionStart = ta.selectionEnd = start + md.length;
+    ta.focus();
+    sel.selectedIndex = 0;
+  }}
+  function copyLoreLink(uuid) {{
+    var md = '[link](lore://' + uuid + ')';
+    if (navigator.clipboard) {{
+      navigator.clipboard.writeText(md).then(function() {{
+        showCopyToast('Link copied');
+      }});
+    }} else {{
+      var ta = document.createElement('textarea');
+      ta.value = md; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      showCopyToast('Link copied');
+    }}
+  }}
+  function showCopyToast(msg) {{
+    var t = document.createElement('div');
+    t.textContent = msg;
+    t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--panel-strong);color:var(--ink);padding:6px 16px;border-radius:var(--radius);box-shadow:0 2px 8px var(--shadow);z-index:9999;font-size:0.85rem;';
+    document.body.appendChild(t);
+    setTimeout(function() {{ t.remove(); }}, 2000);
   }}
   </script>
 </body>
@@ -1762,6 +1801,7 @@ pub fn render_project_page(
     theme: UiTheme,
     project: &ProjectName,
     display_name: &str,
+    project_uuid: &str,
     blocks: &[Block],
     all_blocks: &[Block],
     flash: Option<&str>,
@@ -1776,7 +1816,9 @@ pub fn render_project_page(
     librarian_answer: Option<&UiLibrarianAnswer>,
     librarian_history: &[UiLibrarianAnswer],
     pending_actions: &[UiPendingLibrarianAction],
+    store: &FileBlockStore,
 ) -> String {
+    let project_infos = store.list_project_infos().unwrap_or_default();
     let search_value = search.unwrap_or_default();
     let results_label = if !search_value.is_empty() {
         format!(
@@ -1791,25 +1833,26 @@ pub fn render_project_page(
     let blocks_html = if blocks.is_empty() && can_write {
         format!(
             r#"<section class="empty-state"><h2>No blocks yet</h2><p>Click the button below to add the first block.</p></section>{}"#,
-            render_block_inserter(project, None, csrf_token),
+            render_block_inserter(project, None, csrf_token, &project_infos),
         )
     } else if blocks.is_empty() {
         r#"<section class="empty-state"><h2>No blocks yet</h2></section>"#.to_string()
     } else {
         let mut html = String::new();
         if can_write {
-            html.push_str(&render_block_inserter(project, None, csrf_token));
+            html.push_str(&render_block_inserter(project, None, csrf_token, &project_infos));
         }
         for block in blocks {
             html.push_str(&render_block(
-                project, block, all_blocks, can_write, csrf_token,
+                project, block, all_blocks, can_write, &project_infos, csrf_token,
             ));
             if can_write {
-                html.push_str(&render_block_inserter(project, Some(&block.id), csrf_token));
+                html.push_str(&render_block_inserter(project, Some(&block.id), csrf_token, &project_infos));
             }
         }
         html
     };
+    let blocks_html = resolve_lore_links_in_html(&blocks_html, store);
     let librarian_panel = render_librarian_panel(
         project,
         csrf_token,
@@ -1840,11 +1883,19 @@ pub fn render_project_page(
         String::new()
     };
 
+    let copy_project_link_btn = format!(
+        r##"<button type="button" class="block-header-btn" title="Copy link to this project" onclick="copyLoreLink('{project_uuid}')" style="margin-left:var(--s-3);">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+  </button>"##,
+        project_uuid = escape_attribute(project_uuid),
+    );
+
     let rename_html = if can_write && is_admin {
         format!(
-            r#"<h1 class="page-title editable-title" style="margin:0;" id="project-title"
+            r#"<div style="display:flex; align-items:center;">
+            <h1 class="page-title editable-title" style="margin:0;" id="project-title"
                 title="Click to rename" onclick="document.getElementById('rename-form').style.display='flex'; this.style.display='none';"
-            >{display_name}</h1>
+            >{display_name}</h1>{copy_project_link_btn}</div>
             <form id="rename-form" method="post" action="/ui/{project_slug}/rename"
                   style="display:none; align-items:center; gap:var(--s-3); margin:0;">
               <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -1857,11 +1908,13 @@ pub fn render_project_page(
             display_name_attr = escape_attribute(display_name),
             project_slug = escape_attribute(project.as_str()),
             csrf_token = escape_attribute(csrf_token),
+            copy_project_link_btn = copy_project_link_btn,
         )
     } else {
         format!(
-            r#"<h1 class="page-title" style="margin:0;">{display_name}</h1>"#,
+            r#"<div style="display:flex; align-items:center;"><h1 class="page-title" style="margin:0;">{display_name}</h1>{copy_project_link_btn}</div>"#,
             display_name = escape_text(display_name),
+            copy_project_link_btn = copy_project_link_btn,
         )
     };
 
@@ -2883,10 +2936,39 @@ fn selected(current: Option<&str>, value: &str) -> &'static str {
     }
 }
 
+fn render_doc_link_picker(project_infos: &[ProjectInfo]) -> String {
+    if project_infos.is_empty() {
+        return String::new();
+    }
+    let options: String = project_infos
+        .iter()
+        .map(|info| {
+            format!(
+                r#"<option value="{id}" data-name="{name}">{display}</option>"#,
+                id = escape_attribute(&info.id),
+                name = escape_attribute(&info.display_name),
+                display = escape_text(&info.display_name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<div class="doc-link-picker">
+      <select class="doc-link-select">
+        <option value="">Link to document...</option>
+        {options}
+      </select>
+      <button type="button" class="button-link" onclick="insertDocLink(this)">Insert link</button>
+    </div>"#,
+        options = options,
+    )
+}
+
 fn render_block_inserter(
     project: &ProjectName,
     after_block_id: Option<&BlockId>,
     csrf_token: &str,
+    project_infos: &[ProjectInfo],
 ) -> String {
     let after_value = after_block_id
         .map(|id| escape_attribute(id.as_str()).to_string())
@@ -2915,6 +2997,7 @@ fn render_block_inserter(
       <input type="hidden" name="block_type" value="markdown">
       <input type="hidden" name="after_block_id" value="{after_value}">
       <textarea name="content" placeholder="Write markdown..." rows="6"></textarea>
+      {doc_link_picker}
       <button type="submit">Add markdown</button>
     </form>
     <form class="inserter-form inserter-form-svg" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
@@ -2942,6 +3025,7 @@ fn render_block_inserter(
         project_attr = project_attr,
         csrf_attr = csrf_attr,
         after_value = after_value,
+        doc_link_picker = render_doc_link_picker(project_infos),
     )
 }
 
@@ -2950,6 +3034,7 @@ fn render_block(
     block: &Block,
     all_blocks: &[Block],
     can_write: bool,
+    project_infos: &[ProjectInfo],
     csrf_token: &str,
 ) -> String {
     let selected_after_block_id = all_blocks
@@ -2984,11 +3069,13 @@ fn render_block(
         String::new()
     };
 
+    let edit_doc_link_picker = render_doc_link_picker(project_infos);
     let edit_form = if can_write {
         format!(
             r#"<form method="post" action="/ui/{project_slug}/blocks/{block_id}/edit" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <textarea name="content" class="block-edit-textarea">{content}</textarea>
+    {edit_doc_link_picker}
     <div class="block-edit-extras">
       <label>
         Replace image
@@ -3014,16 +3101,25 @@ fn render_block(
             type_opts = render_block_type_options(block.block_type),
             placement = placement_options,
             content = escape_text(&block.content),
+            edit_doc_link_picker = edit_doc_link_picker,
         )
     } else {
         String::new()
     };
+
+    let copy_link_btn = format!(
+        r##"<button type="button" class="block-header-btn" title="Copy link" onclick="copyLoreLink('{block_id}')">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+  </button>"##,
+        block_id = block_id,
+    );
 
     format!(
         r#"<article class="block" id="block-{block_id}" draggable="{draggable}" data-block-id="{block_id}"
   {drag_attrs}>
   <div class="block-meta">
     <span class="pill">{type_label}</span>
+    {copy_link_btn}
     {header_actions}
   </div>
   <div class="block-body" id="body-{block_id}">{body}</div>
@@ -3031,6 +3127,7 @@ fn render_block(
 </article>"#,
         block_id = block_id,
         type_label = escape_text(block_type_label(block.block_type)),
+        copy_link_btn = copy_link_btn,
         header_actions = header_actions,
         body = render_block_body(block),
         edit_form = edit_form,
@@ -3064,6 +3161,39 @@ fn render_markdown(content: &str) -> String {
     );
     html::push_html(&mut html_output, parser);
     html_output
+}
+
+/// Post-process rendered HTML to resolve lore:// links into real URLs.
+/// Replaces href="lore://UUID" with the correct /ui/... path.
+/// Unresolvable links get a broken-link style.
+fn resolve_lore_links_in_html(html: &str, store: &FileBlockStore) -> String {
+    use crate::store::LoreLinkTarget;
+    let re = regex::Regex::new(r#"href="lore://([0-9a-fA-F-]+)""#).unwrap();
+    re.replace_all(html, |caps: &regex::Captures| {
+        let uuid = &caps[1];
+        match store.resolve_lore_link(uuid) {
+            Some(LoreLinkTarget::Project(slug, _display)) => {
+                format!(
+                    r#"href="/ui/{}" class="lore-link lore-link-project""#,
+                    escape_attribute(slug.as_str())
+                )
+            }
+            Some(LoreLinkTarget::Block(slug, block_id, _bt, _preview)) => {
+                format!(
+                    r#"href="/ui/{}#block-{}" class="lore-link lore-link-block""#,
+                    escape_attribute(slug.as_str()),
+                    escape_attribute(block_id.as_str()),
+                )
+            }
+            None => {
+                format!(
+                    r##"href="#" class="lore-link lore-link-broken" title="Link target not found ({})" onclick="return false""##,
+                    escape_attribute(uuid)
+                )
+            }
+        }
+    })
+    .into_owned()
 }
 
 fn render_image_block(block: &Block) -> String {
@@ -4359,6 +4489,32 @@ fn shared_styles(theme: UiTheme) -> String {
       object-fit: contain;
     }
 
+    a.lore-link {
+      text-decoration-style: dotted;
+    }
+    a.lore-link-project::before {
+      content: "\1F4C4  ";
+      font-size: 0.85em;
+    }
+    a.lore-link-block::before {
+      content: "\1F517  ";
+      font-size: 0.85em;
+    }
+    .doc-link-picker {
+      display: flex;
+      align-items: center;
+      gap: var(--s-3);
+    }
+    .doc-link-picker select {
+      flex: 1;
+      min-width: 0;
+    }
+    a.lore-link-broken {
+      color: #dc2626;
+      text-decoration: line-through;
+      cursor: not-allowed;
+    }
+
     .block-edit-panel form {
       display: grid;
       gap: var(--s-4);
@@ -4594,4 +4750,47 @@ fn shared_styles(theme: UiTheme) -> String {
     }
     "#;
     format!("{root}{rest}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BlockType, NewBlock};
+    use crate::store::FileBlockStore;
+    use tempfile::tempdir;
+
+    #[test]
+    fn lore_links_resolve_in_rendered_markdown() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let info = store.create_project("My Docs", None).unwrap();
+        let block = store
+            .create_block(NewBlock {
+                project: info.slug.clone(),
+                block_type: BlockType::Markdown,
+                content: "Hello world".into(),
+                author_key: "key-a".into(),
+                left: None,
+                right: None,
+                image_upload: None,
+            })
+            .unwrap();
+
+        // Project link resolves
+        let html = format!(r#"<a href="lore://{}">My Docs</a>"#, info.id);
+        let resolved = resolve_lore_links_in_html(&html, &store);
+        assert!(resolved.contains(&format!(r#"href="/ui/{}""#, info.slug.as_str())));
+        assert!(resolved.contains("lore-link-project"));
+
+        // Block link resolves
+        let html = format!(r#"<a href="lore://{}">a block</a>"#, block.id.as_str());
+        let resolved = resolve_lore_links_in_html(&html, &store);
+        assert!(resolved.contains(&format!("block-{}", block.id.as_str())));
+        assert!(resolved.contains("lore-link-block"));
+
+        // Unknown UUID gets broken link
+        let html = r#"<a href="lore://00000000-0000-0000-0000-000000000000">gone</a>"#;
+        let resolved = resolve_lore_links_in_html(html, &store);
+        assert!(resolved.contains("lore-link-broken"));
+    }
 }

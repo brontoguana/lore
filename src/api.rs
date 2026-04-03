@@ -3353,6 +3353,7 @@ async fn project_page(
         resolved_theme(&session.user, &server_config),
         &project,
         &meta.display_name,
+        meta.id.as_deref().unwrap_or(""),
         &blocks,
         &all_blocks,
         query.flash.as_deref(),
@@ -3367,6 +3368,7 @@ async fn project_page(
         None,
         &ui_librarian_answers_from_history(&state.store, &project, librarian_history)?,
         &ui_pending_librarian_actions(&state.store, &project, pending_actions)?,
+        &state.store,
     );
     Ok(Html(page))
 }
@@ -3517,6 +3519,7 @@ async fn answer_librarian_from_ui(
         resolved_theme(&session.user, &server_config),
         &project,
         &meta.display_name,
+        meta.id.as_deref().unwrap_or(""),
         &all_blocks,
         &all_blocks,
         Some(flash),
@@ -3535,6 +3538,7 @@ async fn answer_librarian_from_ui(
             &project,
             state.pending_librarian_actions.list_project(&project, 8)?,
         )?,
+        &state.store,
     );
     Ok(Html(page))
 }
@@ -3592,6 +3596,7 @@ async fn run_project_librarian_action_from_ui(
         resolved_theme(&session.user, &server_config),
         &project,
         &meta.display_name,
+        meta.id.as_deref().unwrap_or(""),
         &all_blocks,
         &all_blocks,
         Some(
@@ -3612,6 +3617,7 @@ async fn run_project_librarian_action_from_ui(
         Some(&current_answer),
         &history_answers,
         &pending_actions,
+        &state.store,
     );
     Ok(Html(page))
 }
