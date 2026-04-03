@@ -496,7 +496,8 @@ pub fn render_projects_page(
     }}
 
     /* --- Drag and drop --- */
-    function onDragStart(e) {{
+    function onHandleDragStart(e) {{
+      e.stopPropagation();
       var node = e.target.closest('.tree-node');
       dragSlug = node.getAttribute('data-slug');
       e.dataTransfer.effectAllowed = 'move';
@@ -624,18 +625,10 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
                     depth + 1,
                 );
 
-                let add_btn = if is_admin {
+                let admin_btns = if is_admin {
                     format!(
-                        r#"<button type="button" class="tree-add-child" onclick="addChildRow(this, '{slug_attr}')">+</button>"#,
+                        r#"<button type="button" class="tree-add-child" onclick="event.stopPropagation(); addChildRow(this, '{slug_attr}')">+</button><button type="button" class="tree-drag-handle" draggable="true" ondragstart="onHandleDragStart(event)" ondragend="onDragEnd(event)" title="Drag to move"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/></svg></button>"#,
                         slug_attr = escape_attribute(slug),
-                    )
-                } else {
-                    String::new()
-                };
-
-                let drag_attrs = if is_admin {
-                    format!(
-                        r#" draggable="true" ondragstart="onDragStart(event)" ondragend="onDragEnd(event)""#
                     )
                 } else {
                     String::new()
@@ -652,12 +645,12 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
                 };
 
                 format!(
-                    r#"<li class="tree-node" data-slug="{slug}" data-parent="{parent_attr}"{drag_attrs}>
+                    r#"<li class="tree-node" data-slug="{slug}" data-parent="{parent_attr}">
   <div class="tree-node-row" ondragover="onNodeDragOver(event)" ondragleave="onNodeDragLeave(event)" ondrop="onNodeDrop(event)">
     <a href="/ui/{slug}" class="tree-link">{display}</a>
     <div class="tree-row-right">
       <span class="tree-perm">{perm}</span>
-      {add_btn}
+      {admin_btns}
     </div>
   </div>
   {sub}
@@ -665,10 +658,9 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
 </li>"#,
                     slug = escape_attribute(slug),
                     parent_attr = escape_attribute(parent_attr),
-                    drag_attrs = drag_attrs,
                     display = display,
                     perm = perm,
-                    add_btn = add_btn,
+                    admin_btns = admin_btns,
                     sub = sub,
                     drop_zone = drop_zone,
                 )
@@ -1599,34 +1591,38 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
         r##"<h1 class="page-title">Agents</h1>
 
     <section class="panel" style="margin-bottom: var(--s-6);">
-      <div class="panel-header">
-        <h2>Setup instructions for your agent</h2>
-        <p>Copy this block and give it to your agent. It explains what Lore is, how to connect, and what commands are available.</p>
+      <div class="panel-header" style="display:flex; justify-content:space-between; align-items:flex-start;">
+        <div>
+          <h2>Setup instructions for your agent</h2>
+          <p>Copy this block and give it to your agent. It explains what Lore is, how to connect, and what commands are available.</p>
+        </div>
+        <button type="button" class="button-link" onclick="copyField('agent-instruction')">Copy</button>
       </div>
-      <div class="padded" style="position:relative;">
+      <div class="padded">
         <textarea readonly id="agent-instruction" style="min-height: 20rem; font-family: var(--font-mono); font-size: 0.85rem;">{agent_instruction}</textarea>
-        <button type="button" class="copy-btn" onclick="copyField('agent-instruction')" style="position:absolute; top:var(--s-5); right:var(--s-5);">Copy</button>
       </div>
     </section>
 
-    <div class="layout">
+    <div class="agents-options">
       <section class="panel">
-        <div class="panel-header">
-          <h2>Option 1 — CLI</h2>
-          <p>Best for code agents like Claude Code, Cursor, Windsurf, Aider, or any tool that can run shell commands. Also works for human users who want a quick terminal interface.</p>
+        <div class="panel-header" style="display:flex; justify-content:space-between; align-items:flex-start;">
+          <div>
+            <h2>CLI</h2>
+            <p>Best for code agents like Claude Code, Cursor, Windsurf, Aider, or any tool that can run shell commands. Also works for human users who want a quick terminal interface.</p>
+          </div>
         </div>
         <div class="padded">
           <h3 style="margin:0 0 var(--s-2);">Install</h3>
           <p style="margin:0 0 var(--s-2);">macOS and Linux:</p>
-          <div style="position:relative;">
-            <textarea readonly id="cli-install-unix" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">curl -fsSL {install_script_url} | sh</textarea>
-            <button type="button" class="copy-btn" onclick="copyField('cli-install-unix')" style="position:absolute; top:4px; right:4px;">Copy</button>
+          <div style="display:flex; gap:var(--s-3); align-items:flex-start;">
+            <textarea readonly id="cli-install-unix" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem; flex:1;">curl -fsSL {install_script_url} | sh</textarea>
+            <button type="button" class="button-link" onclick="copyField('cli-install-unix')" style="flex-shrink:0;">Copy</button>
           </div>
           <p style="margin:var(--s-3) 0 var(--s-2);">On Windows, use WSL and run the same command above.</p>
           <h3 style="margin:var(--s-4) 0 var(--s-2);">Configure</h3>
-          <div style="position:relative;">
-            <textarea readonly id="cli-config" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">lore config set --url {base_url} --token YOUR_TOKEN</textarea>
-            <button type="button" class="copy-btn" onclick="copyField('cli-config')" style="position:absolute; top:4px; right:4px;">Copy</button>
+          <div style="display:flex; gap:var(--s-3); align-items:flex-start;">
+            <textarea readonly id="cli-config" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem; flex:1;">lore config set --url {base_url} --token YOUR_TOKEN</textarea>
+            <button type="button" class="button-link" onclick="copyField('cli-config')" style="flex-shrink:0;">Copy</button>
           </div>
           <h3 style="margin:var(--s-4) 0 var(--s-2);">Commands</h3>
           <table class="agents-cmd-table">
@@ -1645,16 +1641,18 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
       </section>
 
       <section class="panel">
-        <div class="panel-header">
-          <h2>Option 2 — MCP</h2>
-          <p>Best for MCP-native hosts like Claude Desktop, Cursor (MCP mode), or any runtime that supports the Model Context Protocol tool server standard.</p>
+        <div class="panel-header" style="display:flex; justify-content:space-between; align-items:flex-start;">
+          <div>
+            <h2>MCP</h2>
+            <p>Best for MCP-native hosts like Claude Desktop, Cursor (MCP mode), or any runtime that supports the Model Context Protocol tool server standard.</p>
+          </div>
         </div>
         <div class="padded">
           <h3 style="margin:0 0 var(--s-2);">MCP config</h3>
           <p style="margin:0 0 var(--s-2);">Add this to your MCP client configuration. Replace YOUR_TOKEN with an agent token from the Admin panel.</p>
-          <div style="position:relative;">
-            <textarea readonly id="mcp-config" style="min-height:10rem; font-family:var(--font-mono); font-size:0.85rem;">{mcp_config}</textarea>
-            <button type="button" class="copy-btn" onclick="copyField('mcp-config')" style="position:absolute; top:4px; right:4px;">Copy</button>
+          <div style="display:flex; gap:var(--s-3); align-items:flex-start;">
+            <textarea readonly id="mcp-config" style="min-height:10rem; font-family:var(--font-mono); font-size:0.85rem; flex:1;">{mcp_config}</textarea>
+            <button type="button" class="button-link" onclick="copyField('mcp-config')" style="flex-shrink:0;">Copy</button>
           </div>
           <h3 style="margin:var(--s-4) 0 var(--s-2);">Available tools</h3>
           <table class="agents-cmd-table">
@@ -1677,7 +1675,8 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
       var el = document.getElementById(id);
       if (!el) return;
       navigator.clipboard.writeText(el.value).then(function() {{
-        var btn = el.parentElement.querySelector('.copy-btn');
+        // Find the button that triggered this -- walk up from el to find the nearest copy trigger
+        var btn = event && event.target && event.target.closest('button');
         if (btn) {{ var orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(function(){{ btn.textContent = orig; }}, 1500); }}
       }});
     }}
@@ -3240,9 +3239,17 @@ fn render_block(
     let project_slug = escape_attribute(project.as_str());
     let csrf = escape_attribute(csrf_token);
 
+    let copy_link_btn = format!(
+        r##"<button type="button" class="block-header-btn" title="Copy link" onclick="copyLoreLink('{block_id}')">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+  </button>"##,
+        block_id = block_id,
+    );
+
     let header_actions = if can_write {
         format!(
             r##"<div class="block-header-actions">
+  {copy_link_btn}
   <button type="button" class="block-header-btn" title="Edit" onclick="toggleBlockEdit('{block_id}')">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
   </button>
@@ -3253,12 +3260,19 @@ fn render_block(
     <input type="hidden" name="csrf_token" value="{csrf}">
   </form>
 </div>"##,
+            copy_link_btn = copy_link_btn,
             block_id = block_id,
             project_slug = project_slug,
             csrf = csrf,
         )
     } else {
-        String::new()
+        // Read-only users still get the copy link button
+        format!(
+            r##"<div class="block-header-actions">
+  {copy_link_btn}
+</div>"##,
+            copy_link_btn = copy_link_btn,
+        )
     };
 
     let edit_doc_link_picker = render_doc_link_picker(project_infos);
@@ -3299,19 +3313,11 @@ fn render_block(
         String::new()
     };
 
-    let copy_link_btn = format!(
-        r##"<button type="button" class="block-header-btn" title="Copy link" onclick="copyLoreLink('{block_id}')">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-  </button>"##,
-        block_id = block_id,
-    );
-
     format!(
         r#"<article class="block" id="block-{block_id}" draggable="{draggable}" data-block-id="{block_id}"
   {drag_attrs}>
   <div class="block-meta">
     <span class="pill">{type_label}</span>
-    {copy_link_btn}
     {header_actions}
   </div>
   <div class="block-body" id="body-{block_id}">{body}</div>
@@ -3319,7 +3325,6 @@ fn render_block(
 </article>"#,
         block_id = block_id,
         type_label = escape_text(block_type_label(block.block_type)),
-        copy_link_btn = copy_link_btn,
         header_actions = header_actions,
         body = render_block_body(block),
         edit_form = edit_form,
@@ -4141,6 +4146,14 @@ fn shared_styles(theme: UiTheme) -> String {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
+    .agents-options {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--s-5);
+      margin-top: var(--s-6);
+      align-items: start;
+    }
+
     .stack {
       display: grid;
       gap: var(--s-4);
@@ -4212,7 +4225,8 @@ fn shared_styles(theme: UiTheme) -> String {
     }
 
     .tree-add-child,
-    .tree-add-btn {
+    .tree-add-btn,
+    .tree-drag-handle {
       background: none;
       border: 1px solid var(--line);
       color: var(--muted);
@@ -4221,10 +4235,24 @@ fn shared_styles(theme: UiTheme) -> String {
       font-size: 0.85rem;
       padding: 2px 8px;
       min-height: auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .tree-add-child:hover,
     .tree-add-btn:hover {
+      background: var(--surface-hover);
+      color: var(--ink);
+    }
+
+    .tree-drag-handle {
+      cursor: grab;
+    }
+    .tree-drag-handle:active {
+      cursor: grabbing;
+    }
+    .tree-drag-handle:hover {
       background: var(--surface-hover);
       color: var(--ink);
     }
@@ -4258,12 +4286,6 @@ fn shared_styles(theme: UiTheme) -> String {
     }
 
     /* Drag and drop */
-    .tree-node[draggable="true"] {
-      cursor: grab;
-    }
-    .tree-node[draggable="true"]:active {
-      cursor: grabbing;
-    }
     .tree-dragging {
       opacity: 0.4;
     }
@@ -4967,6 +4989,7 @@ fn shared_styles(theme: UiTheme) -> String {
 
       .layout,
       .admin-layout,
+      .agents-options,
       .searchbar {
         grid-template-columns: 1fr;
       }
