@@ -1615,26 +1615,30 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
           <h3 style="margin:0 0 var(--s-2);">Install</h3>
           <p style="margin:0 0 var(--s-2);">macOS and Linux:</p>
           <textarea readonly id="cli-install-unix" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">curl -fsSL {install_script_url} | sh</textarea>
+          <div style="margin-top: var(--s-2); text-align: right;">
+            <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('cli-install-unix')">Copy install command</button>
+          </div>
           <p style="margin:var(--s-3) 0 var(--s-2);">On Windows, use WSL and run the same command above.</p>
           <h3 style="margin:var(--s-4) 0 var(--s-2);">Configure</h3>
           <textarea readonly id="cli-config" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">lore config set --url {base_url} --token YOUR_TOKEN</textarea>
-          <h3 style="margin:var(--s-4) 0 var(--s-2);">Commands</h3>
-          <table class="agents-cmd-table">
-            <tr><td><code>lore projects</code></td><td>List all projects</td></tr>
-            <tr><td><code>lore blocks list &lt;project&gt;</code></td><td>List blocks in a project</td></tr>
-            <tr><td><code>lore blocks read &lt;project&gt;</code></td><td>Read all block content</td></tr>
-            <tr><td><code>lore grep &lt;project&gt; -q "query"</code></td><td>Search blocks</td></tr>
-            <tr><td><code>lore add &lt;project&gt; --type markdown --content "..."</code></td><td>Add a block</td></tr>
-            <tr><td><code>lore update &lt;block-id&gt; --content "..."</code></td><td>Update a block</td></tr>
-            <tr><td><code>lore move &lt;block-id&gt; --after &lt;other-id&gt;</code></td><td>Reorder a block</td></tr>
-            <tr><td><code>lore delete &lt;block-id&gt;</code></td><td>Delete a block</td></tr>
-            <tr><td><code>lore history list &lt;project&gt;</code></td><td>View project history</td></tr>
-            <tr><td><code>lore librarian answer &lt;project&gt; -q "question"</code></td><td>Ask the librarian</td></tr>
-          </table>
-          <div style="margin-top: var(--s-3); text-align: right;">
-            <button type="button" class="button-link" onclick="copyField('cli-install-unix')">Copy install command</button>
-            <button type="button" class="button-link" style="margin-left: var(--s-2);" onclick="copyField('cli-config')">Copy config command</button>
+          <div style="margin-top: var(--s-2); text-align: right;">
+            <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('cli-config')">Copy config command</button>
           </div>
+          <details>
+            <summary style="margin:var(--s-4) 0 var(--s-2); cursor:pointer; color:var(--accent); font-weight:600;">Show commands</summary>
+            <table class="agents-cmd-table">
+              <tr><td><code>lore projects</code></td><td>List all projects</td></tr>
+              <tr><td><code>lore blocks list &lt;project&gt;</code></td><td>List blocks in a project</td></tr>
+              <tr><td><code>lore blocks read &lt;project&gt;</code></td><td>Read all block content</td></tr>
+              <tr><td><code>lore grep &lt;project&gt; -q "query"</code></td><td>Search blocks</td></tr>
+              <tr><td><code>lore add &lt;project&gt; --type markdown --content "..."</code></td><td>Add a block</td></tr>
+              <tr><td><code>lore update &lt;block-id&gt; --content "..."</code></td><td>Update a block</td></tr>
+              <tr><td><code>lore move &lt;block-id&gt; --after &lt;other-id&gt;</code></td><td>Reorder a block</td></tr>
+              <tr><td><code>lore delete &lt;block-id&gt;</code></td><td>Delete a block</td></tr>
+              <tr><td><code>lore history list &lt;project&gt;</code></td><td>View project history</td></tr>
+              <tr><td><code>lore librarian answer &lt;project&gt; -q "question"</code></td><td>Ask the librarian</td></tr>
+            </table>
+          </details>
         </div>
       </section>
 
@@ -1647,21 +1651,23 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
           <h3 style="margin:0 0 var(--s-2);">MCP config</h3>
           <p style="margin:0 0 var(--s-2);">Add this to your MCP client configuration. Replace YOUR_TOKEN with an agent token from the Admin panel.</p>
           <textarea readonly id="mcp-config" style="min-height:10rem; font-family:var(--font-mono); font-size:0.85rem;">{mcp_config}</textarea>
-          <h3 style="margin:var(--s-4) 0 var(--s-2);">Available tools</h3>
-          <table class="agents-cmd-table">
-            <tr><td><code>list_projects</code></td><td>List all accessible projects</td></tr>
-            <tr><td><code>list_blocks</code></td><td>List blocks in a project</td></tr>
-            <tr><td><code>read_block</code></td><td>Read a single block by ID</td></tr>
-            <tr><td><code>read_blocks_around</code></td><td>Read blocks near a given block</td></tr>
-            <tr><td><code>grep_blocks</code></td><td>Search block content</td></tr>
-            <tr><td><code>create_block</code></td><td>Add a new block to a project</td></tr>
-            <tr><td><code>update_block</code></td><td>Modify an existing block</td></tr>
-            <tr><td><code>move_block</code></td><td>Reorder a block within a project</td></tr>
-            <tr><td><code>delete_block</code></td><td>Remove a block</td></tr>
-          </table>
-          <div style="margin-top: var(--s-3); text-align: right;">
-            <button type="button" class="button-link" onclick="copyField('mcp-config')">Copy MCP config</button>
+          <div style="margin-top: var(--s-2); text-align: right;">
+            <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('mcp-config')">Copy MCP config</button>
           </div>
+          <details>
+            <summary style="margin:var(--s-4) 0 var(--s-2); cursor:pointer; color:var(--accent); font-weight:600;">Show available tools</summary>
+            <table class="agents-cmd-table">
+              <tr><td><code>list_projects</code></td><td>List all accessible projects</td></tr>
+              <tr><td><code>list_blocks</code></td><td>List blocks in a project</td></tr>
+              <tr><td><code>read_block</code></td><td>Read a single block by ID</td></tr>
+              <tr><td><code>read_blocks_around</code></td><td>Read blocks near a given block</td></tr>
+              <tr><td><code>grep_blocks</code></td><td>Search block content</td></tr>
+              <tr><td><code>create_block</code></td><td>Add a new block to a project</td></tr>
+              <tr><td><code>update_block</code></td><td>Modify an existing block</td></tr>
+              <tr><td><code>move_block</code></td><td>Reorder a block within a project</td></tr>
+              <tr><td><code>delete_block</code></td><td>Remove a block</td></tr>
+            </table>
+          </details>
         </div>
       </section>
     </div>
@@ -4143,11 +4149,10 @@ fn shared_styles(theme: UiTheme) -> String {
     }
 
     .agents-options {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
+      display: flex;
+      flex-direction: column;
       gap: var(--s-5);
       margin-top: var(--s-6);
-      align-items: start;
     }
 
     .stack {
@@ -4985,7 +4990,6 @@ fn shared_styles(theme: UiTheme) -> String {
 
       .layout,
       .admin-layout,
-      .agents-options,
       .searchbar {
         grid-template-columns: 1fr;
       }
