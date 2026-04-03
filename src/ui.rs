@@ -49,6 +49,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     </div>
     <div class="top-nav-links">
       <a href="/ui">Projects</a>
+      <a href="/ui/agents">Agents</a>
       {admin_link}
       <a href="/ui/settings">Settings</a>
       <form method="post" action="/logout">
@@ -1504,6 +1505,197 @@ pub fn render_setup_page(config: &ServerConfig, setup_instruction: &str) -> Stri
             theme: config.default_theme,
             csrf_token: None,
             flash: None,
+        },
+        content,
+    )
+}
+
+pub fn render_agents_page(
+    config: &ServerConfig,
+    username: &str,
+    is_admin: bool,
+    theme: UiTheme,
+    flash: Option<&str>,
+) -> String {
+    let base_url = config.base_url();
+    let mcp_url = config.mcp_url();
+    let install_script_url =
+        "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh";
+    let mcp_config_placeholder = format!(
+        r#"{{
+  "transport": "streamable_http",
+  "url": "{mcp_url}",
+  "headers": {{
+    "Authorization": "Bearer YOUR_TOKEN",
+    "Accept": "application/json, text/event-stream",
+    "MCP-Protocol-Version": "2025-06-18"
+  }}
+}}"#,
+    );
+    let agent_instruction = format!(
+        r#"# Lore — shared project knowledge base
+
+Lore is a structured knowledge base your team uses to store and retrieve project documentation, decisions, and context. You can read and write project documents made up of ordered blocks (markdown, SVG, or images).
+
+## Server
+
+Base URL: {base_url}
+MCP endpoint: {mcp_url}
+
+## Authentication
+
+All requests require an agent token. Ask the Lore admin for a scoped token with the appropriate project grants, then include it as:
+  Authorization: Bearer YOUR_TOKEN
+
+## How to connect
+
+You have two options:
+
+### Option 1 — Lore CLI (recommended for code agents)
+
+Install:
+  curl -fsSL {install_script_url} | sh
+
+On Windows, use WSL (Windows Subsystem for Linux) and run the Linux install command above.
+
+Configure:
+  lore config set --url {base_url} --token YOUR_TOKEN
+
+Commands:
+  lore projects                     — list projects
+  lore blocks list <project>        — list blocks in a project
+  lore blocks read <project>        — read all block content
+  lore grep <project> -q "query"    — search blocks
+  lore add <project> --type markdown --content "..."  — add a block
+  lore update <block-id> --content "..."              — update a block
+  lore delete <block-id>            — delete a block
+  lore history list <project>       — view project history
+  lore librarian answer <project> -q "question"       — ask the librarian
+
+### Option 2 — MCP (for MCP-native hosts)
+
+Add this to your MCP client config (Claude Desktop, Cursor, etc.):
+
+{{
+  "transport": "streamable_http",
+  "url": "{mcp_url}",
+  "headers": {{
+    "Authorization": "Bearer YOUR_TOKEN",
+    "Accept": "application/json, text/event-stream",
+    "MCP-Protocol-Version": "2025-06-18"
+  }}
+}}
+
+Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around, grep_blocks, create_block, update_block, move_block, delete_block.
+
+## Usage guidance
+
+- Read existing documents before writing to understand structure and conventions
+- Use markdown blocks for text content
+- Use the librarian to ask questions about project context
+- Link between documents using lore:// links in standard markdown format"#,
+    );
+    let content = format!(
+        r##"<h1 class="page-title">Agents</h1>
+
+    <section class="panel" style="margin-bottom: var(--s-6);">
+      <div class="panel-header">
+        <h2>Setup instructions for your agent</h2>
+        <p>Copy this block and give it to your agent. It explains what Lore is, how to connect, and what commands are available.</p>
+      </div>
+      <div class="padded" style="position:relative;">
+        <textarea readonly id="agent-instruction" style="min-height: 20rem; font-family: var(--font-mono); font-size: 0.85rem;">{agent_instruction}</textarea>
+        <button type="button" class="copy-btn" onclick="copyField('agent-instruction')" style="position:absolute; top:var(--s-5); right:var(--s-5);">Copy</button>
+      </div>
+    </section>
+
+    <div class="layout">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Option 1 — CLI</h2>
+          <p>Best for code agents like Claude Code, Cursor, Windsurf, Aider, or any tool that can run shell commands. Also works for human users who want a quick terminal interface.</p>
+        </div>
+        <div class="padded">
+          <h3 style="margin:0 0 var(--s-2);">Install</h3>
+          <p style="margin:0 0 var(--s-2);">macOS and Linux:</p>
+          <div style="position:relative;">
+            <textarea readonly id="cli-install-unix" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">curl -fsSL {install_script_url} | sh</textarea>
+            <button type="button" class="copy-btn" onclick="copyField('cli-install-unix')" style="position:absolute; top:4px; right:4px;">Copy</button>
+          </div>
+          <p style="margin:var(--s-3) 0 var(--s-2);">On Windows, use WSL and run the same command above.</p>
+          <h3 style="margin:var(--s-4) 0 var(--s-2);">Configure</h3>
+          <div style="position:relative;">
+            <textarea readonly id="cli-config" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">lore config set --url {base_url} --token YOUR_TOKEN</textarea>
+            <button type="button" class="copy-btn" onclick="copyField('cli-config')" style="position:absolute; top:4px; right:4px;">Copy</button>
+          </div>
+          <h3 style="margin:var(--s-4) 0 var(--s-2);">Commands</h3>
+          <table class="agents-cmd-table">
+            <tr><td><code>lore projects</code></td><td>List all projects</td></tr>
+            <tr><td><code>lore blocks list &lt;project&gt;</code></td><td>List blocks in a project</td></tr>
+            <tr><td><code>lore blocks read &lt;project&gt;</code></td><td>Read all block content</td></tr>
+            <tr><td><code>lore grep &lt;project&gt; -q "query"</code></td><td>Search blocks</td></tr>
+            <tr><td><code>lore add &lt;project&gt; --type markdown --content "..."</code></td><td>Add a block</td></tr>
+            <tr><td><code>lore update &lt;block-id&gt; --content "..."</code></td><td>Update a block</td></tr>
+            <tr><td><code>lore move &lt;block-id&gt; --after &lt;other-id&gt;</code></td><td>Reorder a block</td></tr>
+            <tr><td><code>lore delete &lt;block-id&gt;</code></td><td>Delete a block</td></tr>
+            <tr><td><code>lore history list &lt;project&gt;</code></td><td>View project history</td></tr>
+            <tr><td><code>lore librarian answer &lt;project&gt; -q "question"</code></td><td>Ask the librarian</td></tr>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Option 2 — MCP</h2>
+          <p>Best for MCP-native hosts like Claude Desktop, Cursor (MCP mode), or any runtime that supports the Model Context Protocol tool server standard.</p>
+        </div>
+        <div class="padded">
+          <h3 style="margin:0 0 var(--s-2);">MCP config</h3>
+          <p style="margin:0 0 var(--s-2);">Add this to your MCP client configuration. Replace YOUR_TOKEN with an agent token from the Admin panel.</p>
+          <div style="position:relative;">
+            <textarea readonly id="mcp-config" style="min-height:10rem; font-family:var(--font-mono); font-size:0.85rem;">{mcp_config}</textarea>
+            <button type="button" class="copy-btn" onclick="copyField('mcp-config')" style="position:absolute; top:4px; right:4px;">Copy</button>
+          </div>
+          <h3 style="margin:var(--s-4) 0 var(--s-2);">Available tools</h3>
+          <table class="agents-cmd-table">
+            <tr><td><code>list_projects</code></td><td>List all accessible projects</td></tr>
+            <tr><td><code>list_blocks</code></td><td>List blocks in a project</td></tr>
+            <tr><td><code>read_block</code></td><td>Read a single block by ID</td></tr>
+            <tr><td><code>read_blocks_around</code></td><td>Read blocks near a given block</td></tr>
+            <tr><td><code>grep_blocks</code></td><td>Search block content</td></tr>
+            <tr><td><code>create_block</code></td><td>Add a new block to a project</td></tr>
+            <tr><td><code>update_block</code></td><td>Modify an existing block</td></tr>
+            <tr><td><code>move_block</code></td><td>Reorder a block within a project</td></tr>
+            <tr><td><code>delete_block</code></td><td>Remove a block</td></tr>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <script>
+    function copyField(id) {{
+      var el = document.getElementById(id);
+      if (!el) return;
+      navigator.clipboard.writeText(el.value).then(function() {{
+        var btn = el.parentElement.querySelector('.copy-btn');
+        if (btn) {{ var orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(function(){{ btn.textContent = orig; }}, 1500); }}
+      }});
+    }}
+    </script>"##,
+        agent_instruction = escape_text(&agent_instruction),
+        install_script_url = escape_text(install_script_url),
+        base_url = escape_text(&base_url),
+        mcp_config = escape_text(&mcp_config_placeholder),
+    );
+
+    render_shell(
+        PageShell {
+            title: "Lore agents",
+            username: Some(username),
+            is_admin,
+            theme,
+            csrf_token: None,
+            flash,
         },
         content,
     )
@@ -4638,6 +4830,46 @@ fn shared_styles(theme: UiTheme) -> String {
     .diff-removed { background: var(--diff-rm-bg); }
     .diff-removed .diff-prefix { color: var(--diff-rm-prefix); }
     .diff-context { background: var(--diff-ctx-bg); }
+
+    .agents-cmd-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+
+    .agents-cmd-table td {
+      padding: var(--s-2) var(--s-3);
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+
+    .agents-cmd-table td:first-child {
+      white-space: nowrap;
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      color: var(--accent);
+    }
+
+    .agents-cmd-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .copy-btn {
+      background: var(--panel);
+      color: var(--muted);
+      border: 1px solid var(--line);
+      border-radius: var(--s-2);
+      padding: var(--s-1) var(--s-3);
+      font-size: 0.8rem;
+      cursor: pointer;
+      min-height: auto;
+      width: auto;
+    }
+
+    .copy-btn:hover {
+      color: var(--ink);
+      border-color: var(--muted);
+    }
 
     .admin-sidebar-layout {
       display: grid;

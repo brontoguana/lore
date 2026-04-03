@@ -2,36 +2,17 @@
 
 Lore is a self-hosted project memory system for humans and agents.
 
-It exposes:
+It stores project data as ordered typed blocks on disk, records project history, supports reversible versioning, and can export into Git. Humans use it through a browser UI. Agents connect via the CLI or MCP -- see the Agents page in the UI after setup.
 
-- a browser UI
-- a project-scoped HTTP API
-- a native MCP endpoint
-- a Rust CLI
+## Server install
 
-Lore stores project data as ordered typed blocks on disk rather than in a traditional database. It also records project history, supports reversible versioning, and can export project state plus history into Git.
-
-Install
-
-CLI installer:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh | sh
-```
-
-Server installer:
+Install the server management binary:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-server.sh | sh
 ```
 
-The install scripts are designed to download versioned GitHub release artifacts, verify published checksums, and place the binaries in a predictable local install path.
-
-Docker is not the primary install path today. Lore currently prioritizes direct binary installation and simple self-hosting.
-
-Run
-
-After installing the server binary, run the full setup:
+Run the full setup:
 
 ```sh
 lore-server install
@@ -44,9 +25,9 @@ This will:
 4. Start both services as systemd daemons (requires sudo)
 5. Install a tightly scoped sudoers rule so future `lore-server update` runs can restart Lore and Caddy without prompting
 
-Then open `https://yourdomain.com/setup` — that setup flow explains when to use HTTP vs MCP and gives agent-oriented instructions.
+Then open `https://yourdomain.com/setup` for agent-oriented setup instructions.
 
-Other commands:
+Other server commands:
 
 ```sh
 lore-server status       # check if everything is running
@@ -55,56 +36,23 @@ lore-server uninstall    # remove services (keeps data)
 lore-server clean        # remove services + binaries (keeps data)
 ```
 
-Updates
+Docker is not the primary install path today. Lore prioritizes direct binary installation and simple self-hosting.
 
-The CLI includes an optional self-update flow backed by GitHub releases:
-
-```sh
-lore self-update status
-lore self-update check
-lore self-update apply
-lore self-update enable
-```
-
-The server also supports optional startup self-update from the admin UI. When enabled, `lore-server` checks the configured GitHub repo before it starts listening, installs a newer release in place if one exists, and relaunches itself once with the same arguments.
-
-CLI usage
-
-Set defaults once:
-
-```sh
-lore config set --url http://127.0.0.1:7043 --token YOUR_AGENT_TOKEN --project alpha.docs
-```
-
-Examples:
-
-```sh
-lore projects
-lore self-update check
-lore blocks list
-lore grep "deployment"
-lore blocks read BLOCK_ID
-lore add "New note"
-lore update BLOCK_ID "Updated content"
-lore librarian answer "Summarise the current project status"
-lore history list
-lore history show VERSION_ID
-```
-
-Current capabilities
+## Current capabilities
 
 - Human login with local auth, OIDC, and optional trusted-header auth
 - Roles, users, sessions, and scoped agent tokens
 - Generated setup pages at `/setup` and `/setup.txt`
-- Project-scoped answer librarian and project librarian
-- Optional approval for project librarian actions
+- Lore links (`lore://` protocol) for cross-document and block-level linking
+- Project-scoped librarian with optional edit approval
 - Audit trails for auth, librarian activity, and project actions
 - Reversible project version history with diff-style views
+- Drag-and-drop block and project reordering
 - Admin-configured Git export
 - Optional GitHub-release-backed self-update for the CLI and server
 - Per-user UI theme selection with server default fallback
 
-Build locally
+## Build locally
 
 ```sh
 cargo test -q

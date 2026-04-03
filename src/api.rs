@@ -28,7 +28,7 @@ use crate::ui::{
     UiDiffLineKind, UiLibrarianAnswer, UiPendingLibrarianAction, UiProjectVersion,
     UiProjectVersionOperation, UiUserSummary, render_admin_audit_page, render_admin_page,
     render_login_page, render_project_audit_page, render_project_history_page, render_project_page,
-    render_projects_page, render_settings_page, render_setup_page,
+    render_agents_page, render_projects_page, render_settings_page, render_setup_page,
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
@@ -278,6 +278,7 @@ fn build_app_with_librarian(
         )
         .route("/ui", get(projects_page))
         .route("/ui/projects", post(create_project_from_ui))
+        .route("/ui/agents", get(agents_page))
         .route("/ui/settings", get(settings_page))
         .route("/ui/settings/theme", post(update_theme_from_ui))
         .route("/ui/admin", get(admin_page))
@@ -2515,6 +2516,21 @@ async fn admin_page(
         None,
         query.flash.as_deref(),
         query.section.as_deref().unwrap_or("users"),
+    )))
+}
+
+async fn agents_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> UiResult<Html<String>> {
+    let session = require_ui_session(&state, &headers)?;
+    let config = state.config.load()?;
+    Ok(Html(render_agents_page(
+        &config,
+        session.user.username.as_str(),
+        session.user.is_admin,
+        resolved_theme(&session.user, &config),
+        None,
     )))
 }
 

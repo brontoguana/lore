@@ -122,6 +122,33 @@ install "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 if [ "$CURRENT_VERSION" != "not installed" ]; then
   echo "updated $BINARY_NAME to $REMOTE_VERSION (was $CURRENT_VERSION)"
 else
+  echo ""
+  echo " _      ____  _____  ______ "
+  echo "| |    / __ \\|  __ \\|  ____|"
+  echo "| |   | |  | | |__) | |__   "
+  echo "| |   | |  | |  _  /|  __|  "
+  echo "| |___| |__| | | \\ \\| |____ "
+  echo "|______\\____/|_|  \\_\\______|"
+  echo ""
   echo "installed $BINARY_NAME $REMOTE_VERSION to $INSTALL_DIR/$BINARY_NAME"
-  echo "ensure $INSTALL_DIR is on your PATH"
+  echo ""
+
+  # Check if INSTALL_DIR is on PATH
+  case ":$PATH:" in
+    *":$INSTALL_DIR:"*) ;;
+    *)
+      echo "add $INSTALL_DIR to your PATH:"
+      echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+      echo ""
+      ;;
+  esac
+
+  echo "quick start:"
+  echo "  lore config set --url https://your-server.com --token YOUR_TOKEN"
+  echo "  lore projects                # list projects"
+  echo "  lore blocks <project>        # list blocks in a project"
+  echo "  lore read <project>          # read all blocks"
+  echo "  lore add <project> --type markdown --content '...'  # add a block"
+  echo ""
+  echo "run lore --help for all commands."
 fi
