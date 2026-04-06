@@ -380,6 +380,10 @@ fn build_app_with_librarian(
             "/ui/{project}/blocks/{id}/move",
             post(move_block_from_form),
         )
+        .route(
+            "/ui/{project}/blocks/{id}/pin",
+            post(toggle_block_pin_from_form),
+        )
         .layer(axum::middleware::map_response(add_security_headers))
         .with_state(AppState::with_librarian(store, librarian_client))
 }
@@ -483,7 +487,7 @@ struct UpdateBlockRequest {
 
 struct UpdateBlockForm {
     csrf_token: String,
-    block_type: BlockType,
+    block_type: Option<BlockType>,
     content: String,
     after_block_id: Option<String>,
     image_upload: Option<ImageUpload>,
@@ -3819,6 +3823,13 @@ async fn update_block_from_form(
     let block_id = BlockId::from_string(id)?;
     let form = parse_update_block_form(multipart).await?;
     verify_csrf(&session, &form.csrf_token)?;
+    let block_type = match form.block_type {
+        Some(bt) => bt,
+        None => {
+            let existing = state.store.get_block(&project, &block_id)?;
+            existing.block_type
+        }
+    };
     let after_block_id = form.after_block_id.map(BlockId::from_string).transpose()?;
     let (left, right) =
         state
@@ -3827,7 +3838,7 @@ async fn update_block_from_form(
     let update = UpdateBlock {
         project: project.clone(),
         block_id: block_id.clone(),
-        block_type: form.block_type,
+        block_type,
         content: form.content,
         author_key: session.user.username.as_str().to_string(),
         left,
@@ -3932,6 +3943,34 @@ async fn move_block_from_form(
         )?],
     )?;
     Ok(Redirect::to(&format!("/ui/{}", project.as_str())))
+}
+
+#[derive(Deserialize)]
+struct TogglePinForm {
+    csrf_token: String,
+}
+
+async fn toggle_block_pin_from_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, id)): Path<(String, String)>,
+    Form(form): Form<TogglePinForm>,
+) -> UiResult<Redirect> {
+    let project = ProjectName::new(project)?;
+    let session = require_ui_session(&state, &headers)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let block_id = BlockId::from_string(id)?;
+    let block = state.store.get_block(&project, &block_id)?;
+    state
+        .store
+        .set_block_pinned(&project, &block_id, !block.pinned)?;
+    let label = if block.pinned { "unpinned" } else { "pinned" };
+    Ok(Redirect::to(&format!(
+        "/ui/{}?flash=Block%20{}",
+        project.as_str(),
+        label
+    )))
 }
 
 async fn block_media(
@@ -6962,7 +7001,7 @@ impl IntoResponse for ApiError {
         let status = match self.0 {
             LoreError::Validation(_) | LoreError::InvalidOrderRange => StatusCode::BAD_REQUEST,
             LoreError::BlockNotFound(_) => StatusCode::NOT_FOUND,
-            LoreError::PermissionDenied => StatusCode::FORBIDDEN,
+            LoreError::PermissionDenied | LoreError::BlockPinned => StatusCode::FORBIDDEN,
             LoreError::ExternalService(_) => StatusCode::BAD_GATEWAY,
             LoreError::Io(_) | LoreError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -6984,6 +7023,7 @@ impl IntoResponse for UiError {
             LoreError::Validation(_) | LoreError::InvalidOrderRange => StatusCode::BAD_REQUEST,
             LoreError::BlockNotFound(_) => StatusCode::NOT_FOUND,
             LoreError::PermissionDenied => unreachable!(),
+            LoreError::BlockPinned => StatusCode::FORBIDDEN,
             LoreError::ExternalService(_) => StatusCode::BAD_GATEWAY,
             LoreError::Io(_) | LoreError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -7047,8 +7087,7 @@ async fn parse_update_block_form(mut multipart: Multipart) -> Result<UpdateBlock
 
     Ok(UpdateBlockForm {
         csrf_token,
-        block_type: block_type
-            .ok_or_else(|| LoreError::Validation("block type is required".into()))?,
+        block_type,
         content,
         after_block_id,
         image_upload,

@@ -348,6 +348,7 @@ impl FileBlockStore {
             content: content_ref,
             media: media_ref,
             created_at,
+            pinned: false,
         };
 
         let metadata_path = self.block_metadata_path(&new_block.project, &id);
@@ -473,6 +474,23 @@ impl FileBlockStore {
         self.delete_block_internal(project, block_id, None)
     }
 
+    pub fn set_block_pinned(
+        &self,
+        project: &ProjectName,
+        block_id: &BlockId,
+        pinned: bool,
+    ) -> Result<()> {
+        let metadata_path = self.block_metadata_path(project, block_id);
+        if !metadata_path.exists() {
+            return Err(LoreError::BlockNotFound(block_id.as_str().to_string()));
+        }
+        let mut stored: StoredBlock = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        stored.pinned = pinned;
+        let bytes = serde_json::to_vec_pretty(&stored)?;
+        fs::write(metadata_path, bytes)?;
+        Ok(())
+    }
+
     fn delete_block_internal(
         &self,
         project: &ProjectName,
@@ -486,6 +504,9 @@ impl FileBlockStore {
 
         let stored: StoredBlock = serde_json::from_slice(&fs::read(&metadata_path)?)?;
         if let Some(owner_fingerprint) = owner_fingerprint {
+            if stored.pinned {
+                return Err(LoreError::BlockPinned);
+            }
             if &stored.author != owner_fingerprint {
                 return Err(LoreError::PermissionDenied);
             }
@@ -526,6 +547,9 @@ impl FileBlockStore {
         let mut stored: StoredBlock = serde_json::from_slice(&fs::read(&metadata_path)?)?;
         match &mode {
             UpdateMode::AgentOwner(fingerprint) => {
+                if stored.pinned {
+                    return Err(LoreError::BlockPinned);
+                }
                 if &stored.author != fingerprint {
                     return Err(LoreError::PermissionDenied);
                 }
@@ -686,6 +710,7 @@ impl FileBlockStore {
             content: content_ref,
             media: media_ref,
             created_at: snapshot.created_at,
+            pinned: false,
         };
         let bytes = serde_json::to_vec_pretty(&stored)?;
         fs::write(metadata_path, bytes)?;
@@ -739,6 +764,7 @@ impl FileBlockStore {
             content,
             media_type: stored.media.as_ref().map(|media| media.media_type.clone()),
             created_at: stored.created_at,
+            pinned: stored.pinned,
         })
     }
 

@@ -3324,6 +3324,17 @@ fn render_block(
         block_id = block_id,
     );
 
+    let pin_title = if block.pinned {
+        "Unpin (allow agent edits)"
+    } else {
+        "Pin (block agent edits)"
+    };
+    let pin_class = if block.pinned {
+        "block-header-btn pinned"
+    } else {
+        "block-header-btn"
+    };
+
     let header_actions = if can_write {
         format!(
             r##"<div class="block-header-actions">
@@ -3331,6 +3342,9 @@ fn render_block(
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
   </button>
   {copy_link_btn}
+  <button type="button" class="{pin_class}" title="{pin_title}" onclick="document.getElementById('pin-{block_id}').submit();">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
+  </button>
   <button type="button" class="block-header-btn" title="Save" onclick="document.querySelector('#edit-{block_id} form').submit();">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
   </button>
@@ -3340,11 +3354,16 @@ fn render_block(
   <form id="del-{block_id}" method="post" action="/ui/{project_slug}/blocks/{block_id}/delete" style="display:none;">
     <input type="hidden" name="csrf_token" value="{csrf}">
   </form>
+  <form id="pin-{block_id}" method="post" action="/ui/{project_slug}/blocks/{block_id}/pin" style="display:none;">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+  </form>
 </div>"##,
             copy_link_btn = copy_link_btn,
             block_id = block_id,
             project_slug = project_slug,
             csrf = csrf,
+            pin_class = pin_class,
+            pin_title = pin_title,
         )
     } else {
         // Read-only users still get the copy link button
@@ -3390,17 +3409,20 @@ fn render_block(
     } else {
         "editline-band-odd"
     };
+    let band_pinned = if block.pinned { " editline-band-pinned" } else { "" };
 
     let band_html = if can_write {
         format!(
-            r#"<div class="editline-band {band_class}" onclick="toggleBlockEdit('{block_id}')" title="Click to edit"></div>"#,
+            r#"<div class="editline-band {band_class}{band_pinned}" onclick="toggleBlockEdit('{block_id}')" title="Click to edit"></div>"#,
             band_class = band_class,
+            band_pinned = band_pinned,
             block_id = block_id,
         )
     } else {
         format!(
-            r#"<div class="editline-band {band_class}"></div>"#,
+            r#"<div class="editline-band {band_class}{band_pinned}"></div>"#,
             band_class = band_class,
+            band_pinned = band_pinned,
         )
     };
 
@@ -4449,6 +4471,15 @@ fn shared_styles(theme: UiTheme) -> String {
       width: 9px;
     }
 
+    .editline-band-pinned {
+      background: var(--accent) !important;
+      opacity: 0.6;
+    }
+
+    .editline-band-pinned:hover {
+      opacity: 1;
+    }
+
     /* Edit-line gap rows (inserters) */
     .editline-gap-row {
       min-height: 4px;
@@ -4763,6 +4794,12 @@ fn shared_styles(theme: UiTheme) -> String {
       background: #fef2f2;
       border-color: #dc2626;
       color: #dc2626;
+    }
+
+    .block-header-btn.pinned {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--accent);
     }
 
     .block-edit-panel {

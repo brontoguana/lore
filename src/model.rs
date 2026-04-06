@@ -253,6 +253,8 @@ pub struct StoredBlock {
     pub content: ContentRef,
     pub media: Option<MediaRef>,
     pub created_at: OffsetDateTime,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -350,4 +352,6 @@ pub struct Block {
     pub content: String,
     pub media_type: Option<String>,
     pub created_at: OffsetDateTime,
+    #[serde(default)]
+    pub pinned: bool,
 }

@@ -10,6 +10,8 @@ pub enum LoreError {
     BlockNotFound(String),
     #[error("permission denied")]
     PermissionDenied,
+    #[error("block is pinned and cannot be modified by agents")]
+    BlockPinned,
     #[error("external service error: {0}")]
     ExternalService(String),
     #[error("io error: {0}")]
