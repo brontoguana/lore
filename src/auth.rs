@@ -1,4 +1,4 @@
-use crate::config::UiTheme;
+use crate::config::{ColorMode, UiTheme};
 use crate::error::{LoreError, Result};
 use crate::model::ProjectName;
 use argon2::Argon2;
@@ -208,6 +208,8 @@ pub struct StoredUser {
     pub is_admin: bool,
     #[serde(default)]
     pub theme: Option<UiTheme>,
+    #[serde(default)]
+    pub color_mode: Option<ColorMode>,
     pub disabled_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
 }
@@ -266,6 +268,7 @@ pub struct AuthenticatedUser {
     pub is_admin: bool,
     pub roles: Vec<StoredRole>,
     pub theme: Option<UiTheme>,
+    pub color_mode: Option<ColorMode>,
 }
 
 impl AuthenticatedUser {
@@ -430,6 +433,7 @@ impl LocalAuthStore {
         &self,
         username: &UserName,
         theme: Option<UiTheme>,
+        color_mode: Option<ColorMode>,
     ) -> Result<StoredUser> {
         let mut users = self.load_users()?;
         let index = users
@@ -437,6 +441,7 @@ impl LocalAuthStore {
             .position(|existing| &existing.username == username)
             .ok_or(LoreError::PermissionDenied)?;
         users[index].theme = theme;
+        users[index].color_mode = color_mode;
         let stored = users[index].clone();
         self.save_users(&users)?;
         Ok(stored)
@@ -659,6 +664,7 @@ impl LocalAuthStore {
             role_names: user.role_names,
             is_admin: user.is_admin,
             theme: None,
+            color_mode: None,
             disabled_at: None,
             created_at: OffsetDateTime::now_utc(),
         };
@@ -749,6 +755,7 @@ impl LocalAuthStore {
             is_admin: user.is_admin,
             roles,
             theme: user.theme,
+            color_mode: user.color_mode,
         })
     }
 
@@ -872,7 +879,7 @@ mod tests {
         LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant, ProjectPermission, RoleName,
         UserName,
     };
-    use crate::config::UiTheme;
+    use crate::config::{ColorMode, UiTheme};
     use crate::model::ProjectName;
     use tempfile::tempdir;
 
@@ -945,11 +952,13 @@ mod tests {
         auth.update_user_theme(
             &UserName::new("admin".to_string()).unwrap(),
             Some(UiTheme::Signal),
+            Some(ColorMode::Dark),
         )
         .unwrap();
 
         let user = auth.authenticate("admin", "correct-horse-battery").unwrap();
         assert_eq!(user.theme, Some(UiTheme::Signal));
+        assert_eq!(user.color_mode, Some(ColorMode::Dark));
     }
 
     #[test]

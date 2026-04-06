@@ -77,6 +77,47 @@ fn default_ui_theme() -> UiTheme {
     UiTheme::Parchment
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorMode {
+    System,
+    Light,
+    Dark,
+}
+
+impl ColorMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "system" => Ok(Self::System),
+            "light" => Ok(Self::Light),
+            "dark" => Ok(Self::Dark),
+            _ => Err(LoreError::Validation(
+                "color mode must be system, light, or dark".into(),
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::System => "Follow system",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    pub fn all() -> [Self; 3] {
+        [Self::System, Self::Light, Self::Dark]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
     pub external_scheme: ExternalScheme,

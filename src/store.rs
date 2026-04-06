@@ -491,6 +491,63 @@ impl FileBlockStore {
         Ok(())
     }
 
+    /// Merge consecutive markdown blocks into single blocks, joining content
+    /// with a newline. Pinned blocks break a run (they are never merged).
+    /// Returns the number of blocks removed.
+    pub fn compact_markdown_blocks(&self, project: &ProjectName) -> Result<usize> {
+        let blocks = self.list_blocks(project)?;
+        let mut removed = 0usize;
+
+        // Collect runs of consecutive markdown blocks (pinned blocks break a run)
+        let mut runs: Vec<Vec<&Block>> = Vec::new();
+        let mut current_run: Vec<&Block> = Vec::new();
+        for block in &blocks {
+            if block.block_type == BlockType::Markdown && !block.pinned {
+                current_run.push(block);
+            } else {
+                if current_run.len() > 1 {
+                    runs.push(std::mem::take(&mut current_run));
+                } else {
+                    current_run.clear();
+                }
+            }
+        }
+        if current_run.len() > 1 {
+            runs.push(current_run);
+        }
+
+        for run in &runs {
+            // Merge all content into the first block
+            let merged_content = run
+                .iter()
+                .map(|b| b.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Update the first block with merged content
+            let first = &run[0];
+            let metadata_path = self.block_metadata_path(project, &first.id);
+            let mut stored: StoredBlock = serde_json::from_slice(&std::fs::read(&metadata_path)?)?;
+            self.remove_external_blob_if_present(project, &stored.content)?;
+            stored.content = self.persist_text_content(
+                project,
+                &first.id,
+                BlockType::Markdown,
+                &merged_content,
+            )?;
+            let bytes = serde_json::to_vec_pretty(&stored)?;
+            std::fs::write(&metadata_path, bytes)?;
+
+            // Delete the remaining blocks in the run
+            for block in &run[1..] {
+                self.delete_block_internal(project, &block.id, None)?;
+                removed += 1;
+            }
+        }
+
+        Ok(removed)
+    }
+
     fn delete_block_internal(
         &self,
         project: &ProjectName,

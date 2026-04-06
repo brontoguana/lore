@@ -7,7 +7,7 @@ use crate::auth::{
 use crate::config::{
     ExternalAuthSecretUpdate, ExternalAuthStore, ExternalScheme, OidcConfig, OidcConfigStore,
     OidcLoginStateStore, OidcSecretUpdate, OidcUsernameClaim, ServerConfig, ServerConfigStore,
-    StoredOidcLoginState, UiTheme,
+    ColorMode, StoredOidcLoginState, UiTheme,
 };
 use crate::error::LoreError;
 use crate::librarian::{
@@ -384,6 +384,7 @@ fn build_app_with_librarian(
             "/ui/{project}/blocks/{id}/pin",
             post(toggle_block_pin_from_form),
         )
+        .route("/ui/{project}/compact", post(compact_blocks_from_form))
         .layer(axum::middleware::map_response(add_security_headers))
         .with_state(AppState::with_librarian(store, librarian_client))
 }
@@ -450,6 +451,7 @@ struct DeleteBlockQuery {
 struct SettingsPageQuery {
     flash: Option<String>,
     preview: Option<String>,
+    mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -654,6 +656,8 @@ struct UpdateSetupUiForm {
 struct UpdateThemeUiForm {
     csrf_token: String,
     theme: String,
+    #[serde(default)]
+    color_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1119,6 +1123,7 @@ async fn login_page(
     let server_config = state.config.load()?;
     Ok(Html(render_login_page(
         server_config.default_theme,
+        ColorMode::System,
         state.auth.has_users()?,
         state.external_auth.load()?.is_configured(),
         state.oidc.load()?.is_configured(),
@@ -2461,6 +2466,7 @@ async fn projects_page(
         .collect();
     Ok(Html(render_projects_page(
         resolved_theme(&session.user, &server_config),
+        resolved_color_mode(&session.user),
         session.user.username.as_str(),
         session.user.is_admin,
         &visible,
@@ -2488,6 +2494,7 @@ async fn admin_page(
     let projects = state.store.list_project_infos()?;
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
+        resolved_color_mode(&session.user),
         session.user.username.as_str(),
         &session.csrf_token,
         &state.auth.list_roles()?,
@@ -2534,6 +2541,7 @@ async fn agents_page(
         session.user.username.as_str(),
         session.user.is_admin,
         resolved_theme(&session.user, &config),
+        resolved_color_mode(&session.user),
         None,
     )))
 }
@@ -2549,12 +2557,19 @@ async fn settings_page(
         .preview
         .as_deref()
         .and_then(|s| UiTheme::parse(s).ok());
+    let preview_mode = query
+        .mode
+        .as_deref()
+        .and_then(|s| ColorMode::parse(s).ok());
     let theme = preview_theme.unwrap_or_else(|| resolved_theme(&session.user, &config));
+    let color_mode = preview_mode.unwrap_or_else(|| resolved_color_mode(&session.user));
     Ok(Html(render_settings_page(
         theme,
+        color_mode,
         session.user.username.as_str(),
         &session.csrf_token,
         session.user.theme,
+        session.user.color_mode,
         config.default_theme,
         session.user.is_admin,
         query.flash.as_deref(),
@@ -2853,6 +2868,7 @@ async fn create_agent_token_from_ui(
     let projects = state.store.list_project_infos()?;
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
+        resolved_color_mode(&session.user),
         session.user.username.as_str(),
         &session.csrf_token,
         &state.auth.list_roles()?,
@@ -2923,6 +2939,7 @@ async fn rotate_agent_token_from_ui(
     let projects = state.store.list_project_infos()?;
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
+        resolved_color_mode(&session.user),
         session.user.username.as_str(),
         &session.csrf_token,
         &state.auth.list_roles()?,
@@ -3024,9 +3041,14 @@ async fn update_theme_from_ui(
     } else {
         Some(UiTheme::parse(&form.theme)?)
     };
+    let color_mode = if form.color_mode.trim().is_empty() || form.color_mode.trim() == "system" {
+        None
+    } else {
+        Some(ColorMode::parse(&form.color_mode)?)
+    };
     state
         .auth
-        .update_user_theme(&session.user.username, theme)?;
+        .update_user_theme(&session.user.username, theme, color_mode)?;
     // If admin is the only user, also set as server default theme
     if session.user.is_admin {
         if let Some(t) = theme {
@@ -3371,6 +3393,7 @@ async fn project_page(
     let server_config = state.config.load()?;
     let page = render_project_page(
         resolved_theme(&session.user, &server_config),
+        resolved_color_mode(&session.user),
         &project,
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
@@ -3413,6 +3436,7 @@ async fn project_audit_page(
     )?;
     Ok(Html(render_project_audit_page(
         resolved_theme(&session.user, &state.config.load()?),
+        resolved_color_mode(&session.user),
         &project,
         &meta.display_name,
         session.user.username.as_str(),
@@ -3439,6 +3463,7 @@ async fn admin_audit_page(
     )?;
     Ok(Html(render_admin_audit_page(
         resolved_theme(&session.user, &state.config.load()?),
+        resolved_color_mode(&session.user),
         session.user.username.as_str(),
         &session.csrf_token,
         &runs,
@@ -3459,6 +3484,7 @@ async fn project_history_page(
     let versions = ui_project_versions(state.project_history.list_recent_project(&project, 100)?);
     Ok(Html(render_project_history_page(
         resolved_theme(&session.user, &state.config.load()?),
+        resolved_color_mode(&session.user),
         &project,
         &meta.display_name,
         session.user.username.as_str(),
@@ -3536,6 +3562,7 @@ async fn answer_librarian_from_ui(
     let server_config = state.config.load()?;
     let page = render_project_page(
         resolved_theme(&session.user, &server_config),
+        resolved_color_mode(&session.user),
         &project,
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
@@ -3612,6 +3639,7 @@ async fn run_project_librarian_action_from_ui(
     let server_config = state.config.load()?;
     let page = render_project_page(
         resolved_theme(&session.user, &server_config),
+        resolved_color_mode(&session.user),
         &project,
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
@@ -3830,11 +3858,15 @@ async fn update_block_from_form(
             existing.block_type
         }
     };
-    let after_block_id = form.after_block_id.map(BlockId::from_string).transpose()?;
-    let (left, right) =
-        state
-            .store
-            .resolve_after_block(&project, after_block_id.as_ref(), Some(&block_id))?;
+    let (left, right) = match form.after_block_id {
+        Some(aid) => {
+            let after_id = BlockId::from_string(aid)?;
+            state
+                .store
+                .resolve_after_block(&project, Some(&after_id), Some(&block_id))?
+        }
+        None => (None, None),
+    };
     let update = UpdateBlock {
         project: project.clone(),
         block_id: block_id.clone(),
@@ -3970,6 +4002,29 @@ async fn toggle_block_pin_from_form(
         "/ui/{}?flash=Block%20{}",
         project.as_str(),
         label
+    )))
+}
+
+async fn compact_blocks_from_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<CsrfOnlyForm>,
+) -> UiResult<Redirect> {
+    let project = ProjectName::new(project)?;
+    let session = require_ui_session(&state, &headers)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let removed = state.store.compact_markdown_blocks(&project)?;
+    let msg = if removed == 0 {
+        "Nothing%20to%20compact".to_string()
+    } else {
+        format!("Compacted%20({removed}%20blocks%20merged)")
+    };
+    Ok(Redirect::to(&format!(
+        "/ui/{}?flash={}",
+        project.as_str(),
+        msg
     )))
 }
 
@@ -4359,6 +4414,10 @@ fn build_mcp_config_example(config: &ServerConfig, token: &str) -> String {
 
 fn resolved_theme(user: &AuthenticatedUser, config: &ServerConfig) -> UiTheme {
     user.theme.unwrap_or(config.default_theme)
+}
+
+fn resolved_color_mode(user: &AuthenticatedUser) -> ColorMode {
+    user.color_mode.unwrap_or(ColorMode::System)
 }
 
 fn user_summary(state: &AppState, user: crate::auth::StoredUser) -> Result<UserSummary, LoreError> {

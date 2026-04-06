@@ -20,7 +20,7 @@ pub use auth::{
 pub use config::{
     ExternalAuthConfig, ExternalAuthSecretUpdate, ExternalAuthStore, ExternalScheme, OidcConfig,
     OidcConfigStore, OidcLoginStateStore, OidcSecretUpdate, OidcUsernameClaim, ServerConfig,
-    ServerConfigStore, UiTheme,
+    ServerConfigStore, UiTheme, ColorMode,
 };
 pub use error::{LoreError, Result};
 pub use model::{

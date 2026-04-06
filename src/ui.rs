@@ -1,6 +1,6 @@
 use crate::audit::{AuditActor, AuditActorKind};
 use crate::auth::{ProjectGrant, ProjectPermission, StoredRole};
-use crate::config::{ExternalAuthConfig, ExternalScheme, OidcConfig, ServerConfig, UiTheme};
+use crate::config::{ColorMode, ExternalAuthConfig, ExternalScheme, OidcConfig, ServerConfig, UiTheme};
 use crate::librarian::{
     LibrarianActor, LibrarianActorKind, LibrarianConfig, LibrarianRunKind, LibrarianRunStatus,
     ProjectLibrarianOperationType, ProviderCheckResult, StoredLibrarianOperation,
@@ -23,6 +23,7 @@ pub struct PageShell<'a> {
     pub username: Option<&'a str>,
     pub is_admin: bool,
     pub theme: UiTheme,
+    pub color_mode: ColorMode,
     pub csrf_token: Option<&'a str>,
     pub flash: Option<&'a str>,
 }
@@ -47,7 +48,10 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
       <a href="/ui" class="logo">Lore</a>
       <span class="eyebrow" style="margin-top:2px;">{username}</span>
     </div>
-    <div class="top-nav-links">
+    <button class="burger-btn" onclick="toggleBurger()" aria-label="Menu">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <div class="top-nav-links" id="top-nav-links">
       <a href="/ui">Projects</a>
       <a href="/ui/agents">Agents</a>
       {admin_link}
@@ -83,6 +87,10 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     {content}
   </main>
   <script>
+  function toggleBurger() {{
+    var links = document.getElementById('top-nav-links');
+    if (links) links.classList.toggle('burger-open');
+  }}
   function showInserterForm(btn, type) {{
     var expand = btn.closest('.inserter-expand');
     var forms = expand.querySelectorAll('.inserter-form');
@@ -275,7 +283,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
 </body>
 </html>"#,
         title = escape_text(shell.title),
-        styles = shared_styles(shell.theme),
+        styles = shared_styles(shell.theme, shell.color_mode),
         nav_html = nav_html,
         flash_html = flash_html,
         content = content,
@@ -400,6 +408,7 @@ pub struct UiProjectVersion {
 
 pub fn render_login_page(
     theme: UiTheme,
+    color_mode: ColorMode,
     has_users: bool,
     external_auth_enabled: bool,
     oidc_enabled: bool,
@@ -478,6 +487,7 @@ pub fn render_login_page(
             username: None,
             is_admin: false,
             theme,
+            color_mode,
             csrf_token: None,
             flash,
         },
@@ -487,6 +497,7 @@ pub fn render_login_page(
 
 pub fn render_projects_page(
     theme: UiTheme,
+    color_mode: ColorMode,
     username: &str,
     is_admin: bool,
     projects: &[ProjectListEntry],
@@ -653,6 +664,7 @@ pub fn render_projects_page(
             username: Some(username),
             is_admin,
             theme,
+            color_mode,
             csrf_token: Some(csrf_token),
             flash,
         },
@@ -758,6 +770,7 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
 
 pub fn render_admin_page(
     theme: UiTheme,
+    color_mode: ColorMode,
     username: &str,
     csrf_token: &str,
     roles: &[StoredRole],
@@ -1485,6 +1498,7 @@ pub fn render_admin_page(
             username: Some(username),
             is_admin: true,
             theme,
+            color_mode,
             csrf_token: Some(csrf_token),
             flash,
         },
@@ -1564,6 +1578,7 @@ pub fn render_setup_page(config: &ServerConfig, setup_instruction: &str) -> Stri
             username: None,
             is_admin: false,
             theme: config.default_theme,
+            color_mode: ColorMode::System,
             csrf_token: None,
             flash: None,
         },
@@ -1576,6 +1591,7 @@ pub fn render_agents_page(
     username: &str,
     is_admin: bool,
     theme: UiTheme,
+    color_mode: ColorMode,
     flash: Option<&str>,
 ) -> String {
     let base_url = config.base_url();
@@ -1781,6 +1797,7 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
             username: Some(username),
             is_admin,
             theme,
+            color_mode,
             csrf_token: None,
             flash,
         },
@@ -1790,9 +1807,11 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
 
 pub fn render_settings_page(
     theme: UiTheme,
+    color_mode: ColorMode,
     username: &str,
     csrf_token: &str,
     selected_theme: Option<UiTheme>,
+    selected_color_mode: Option<ColorMode>,
     server_default_theme: UiTheme,
     is_admin: bool,
     flash: Option<&str>,
@@ -1800,6 +1819,28 @@ pub fn render_settings_page(
     let preference_label = selected_theme
         .map(UiTheme::display_name)
         .unwrap_or("Use server default");
+
+    let mode_label = selected_color_mode
+        .map(ColorMode::display_name)
+        .unwrap_or("Follow system");
+
+    let mode_options: String = ColorMode::all()
+        .into_iter()
+        .map(|m| {
+            format!(
+                r#"<option value="{}"{}>{}</option>"#,
+                m.as_str(),
+                if selected_color_mode == Some(m) {
+                    " selected"
+                } else if selected_color_mode.is_none() && m == ColorMode::System {
+                    " selected"
+                } else {
+                    ""
+                },
+                escape_text(m.display_name())
+            )
+        })
+        .collect();
 
     let content = format!(
         r#"<h1 class="page-title">Settings</h1>
@@ -1813,10 +1854,17 @@ pub fn render_settings_page(
         <form method="post" action="/ui/settings/theme" id="theme-form">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
           <input type="hidden" name="theme" id="theme-input" value="{current_theme_value}">
+          <input type="hidden" name="color_mode" id="mode-input" value="{current_mode_value}">
           <button type="submit" id="save-theme-btn" disabled>Save theme</button>
         </form>
         <div class="theme-selector padded">
           {theme_selector_cards}
+        </div>
+        <div class="padded" style="padding-top:0;">
+          <label style="font-weight:600; font-size:0.85rem; margin-bottom:var(--s-1); display:block;">Appearance</label>
+          <select id="mode-select" style="max-width:200px;">
+            {mode_options}
+          </select>
         </div>
       </section>
       <section class="panel">
@@ -1824,7 +1872,8 @@ pub fn render_settings_page(
           <h2>Current</h2>
         </div>
         <div class="meta-stack padded">
-          <p><strong>Saved preference</strong><br>{preference_label}</p>
+          <p><strong>Theme</strong><br>{preference_label}</p>
+          <p><strong>Appearance</strong><br>{mode_label}</p>
           <p><strong>Server default</strong><br>{server_default_label}</p>
         </div>
       </section>
@@ -1832,33 +1881,57 @@ pub fn render_settings_page(
     <script>
     (function() {{
       var cards = document.querySelectorAll('.theme-card[data-theme]');
-      var input = document.getElementById('theme-input');
+      var themeInput = document.getElementById('theme-input');
+      var modeInput = document.getElementById('mode-input');
+      var modeSelect = document.getElementById('mode-select');
       var btn = document.getElementById('save-theme-btn');
-      var saved = '{current_theme_value}';
+      var savedTheme = '{current_theme_value}';
+      var savedMode = '{current_mode_value}';
       var params = new URLSearchParams(window.location.search);
       var preview = params.get('preview');
-      if (preview && preview !== saved) {{
+      var previewMode = params.get('mode');
+      if (preview && preview !== savedTheme) {{
         btn.disabled = false;
-        input.value = preview;
+        themeInput.value = preview;
+      }}
+      if (previewMode) {{
+        modeSelect.value = previewMode;
+        modeInput.value = previewMode;
+        if (previewMode !== savedMode) btn.disabled = false;
+      }}
+      function checkDirty() {{
+        btn.disabled = (themeInput.value === savedTheme && modeInput.value === savedMode);
       }}
       cards.forEach(function(card) {{
         card.addEventListener('click', function() {{
           cards.forEach(function(c) {{ c.classList.remove('selected'); }});
           card.classList.add('selected');
           var theme = card.getAttribute('data-theme');
-          input.value = theme;
-          btn.disabled = (theme === saved);
-          window.location.href = '/ui/settings?preview=' + encodeURIComponent(theme);
+          themeInput.value = theme;
+          var url = '/ui/settings?preview=' + encodeURIComponent(theme) + '&mode=' + encodeURIComponent(modeInput.value);
+          window.location.href = url;
         }});
+      }});
+      modeSelect.addEventListener('change', function() {{
+        modeInput.value = modeSelect.value;
+        var url = '/ui/settings?preview=' + encodeURIComponent(themeInput.value) + '&mode=' + encodeURIComponent(modeSelect.value);
+        window.location.href = url;
       }});
     }})();
     </script>"#,
         csrf_token = escape_attribute(csrf_token),
         current_theme_value = escape_attribute(selected_theme.map(|t| t.as_str()).unwrap_or("")),
+        current_mode_value = escape_attribute(
+            selected_color_mode
+                .map(|m| m.as_str())
+                .unwrap_or("system")
+        ),
         preference_label = escape_text(preference_label),
+        mode_label = escape_text(mode_label),
         server_default_label = escape_text(server_default_theme.display_name()),
         theme_selector_cards =
             render_theme_selector_cards(selected_theme, server_default_theme, theme),
+        mode_options = mode_options,
     );
 
     render_shell(
@@ -1867,6 +1940,7 @@ pub fn render_settings_page(
             username: Some(username),
             is_admin,
             theme,
+            color_mode,
             csrf_token: Some(csrf_token),
             flash,
         },
@@ -1876,6 +1950,7 @@ pub fn render_settings_page(
 
 pub fn render_admin_audit_page(
     theme: UiTheme,
+    color_mode: ColorMode,
     username: &str,
     csrf_token: &str,
     runs: &[UiLibrarianAnswer],
@@ -1945,6 +2020,7 @@ pub fn render_admin_audit_page(
             username: Some(username),
             is_admin: true,
             theme,
+            color_mode,
             csrf_token: Some(csrf_token),
             flash: None,
         },
@@ -1954,6 +2030,7 @@ pub fn render_admin_audit_page(
 
 pub fn render_project_audit_page(
     theme: UiTheme,
+    color_mode: ColorMode,
     project: &ProjectName,
     display_name: &str,
     username: &str,
@@ -2016,6 +2093,7 @@ pub fn render_project_audit_page(
             username: Some(username),
             is_admin,
             theme,
+            color_mode,
             csrf_token: Some(csrf_token),
             flash: None,
         },
@@ -2025,6 +2103,7 @@ pub fn render_project_audit_page(
 
 pub fn render_project_history_page(
     theme: UiTheme,
+    color_mode: ColorMode,
     project: &ProjectName,
     display_name: &str,
     username: &str,
@@ -2069,6 +2148,7 @@ pub fn render_project_history_page(
             username: Some(username),
             is_admin,
             theme,
+            color_mode,
             csrf_token: Some(csrf_token),
             flash: None,
         },
@@ -2078,6 +2158,7 @@ pub fn render_project_history_page(
 
 pub fn render_project_page(
     theme: UiTheme,
+    color_mode: ColorMode,
     project: &ProjectName,
     display_name: &str,
     project_uuid: &str,
@@ -2282,6 +2363,7 @@ pub fn render_project_page(
             username: Some(username),
             is_admin,
             theme,
+            color_mode,
             csrf_token: Some(csrf_token),
             flash,
         },
@@ -2330,6 +2412,20 @@ fn render_librarian_panel(
     } else {
         ""
     };
+    let compact_html = if can_write {
+        r#"<div class="stack" style="border-top:1px solid var(--line);padding-top:var(--s-3)">
+    <p class="hint">Tools</p>
+    <form method="post" action="/ui/{project}/compact" onsubmit="return confirm('Merge all consecutive markdown blocks into single blocks?')">
+      <input type="hidden" name="csrf_token" value="{csrf_token}">
+      <button type="submit" class="button-link" title="Merge consecutive markdown blocks into single blocks">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16"/><path d="M4 6h16"/><path d="m7 9-3 3 3 3"/><path d="m17 9 3 3-3 3"/></svg>
+        Compact
+      </button>
+    </form>
+  </div>"#
+    } else {
+        ""
+    };
 
     format!(
         r#"<section class="panel composer">
@@ -2355,6 +2451,7 @@ fn render_librarian_panel(
     <p class="hint">Pending actions</p>
     {pending_html}
   </div>
+  {compact_html}
 </section>"#,
         project = escape_attribute(project.as_str()),
         csrf_token = escape_attribute(csrf_token),
@@ -2363,6 +2460,7 @@ fn render_librarian_panel(
         answer_html = answer_html,
         history_html = history_html,
         pending_html = pending_html,
+        compact_html = compact_html,
     )
 }
 
@@ -3698,9 +3796,9 @@ struct ThemePalette {
     diff_removed_prefix: &'static str,
 }
 
-fn theme_palette(theme: UiTheme) -> ThemePalette {
-    match theme {
-        UiTheme::Parchment => ThemePalette {
+fn theme_palette(theme: UiTheme, dark: bool) -> ThemePalette {
+    match (theme, dark) {
+        (UiTheme::Parchment, false) => ThemePalette {
             color_scheme: "light",
             bg: "#f4efe7",
             panel: "rgba(255,255,255,0.88)",
@@ -3737,7 +3835,44 @@ fn theme_palette(theme: UiTheme) -> ThemePalette {
             diff_removed_background: "rgba(181, 82, 51, 0.12)",
             diff_removed_prefix: "#a33a1d",
         },
-        UiTheme::Graphite => ThemePalette {
+        (UiTheme::Parchment, true) => ThemePalette {
+            color_scheme: "dark",
+            bg: "#1e1914",
+            panel: "rgba(35,28,22,0.9)",
+            panel_strong: "#2a221a",
+            ink: "#ede5d8",
+            muted: "#a3957f",
+            line: "rgba(200, 170, 130, 0.18)",
+            accent: "#e07050",
+            accent_soft: "rgba(224, 112, 80, 0.16)",
+            shadow: "0 20px 60px rgba(10, 5, 0, 0.5)",
+            radius: "22px",
+            font_sans: "Inter, -apple-system, system-ui, sans-serif",
+            font_mono: "\"SFMono-Regular\", \"Cascadia Mono\", \"Liberation Mono\", monospace",
+            body_background: "radial-gradient(circle at top left, rgba(160, 90, 50, 0.2), transparent 28rem), radial-gradient(circle at top right, rgba(80, 110, 140, 0.12), transparent 22rem), linear-gradient(180deg, #1a1510 0%, var(--bg) 100%)",
+            button_background: "linear-gradient(135deg, #c45a30, #8b3a18)",
+            button_text: "#fff8f2",
+            hero_button_background: "linear-gradient(135deg, #c45a30, #8b3a18)",
+            hero_button_text: "#fff8f2",
+            flash_background: "rgba(62, 180, 110, 0.14)",
+            flash_text: "#b8f0d0",
+            flash_border: "rgba(62, 180, 110, 0.24)",
+            callout_background: "rgba(224, 112, 80, 0.1)",
+            code_background: "#120e0a",
+            code_text: "#f0e6d8",
+            media_background: "#1a1510",
+            media_image_background: "linear-gradient(180deg, #251e16, #1a1510)",
+            empty_background: "rgba(35,28,22,0.68)",
+            details_background: "rgba(35,28,22,0.72)",
+            input_background: "rgba(255,255,255,0.08)",
+            surface_hover: "rgba(255,255,255,0.1)",
+            diff_context_background: "rgba(255,255,255,0.04)",
+            diff_added_background: "rgba(62, 180, 110, 0.14)",
+            diff_added_prefix: "#6dd8a0",
+            diff_removed_background: "rgba(224, 112, 80, 0.14)",
+            diff_removed_prefix: "#f0a090",
+        },
+        (UiTheme::Graphite, true) => ThemePalette {
             color_scheme: "dark",
             bg: "#11161c",
             panel: "rgba(20,27,35,0.9)",
@@ -3774,7 +3909,44 @@ fn theme_palette(theme: UiTheme) -> ThemePalette {
             diff_removed_background: "rgba(248, 113, 113, 0.14)",
             diff_removed_prefix: "#fca5a5",
         },
-        UiTheme::Signal => ThemePalette {
+        (UiTheme::Graphite, false) => ThemePalette {
+            color_scheme: "light",
+            bg: "#edf1f7",
+            panel: "rgba(255,255,255,0.9)",
+            panel_strong: "#ffffff",
+            ink: "#1a2233",
+            muted: "#637088",
+            line: "rgba(30, 50, 80, 0.14)",
+            accent: "#3b82f6",
+            accent_soft: "rgba(59, 130, 246, 0.12)",
+            shadow: "0 20px 60px rgba(20, 40, 70, 0.1)",
+            radius: "20px",
+            font_sans: "\"Avenir Next\", \"Segoe UI\", \"Helvetica Neue\", sans-serif",
+            font_mono: "\"SFMono-Regular\", \"Cascadia Code\", \"Liberation Mono\", monospace",
+            body_background: "radial-gradient(circle at top left, rgba(59, 130, 246, 0.14), transparent 28rem), radial-gradient(circle at top right, rgba(99, 200, 220, 0.1), transparent 22rem), linear-gradient(180deg, #f3f6fb 0%, var(--bg) 100%)",
+            button_background: "linear-gradient(135deg, #2563eb, #0f766e)",
+            button_text: "#f8fbff",
+            hero_button_background: "linear-gradient(135deg, #2563eb, #0f766e)",
+            hero_button_text: "#f8fbff",
+            flash_background: "rgba(16, 185, 129, 0.12)",
+            flash_text: "#065f46",
+            flash_border: "rgba(16, 185, 129, 0.2)",
+            callout_background: "rgba(59, 130, 246, 0.08)",
+            code_background: "#1a2233",
+            code_text: "#dce5f0",
+            media_background: "#ffffff",
+            media_image_background: "linear-gradient(180deg, #fafbfe, #edf1f7)",
+            empty_background: "rgba(255,255,255,0.66)",
+            details_background: "rgba(255,255,255,0.66)",
+            input_background: "rgba(255,255,255,0.92)",
+            surface_hover: "rgba(255,255,255,0.9)",
+            diff_context_background: "rgba(255,255,255,0.94)",
+            diff_added_background: "rgba(16, 185, 129, 0.12)",
+            diff_added_prefix: "#047857",
+            diff_removed_background: "rgba(239, 68, 68, 0.1)",
+            diff_removed_prefix: "#dc2626",
+        },
+        (UiTheme::Signal, false) => ThemePalette {
             color_scheme: "light",
             bg: "#e7f0ec",
             panel: "rgba(248,252,250,0.9)",
@@ -3810,6 +3982,43 @@ fn theme_palette(theme: UiTheme) -> ThemePalette {
             diff_added_prefix: "#1d7257",
             diff_removed_background: "rgba(181, 82, 51, 0.12)",
             diff_removed_prefix: "#a33a1d",
+        },
+        (UiTheme::Signal, true) => ThemePalette {
+            color_scheme: "dark",
+            bg: "#0e1a16",
+            panel: "rgba(18,32,27,0.9)",
+            panel_strong: "#152520",
+            ink: "#e2f0ea",
+            muted: "#7fa99a",
+            line: "rgba(120, 200, 170, 0.18)",
+            accent: "#20c997",
+            accent_soft: "rgba(32, 201, 151, 0.16)",
+            shadow: "0 18px 54px rgba(5, 20, 15, 0.5)",
+            radius: "18px",
+            font_sans: "Inter, -apple-system, system-ui, sans-serif",
+            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
+            body_background: "radial-gradient(circle at top left, rgba(15, 143, 111, 0.2), transparent 28rem), radial-gradient(circle at top right, rgba(200, 100, 160, 0.1), transparent 22rem), linear-gradient(180deg, #0a1510 0%, var(--bg) 100%)",
+            button_background: "linear-gradient(135deg, #20c997, #1768ac)",
+            button_text: "#f0fff8",
+            hero_button_background: "linear-gradient(135deg, #20c997, #1768ac)",
+            hero_button_text: "#f0fff8",
+            flash_background: "rgba(32, 201, 151, 0.14)",
+            flash_text: "#b0f0d8",
+            flash_border: "rgba(32, 201, 151, 0.24)",
+            callout_background: "rgba(32, 201, 151, 0.1)",
+            code_background: "#08120e",
+            code_text: "#d0f8e8",
+            media_background: "#0e1a16",
+            media_image_background: "linear-gradient(180deg, #1a2e26, #0e1a16)",
+            empty_background: "rgba(18,32,27,0.68)",
+            details_background: "rgba(18,32,27,0.72)",
+            input_background: "rgba(255,255,255,0.08)",
+            surface_hover: "rgba(255,255,255,0.1)",
+            diff_context_background: "rgba(255,255,255,0.04)",
+            diff_added_background: "rgba(32, 201, 151, 0.14)",
+            diff_added_prefix: "#5ee8c0",
+            diff_removed_background: "rgba(248, 113, 113, 0.14)",
+            diff_removed_prefix: "#fca5a5",
         },
     }
 }
@@ -3883,103 +4092,120 @@ fn render_theme_selector_cards(
         .join("")
 }
 
-fn shared_styles(theme: UiTheme) -> String {
-    let palette = theme_palette(theme);
-    let root = format!(
-        r#"
-    :root {{
-      color-scheme: {};
-      --bg: {};
-      --panel: {};
-      --panel-strong: {};
-      --ink: {};
-      --muted: {};
-      --line: {};
-      --accent: {};
-      --accent-soft: {};
-      --shadow: {};
-      --radius: {};
-      --font-sans: {};
-      --font-mono: {};
-      --button-bg: {};
-      --button-ink: {};
-      --hero-button-bg: {};
-      --hero-button-ink: {};
-      --flash-bg: {};
-      --flash-ink: {};
-      --flash-line: {};
-      --callout-bg: {};
-      --code-bg: {};
-      --code-ink: {};
-      --media-bg: {};
-      --media-image-bg: {};
-      --empty-bg: {};
-      --details-bg: {};
-      --input-bg: {};
-      --surface-hover: {};
-      --diff-ctx-bg: {};
-      --diff-add-bg: {};
-      --diff-add-prefix: {};
-      --diff-rm-bg: {};
-      --diff-rm-prefix: {};
+fn palette_css_vars(p: &ThemePalette) -> String {
+    format!(
+        r#"color-scheme: {color_scheme};
+      --bg: {bg};
+      --panel: {panel};
+      --panel-strong: {panel_strong};
+      --ink: {ink};
+      --muted: {muted};
+      --line: {line};
+      --accent: {accent};
+      --accent-soft: {accent_soft};
+      --shadow: {shadow};
+      --radius: {radius};
+      --font-sans: {font_sans};
+      --font-mono: {font_mono};
+      --button-bg: {button_bg};
+      --button-ink: {button_ink};
+      --hero-button-bg: {hero_button_bg};
+      --hero-button-ink: {hero_button_ink};
+      --flash-bg: {flash_bg};
+      --flash-ink: {flash_ink};
+      --flash-line: {flash_line};
+      --callout-bg: {callout_bg};
+      --code-bg: {code_bg};
+      --code-ink: {code_ink};
+      --media-bg: {media_bg};
+      --media-image-bg: {media_image_bg};
+      --empty-bg: {empty_bg};
+      --details-bg: {details_bg};
+      --input-bg: {input_bg};
+      --surface-hover: {surface_hover};
+      --diff-ctx-bg: {diff_ctx_bg};
+      --diff-add-bg: {diff_add_bg};
+      --diff-add-prefix: {diff_add_prefix};
+      --diff-rm-bg: {diff_rm_bg};
+      --diff-rm-prefix: {diff_rm_prefix};
+      --body-bg: {body_bg};"#,
+        color_scheme = p.color_scheme,
+        bg = p.bg,
+        panel = p.panel,
+        panel_strong = p.panel_strong,
+        ink = p.ink,
+        muted = p.muted,
+        line = p.line,
+        accent = p.accent,
+        accent_soft = p.accent_soft,
+        shadow = p.shadow,
+        radius = p.radius,
+        font_sans = p.font_sans,
+        font_mono = p.font_mono,
+        button_bg = p.button_background,
+        button_ink = p.button_text,
+        hero_button_bg = p.hero_button_background,
+        hero_button_ink = p.hero_button_text,
+        flash_bg = p.flash_background,
+        flash_ink = p.flash_text,
+        flash_line = p.flash_border,
+        callout_bg = p.callout_background,
+        code_bg = p.code_background,
+        code_ink = p.code_text,
+        media_bg = p.media_background,
+        media_image_bg = p.media_image_background,
+        empty_bg = p.empty_background,
+        details_bg = p.details_background,
+        input_bg = p.input_background,
+        surface_hover = p.surface_hover,
+        diff_ctx_bg = p.diff_context_background,
+        diff_add_bg = p.diff_added_background,
+        diff_add_prefix = p.diff_added_prefix,
+        diff_rm_bg = p.diff_removed_background,
+        diff_rm_prefix = p.diff_removed_prefix,
+        body_bg = p.body_background,
+    )
+}
 
-      --s-1: 4px;
-      --s-2: 8px;
-      --s-3: 12px;
-      --s-4: 16px;
-      --s-5: 24px;
-      --s-6: 32px;
-      --s-7: 48px;
-      --s-8: 64px;
-    }}
+fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
+    let root = match mode {
+        ColorMode::Light => {
+            let p = theme_palette(theme, false);
+            format!(
+                "    :root {{\n      {vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}",
+                vars = palette_css_vars(&p)
+            )
+        }
+        ColorMode::Dark => {
+            let p = theme_palette(theme, true);
+            format!(
+                "    :root {{\n      {vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}",
+                vars = palette_css_vars(&p)
+            )
+        }
+        ColorMode::System => {
+            let light = theme_palette(theme, false);
+            let dark = theme_palette(theme, true);
+            format!(
+                "    :root {{\n      {light_vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root {{\n        {dark_vars}\n      }}\n    }}",
+                light_vars = palette_css_vars(&light),
+                dark_vars = palette_css_vars(&dark)
+            )
+        }
+    };
+    let base = r#"
 
-    * {{ box-sizing: border-box; }}
+    * { box-sizing: border-box; }
 
-    body {{
+    body {
       margin: 0;
       font-family: var(--font-sans);
       color: var(--ink);
-      background: {};
+      background: var(--body-bg);
       min-height: 100vh;
       line-height: 1.5;
-    }}
-"#,
-        palette.color_scheme,
-        palette.bg,
-        palette.panel,
-        palette.panel_strong,
-        palette.ink,
-        palette.muted,
-        palette.line,
-        palette.accent,
-        palette.accent_soft,
-        palette.shadow,
-        palette.radius,
-        palette.font_sans,
-        palette.font_mono,
-        palette.button_background,
-        palette.button_text,
-        palette.hero_button_background,
-        palette.hero_button_text,
-        palette.flash_background,
-        palette.flash_text,
-        palette.flash_border,
-        palette.callout_background,
-        palette.code_background,
-        palette.code_text,
-        palette.media_background,
-        palette.media_image_background,
-        palette.empty_background,
-        palette.details_background,
-        palette.input_background,
-        palette.surface_hover,
-        palette.diff_context_background,
-        palette.diff_added_background,
-        palette.diff_added_prefix,
-        palette.diff_removed_background,
-        palette.diff_removed_prefix,
-        palette.body_background,
-    );
+    }
+"#;
     let rest = r#"
     .shell {
       width: min(1080px, calc(100vw - var(--s-6)));
@@ -4048,6 +4274,20 @@ fn shared_styles(theme: UiTheme) -> String {
     }
 
     .top-nav-links button:hover {
+      color: var(--ink);
+    }
+
+    .burger-btn {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      padding: var(--s-2);
+      min-height: auto;
+      width: auto;
+    }
+    .burger-btn:hover {
       color: var(--ink);
     }
 
@@ -5111,8 +5351,8 @@ fn shared_styles(theme: UiTheme) -> String {
         grid-template-columns: 1fr;
       }
       .admin-nav {
-        grid-auto-flow: column;
-        overflow-x: auto;
+        grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+        overflow-x: visible;
       }
     }
 
@@ -5181,6 +5421,42 @@ fn shared_styles(theme: UiTheme) -> String {
         height: 28px;
       }
 
+      /* Burger menu */
+      .burger-btn {
+        display: block;
+      }
+
+      .top-nav-links {
+        display: none;
+        position: absolute;
+        top: 64px;
+        right: 0;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--s-2);
+        padding: var(--s-3);
+        flex-direction: column;
+        gap: var(--s-3);
+        min-width: 160px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+        z-index: 200;
+      }
+
+      .top-nav-links.burger-open {
+        display: flex;
+      }
+
+      .top-nav-inner {
+        position: relative;
+      }
+
+      /* Admin nav buttons: wrap on mobile */
+      .admin-nav {
+        grid-auto-flow: row;
+        grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+        overflow-x: visible;
+      }
+
       /* Mobile: hide edit line by default, show pencil toggle */
       #document {
         position: relative;
@@ -5201,7 +5477,7 @@ fn shared_styles(theme: UiTheme) -> String {
       }
     }
     "#;
-    format!("{root}{rest}")
+    format!("{root}{base}{rest}")
 }
 
 #[cfg(test)]
