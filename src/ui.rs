@@ -98,19 +98,49 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
   function toggleBlockEdit(blockId) {{
     var body = document.getElementById('body-' + blockId);
     var edit = document.getElementById('edit-' + blockId);
+    var meta = document.getElementById('meta-' + blockId);
     var article = document.getElementById('block-' + blockId);
     if (!body || !edit) return;
+    var row = article.closest('.editline-row');
+    var band = row ? row.querySelector('.editline-band') : null;
     if (edit.style.display === 'none') {{
       body.style.display = 'none';
       edit.style.display = '';
-      article.setAttribute('draggable', 'false');
+      if (meta) meta.style.display = '';
+      if (band) band.classList.add('editline-band-active');
+      article.classList.add('editing');
       var ta = edit.querySelector('textarea');
       if (ta) {{ ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }}
     }} else {{
       body.style.display = '';
       edit.style.display = 'none';
-      article.setAttribute('draggable', 'true');
+      if (meta) meta.style.display = 'none';
+      if (band) band.classList.remove('editline-band-active');
+      article.classList.remove('editing');
     }}
+  }}
+  function toggleEditlineInserter(btn) {{
+    var row = btn.closest('.editline-gap-row');
+    var ins = row ? row.querySelector('.block-inserter') : null;
+    if (!ins) return;
+    var ex = ins.querySelector('.inserter-expand');
+    if (!ex) return;
+    if (ex.style.display === 'none') {{
+      ex.style.display = '';
+      btn.textContent = '\u{{2212}}';
+      ins.classList.add('expanded');
+    }} else {{
+      ex.style.display = 'none';
+      btn.textContent = '+';
+      ins.classList.remove('expanded');
+    }}
+  }}
+  function toggleEditline() {{
+    var doc = document.getElementById('document');
+    if (!doc) return;
+    doc.classList.toggle('editline-visible');
+    var btn = document.getElementById('editline-toggle');
+    if (btn) btn.classList.toggle('active', doc.classList.contains('editline-visible'));
   }}
   var _dragBlockId = null;
   function blockDragStart(e) {{
@@ -2052,9 +2082,9 @@ pub fn render_project_page(
         if can_write {
             html.push_str(&render_block_inserter(project, None, csrf_token, &project_infos));
         }
-        for block in blocks {
+        for (i, block) in blocks.iter().enumerate() {
             html.push_str(&render_block(
-                project, block, all_blocks, can_write, &project_infos, csrf_token,
+                project, block, all_blocks, can_write, &project_infos, csrf_token, i,
             ));
             if can_write {
                 html.push_str(&render_block_inserter(project, Some(&block.id), csrf_token, &project_infos));
@@ -2167,6 +2197,9 @@ pub fn render_project_page(
 
     <div class="layout">
       <section class="panel" id="document">
+        <button type="button" class="editline-toggle" id="editline-toggle" onclick="toggleEditline()" title="Toggle edit mode">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+        </button>
         {results_label}
         <div class="timeline">{blocks_html}</div>
       </section>
@@ -3186,51 +3219,45 @@ fn render_block_inserter(
     let project_attr = escape_attribute(project.as_str());
     let csrf_attr = escape_attribute(csrf_token);
     format!(
-        r#"<div class="block-inserter" data-after="{after_value}"
-  ondragover="blockDragOverInserter(event)" ondragleave="blockDragLeaveInserter(event)" ondrop="blockDropInserter(event)">
-  <div class="inserter-hover-zone">
-    <button type="button" class="inserter-btn" onclick="
-      var p=this.closest('.block-inserter');
-      var ex=p.querySelector('.inserter-expand');
-      if(ex.style.display==='none'){{ex.style.display='';this.textContent='\u{{2212}}';p.classList.add('expanded')}}
-      else{{ex.style.display='none';this.textContent='+';p.classList.remove('expanded')}}
-    ">+</button>
-  </div>
-  <div class="inserter-expand" style="display:none">
-    <div class="inserter-types">
-      <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'md')">Markdown</button>
-      <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'svg')">SVG</button>
-      <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'image')">Image</button>
+        r#"<div class="editline-row editline-gap-row">
+  <div class="block-inserter" data-after="{after_value}">
+    <div class="inserter-expand" style="display:none">
+      <div class="inserter-types">
+        <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'md')">Markdown</button>
+        <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'svg')">SVG</button>
+        <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'image')">Image</button>
+      </div>
+      <form class="inserter-form inserter-form-md" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{csrf_attr}">
+        <input type="hidden" name="block_type" value="markdown">
+        <input type="hidden" name="after_block_id" value="{after_value}">
+        <textarea name="content" placeholder="Write markdown..." rows="6"></textarea>
+        {doc_link_picker}
+        <button type="submit">Add markdown</button>
+      </form>
+      <form class="inserter-form inserter-form-svg" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{csrf_attr}">
+        <input type="hidden" name="block_type" value="svg">
+        <input type="hidden" name="after_block_id" value="{after_value}">
+        <textarea name="content" placeholder="Paste SVG markup or describe what you want..." rows="6"></textarea>
+        <label>Or upload an SVG file
+          <input type="file" name="image_file" accept=".svg,image/svg+xml">
+        </label>
+        <button type="submit">Add SVG</button>
+      </form>
+      <form class="inserter-form inserter-form-image" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{csrf_attr}">
+        <input type="hidden" name="block_type" value="image">
+        <input type="hidden" name="after_block_id" value="{after_value}">
+        <label>Upload image
+          <input type="file" name="image_file" accept="image/*">
+        </label>
+        <textarea name="content" placeholder="Optional caption or note..." rows="2"></textarea>
+        <button type="submit">Add image</button>
+      </form>
     </div>
-    <form class="inserter-form inserter-form-md" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
-      <input type="hidden" name="csrf_token" value="{csrf_attr}">
-      <input type="hidden" name="block_type" value="markdown">
-      <input type="hidden" name="after_block_id" value="{after_value}">
-      <textarea name="content" placeholder="Write markdown..." rows="6"></textarea>
-      {doc_link_picker}
-      <button type="submit">Add markdown</button>
-    </form>
-    <form class="inserter-form inserter-form-svg" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
-      <input type="hidden" name="csrf_token" value="{csrf_attr}">
-      <input type="hidden" name="block_type" value="svg">
-      <input type="hidden" name="after_block_id" value="{after_value}">
-      <textarea name="content" placeholder="Paste SVG markup or describe what you want..." rows="6"></textarea>
-      <label>Or upload an SVG file
-        <input type="file" name="image_file" accept=".svg,image/svg+xml">
-      </label>
-      <button type="submit">Add SVG</button>
-    </form>
-    <form class="inserter-form inserter-form-image" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
-      <input type="hidden" name="csrf_token" value="{csrf_attr}">
-      <input type="hidden" name="block_type" value="image">
-      <input type="hidden" name="after_block_id" value="{after_value}">
-      <label>Upload image
-        <input type="file" name="image_file" accept="image/*">
-      </label>
-      <textarea name="content" placeholder="Optional caption or note..." rows="2"></textarea>
-      <button type="submit">Add image</button>
-    </form>
   </div>
+  <div class="editline-gap"><button type="button" class="editline-plus" onclick="toggleEditlineInserter(this)">+</button></div>
 </div>"#,
         project_attr = project_attr,
         csrf_attr = csrf_attr,
@@ -3246,6 +3273,7 @@ fn render_block(
     can_write: bool,
     project_infos: &[ProjectInfo],
     csrf_token: &str,
+    block_index: usize,
 ) -> String {
     let selected_after_block_id = all_blocks
         .iter()
@@ -3332,27 +3360,40 @@ fn render_block(
         String::new()
     };
 
+    let band_class = if block_index % 2 == 0 {
+        "editline-band-even"
+    } else {
+        "editline-band-odd"
+    };
+
+    let band_html = if can_write {
+        format!(
+            r#"<div class="editline-band {band_class}" onclick="toggleBlockEdit('{block_id}')" title="Click to edit"></div>"#,
+            band_class = band_class,
+            block_id = block_id,
+        )
+    } else {
+        format!(
+            r#"<div class="editline-band {band_class}"></div>"#,
+            band_class = band_class,
+        )
+    };
+
     format!(
-        r#"<article class="block" id="block-{block_id}" draggable="{draggable}" data-block-id="{block_id}"
-  {drag_attrs}>
-  <div class="block-meta">
+        r#"<div class="editline-row"><article class="block" id="block-{block_id}" data-block-id="{block_id}">
+  <div class="block-meta" id="meta-{block_id}" style="display:none;">
     <span class="pill">{type_label}</span>
     {header_actions}
   </div>
   <div class="block-body" id="body-{block_id}">{body}</div>
   <div class="block-edit-panel" id="edit-{block_id}" style="display:none;">{edit_form}</div>
-</article>"#,
+</article>{band_html}</div>"#,
         block_id = block_id,
         type_label = escape_text(block_type_label(block.block_type)),
         header_actions = header_actions,
         body = render_block_body(block),
         edit_form = edit_form,
-        draggable = if can_write { "true" } else { "false" },
-        drag_attrs = if can_write {
-            format!(r#"ondragstart="blockDragStart(event)" ondragend="blockDragEnd(event)""#)
-        } else {
-            String::new()
-        },
+        band_html = band_html,
     )
 }
 
@@ -4331,62 +4372,92 @@ fn shared_styles(theme: UiTheme) -> String {
       padding: var(--s-5);
     }
 
-    .block {
-      padding: var(--s-5);
-      border: 1px solid var(--line);
-      border-radius: var(--s-5);
-      background: var(--panel-strong);
-      transition: border-color 0.2s, opacity 0.2s, box-shadow 0.2s;
-      margin-bottom: 2px;
-    }
-
-    .block.dragging {
-      opacity: 0.4;
-    }
-
-    .block[draggable="true"] {
-      cursor: grab;
-    }
-
-    .block[draggable="true"]:active {
-      cursor: grabbing;
-    }
-
-    .block-inserter {
+    /* Edit-line paradigm: seamless document with vertical band indicator */
+    .editline-row {
       display: flex;
-      flex-direction: column;
-      align-items: center;
-      height: 0;
+      align-items: stretch;
+    }
+
+    .editline-row > .block {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .block {
+      padding: var(--s-3) 0;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      transition: background 0.15s;
+    }
+
+    .block.editing {
+      background: var(--surface-hover);
+      border-radius: var(--radius);
+      padding: var(--s-3) var(--s-4);
+    }
+
+    .editline-band {
+      width: 7px;
+      flex-shrink: 0;
+      cursor: pointer;
+      transition: background 0.15s, width 0.15s;
+      border-radius: 2px;
+      margin-left: var(--s-3);
+    }
+
+    .editline-band-even {
+      background: var(--accent-soft);
+    }
+
+    .editline-band-odd {
+      background: var(--line);
+    }
+
+    .editline-band:hover {
+      background: var(--accent);
+      width: 9px;
+    }
+
+    .editline-band-active {
+      background: var(--accent) !important;
+      width: 9px;
+    }
+
+    /* Edit-line gap rows (inserters) */
+    .editline-gap-row {
+      min-height: 4px;
       position: relative;
-      z-index: 5;
     }
 
-    .block-inserter.expanded {
-      height: auto;
-      margin: 4px 0;
+    .editline-gap-row > .block-inserter {
+      flex: 1;
+      min-width: 0;
     }
 
-    .inserter-hover-zone {
-      position: absolute;
-      top: -18px;
-      bottom: -18px;
-      left: 0;
-      right: 0;
+    .editline-gap {
+      width: 7px;
+      flex-shrink: 0;
+      margin-left: var(--s-3);
       display: flex;
       align-items: center;
       justify-content: center;
-      z-index: 5;
+      position: relative;
     }
 
-    .inserter-btn {
-      width: 32px;
-      height: 32px;
+    .editline-plus {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: 20px;
+      height: 20px;
       min-height: auto;
       border-radius: 50%;
       border: 2px solid var(--line);
       background: var(--panel-strong);
       color: var(--muted);
-      font-size: 1.2rem;
+      font-size: 0.85rem;
       font-weight: bold;
       line-height: 1;
       cursor: pointer;
@@ -4395,51 +4466,56 @@ fn shared_styles(theme: UiTheme) -> String {
       align-items: center;
       justify-content: center;
       opacity: 0;
-      transition: opacity 0.15s, border-color 0.2s, color 0.2s, background 0.2s, box-shadow 0.2s;
+      transition: opacity 0.15s, border-color 0.2s, color 0.2s, background 0.2s;
       z-index: 6;
       box-shadow: 0 1px 4px rgba(0,0,0,0.15);
     }
 
-    .inserter-hover-zone:hover .inserter-btn,
-    .block-inserter.expanded .inserter-btn {
+    .editline-gap-row:hover .editline-plus {
       opacity: 1;
     }
 
-    .inserter-btn:hover {
+    .editline-plus:hover {
       border-color: var(--accent);
       color: var(--accent);
       background: var(--accent-soft);
-      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
     }
 
-    .block-inserter.drag-active {
-      height: 16px;
-    }
-
-    .block-inserter.drag-active .inserter-hover-zone {
-      top: -4px;
-      bottom: -4px;
-    }
-
-    .block-inserter.drag-active::before {
-      content: '';
-      position: absolute;
-      top: 50%;
-      left: 10%;
-      right: 10%;
-      height: 3px;
-      background: var(--accent-soft);
-      border-radius: 2px;
-      transform: translateY(-50%);
-      transition: background 0.15s;
-    }
-
-    .block-inserter.drag-over::before {
-      background: var(--accent);
-    }
-
-    .block-inserter.drag-active .inserter-btn {
+    /* Pencil toggle for mobile edit line */
+    .editline-toggle {
       display: none;
+      position: absolute;
+      top: var(--s-3);
+      right: var(--s-3);
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: 2px solid var(--line);
+      background: var(--panel-strong);
+      color: var(--muted);
+      cursor: pointer;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      z-index: 10;
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+    }
+
+    .editline-toggle:hover,
+    .editline-toggle.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .block-inserter {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .block-inserter.expanded {
+      margin: var(--s-2) 0;
     }
 
     .inserter-expand {
@@ -5018,6 +5094,25 @@ fn shared_styles(theme: UiTheme) -> String {
       .block-header-btn {
         width: 28px;
         height: 28px;
+      }
+
+      /* Mobile: hide edit line by default, show pencil toggle */
+      #document {
+        position: relative;
+      }
+
+      .editline-toggle {
+        display: flex;
+      }
+
+      .editline-band,
+      .editline-gap {
+        display: none;
+      }
+
+      #document.editline-visible .editline-band,
+      #document.editline-visible .editline-gap {
+        display: flex;
       }
     }
     "#;

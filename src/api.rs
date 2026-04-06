@@ -7513,7 +7513,7 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("alpha.docs"));
-        assert!(html.contains("inserter-btn"));
+        assert!(html.contains("editline-plus"));
         assert!(html.contains("<h1>Hello</h1>"));
         assert!(html.contains("width=device-width, initial-scale=1"));
         assert!(html.contains(">admin</span>"));
