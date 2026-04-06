@@ -110,7 +110,10 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
       if (band) band.classList.add('editline-band-active');
       article.classList.add('editing');
       var ta = edit.querySelector('textarea');
-      if (ta) {{ ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }}
+      if (ta) {{
+        edit.dataset.origContent = ta.value;
+        ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+      }}
     }} else {{
       body.style.display = '';
       edit.style.display = 'none';
@@ -142,6 +145,36 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     var btn = document.getElementById('editline-toggle');
     if (btn) btn.classList.toggle('active', doc.classList.contains('editline-visible'));
   }}
+  document.addEventListener('keydown', function(e) {{
+    if (e.key !== 'Escape') return;
+    // Check for an open edit panel
+    var editPanel = document.querySelector('.block-edit-panel[style=""],.block-edit-panel:not([style*="display:none"])');
+    if (editPanel && editPanel.style.display !== 'none') {{
+      var ta = editPanel.querySelector('textarea');
+      var blockId = editPanel.id.replace('edit-', '');
+      var orig = editPanel.dataset.origContent || '';
+      if (ta && ta.value !== orig) {{
+        if (!confirm('You have unsaved changes. Discard?')) return;
+      }}
+      toggleBlockEdit(blockId);
+      e.preventDefault();
+      return;
+    }}
+    // Check for an open inserter
+    var openIns = document.querySelector('.block-inserter.expanded');
+    if (openIns) {{
+      var ta = openIns.querySelector('textarea');
+      var hasContent = false;
+      openIns.querySelectorAll('textarea').forEach(function(t) {{ if (t.value.trim()) hasContent = true; }});
+      if (hasContent) {{
+        if (!confirm('You have unsaved content. Discard?')) return;
+        openIns.querySelectorAll('textarea').forEach(function(t) {{ t.value = ''; }});
+      }}
+      var plusBtn = openIns.closest('.editline-gap-row').querySelector('.editline-plus');
+      if (plusBtn) toggleEditlineInserter(plusBtn);
+      e.preventDefault();
+    }}
+  }});
   var _dragBlockId = null;
   function blockDragStart(e) {{
     _dragBlockId = e.currentTarget.dataset.blockId;
@@ -3201,7 +3234,7 @@ fn render_doc_link_picker(project_infos: &[ProjectInfo]) -> String {
         <option value="">Link to document...</option>
         {options}
       </select>
-      <button type="button" class="button-link" onclick="insertDocLink(this)">Insert link</button>
+      <button type="button" class="copy-btn" onclick="insertDocLink(this)" title="Insert link">&#x1F517;</button>
     </div>"#,
         options = options,
     )
@@ -3226,6 +3259,7 @@ fn render_block_inserter(
         <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'md')">Markdown</button>
         <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'svg')">SVG</button>
         <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'image')">Image</button>
+        <button type="button" class="cancel-circle" onclick="toggleEditlineInserter(this.closest('.editline-gap-row').querySelector('.editline-plus'))" title="Cancel"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
       </div>
       <form class="inserter-form inserter-form-md" style="display:none" method="post" action="/ui/{project_attr}/blocks" enctype="multipart/form-data">
         <input type="hidden" name="csrf_token" value="{csrf_attr}">
@@ -3345,7 +3379,7 @@ fn render_block(
     </div>
     <div class="block-edit-actions">
       <button type="submit">Save</button>
-      <button type="button" onclick="toggleBlockEdit('{block_id}')">Cancel</button>
+      <button type="button" class="cancel-circle" onclick="toggleBlockEdit('{block_id}')" title="Cancel editing"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
   </form>"#,
             block_id = block_id,
@@ -4479,6 +4513,29 @@ fn shared_styles(theme: UiTheme) -> String {
       border-color: var(--accent);
       color: var(--accent);
       background: var(--accent-soft);
+    }
+
+    /* Cancel circle button (X) for edit/insert forms */
+    .cancel-circle {
+      width: 24px;
+      height: 24px;
+      min-height: auto;
+      border-radius: 50%;
+      border: 2px solid var(--line);
+      background: var(--panel-strong);
+      color: var(--muted);
+      cursor: pointer;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: border-color 0.2s, color 0.2s, background 0.2s;
+      flex-shrink: 0;
+    }
+    .cancel-circle:hover {
+      border-color: var(--danger);
+      color: var(--danger);
+      background: #fff0f0;
     }
 
     /* Pencil toggle for mobile edit line */
