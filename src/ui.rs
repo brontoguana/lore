@@ -405,7 +405,7 @@ pub fn render_login_page(
         "Create the first admin account"
     };
     let subtitle = if has_users {
-        "Use a local Lore account. Browser sessions are cookie-backed, HttpOnly, and protected by a per-session CSRF token."
+        ""
     } else {
         "Lore has no human accounts yet. Create the initial local administrator to unlock the UI."
     };
@@ -438,7 +438,7 @@ pub fn render_login_page(
         r#"<section class="panel auth-panel">
       <p class="eyebrow">Lore</p>
       <h1>{title}</h1>
-      <p class="subtitle">{subtitle}</p>
+      {subtitle_html}
       <form method="post" action="{action}">
         <label>
           Username
@@ -454,7 +454,7 @@ pub fn render_login_page(
       {external_auth_html}
     </section>"#,
         title = escape_text(title),
-        subtitle = escape_text(subtitle),
+        subtitle_html = if subtitle.is_empty() { String::new() } else { format!("<p class=\"subtitle\">{}</p>", escape_text(subtitle)) },
         action = action,
         button = escape_text(button),
         autocomplete = if has_users {
