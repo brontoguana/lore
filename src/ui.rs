@@ -1596,8 +1596,9 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
         <p>Copy this block and give it to your agent. It explains what Lore is, how to connect, and what commands are available.</p>
       </div>
       <div class="padded">
-        <textarea readonly id="agent-instruction" style="min-height: 20rem; font-family: var(--font-mono); font-size: 0.85rem;">{agent_instruction}</textarea>
-        <div style="margin-top: var(--s-3); text-align: right;">
+        <textarea readonly id="agent-instruction" style="height: 5rem; font-family: var(--font-mono); font-size: 0.85rem; resize: none; overflow: hidden;">{agent_instruction}</textarea>
+        <div style="margin-top: var(--s-3); display: flex; justify-content: space-between; align-items: center;">
+          <a href="#" id="expand-instructions" style="font-size: 0.85rem;" onclick="toggleInstructions(event)">Expand to read full instructions</a>
           <button type="button" class="button-link" onclick="copyField('agent-instruction')">Copy</button>
         </div>
       </div>
@@ -1673,6 +1674,22 @@ Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around,
     </div>
 
     <script>
+    function toggleInstructions(e) {{
+      e.preventDefault();
+      var ta = document.getElementById('agent-instruction');
+      var link = document.getElementById('expand-instructions');
+      if (ta.style.height === '5rem') {{
+        ta.style.height = '20rem';
+        ta.style.overflow = 'auto';
+        ta.style.resize = 'vertical';
+        link.textContent = 'Collapse';
+      }} else {{
+        ta.style.height = '5rem';
+        ta.style.overflow = 'hidden';
+        ta.style.resize = 'none';
+        link.textContent = 'Expand to read full instructions';
+      }}
+    }}
     function copyField(id) {{
       var el = document.getElementById(id);
       if (!el) return;
