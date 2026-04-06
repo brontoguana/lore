@@ -3371,7 +3371,6 @@ async fn project_page(
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
         &blocks,
-        &all_blocks,
         query.flash.as_deref(),
         query.q.as_deref(),
         query.block_type.as_deref(),
@@ -3537,7 +3536,6 @@ async fn answer_librarian_from_ui(
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
         &all_blocks,
-        &all_blocks,
         Some(flash),
         None,
         None,
@@ -3613,7 +3611,6 @@ async fn run_project_librarian_action_from_ui(
         &project,
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
-        &all_blocks,
         &all_blocks,
         Some(
             if current_answer.status == LibrarianRunStatus::PendingApproval {
@@ -7518,7 +7515,7 @@ mod tests {
         assert!(html.contains("width=device-width, initial-scale=1"));
         assert!(html.contains(">admin</span>"));
         assert!(html.contains("id=\"document\""));
-        assert!(html.contains("title=\"Edit\""));
+        assert!(html.contains("title=\"Save\""));
         assert!(html.contains("class=\"block-header-btn danger\""));
     }
 

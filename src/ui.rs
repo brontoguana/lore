@@ -122,6 +122,17 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
       article.classList.remove('editing');
     }}
   }}
+  function cancelBlockEdit(blockId) {{
+    var editPanel = document.getElementById('edit-' + blockId);
+    if (editPanel) {{
+      var ta = editPanel.querySelector('textarea');
+      var orig = editPanel.dataset.origContent || '';
+      if (ta && ta.value !== orig) {{
+        if (!confirm('You have unsaved changes. Discard?')) return;
+      }}
+    }}
+    toggleBlockEdit(blockId);
+  }}
   function toggleEditlineInserter(btn) {{
     var row = btn.closest('.editline-gap-row');
     var ins = row ? row.querySelector('.block-inserter') : null;
@@ -150,13 +161,8 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     // Check for an open edit panel
     var editPanel = document.querySelector('.block-edit-panel[style=""],.block-edit-panel:not([style*="display:none"])');
     if (editPanel && editPanel.style.display !== 'none') {{
-      var ta = editPanel.querySelector('textarea');
       var blockId = editPanel.id.replace('edit-', '');
-      var orig = editPanel.dataset.origContent || '';
-      if (ta && ta.value !== orig) {{
-        if (!confirm('You have unsaved changes. Discard?')) return;
-      }}
-      toggleBlockEdit(blockId);
+      cancelBlockEdit(blockId);
       e.preventDefault();
       return;
     }}
@@ -2076,7 +2082,6 @@ pub fn render_project_page(
     display_name: &str,
     project_uuid: &str,
     blocks: &[Block],
-    all_blocks: &[Block],
     flash: Option<&str>,
     search: Option<&str>,
     search_block_type: Option<&str>,
@@ -2117,7 +2122,7 @@ pub fn render_project_page(
         }
         for (i, block) in blocks.iter().enumerate() {
             html.push_str(&render_block(
-                project, block, all_blocks, can_write, &project_infos, csrf_token, i,
+                project, block, can_write, &project_infos, csrf_token, i,
             ));
             if can_write {
                 html.push_str(&render_block_inserter(project, Some(&block.id), csrf_token, &project_infos));
@@ -3303,19 +3308,11 @@ fn render_block_inserter(
 fn render_block(
     project: &ProjectName,
     block: &Block,
-    all_blocks: &[Block],
     can_write: bool,
     project_infos: &[ProjectInfo],
     csrf_token: &str,
     block_index: usize,
 ) -> String {
-    let selected_after_block_id = all_blocks
-        .iter()
-        .take_while(|candidate| candidate.id != block.id)
-        .last()
-        .map(|candidate| candidate.id.as_str());
-    let placement_options =
-        render_after_options(all_blocks, Some(block.id.as_str()), selected_after_block_id);
     let block_id = escape_attribute(block.id.as_str());
     let project_slug = escape_attribute(project.as_str());
     let csrf = escape_attribute(csrf_token);
@@ -3330,11 +3327,14 @@ fn render_block(
     let header_actions = if can_write {
         format!(
             r##"<div class="block-header-actions">
-  {copy_link_btn}
-  <button type="button" class="block-header-btn" title="Edit" onclick="toggleBlockEdit('{block_id}')">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
-  </button>
   <button type="button" class="block-header-btn danger" title="Delete" onclick="if(confirm('Delete this block? This cannot be undone.')){{document.getElementById('del-{block_id}').submit();}}">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+  </button>
+  {copy_link_btn}
+  <button type="button" class="block-header-btn" title="Save" onclick="document.querySelector('#edit-{block_id} form').submit();">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+  </button>
+  <button type="button" class="block-header-btn" title="Cancel" onclick="cancelBlockEdit('{block_id}')">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
   </button>
   <form id="del-{block_id}" method="post" action="/ui/{project_slug}/blocks/{block_id}/delete" style="display:none;">
@@ -3363,32 +3363,23 @@ fn render_block(
     <input type="hidden" name="csrf_token" value="{csrf}">
     <textarea name="content" class="block-edit-textarea">{content}</textarea>
     {edit_doc_link_picker}
-    <div class="block-edit-extras">
-      <label>
-        Replace image
-        <input type="file" name="image_file" accept="image/*">
-      </label>
-      <label>
-        Type
-        <select name="block_type">{type_opts}</select>
-      </label>
-      <label>
-        Place after
-        <select name="after_block_id">{placement}</select>
-      </label>
-    </div>
-    <div class="block-edit-actions">
-      <button type="submit">Save</button>
-      <button type="button" class="cancel-circle" onclick="toggleBlockEdit('{block_id}')" title="Cancel editing"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
-    </div>
+    {image_replace}
   </form>"#,
             block_id = block_id,
             project_slug = project_slug,
             csrf = csrf,
-            type_opts = render_block_type_options(block.block_type),
-            placement = placement_options,
             content = escape_text(&block.content),
             edit_doc_link_picker = edit_doc_link_picker,
+            image_replace = if block.block_type == crate::model::BlockType::Image {
+                r#"<div class="block-edit-extras">
+      <label>
+        Replace image
+        <input type="file" name="image_file" accept="image/*">
+      </label>
+    </div>"#
+            } else {
+                ""
+            },
         )
     } else {
         String::new()
