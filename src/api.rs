@@ -10015,31 +10015,74 @@ mod tests {
     fn svg_sanitization_strips_dangerous_elements() {
         use crate::ui::sanitize_svg;
 
+        // Script tags removed, safe elements preserved
         let malicious = r#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect width="10" height="10"/></svg>"#;
         let clean = sanitize_svg(malicious);
-        assert!(!clean.contains("script"), "script tag should be stripped");
+        assert!(!clean.contains("<script"), "script tag should be stripped");
         assert!(clean.contains("rect"), "safe elements should be preserved");
 
+        // Event handlers stripped, element kept
         let with_event = r#"<svg><rect onclick="alert(1)" width="10"/></svg>"#;
         let clean = sanitize_svg(with_event);
-        assert!(
-            !clean.contains("onclick"),
-            "event handlers should be stripped"
-        );
+        assert!(!clean.contains("onclick"), "event handlers should be stripped");
         assert!(clean.contains("rect"), "element should remain");
 
+        // foreignObject and its children removed
         let with_foreign =
             r#"<svg><foreignObject><div>xss</div></foreignObject><circle r="5"/></svg>"#;
         let clean = sanitize_svg(with_foreign);
-        assert!(
-            !clean.contains("foreignObject"),
-            "foreignObject should be stripped"
-        );
+        assert!(!clean.contains("foreignObject"), "foreignObject stripped");
+        assert!(!clean.contains("div"), "children of blocked elements stripped");
         assert!(clean.contains("circle"), "safe elements should remain");
 
+        // Safe SVG passes through unchanged
         let safe = r#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="100" height="50" fill="blue"/><text x="10" y="30">Hello</text></svg>"#;
         let clean = sanitize_svg(safe);
         assert_eq!(clean, safe, "safe SVG should pass through unchanged");
+
+        // Mixed-case bypass attempt
+        let upper = r#"<svg><SCRIPT>alert(1)</SCRIPT><rect width="5"/></svg>"#;
+        let clean = sanitize_svg(upper);
+        assert!(!clean.contains("SCRIPT"), "mixed-case script stripped");
+        assert!(clean.contains("rect"));
+
+        // External use href blocked, local ref preserved
+        let ext_use = r#"<svg><use href="http://evil.com/x.svg#a"/></svg>"#;
+        let clean = sanitize_svg(ext_use);
+        assert!(!clean.contains("evil.com"), "external use href blocked");
+        let local_use = r##"<svg><use href="#mySymbol"/></svg>"##;
+        let clean = sanitize_svg(local_use);
+        assert!(clean.contains("#mySymbol"), "local use href preserved");
+
+        // Image: external URL blocked, data URI preserved
+        let ext_img = r#"<svg><image href="http://evil.com/track.png"/></svg>"#;
+        let clean = sanitize_svg(ext_img);
+        assert!(!clean.contains("evil.com"), "external image href blocked");
+        let data_img = r#"<svg><image href="data:image/png;base64,abc"/></svg>"#;
+        let clean = sanitize_svg(data_img);
+        assert!(clean.contains("data:image/png"), "data URI image preserved");
+
+        // Style attribute: safe properties kept, dangerous values stripped
+        let safe_style = r#"<svg><rect style="fill:red;opacity:0.5"/></svg>"#;
+        let clean = sanitize_svg(safe_style);
+        assert!(clean.contains("fill:red"), "safe style kept");
+        assert!(clean.contains("opacity:0.5"), "safe style kept");
+        let bad_style =
+            r#"<svg><rect style="fill:red;background:url(javascript:alert(1))"/></svg>"#;
+        let clean = sanitize_svg(bad_style);
+        assert!(clean.contains("fill:red"), "safe part of style kept");
+        assert!(!clean.contains("javascript"), "dangerous style value stripped");
+
+        // Malformed XML returns empty string
+        let broken = r#"<svg><rect width="10""#;
+        let clean = sanitize_svg(broken);
+        assert!(clean.is_empty(), "malformed XML returns empty");
+
+        // iframe, embed, object all blocked
+        let iframe = r#"<svg><iframe src="http://evil.com"/><rect width="5"/></svg>"#;
+        let clean = sanitize_svg(iframe);
+        assert!(!clean.contains("iframe"), "iframe stripped");
+        assert!(clean.contains("rect"));
     }
 
     #[tokio::test]

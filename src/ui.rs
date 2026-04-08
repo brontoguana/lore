@@ -157,13 +157,6 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
       ins.classList.remove('expanded');
     }}
   }}
-  function toggleEditline() {{
-    var doc = document.getElementById('document');
-    if (!doc) return;
-    doc.classList.toggle('editline-visible');
-    var btn = document.getElementById('editline-toggle');
-    if (btn) btn.classList.toggle('active', doc.classList.contains('editline-visible'));
-  }}
   document.addEventListener('keydown', function(e) {{
     if (e.key !== 'Escape') return;
     // Check for an open edit panel
@@ -190,40 +183,38 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     }}
   }});
   var _dragBlockId = null;
-  function blockDragStart(e) {{
+  function bandDragStart(e) {{
     _dragBlockId = e.currentTarget.dataset.blockId;
-    e.currentTarget.classList.add('dragging');
+    e.currentTarget.classList.add('editline-band-dragging');
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', _dragBlockId);
-    document.querySelectorAll('.block-inserter').forEach(function(ins) {{
-      ins.classList.add('drag-active');
+    document.querySelectorAll('.editline-gap').forEach(function(g) {{
+      g.classList.add('editline-gap-drop-ready');
     }});
   }}
-  function blockDragEnd(e) {{
+  function bandDragEnd(e) {{
     _dragBlockId = null;
-    e.currentTarget.classList.remove('dragging');
-    document.querySelectorAll('.block-inserter').forEach(function(ins) {{
-      ins.classList.remove('drag-active', 'drag-over');
+    e.currentTarget.classList.remove('editline-band-dragging');
+    document.querySelectorAll('.editline-gap').forEach(function(g) {{
+      g.classList.remove('editline-gap-drop-ready', 'editline-gap-drop-hover');
     }});
   }}
-  function blockDragOverInserter(e) {{
+  function gapDragOver(e) {{
     if (!_dragBlockId) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    e.currentTarget.classList.add('drag-over');
+    e.currentTarget.classList.add('editline-gap-drop-hover');
   }}
-  function blockDragLeaveInserter(e) {{
-    e.currentTarget.classList.remove('drag-over');
+  function gapDragLeave(e) {{
+    e.currentTarget.classList.remove('editline-gap-drop-hover');
   }}
-  function blockDropInserter(e) {{
+  function gapDrop(e) {{
     e.preventDefault();
-    var ins = e.currentTarget;
-    ins.classList.remove('drag-over');
-    var afterId = ins.dataset.after || '';
+    var gap = e.currentTarget;
+    gap.classList.remove('editline-gap-drop-hover');
+    var afterId = gap.dataset.after || '';
     var blockId = _dragBlockId;
     if (!blockId) return;
-    var article = document.getElementById('block-' + blockId);
-    if (!article) return;
     var project = window.location.pathname.split('/ui/')[1];
     if (project) project = project.split('?')[0].split('#')[0];
     if (!project) return;
@@ -1635,7 +1626,7 @@ Install:
 
 On Windows, use WSL (Windows Subsystem for Linux) and run the Linux install command above.
 
-Configure:
+Configure (saves the URL and token so future commands just work):
   lore config set --url {base_url} --token YOUR_TOKEN
 
 Commands:
@@ -1665,9 +1656,16 @@ Add this to your MCP client config (Claude Desktop, Cursor, etc.):
 
 Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around, grep_blocks, create_block, update_block, move_block, delete_block.
 
+## Add to your persistent config
+
+Add the following to your memory or config file (CLAUDE.md, AGENTS.md, GEMINI.md, or equivalent):
+
+- Use Lore for project information, tracking, and updates.
+- If the Lore MCP server is available, use it (server URL: {mcp_url}). Otherwise use the Lore CLI — run `lore help` for usage details.
+
 ## Usage guidance
 
-- Read existing documents before writing to understand structure and conventions
+- Read existing blocks before creating new ones to avoid duplicating content
 - Use markdown blocks for text content
 - Use the librarian to ask questions about project context
 - Link between documents using lore:// links in standard markdown format"#,
@@ -1875,6 +1873,7 @@ pub fn render_settings_page(
           <p><strong>Theme</strong><br>{preference_label}</p>
           <p><strong>Appearance</strong><br>{mode_label}</p>
           <p><strong>Server default</strong><br>{server_default_label}</p>
+          <p><strong>Server version</strong><br>v{server_version}</p>
         </div>
       </section>
     </div>
@@ -1932,6 +1931,7 @@ pub fn render_settings_page(
         theme_selector_cards =
             render_theme_selector_cards(selected_theme, server_default_theme, theme),
         mode_options = mode_options,
+        server_version = env!("CARGO_PKG_VERSION"),
     );
 
     render_shell(
@@ -2316,9 +2316,6 @@ pub fn render_project_page(
 
     <div class="layout">
       <section class="panel" id="document">
-        <button type="button" class="editline-toggle" id="editline-toggle" onclick="toggleEditline()" title="Toggle edit mode">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
-        </button>
         {results_label}
         <div class="timeline">{blocks_html}</div>
       </section>
@@ -2413,7 +2410,8 @@ fn render_librarian_panel(
         ""
     };
     let compact_html = if can_write {
-        r#"<div class="stack" style="border-top:1px solid var(--line);padding-top:var(--s-3)">
+        format!(
+            r#"<div class="stack" style="border-top:1px solid var(--line);padding-top:var(--s-3)">
     <p class="hint">Tools</p>
     <form method="post" action="/ui/{project}/compact" onsubmit="return confirm('Merge all consecutive markdown blocks into single blocks?')">
       <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -2422,9 +2420,12 @@ fn render_librarian_panel(
         Compact
       </button>
     </form>
-  </div>"#
+  </div>"#,
+            project = escape_attribute(project.as_str()),
+            csrf_token = escape_attribute(csrf_token),
+        )
     } else {
-        ""
+        String::new()
     };
 
     format!(
@@ -3394,7 +3395,7 @@ fn render_block_inserter(
       </form>
     </div>
   </div>
-  <div class="editline-gap"><button type="button" class="editline-plus" onclick="toggleEditlineInserter(this)">+</button></div>
+  <div class="editline-gap" data-after="{after_value}" ondragover="gapDragOver(event)" ondragleave="gapDragLeave(event)" ondrop="gapDrop(event)"><button type="button" class="editline-plus" onclick="toggleEditlineInserter(this)">+</button></div>
 </div>"#,
         project_attr = project_attr,
         csrf_attr = csrf_attr,
@@ -3511,7 +3512,7 @@ fn render_block(
 
     let band_html = if can_write {
         format!(
-            r#"<div class="editline-band {band_class}{band_pinned}" onclick="toggleBlockEdit('{block_id}')" title="Click to edit"></div>"#,
+            r#"<div class="editline-band {band_class}{band_pinned}" data-block-id="{block_id}" draggable="true" ondragstart="bandDragStart(event)" ondragend="bandDragEnd(event)" onclick="toggleBlockEdit('{block_id}')" title="Click to edit · Drag to reorder"></div>"#,
             band_class = band_class,
             band_pinned = band_pinned,
             block_id = block_id,
@@ -3647,22 +3648,364 @@ fn render_data_image(mime: &str, content: &str, alt: &str) -> String {
     )
 }
 
+/// Allowlist-based SVG sanitizer. Parses the input as XML, keeps only
+/// elements and attributes on an explicit allowlist, and rebuilds the
+/// output. Anything not on the lists is silently dropped. Returns an
+/// empty string for malformed XML.
 pub fn sanitize_svg(input: &str) -> String {
-    use regex::Regex;
-    let dangerous_tags = Regex::new(
-        r#"(?i)<\s*/?\s*(script|foreignObject|iframe|embed|object|applet|meta|link|base)\b[^>]*>"#,
-    )
-    .unwrap();
-    let event_handlers = Regex::new(r#"(?i)\s+on\w+\s*=\s*["'][^"']*["']"#).unwrap();
-    let event_handlers_unquoted = Regex::new(r"(?i)\s+on\w+\s*=\s*\S+").unwrap();
-    let external_use =
-        Regex::new(r#"(?i)<\s*use\b[^>]*href\s*=\s*["']https?://[^"']*["'][^>]*>"#).unwrap();
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
 
-    let result = dangerous_tags.replace_all(input, "");
-    let result = event_handlers.replace_all(&result, "");
-    let result = event_handlers_unquoted.replace_all(&result, "");
-    let result = external_use.replace_all(&result, "");
-    result.into_owned()
+    let mut reader = Reader::from_str(input);
+    reader.config_mut().trim_text(false);
+    let mut out = String::with_capacity(input.len());
+    let mut skip_depth: usize = 0;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let qn = e.name();
+                let name = std::str::from_utf8(qn.as_ref()).unwrap_or("");
+                let lower = name.to_ascii_lowercase();
+                if skip_depth > 0 {
+                    skip_depth += 1;
+                    continue;
+                }
+                if !is_allowed_svg_element(&lower) {
+                    skip_depth = 1;
+                    continue;
+                }
+                svg_write_open_tag(&mut out, e, name, &lower, false);
+            }
+            Ok(Event::End(ref e)) => {
+                if skip_depth > 0 {
+                    skip_depth -= 1;
+                    continue;
+                }
+                let qn = e.name();
+                let name = std::str::from_utf8(qn.as_ref()).unwrap_or("");
+                out.push_str("</");
+                out.push_str(name);
+                out.push('>');
+            }
+            Ok(Event::Empty(ref e)) => {
+                if skip_depth > 0 {
+                    continue;
+                }
+                let qn = e.name();
+                let name = std::str::from_utf8(qn.as_ref()).unwrap_or("");
+                let lower = name.to_ascii_lowercase();
+                if !is_allowed_svg_element(&lower) {
+                    continue;
+                }
+                svg_write_open_tag(&mut out, e, name, &lower, true);
+            }
+            Ok(Event::Text(ref e)) => {
+                if skip_depth > 0 {
+                    continue;
+                }
+                if let Ok(s) = std::str::from_utf8(e.as_ref()) {
+                    out.push_str(s);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {} // drop comments, PIs, doctypes, CDATA
+            Err(_) => return String::new(),
+        }
+    }
+    out
+}
+
+fn svg_write_open_tag(
+    out: &mut String,
+    elem: &quick_xml::events::BytesStart<'_>,
+    tag: &str,
+    lower_tag: &str,
+    self_close: bool,
+) {
+    out.push('<');
+    out.push_str(tag);
+    for attr in elem.attributes().flatten() {
+        let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
+        let lower_key = key.to_ascii_lowercase();
+        if !is_allowed_svg_attribute(&lower_key) {
+            continue;
+        }
+        let raw_val = std::str::from_utf8(&attr.value).unwrap_or("");
+
+        // href / xlink:href — local refs only, data:image/ for <image>
+        if lower_key == "href" || lower_key == "xlink:href" {
+            let decoded = attr.unescape_value().unwrap_or_default();
+            if lower_tag == "image" {
+                if !decoded.starts_with("data:image/") && !decoded.starts_with('#') {
+                    continue;
+                }
+            } else if !decoded.starts_with('#') {
+                continue;
+            }
+        }
+
+        // style — sanitize individual CSS declarations
+        if lower_key == "style" {
+            let decoded = attr.unescape_value().unwrap_or_default();
+            let safe = sanitize_svg_style(&decoded);
+            if safe.is_empty() {
+                continue;
+            }
+            out.push(' ');
+            out.push_str(key);
+            out.push_str("=\"");
+            svg_push_escaped_attr(out, &safe);
+            out.push('"');
+            continue;
+        }
+
+        // Pass through with raw (already-escaped) value; only re-escape
+        // double-quotes in case the original used single-quote delimiters.
+        out.push(' ');
+        out.push_str(key);
+        out.push_str("=\"");
+        svg_push_raw_attr_val(out, raw_val);
+        out.push('"');
+    }
+    if self_close {
+        out.push_str("/>");
+    } else {
+        out.push('>');
+    }
+}
+
+fn is_allowed_svg_element(lower: &str) -> bool {
+    matches!(
+        lower,
+        "svg"
+            | "g"
+            | "defs"
+            | "symbol"
+            | "use"
+            | "clippath"
+            | "mask"
+            | "pattern"
+            | "lineargradient"
+            | "radialgradient"
+            | "stop"
+            | "filter"
+            | "fegaussianblur"
+            | "feoffset"
+            | "femerge"
+            | "femergenode"
+            | "feflood"
+            | "fecomposite"
+            | "feblend"
+            | "fecolormatrix"
+            | "rect"
+            | "circle"
+            | "ellipse"
+            | "line"
+            | "polyline"
+            | "polygon"
+            | "path"
+            | "text"
+            | "tspan"
+            | "textpath"
+            | "image"
+            | "title"
+            | "desc"
+            | "marker"
+            | "animate"
+            | "animatetransform"
+            | "animatemotion"
+            | "set"
+    )
+}
+
+fn is_allowed_svg_attribute(lower: &str) -> bool {
+    matches!(
+        lower,
+        "id"
+            | "class"
+            | "style"
+            | "x"
+            | "y"
+            | "x1"
+            | "y1"
+            | "x2"
+            | "y2"
+            | "cx"
+            | "cy"
+            | "r"
+            | "rx"
+            | "ry"
+            | "width"
+            | "height"
+            | "viewbox"
+            | "xmlns"
+            | "xmlns:xlink"
+            | "fill"
+            | "stroke"
+            | "stroke-width"
+            | "stroke-linecap"
+            | "stroke-linejoin"
+            | "stroke-dasharray"
+            | "stroke-dashoffset"
+            | "opacity"
+            | "fill-opacity"
+            | "stroke-opacity"
+            | "transform"
+            | "d"
+            | "points"
+            | "font-family"
+            | "font-size"
+            | "font-weight"
+            | "font-style"
+            | "text-anchor"
+            | "dominant-baseline"
+            | "dx"
+            | "dy"
+            | "rotate"
+            | "letter-spacing"
+            | "text-decoration"
+            | "clip-path"
+            | "clip-rule"
+            | "mask"
+            | "filter"
+            | "marker-start"
+            | "marker-mid"
+            | "marker-end"
+            | "preserveaspectratio"
+            | "color"
+            | "display"
+            | "visibility"
+            | "overflow"
+            | "gradientunits"
+            | "gradienttransform"
+            | "spreadmethod"
+            | "offset"
+            | "stop-color"
+            | "stop-opacity"
+            | "patternunits"
+            | "patterntransform"
+            | "href"
+            | "xlink:href"
+            | "dur"
+            | "begin"
+            | "end"
+            | "repeatcount"
+            | "from"
+            | "to"
+            | "values"
+            | "keytimes"
+            | "calcmode"
+            | "attributename"
+            | "type"
+            | "result"
+            | "in"
+            | "in2"
+            | "stddeviation"
+            | "flood-color"
+            | "flood-opacity"
+            | "mode"
+            | "fill-rule"
+            | "xml:space"
+            | "version"
+            | "markerwidth"
+            | "markerheight"
+            | "orient"
+            | "refx"
+            | "refy"
+            | "markerunits"
+            | "patterncontentunits"
+            | "alignment-baseline"
+            | "baseline-shift"
+    )
+}
+
+fn sanitize_svg_style(style: &str) -> String {
+    style
+        .split(';')
+        .filter_map(|decl| {
+            let decl = decl.trim();
+            if decl.is_empty() {
+                return None;
+            }
+            let (prop, val) = decl.split_once(':')?;
+            let prop = prop.trim();
+            let val = val.trim();
+            if !is_safe_svg_css_property(&prop.to_ascii_lowercase()) {
+                return None;
+            }
+            let lower_val = val.to_ascii_lowercase();
+            if lower_val.contains("url(")
+                || lower_val.contains("expression(")
+                || lower_val.contains("javascript:")
+                || lower_val.contains("-moz-binding")
+                || lower_val.contains("behavior")
+            {
+                return None;
+            }
+            Some(format!("{}:{}", prop, val))
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn is_safe_svg_css_property(lower: &str) -> bool {
+    matches!(
+        lower,
+        "color"
+            | "fill"
+            | "stroke"
+            | "stroke-width"
+            | "stroke-linecap"
+            | "stroke-linejoin"
+            | "stroke-dasharray"
+            | "stroke-dashoffset"
+            | "opacity"
+            | "fill-opacity"
+            | "stroke-opacity"
+            | "font-family"
+            | "font-size"
+            | "font-weight"
+            | "font-style"
+            | "text-anchor"
+            | "dominant-baseline"
+            | "text-decoration"
+            | "letter-spacing"
+            | "display"
+            | "visibility"
+            | "overflow"
+            | "transform"
+            | "stop-color"
+            | "stop-opacity"
+            | "fill-rule"
+            | "clip-rule"
+    )
+}
+
+/// Escape a decoded value for use inside a double-quoted XML attribute.
+fn svg_push_escaped_attr(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Push a raw (already entity-escaped) attribute value, only re-escaping
+/// double-quotes that may appear when the original used single-quote
+/// delimiters.
+fn svg_push_raw_attr_val(out: &mut String, raw: &str) {
+    for c in raw.chars() {
+        if c == '"' {
+            out.push_str("&quot;");
+        } else {
+            out.push(c);
+        }
+    }
 }
 
 fn render_block_type_options(selected: BlockType) -> String {
@@ -4720,6 +5063,24 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       opacity: 1;
     }
 
+    .editline-band-dragging {
+      background: var(--accent) !important;
+      width: 9px;
+      opacity: 0.5;
+    }
+
+    .editline-gap-drop-ready {
+      min-height: 12px;
+      background: var(--accent-soft);
+      border-radius: 2px;
+      transition: min-height 0.15s, background 0.15s;
+    }
+
+    .editline-gap-drop-hover {
+      min-height: 20px;
+      background: var(--accent) !important;
+    }
+
     /* Edit-line gap rows (inserters) */
     .editline-gap-row {
       min-height: 4px;
@@ -4800,32 +5161,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: #fff0f0;
     }
 
-    /* Pencil toggle for mobile edit line */
-    .editline-toggle {
-      display: none;
-      position: absolute;
-      top: var(--s-3);
-      right: var(--s-3);
-      width: 32px;
-      height: 32px;
-      border-radius: 50%;
-      border: 2px solid var(--line);
-      background: var(--panel-strong);
-      color: var(--muted);
-      cursor: pointer;
-      align-items: center;
-      justify-content: center;
-      padding: 0;
-      z-index: 10;
-      transition: border-color 0.15s, color 0.15s, background 0.15s;
-    }
-
-    .editline-toggle:hover,
-    .editline-toggle.active {
-      border-color: var(--accent);
-      color: var(--accent);
-      background: var(--accent-soft);
-    }
 
     .block-inserter {
       display: flex;
@@ -5462,19 +5797,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         position: relative;
       }
 
-      .editline-toggle {
-        display: flex;
-      }
-
-      .editline-band,
-      .editline-gap {
-        display: none;
-      }
-
-      #document.editline-visible .editline-band,
-      #document.editline-visible .editline-gap {
-        display: flex;
-      }
     }
     "#;
     format!("{root}{base}{rest}")
