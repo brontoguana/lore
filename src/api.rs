@@ -28,9 +28,9 @@ use crate::ui::{
     AgentTokenSummary, ChatAgentSummary, ProjectListEntry, UiAuditEvent, UiDiffLine,
     UiDiffLineKind, UiLibrarianAnswer, UiPendingLibrarianAction, UiProjectVersion,
     UiProjectVersionOperation, UiUserSummary, UserProjectAccess, render_admin_audit_page,
-    render_admin_page, render_chat_page, render_login_page, render_project_audit_page,
-    render_project_history_page, render_project_page, render_agents_page, render_projects_page,
-    render_settings_page, render_setup_page,
+    render_admin_page, render_agent_guide_page, render_chat_page, render_login_page,
+    render_project_audit_page, render_project_history_page, render_project_page,
+    render_agents_page, render_projects_page, render_settings_page, render_setup_page,
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
@@ -305,6 +305,7 @@ fn build_app_with_librarian(
         .route("/ui", get(projects_page))
         .route("/ui/projects", post(create_project_from_ui))
         .route("/ui/agents", get(agents_page))
+        .route("/ui/agents/guide", get(agent_guide_page))
         .route(
             "/ui/agents/machines/{name}/revoke",
             post(revoke_machine_from_ui),
@@ -2660,6 +2661,22 @@ async fn agents_page(
         &user_projects,
         query.selected.as_deref(),
         query.flash.as_deref(),
+    )))
+}
+
+async fn agent_guide_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> UiResult<Html<String>> {
+    let session = require_ui_session(&state, &headers)?;
+    let config = state.config.load()?;
+    Ok(Html(render_agent_guide_page(
+        &config,
+        resolved_theme(&session.user, &config),
+        resolved_color_mode(&session.user),
+        session.user.username.as_str(),
+        session.user.is_admin,
+        &session.csrf_token,
     )))
 }
 

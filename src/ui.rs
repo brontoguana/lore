@@ -899,35 +899,42 @@ pub fn render_admin_page(
             )
         })
         .unwrap_or_else(|| "<p><strong>Last sync</strong><br>Not run yet.</p>".to_string());
-    let auto_update_status_html = auto_update_status
-        .map(|status| {
-            let latest = status.latest_version.as_deref().unwrap_or("unknown");
-            let current = &status.current_version;
-            let update_available = status.ok
-                && !status.applied
-                && status.latest_version.as_deref().is_some_and(|v| v != current);
-            let apply_button = if update_available {
-                format!(
-                    r#"<form method="post" action="/ui/admin/auto-update/apply" class="inline-form" style="margin-top:0.5rem">
-                      <input type="hidden" name="csrf_token" value="{csrf_token}">
-                      <button type="submit">Apply update to {latest}</button>
-                    </form>"#,
-                    csrf_token = csrf_token,
-                    latest = escape_attribute(latest),
-                )
+    let current_version = env!("CARGO_PKG_VERSION");
+    let (update_now_button, auto_update_status_html) = if let Some(status) = auto_update_status {
+        let latest = status.latest_version.as_deref().unwrap_or("unknown");
+        let update_available = status.ok
+            && !status.applied
+            && status.latest_version.as_deref().is_some_and(|v| v != current_version);
+        let button = format!(
+            r#"<form method="post" action="/ui/admin/auto-update/apply" class="inline-form">
+              <input type="hidden" name="csrf_token" value="{csrf_token}">
+              <button type="submit"{disabled}>{label}</button>
+            </form>"#,
+            csrf_token = csrf_token,
+            disabled = if update_available { "" } else { " disabled" },
+            label = if update_available {
+                format!("Update to v{}", escape_text(latest))
             } else {
-                String::new()
-            };
-            format!(
-                "<p><strong>Last check</strong><br>{}<br>Current {}<br>Latest {}<br>{}</p>{}",
-                escape_text(&format_timestamp(status.checked_at)),
-                escape_text(current),
-                escape_text(latest),
-                escape_text(&status.detail),
-                apply_button,
-            )
-        })
-        .unwrap_or_else(|| "<p><strong>Last check</strong><br>Not run yet.</p>".to_string());
+                "Up to date".to_string()
+            },
+        );
+        let status_html = format!(
+            "<p><strong>Last check</strong><br>{}<br>Latest: v{}<br>{}</p>",
+            escape_text(&format_timestamp(status.checked_at)),
+            escape_text(latest),
+            escape_text(&status.detail),
+        );
+        (button, status_html)
+    } else {
+        let button = format!(
+            r#"<form method="post" action="/ui/admin/auto-update/apply" class="inline-form">
+              <input type="hidden" name="csrf_token" value="{csrf_token}">
+              <button type="submit">Check &amp; update</button>
+            </form>"#,
+            csrf_token = csrf_token,
+        );
+        (button, "<p><strong>Last check</strong><br>Not run yet.</p>".to_string())
+    };
 
     let sections = [
         "users",
@@ -942,7 +949,7 @@ pub fn render_admin_page(
     ];
     let section_labels = [
         "Users",
-        "Roles",
+        "User Roles",
         "Network",
         "Librarian",
         "Git export",
@@ -1046,7 +1053,7 @@ pub fn render_admin_page(
           }});
         }})();
         </script>
-        <div class="panel-header"><h2>Roles</h2><p>Grants define project-level visibility and editing.</p></div>
+        <div class="panel-header"><h2>User Roles</h2><p>Grants define project-level visibility and editing.</p></div>
         <div class="timeline">{roles_html}</div>
       </section>
 
@@ -1225,8 +1232,17 @@ pub fn render_admin_page(
 
       <section class="panel" data-panel="updates"{updates_display}>
         <div class="panel-header">
-          <h2>Server updates</h2>
-          <p>Check for new Lore server releases and apply updates.</p>
+          <h2>Server Update</h2>
+          <p>Current version: v{current_version}</p>
+        </div>
+        {update_now_button}
+        <div class="meta-stack padded">
+          {auto_update_status_html}
+        </div>
+
+        <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>Auto Update</h2>
+          <p>Configure automatic updates on server restart.</p>
         </div>
         <form method="post" action="/ui/admin/auto-update">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -1238,15 +1254,10 @@ pub fn render_admin_page(
             GitHub repo
             <input type="text" name="github_repo" value="{auto_update_repo}" placeholder="{default_update_repo}" required>
           </label>
-          <button type="submit">Save auto update</button>
+          <button type="submit">Save</button>
         </form>
         <div class="meta-stack padded">
           <p><strong>Status</strong><br>{auto_update_state}</p>
-          {auto_update_status_html}
-          <form method="post" action="/ui/admin/auto-update/apply" class="inline-form" style="margin-top:var(--s-3)">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <button type="submit">Update now</button>
-          </form>
         </div>
       </section>
 
@@ -1381,6 +1392,8 @@ pub fn render_admin_page(
         } else {
             "Disabled"
         },
+        current_version = current_version,
+        update_now_button = update_now_button,
         auto_update_status_html = auto_update_status_html,
         external_auth_enabled_checked = if external_auth_config.enabled {
             " checked"
@@ -1659,19 +1672,6 @@ pub fn render_agents_page(
                 )
             };
 
-            // Token display
-            let token_section = format!(
-                r##"<div class="panel-header"><h3>API key</h3><p>Managed via CLI. Regenerate to invalidate the current token.</p></div>
-                <div class="padded">
-                  <form method="post" action="/ui/agents/{}/rotate" class="inline-form">
-                    <input type="hidden" name="csrf_token" value="{}">
-                    <button type="submit">Regenerate token</button>
-                  </form>
-                </div>"##,
-                escape_attribute(&agent.name),
-                escape_attribute(csrf_token),
-            );
-
             format!(
                 r##"<section class="panel" style="margin-top: var(--s-5);">
                 <div class="panel-header"><h2>{display_name}</h2><p>{owner}-{slug} &middot; {backend}</p></div>
@@ -1700,13 +1700,10 @@ pub fn render_agents_page(
                 }})();
                 </script>
 
-                {token_section}
-
                 <div class="panel-header"><h3>Setup instructions</h3><p>Copy and give to your agent.</p></div>
                 <div class="padded">
-                  <textarea readonly id="agent-instruction" style="height: 5rem; font-family: var(--font-mono); font-size: 0.85rem; resize: none; overflow: hidden;">{setup_instruction}</textarea>
-                  <div style="margin-top: var(--s-3); display: flex; justify-content: space-between; align-items: center;">
-                    <a href="#" id="expand-instructions" style="font-size: 0.85rem;" onclick="toggleInstructions(event)">Expand</a>
+                  <textarea readonly id="agent-instruction" style="min-height: 8rem; font-family: var(--font-mono); font-size: 0.85rem;">{setup_instruction}</textarea>
+                  <div style="margin-top: var(--s-3); text-align: right;">
                     <button type="button" class="button-link" onclick="copyField('agent-instruction')">Copy</button>
                   </div>
                 </div>
@@ -1733,7 +1730,6 @@ pub fn render_agents_page(
                 name_attr = escape_attribute(&agent.name),
                 csrf_token = escape_attribute(csrf_token),
                 edit_grants_html = edit_grants_html,
-                token_section = token_section,
                 setup_instruction = escape_text(&setup_instruction),
                 mcp_config_text = escape_text(&mcp_config_text),
             )
@@ -1749,39 +1745,23 @@ pub fn render_agents_page(
 
     <section class="panel">
       <div class="panel-header">
+        <h2>Machines</h2>
+        <p>Registered machines that can provision agents for your account. <a href="/ui/agents/guide">Setup guide</a></p>
+      </div>
+      <div class="agent-list">{machines_html}</div>
+    </section>
+
+    <section class="panel" style="margin-top: var(--s-5);">
+      <div class="panel-header">
         <h2>Agents</h2>
         <p>Each agent gets its own scoped token and project access.</p>
       </div>
       <div class="agent-list">{agent_list_html}</div>
     </section>
 
-    <section class="panel" style="margin-top: var(--s-5);">
-      <div class="panel-header">
-        <h2>Machines</h2>
-        <p>Registered machines that can provision agents for your account.</p>
-      </div>
-      <div class="agent-list">{machines_html}</div>
-    </section>
-
     {detail_html}
 
     <script>
-    function toggleInstructions(e) {{
-      e.preventDefault();
-      var ta = document.getElementById('agent-instruction');
-      var link = document.getElementById('expand-instructions');
-      if (ta.style.height === '5rem') {{
-        ta.style.height = '20rem';
-        ta.style.overflow = 'auto';
-        ta.style.resize = 'vertical';
-        link.textContent = 'Collapse';
-      }} else {{
-        ta.style.height = '5rem';
-        ta.style.overflow = 'hidden';
-        ta.style.resize = 'none';
-        link.textContent = 'Expand';
-      }}
-    }}
     function copyField(id) {{
       var el = document.getElementById(id);
       if (!el) return;
@@ -2039,6 +2019,84 @@ pub struct ChatAgentSummary {
     pub status: String,
     pub last_message: Option<String>,
     pub last_message_time: Option<String>,
+}
+
+pub fn render_agent_guide_page(
+    config: &ServerConfig,
+    theme: UiTheme,
+    color_mode: ColorMode,
+    username: &str,
+    is_admin: bool,
+    csrf_token: &str,
+) -> String {
+    let base_url = config.base_url();
+    let install_script_url =
+        "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh";
+
+    let content = format!(
+        r#"<h1 class="page-title">Machine &amp; Agent Setup</h1>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>1. Install the Lore CLI</h2>
+        <p>Run this on the machine where you want agents to operate.</p>
+      </div>
+      <div class="padded">
+        <div style="display:flex; align-items:center; gap:var(--s-3);">
+          <code style="flex:1; padding:var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.9rem; overflow-x:auto; white-space:nowrap;">curl -fsSL {install_script_url} | sh</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('curl -fsSL {install_script_url} | sh')" title="Copy">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
+        <p class="hint" style="margin-top:var(--s-3);">On Windows, use WSL and run the Linux command above.</p>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top: var(--s-5);">
+      <div class="panel-header">
+        <h2>2. Register this machine</h2>
+        <p>This links the machine to your Lore account so it can create agents.</p>
+      </div>
+      <div class="padded">
+        <div style="display:flex; align-items:center; gap:var(--s-3);">
+          <code style="flex:1; padding:var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.9rem; overflow-x:auto; white-space:nowrap;">lore setup {base_url}</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('lore setup {base_url}')" title="Copy">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
+        <p class="hint" style="margin-top:var(--s-3);">You will be prompted to log in with your Lore username and password, then asked to name this machine.</p>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top: var(--s-5);">
+      <div class="panel-header">
+        <h2>3. Start an agent</h2>
+        <p>Create and run an agent on this machine.</p>
+      </div>
+      <div class="padded">
+        <code style="display:block; padding:var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.9rem;">lore agent my-agent-name</code>
+        <p class="hint" style="margin-top:var(--s-3);">The agent is automatically provisioned on the server and starts polling for messages. Use the Chat tab to talk to it.</p>
+        <p class="hint" style="margin-top:var(--s-2);">Options: <code>--backend gemini</code> or <code>--backend codex</code> to use a different backend (default is Claude).</p>
+      </div>
+    </section>
+
+    <p style="margin-top:var(--s-5);"><a href="/ui/agents">&larr; Back to Agents</a></p>"#,
+        install_script_url = escape_attribute(install_script_url),
+        base_url = escape_text(&base_url),
+    );
+
+    render_shell(
+        PageShell {
+            title: "Lore setup guide",
+            username: Some(username),
+            is_admin,
+            theme,
+            color_mode: ColorMode::System,
+            csrf_token: Some(csrf_token),
+            flash: None,
+        },
+        content,
+    )
 }
 
 pub fn render_chat_page(
@@ -2701,7 +2759,7 @@ pub fn render_project_page(
         format!(
             r#"<div class="agent-context-section editline-row">
   <div class="agent-context-panel">
-    <div class="agent-context-header"><span class="pill">Agent Context</span></div>
+    <div class="section-tag">Agent Context</div>
     <pre class="agent-context-preview" id="agent-context-preview">{preview}</pre>
     <div class="agent-context-full" id="agent-context-full" style="display:none;">
       <pre class="agent-context-full-text">{full_text}</pre>
@@ -2746,13 +2804,15 @@ pub fn render_project_page(
       <button type="submit">Search</button>
     </form>
 
-    {agent_context_html}
-
     <div class="layout">
-      <section class="panel" id="document">
-        {results_label}
-        <div class="timeline">{blocks_html}</div>
-      </section>
+      <div class="main-column">
+        {agent_context_html}
+        <section class="panel" id="document">
+          <div class="section-tag">Document</div>
+          {results_label}
+          <div class="timeline">{blocks_html}</div>
+        </section>
+      </div>
       <aside class="stack">{librarian_panel}{read_only_notice}</aside>
     </div>
     {delete_project_html}"#,
@@ -5217,8 +5277,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       transition: all 0.2s;
     }
 
-    .hero-actions a:hover,
-    .button-link:hover {
+    .hero-actions a:hover {
       background: var(--surface-hover);
       transform: translateY(-1px);
     }
@@ -5233,6 +5292,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .hero-actions a.primary:hover,
     .button-link:hover {
       opacity: 0.9;
+      transform: translateY(-1px);
     }
 
     .layout {
@@ -5638,8 +5698,26 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       min-width: 0;
     }
 
+    .main-column {
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-3);
+      min-width: 0;
+    }
+
+    .section-tag {
+      text-align: right;
+      font-size: 0.75em;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--fg);
+      opacity: 0.35;
+      margin-bottom: var(--s-1);
+    }
+
     .agent-context-section {
-      margin-bottom: var(--s-3);
+      margin-bottom: 0;
     }
 
     .agent-context-panel {
@@ -5648,10 +5726,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: var(--surface-hover);
       border-radius: var(--radius);
       padding: var(--s-3) var(--s-4);
-    }
-
-    .agent-context-header {
-      margin-bottom: var(--s-2);
     }
 
     .agent-context-preview,
