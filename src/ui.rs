@@ -292,6 +292,7 @@ pub struct ProjectListEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentTokenSummary {
     pub name: String,
+    pub display_name: String,
     pub owner: Option<String>,
     pub grants: Vec<ProjectGrant>,
     pub created_at: time::OffsetDateTime,
@@ -1525,7 +1526,7 @@ pub fn render_agents_page(
                     </a>"#,
                     escape_attribute(&agent.name),
                     cls,
-                    escape_text(&agent.name),
+                    escape_text(&agent.display_name),
                     escape_text(&grant_label),
                 )
             })
@@ -1659,7 +1660,7 @@ pub fn render_agents_page(
 
             format!(
                 r##"<section class="panel" style="margin-top: var(--s-5);">
-                <div class="panel-header"><h2>{name}</h2><p>{owner}-{name}</p></div>
+                <div class="panel-header"><h2>{display_name}</h2><p>{owner}-{slug}</p></div>
 
                 <div class="panel-header"><h3>Configuration</h3></div>
                 <form method="post" action="/ui/agents/{name_attr}/grants" id="edit-grants-form">
@@ -1711,7 +1712,8 @@ pub fn render_agents_page(
                   </form>
                 </div>
               </section>"##,
-                name = escape_text(&agent.name),
+                display_name = escape_text(&agent.display_name),
+                slug = escape_text(&agent.name),
                 owner = escape_text(username),
                 name_attr = escape_attribute(&agent.name),
                 csrf_token = escape_attribute(csrf_token),
@@ -3259,7 +3261,7 @@ fn render_user_card(user: &UiUserSummary, agents: &[AgentTokenSummary], csrf_tok
                     .join(", ");
                 format!(
                     r#"<li><span class="meta-code">{}</span> <span style="font-size:0.82rem; color:var(--fg-muted);">{}</span></li>"#,
-                    escape_text(&agent.name),
+                    escape_text(&agent.display_name),
                     escape_text(&grants),
                 )
             })

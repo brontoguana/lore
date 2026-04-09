@@ -40,6 +40,8 @@ pub struct NewSession {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredAgentToken {
     pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub token_hash: String,
     #[serde(default)]
     pub owner: Option<UserName>,
@@ -49,14 +51,20 @@ pub struct StoredAgentToken {
 
 #[derive(Debug, Clone)]
 pub struct NewAgentToken {
-    pub name: String,
+    pub display_name: String,
     pub owner: UserName,
     pub grants: Vec<ProjectGrant>,
 }
 
 impl NewAgentToken {
+    pub fn slug(&self) -> String {
+        slugify_agent_name(&self.display_name)
+    }
+
     pub fn validate(&self) -> Result<()> {
-        validate_agent_token_name(&self.name)?;
+        validate_agent_display_name(&self.display_name)?;
+        let slug = self.slug();
+        validate_agent_token_name(&slug)?;
         if self.grants.is_empty() {
             return Err(LoreError::Validation(
                 "agent token must grant at least one project permission".into(),
@@ -457,9 +465,10 @@ impl LocalAuthStore {
 
     pub fn create_agent_token(&self, token: NewAgentToken) -> Result<CreatedAgentToken> {
         token.validate()?;
+        let slug = token.slug();
         let mut tokens = self.load_agent_tokens()?;
         if tokens.iter().any(|existing| {
-            existing.name == token.name
+            existing.name == slug
                 && existing.owner.as_ref() == Some(&token.owner)
         }) {
             return Err(LoreError::Validation("agent already exists".into()));
@@ -469,7 +478,8 @@ impl LocalAuthStore {
         grants.sort_by(|a, b| a.project.cmp(&b.project));
         let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         let stored = StoredAgentToken {
-            name: token.name,
+            name: slug,
+            display_name: Some(token.display_name),
             token_hash: hash_agent_token(&raw_token),
             owner: Some(token.owner),
             grants,
@@ -860,6 +870,51 @@ fn validate_password(password: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_agent_display_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > MAX_AGENT_TOKEN_NAME_LEN {
+        return Err(LoreError::Validation(format!(
+            "agent name must be 1..={MAX_AGENT_TOKEN_NAME_LEN} characters"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ' '))
+    {
+        return Err(LoreError::Validation(
+            "agent name must contain only letters, digits, spaces, '.', '_' or '-'".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn slugify_agent_name(display_name: &str) -> String {
+    let slug: String = display_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Collapse consecutive hyphens
+    let mut result = String::with_capacity(slug.len());
+    let mut prev_hyphen = false;
+    for ch in slug.chars() {
+        if ch == '-' {
+            if !prev_hyphen {
+                result.push(ch);
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(ch);
+            prev_hyphen = false;
+        }
+    }
+    result.trim_matches('-').to_string()
+}
+
 fn validate_agent_token_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > MAX_AGENT_TOKEN_NAME_LEN {
         return Err(LoreError::Validation(format!(
@@ -1084,7 +1139,7 @@ mod tests {
 
         let created = auth
             .create_agent_token(NewAgentToken {
-                name: "worker-alpha".into(),
+                display_name: "worker-alpha".into(),
                 owner: UserName::new("admin").unwrap(),
                 grants: vec![ProjectGrant {
                     project: ProjectName::new("alpha.docs").unwrap(),

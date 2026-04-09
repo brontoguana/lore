@@ -1585,7 +1585,7 @@ async fn create_agent_token(
     let admin = require_admin(&state, &headers)?;
     let owner = UserName::new(&payload.owner)?;
     let created = state.auth.create_agent_token(NewAgentToken {
-        name: payload.name,
+        display_name: payload.name,
         owner: owner.clone(),
         grants: payload
             .grants
@@ -2591,7 +2591,7 @@ async fn create_agent_from_ui(
     // Validate the user can grant these permissions
     validate_user_grants(&state, &session.user, &grants)?;
     let created = state.auth.create_agent_token(NewAgentToken {
-        name: form.name.clone(),
+        display_name: form.name.clone(),
         owner: session.user.username.clone(),
         grants,
     })?;
@@ -2602,12 +2602,12 @@ async fn create_agent_from_ui(
             name: session.user.username.as_str().to_string(),
         },
         "create agent",
-        Some(form.name.clone()),
+        Some(created.stored.name.clone()),
         None,
     )?;
     Ok(Redirect::to(&format!(
         "/ui/agents?selected={}&created_token={}&flash=Agent%20created.%20Copy%20the%20token%20now.",
-        urlencoding::encode(&form.name),
+        urlencoding::encode(&created.stored.name),
         urlencoding::encode(&created.token),
     ))
     .into_response())
@@ -4586,8 +4586,13 @@ fn block_matches_filters(block: &Block, filters: &BlockFilterOptions) -> bool {
 }
 
 fn agent_token_summary(token: StoredAgentToken) -> AgentTokenSummary {
+    let display_name = token
+        .display_name
+        .clone()
+        .unwrap_or_else(|| token.name.clone());
     AgentTokenSummary {
         name: token.name,
+        display_name,
         owner: token.owner.map(|u| u.as_str().to_string()),
         grants: token.grants,
         created_at: token.created_at,
