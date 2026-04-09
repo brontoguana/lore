@@ -900,35 +900,20 @@ pub fn render_admin_page(
         })
         .unwrap_or_else(|| "<p><strong>Last sync</strong><br>Not run yet.</p>".to_string());
     let current_version = env!("CARGO_PKG_VERSION");
-    let (update_now_button, auto_update_status_html) = if let Some(status) = auto_update_status {
+    let update_now_button = format!(
+        r#"<button type="button" id="update-btn" data-csrf="{csrf_token}" data-state="check">Check for updates</button>"#,
+        csrf_token = csrf_token,
+    );
+    let auto_update_status_html = if let Some(status) = auto_update_status {
         let latest = status.latest_version.as_deref().unwrap_or("unknown");
-        let update_available = status.ok
-            && !status.applied
-            && status.latest_version.as_deref().is_some_and(|v| v != current_version);
-        let button = format!(
-            r#"<button type="button" id="update-btn" data-csrf="{csrf_token}" data-state="{state}"{disabled}>{label}</button>"#,
-            csrf_token = csrf_token,
-            state = if update_available { "apply" } else { "uptodate" },
-            disabled = if update_available { "" } else { " disabled" },
-            label = if update_available {
-                format!("Apply Update v{}", escape_text(latest))
-            } else {
-                "Up to date".to_string()
-            },
-        );
-        let status_html = format!(
+        format!(
             "<p><strong>Last check</strong><br>{}<br>Latest: v{}<br>{}</p>",
             escape_text(&format_timestamp(status.checked_at)),
             escape_text(latest),
             escape_text(&status.detail),
-        );
-        (button, status_html)
+        )
     } else {
-        let button = format!(
-            r#"<button type="button" id="update-btn" data-csrf="{csrf_token}" data-state="check">Check for updates</button>"#,
-            csrf_token = csrf_token,
-        );
-        (button, "<p><strong>Last check</strong><br>Not run yet.</p>".to_string())
+        "<p><strong>Last check</strong><br>Not run yet.</p>".to_string()
     };
 
     let sections = [
@@ -1241,21 +1226,10 @@ pub fn render_admin_page(
           <h2>Auto Update</h2>
           <p>Configure automatic updates on server restart.</p>
         </div>
-        <form method="post" action="/ui/admin/auto-update">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label class="toggle">
-            <input type="checkbox" name="enabled" value="true"{auto_update_enabled_checked}>
-            <span>Enable automatic server self-update on restart</span>
-          </label>
-          <label>
-            GitHub repo
-            <input type="text" name="github_repo" value="{auto_update_repo}" placeholder="{default_update_repo}" required>
-          </label>
-          <button type="submit">Save</button>
-        </form>
-        <div class="meta-stack padded">
-          <p><strong>Status</strong><br>{auto_update_state}</p>
-        </div>
+        <label class="toggle" style="padding:var(--s-5);">
+          <input type="checkbox" id="auto-update-toggle" data-csrf="{csrf_token}"{auto_update_enabled_checked}>
+          <span>Enable automatic server self-update on restart</span>
+        </label>
       </section>
 
       <section class="panel" data-panel="audit"{audit_display}>
@@ -1340,6 +1314,18 @@ pub fn render_admin_page(
               ubtn.disabled = false;
             }});
           }}
+        }});
+      }}
+
+      var autoCb = document.getElementById('auto-update-toggle');
+      if (autoCb) {{
+        autoCb.addEventListener('change', function() {{
+          var csrf = autoCb.getAttribute('data-csrf');
+          fetch('/ui/admin/auto-update/toggle-json', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+            body: 'csrf_token=' + encodeURIComponent(csrf) + '&enabled=' + autoCb.checked
+          }});
         }});
       }}
     }})();
@@ -1430,13 +1416,6 @@ pub fn render_admin_page(
             " checked"
         } else {
             ""
-        },
-        auto_update_repo = escape_attribute(&auto_update_config.github_repo),
-        default_update_repo = escape_attribute(DEFAULT_UPDATE_REPO),
-        auto_update_state = if auto_update_config.enabled {
-            "Enabled on startup"
-        } else {
-            "Disabled"
         },
         current_version = current_version,
         update_now_button = update_now_button,
@@ -1595,6 +1574,8 @@ pub fn render_agents_page(
     let mcp_url = config.mcp_url();
     let install_script_url =
         "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh";
+    let install_ps1_url =
+        "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.ps1";
 
     // Agent list
     let agent_list_html = if agents.is_empty() {
@@ -1662,6 +1643,7 @@ pub fn render_agents_page(
                 &base_url,
                 &mcp_url,
                 install_script_url,
+                install_ps1_url,
                 "YOUR_TOKEN",
             );
             let mcp_config_text = format!(
@@ -1840,6 +1822,7 @@ fn build_agent_setup_instruction_text(
     base_url: &str,
     mcp_url: &str,
     install_script_url: &str,
+    install_ps1_url: &str,
     token: &str,
 ) -> String {
     format!(
@@ -1861,10 +1844,11 @@ All requests require an agent token. Include it as:
 
 ### Option 1 — Lore CLI (recommended for code agents)
 
-Install:
+Install (Linux/macOS):
   curl -fsSL {install_script_url} | sh
 
-On Windows, use WSL (Windows Subsystem for Linux) and run the Linux install command above.
+Install (Windows PowerShell):
+  irm {install_ps1_url} | iex
 
 Configure (saves the URL and token so future commands just work):
   lore config set --url {base_url} --token {token}
@@ -2078,6 +2062,8 @@ pub fn render_agent_guide_page(
     let base_url = config.base_url();
     let install_script_url =
         "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh";
+    let install_ps1_url =
+        "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.ps1";
 
     let content = format!(
         r#"<h1 class="page-title">Machine &amp; Agent Setup</h1>
@@ -2088,13 +2074,20 @@ pub fn render_agent_guide_page(
         <p>Run this on the machine where you want agents to operate.</p>
       </div>
       <div class="padded">
+        <p class="hint" style="margin-bottom:var(--s-2);"><strong>Linux / macOS</strong></p>
         <div style="display:flex; align-items:stretch; gap:var(--s-2);">
           <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">curl -fsSL {install_script_url} | sh</code>
           <button class="button-link" onclick="navigator.clipboard.writeText('curl -fsSL {install_script_url} | sh')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
         </div>
-        <p class="hint" style="margin-top:var(--s-3);">On Windows, use WSL and run the Linux command above.</p>
+        <p class="hint" style="margin-top:var(--s-4); margin-bottom:var(--s-2);"><strong>Windows</strong> (PowerShell)</p>
+        <div style="display:flex; align-items:stretch; gap:var(--s-2);">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">irm {install_ps1_url} | iex</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('irm {install_ps1_url} | iex')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
       </div>
     </section>
 
@@ -5374,6 +5367,10 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .agent-list {
       display: flex;
       flex-direction: column;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      margin: var(--s-3) var(--s-5) var(--s-5);
+      overflow: hidden;
     }
 
     .agent-list-item {
@@ -5385,6 +5382,10 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       text-decoration: none;
       color: var(--fg);
       transition: background 0.1s;
+    }
+
+    .agent-list-item:last-child {
+      border-bottom: none;
     }
 
     .agent-list-item:hover {

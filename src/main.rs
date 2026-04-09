@@ -7,6 +7,7 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
@@ -254,6 +255,7 @@ fn prompt_initial_admin_if_needed(data_root: &str) {
     }
 }
 
+#[cfg(unix)]
 fn read_password_no_echo() -> String {
     let stdin_fd = io::stdin().as_raw_fd();
     let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -282,6 +284,30 @@ fn read_password_no_echo() -> String {
     line.trim_end_matches('\n')
         .trim_end_matches('\r')
         .to_string()
+}
+
+#[cfg(windows)]
+fn read_password_no_echo() -> String {
+    extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> isize;
+        fn GetConsoleMode(hConsoleHandle: isize, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: isize, dwMode: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode: u32 = 0;
+        GetConsoleMode(handle, &mut mode);
+        SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT);
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+        SetConsoleMode(handle, mode);
+        eprintln!();
+        line.trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .to_string()
+    }
 }
 
 async fn run_server(data_root: String, bind: String) {

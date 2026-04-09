@@ -1408,6 +1408,7 @@ fn encode_query(value: &str) -> String {
 
 // --- Helpers ---
 
+#[cfg(unix)]
 fn read_password_hidden(prompt: &str) -> io::Result<String> {
     use std::io::BufRead;
     eprint!("{}", prompt);
@@ -1426,6 +1427,62 @@ fn read_password_hidden(prompt: &str) -> io::Result<String> {
     }
     eprintln!();
     Ok(password.trim().to_string())
+}
+
+#[cfg(windows)]
+fn read_password_hidden(prompt: &str) -> io::Result<String> {
+    use std::io::BufRead;
+    eprint!("{}", prompt);
+    extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> isize;
+        fn GetConsoleMode(hConsoleHandle: isize, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: isize, dwMode: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // -10 as u32
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode: u32 = 0;
+        GetConsoleMode(handle, &mut mode);
+        SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT);
+        let mut password = String::new();
+        io::stdin().lock().read_line(&mut password)?;
+        SetConsoleMode(handle, mode);
+        eprintln!();
+        Ok(password.trim().to_string())
+    }
+}
+
+#[cfg(unix)]
+fn is_process_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
+}
+
+#[cfg(windows)]
+fn is_process_running(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
 }
 
 fn get_hostname() -> String {
@@ -1494,14 +1551,10 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
         if pid_path.exists() {
             if let Ok(pid_str) = fs::read_to_string(&pid_path) {
                 if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    let check = std::process::Command::new("kill")
-                        .args(["-0", &pid.to_string()])
-                        .status();
-                    if check.map(|s| s.success()).unwrap_or(false) {
+                    let is_running = is_process_running(pid);
+                    if is_running {
                         eprintln!("Stopping existing agent '{}' (pid {})", args.name, pid);
-                        let _ = std::process::Command::new("kill")
-                            .arg(pid.to_string())
-                            .status();
+                        kill_process(pid);
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                 }

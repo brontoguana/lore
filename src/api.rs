@@ -365,6 +365,10 @@ fn build_app_with_librarian(
         .route("/ui/admin/oidc", post(update_oidc_from_ui))
         .route("/ui/admin/auto-update", post(update_auto_update_from_ui))
         .route(
+            "/ui/admin/auto-update/toggle-json",
+            post(toggle_auto_update_json),
+        )
+        .route(
             "/ui/admin/auto-update/check",
             post(check_auto_update_from_ui),
         )
@@ -3395,6 +3399,22 @@ async fn update_oidc_from_ui(
         None,
     )?;
     Ok(Redirect::to("/ui/admin?flash=OIDC%20saved"))
+}
+
+async fn toggle_auto_update_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    let session = require_ui_admin(&state, &headers)?;
+    let csrf = form.get("csrf_token").map(|s| s.as_str()).unwrap_or("");
+    verify_csrf(&session, csrf)?;
+    let enabled = form.get("enabled").map(|s| s == "true").unwrap_or(false);
+    let current = state.auto_update_config.load()?;
+    state
+        .auto_update_config
+        .update(enabled, current.github_repo)?;
+    Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
 async fn update_auto_update_from_ui(
