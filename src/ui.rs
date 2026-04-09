@@ -141,6 +141,26 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     }}
     toggleBlockEdit(blockId);
   }}
+  function toggleAgentContext() {{
+    var preview = document.getElementById('agent-context-preview');
+    var full = document.getElementById('agent-context-full');
+    var form = document.getElementById('agent-context-form');
+    var band = document.querySelector('.agent-context-band');
+    if (!form) return;
+    if (form.style.display === 'none') {{
+      if (preview) preview.style.display = 'none';
+      if (full) full.style.display = 'none';
+      form.style.display = '';
+      if (band) band.classList.add('editline-band-active');
+      var ta = form.querySelector('textarea');
+      if (ta) {{ ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }}
+    }} else {{
+      if (preview) preview.style.display = '';
+      if (full) full.style.display = 'none';
+      form.style.display = 'none';
+      if (band) band.classList.remove('editline-band-active');
+    }}
+  }}
   function toggleEditlineInserter(btn) {{
     var row = btn.closest('.editline-gap-row');
     var ins = row ? row.querySelector('.block-inserter') : null;
@@ -2255,6 +2275,7 @@ pub fn render_project_page(
     project: &ProjectName,
     display_name: &str,
     project_uuid: &str,
+    agent_context: Option<&str>,
     blocks: &[Block],
     flash: Option<&str>,
     search: Option<&str>,
@@ -2381,6 +2402,61 @@ pub fn render_project_page(
     };
     let search_btn_class = if search_active { " active" } else { "" };
 
+    let context_text = agent_context.unwrap_or_default();
+    let context_lines: Vec<&str> = context_text.lines().collect();
+    let context_truncated = context_lines.len() > 8;
+    let context_preview: String = if context_truncated {
+        let mut preview = context_lines[..8].join("\n");
+        preview.push_str("\n...");
+        preview
+    } else {
+        context_text.to_string()
+    };
+    let agent_context_html = {
+        let edit_form = if can_write {
+            format!(
+                r#"<form id="agent-context-form" method="post" action="/ui/{project_slug}/context" style="display:none;">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <textarea name="agent_context" class="agent-context-textarea">{content_escaped}</textarea>
+    <div style="display:flex; gap:var(--s-3); margin-top:var(--s-2);">
+      <button type="submit" class="button-link">Save</button>
+      <button type="button" class="button-link" onclick="toggleAgentContext()">Cancel</button>
+    </div>
+  </form>"#,
+                project_slug = escape_attribute(project.as_str()),
+                csrf = escape_attribute(csrf_token),
+                content_escaped = escape_text(context_text),
+            )
+        } else {
+            String::new()
+        };
+        let band_html = if can_write {
+            r#"<div class="editline-band editline-band-even agent-context-band" onclick="toggleAgentContext()" title="Click to edit agent context"></div>"#
+        } else {
+            ""
+        };
+        format!(
+            r#"<div class="agent-context-section editline-row">
+  <div class="agent-context-panel">
+    <div class="agent-context-header"><span class="pill">Agent Context</span></div>
+    <pre class="agent-context-preview" id="agent-context-preview">{preview}</pre>
+    <div class="agent-context-full" id="agent-context-full" style="display:none;">
+      <pre class="agent-context-full-text">{full_text}</pre>
+    </div>
+    {edit_form}
+  </div>{band_html}
+</div>"#,
+            preview = if context_preview.is_empty() {
+                "<span class=\"hint\">No agent context set</span>".to_string()
+            } else {
+                escape_text(&context_preview)
+            },
+            full_text = escape_text(context_text),
+            edit_form = edit_form,
+            band_html = band_html,
+        )
+    };
+
     let content = format!(
         r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
       {rename_html}
@@ -2406,6 +2482,8 @@ pub fn render_project_page(
       </select>
       <button type="submit">Search</button>
     </form>
+
+    {agent_context_html}
 
     <div class="layout">
       <section class="panel" id="document">
@@ -2440,6 +2518,7 @@ pub fn render_project_page(
         } else {
             ""
         },
+        agent_context_html = agent_context_html,
         results_label = results_label,
         blocks_html = blocks_html,
         librarian_panel = librarian_panel,
@@ -5101,6 +5180,50 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .editline-row > .block {
       flex: 1;
       min-width: 0;
+    }
+
+    .agent-context-section {
+      margin-bottom: var(--s-3);
+    }
+
+    .agent-context-panel {
+      flex: 1;
+      min-width: 0;
+      background: var(--surface-hover);
+      border-radius: var(--radius);
+      padding: var(--s-3) var(--s-4);
+    }
+
+    .agent-context-header {
+      margin-bottom: var(--s-2);
+    }
+
+    .agent-context-preview,
+    .agent-context-full-text {
+      margin: 0;
+      font-size: 0.85em;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--fg);
+      opacity: 0.8;
+    }
+
+    .agent-context-textarea {
+      width: 100%;
+      min-height: 120px;
+      max-height: 400px;
+      font-family: var(--font-mono);
+      font-size: 0.85em;
+      padding: var(--s-3);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--bg);
+      color: var(--fg);
+      resize: vertical;
+    }
+
+    .agent-context-band {
+      align-self: stretch;
     }
 
     .block {

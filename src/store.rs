@@ -22,6 +22,8 @@ pub struct ProjectMeta {
     pub sort_order: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_context: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +119,7 @@ impl FileBlockStore {
             parent: None,
             sort_order: 0,
             id: Some(Uuid::new_v4().to_string()),
+            agent_context: None,
         }
     }
 
@@ -137,6 +140,17 @@ impl FileBlockStore {
         }
         let mut meta = self.read_project_meta(project);
         meta.display_name = trimmed.to_string();
+        self.write_project_meta(project, &meta)
+    }
+
+    pub fn write_agent_context(&self, project: &ProjectName, context: &str) -> Result<()> {
+        let mut meta = self.read_project_meta(project);
+        let trimmed = context.trim();
+        meta.agent_context = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
         self.write_project_meta(project, &meta)
     }
 
@@ -300,6 +314,7 @@ impl FileBlockStore {
             parent: parent.map(|s| s.to_string()),
             sort_order,
             id: Some(project_id.clone()),
+            agent_context: None,
         };
         self.write_project_meta(&slug, &meta)?;
         Ok(ProjectInfo {

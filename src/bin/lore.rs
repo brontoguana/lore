@@ -59,6 +59,7 @@ enum Command {
         #[command(subcommand)]
         command: UpdateCommand,
     },
+    Context,
     Setup,
 }
 
@@ -458,6 +459,7 @@ async fn run() -> CliResult<()> {
     let context = build_context(&cli, &config)?;
     match cli.command {
         Command::Projects => projects_command(&context).await?,
+        Command::Context => context_command(&context).await?,
         Command::Blocks { command } => blocks_command(&context, command).await?,
         Command::Grep(args) => grep_command(&context, args).await?,
         Command::Add(args) => add_command(&context, args).await?,
@@ -539,6 +541,16 @@ async fn projects_command(context: &CliContext) -> CliResult<()> {
     }
     for project in projects {
         println!("{}", project.project);
+    }
+    Ok(())
+}
+
+async fn context_command(context: &CliContext) -> CliResult<()> {
+    let text = context.get_text("/v1/context").await?;
+    if text.trim().is_empty() {
+        println!("No agent context set on any readable project.");
+    } else {
+        println!("{text}");
     }
     Ok(())
 }
@@ -1056,6 +1068,20 @@ impl CliContext {
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> CliResult<T> {
         self.send(Method::GET, path, None::<&()>).await
+    }
+
+    async fn get_text(&self, path: &str) -> CliResult<String> {
+        let url = format!("{}{}", self.url, path);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(self.require_token()?)
+            .send()
+            .await?;
+        if response.status().is_success() {
+            return Ok(response.text().await?);
+        }
+        Err(response_error(response).await.into())
     }
 
     async fn send_json<T: DeserializeOwned, B: Serialize>(

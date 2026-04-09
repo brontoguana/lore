@@ -236,6 +236,7 @@ fn build_app_with_librarian(
         .route("/v1/admin/auto-update/apply", post(apply_auto_update))
         .route("/v1/admin/librarian-runs", get(list_admin_librarian_runs))
         .route("/v1/projects", get(list_projects))
+        .route("/v1/context", get(get_all_agent_context))
         .route(
             "/v1/projects/{project}/blocks",
             get(list_project_blocks).post(create_project_block),
@@ -339,6 +340,7 @@ fn build_app_with_librarian(
             post(apply_auto_update_from_ui),
         )
         .route("/ui/{project}", axum::routing::get(project_page))
+        .route("/ui/{project}/context", post(update_agent_context_from_ui))
         .route("/ui/{project}/rename", post(rename_project_from_ui))
         .route("/ui/{project}/move", post(move_project_from_ui))
         .route("/ui/{project}/delete", post(delete_project_from_ui))
@@ -591,6 +593,13 @@ struct CreateProjectUiForm {
 struct RenameProjectUiForm {
     csrf_token: String,
     display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentContextUiForm {
+    csrf_token: String,
+    #[serde(default)]
+    agent_context: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1436,6 +1445,25 @@ async fn list_projects(
         .map(|project| ProjectSummary { project })
         .collect();
     Ok(Json(projects))
+}
+
+async fn get_all_agent_context(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<String> {
+    let actor = require_authenticated_actor(&state, &headers)?;
+    let projects = state.store.list_projects()?;
+    let visible = filter_projects_for_actor(&actor, &projects);
+    let mut parts: Vec<String> = Vec::new();
+    for project in visible {
+        let meta = state.store.read_project_meta(&project);
+        if let Some(ctx) = meta.agent_context {
+            if !ctx.trim().is_empty() {
+                parts.push(format!("# {}\n{}", meta.display_name, ctx));
+            }
+        }
+    }
+    Ok(parts.join("\n\n"))
 }
 
 async fn list_project_blocks(
@@ -2823,6 +2851,23 @@ async fn create_project_from_ui(
     )))
 }
 
+async fn update_agent_context_from_ui(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<AgentContextUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    state.store.write_agent_context(&project, &form.agent_context)?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}?flash=Agent%20context%20saved",
+        project.as_str(),
+    )))
+}
+
 async fn rename_project_from_ui(
     State(state): State<AppState>,
     Path(project): Path<String>,
@@ -3449,6 +3494,7 @@ async fn project_page(
         &project,
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
+        meta.agent_context.as_deref(),
         &blocks,
         query.flash.as_deref(),
         query.q.as_deref(),
@@ -3618,6 +3664,7 @@ async fn answer_librarian_from_ui(
         &project,
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
+        meta.agent_context.as_deref(),
         &all_blocks,
         Some(flash),
         None,
@@ -3695,6 +3742,7 @@ async fn run_project_librarian_action_from_ui(
         &project,
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
+        meta.agent_context.as_deref(),
         &all_blocks,
         Some(
             if current_answer.status == LibrarianRunStatus::PendingApproval {
@@ -6745,6 +6793,24 @@ fn call_mcp_tool(
                 .delete_block(&project, &block_id, &agent.token)?;
             json!({ "deleted": true, "block_id": block_id.as_str() })
         }
+        "get_context" => {
+            let projects = state.store.list_projects()?;
+            let mut parts: Vec<String> = Vec::new();
+            for project in projects.iter().filter(|p| agent.can_read(p)) {
+                let meta = state.store.read_project_meta(project);
+                if let Some(ctx) = meta.agent_context {
+                    if !ctx.trim().is_empty() {
+                        parts.push(format!("# {}\n{}", meta.display_name, ctx));
+                    }
+                }
+            }
+            let text = if parts.is_empty() {
+                "No agent context set on any readable project.".to_string()
+            } else {
+                parts.join("\n\n")
+            };
+            json!({ "context": text })
+        }
         other => {
             return Err(LoreError::Validation(format!("unknown tool: {other}")));
         }
@@ -7033,6 +7099,12 @@ fn mcp_tools() -> Vec<Value> {
                 ("project", "string", "Lore project name"),
                 ("block_id", "string", "Block UUID")
             ])
+        }),
+        json!({
+            "name": "get_context",
+            "title": "Get Agent Context",
+            "description": "Get concatenated agent context from all readable projects.",
+            "inputSchema": { "type": "object", "properties": {} }
         }),
     ]
 }
