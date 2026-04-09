@@ -1243,6 +1243,10 @@ pub fn render_admin_page(
         <div class="meta-stack padded">
           <p><strong>Status</strong><br>{auto_update_state}</p>
           {auto_update_status_html}
+          <form method="post" action="/ui/admin/auto-update/apply" class="inline-form" style="margin-top:var(--s-3)">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <button type="submit">Update now</button>
+          </form>
         </div>
       </section>
 
