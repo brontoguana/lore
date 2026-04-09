@@ -906,14 +906,12 @@ pub fn render_admin_page(
             && !status.applied
             && status.latest_version.as_deref().is_some_and(|v| v != current_version);
         let button = format!(
-            r#"<form method="post" action="/ui/admin/auto-update/apply" class="inline-form">
-              <input type="hidden" name="csrf_token" value="{csrf_token}">
-              <button type="submit"{disabled}>{label}</button>
-            </form>"#,
+            r#"<button type="button" id="update-btn" data-csrf="{csrf_token}" data-state="{state}"{disabled}>{label}</button>"#,
             csrf_token = csrf_token,
+            state = if update_available { "apply" } else { "uptodate" },
             disabled = if update_available { "" } else { " disabled" },
             label = if update_available {
-                format!("Update to v{}", escape_text(latest))
+                format!("Apply Update v{}", escape_text(latest))
             } else {
                 "Up to date".to_string()
             },
@@ -927,10 +925,7 @@ pub fn render_admin_page(
         (button, status_html)
     } else {
         let button = format!(
-            r#"<form method="post" action="/ui/admin/auto-update/apply" class="inline-form">
-              <input type="hidden" name="csrf_token" value="{csrf_token}">
-              <button type="submit">Check &amp; update</button>
-            </form>"#,
+            r#"<button type="button" id="update-btn" data-csrf="{csrf_token}" data-state="check">Check for updates</button>"#,
             csrf_token = csrf_token,
         );
         (button, "<p><strong>Last check</strong><br>Not run yet.</p>".to_string())
@@ -1235,7 +1230,9 @@ pub fn render_admin_page(
           <h2>Server Update</h2>
           <p>Current version: v{current_version}</p>
         </div>
-        {update_now_button}
+        <div style="padding:0 var(--s-5)">
+          {update_now_button}
+        </div>
         <div class="meta-stack padded">
           {auto_update_status_html}
         </div>
@@ -1296,6 +1293,55 @@ pub fn render_admin_page(
           history.replaceState(null, ‘’, ‘/ui/admin?section=’ + id);
         }});
       }});
+
+      var ubtn = document.getElementById(‘update-btn’);
+      if (ubtn) {{
+        ubtn.addEventListener(‘click’, function() {{
+          var state = ubtn.getAttribute(‘data-state’);
+          var csrf = ubtn.getAttribute(‘data-csrf’);
+          if (state === ‘check’) {{
+            ubtn.disabled = true;
+            ubtn.textContent = ‘Checking\u2026’;
+            fetch(‘/ui/admin/auto-update/check-json’, {{
+              method: ‘POST’,
+              headers: {{‘Content-Type’: ‘application/x-www-form-urlencoded’}},
+              body: ‘csrf_token=’ + encodeURIComponent(csrf)
+            }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+              if (d.latest_version && d.latest_version !== d.current_version) {{
+                ubtn.textContent = ‘Apply Update v’ + d.latest_version;
+                ubtn.setAttribute(‘data-state’, ‘apply’);
+                ubtn.disabled = false;
+              }} else {{
+                ubtn.textContent = ‘Up to date’;
+                ubtn.setAttribute(‘data-state’, ‘uptodate’);
+              }}
+            }}).catch(function() {{
+              ubtn.textContent = ‘Check failed’;
+              ubtn.setAttribute(‘data-state’, ‘check’);
+              ubtn.disabled = false;
+            }});
+          }} else if (state === ‘apply’) {{
+            ubtn.disabled = true;
+            ubtn.textContent = ‘Applying update\u2026’;
+            fetch(‘/ui/admin/auto-update/apply-json’, {{
+              method: ‘POST’,
+              headers: {{‘Content-Type’: ‘application/x-www-form-urlencoded’}},
+              body: ‘csrf_token=’ + encodeURIComponent(csrf)
+            }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+              if (d.applied) {{
+                ubtn.textContent = ‘Restarting\u2026’;
+              }} else {{
+                ubtn.textContent = ‘Up to date’;
+                ubtn.setAttribute(‘data-state’, ‘uptodate’);
+              }}
+            }}).catch(function() {{
+              ubtn.textContent = ‘Update failed’;
+              ubtn.setAttribute(‘data-state’, ‘check’);
+              ubtn.disabled = false;
+            }});
+          }}
+        }});
+      }}
     }})();
     </script>"#,
         nav_items = nav_items,
@@ -2042,9 +2088,9 @@ pub fn render_agent_guide_page(
         <p>Run this on the machine where you want agents to operate.</p>
       </div>
       <div class="padded">
-        <div style="display:flex; align-items:center; gap:var(--s-3);">
-          <code style="flex:1; padding:var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.9rem; overflow-x:auto; white-space:nowrap;">curl -fsSL {install_script_url} | sh</code>
-          <button class="button-link" onclick="navigator.clipboard.writeText('curl -fsSL {install_script_url} | sh')" title="Copy">
+        <div style="display:flex; align-items:stretch; gap:var(--s-2);">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">curl -fsSL {install_script_url} | sh</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('curl -fsSL {install_script_url} | sh')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
         </div>
@@ -2058,9 +2104,9 @@ pub fn render_agent_guide_page(
         <p>This links the machine to your Lore account so it can create agents.</p>
       </div>
       <div class="padded">
-        <div style="display:flex; align-items:center; gap:var(--s-3);">
-          <code style="flex:1; padding:var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.9rem; overflow-x:auto; white-space:nowrap;">lore setup {base_url}</code>
-          <button class="button-link" onclick="navigator.clipboard.writeText('lore setup {base_url}')" title="Copy">
+        <div style="display:flex; align-items:stretch; gap:var(--s-2);">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">lore setup {base_url}</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('lore setup {base_url}')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
         </div>
@@ -2074,7 +2120,12 @@ pub fn render_agent_guide_page(
         <p>Create and run an agent on this machine.</p>
       </div>
       <div class="padded">
-        <code style="display:block; padding:var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.9rem;">lore agent my-agent-name</code>
+        <div style="display:flex; align-items:stretch; gap:var(--s-2);">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">lore agent my-agent-name</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('lore agent my-agent-name')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
         <p class="hint" style="margin-top:var(--s-3);">The agent is automatically provisioned on the server and starts polling for messages. Use the Chat tab to talk to it.</p>
         <p class="hint" style="margin-top:var(--s-2);">Options: <code>--backend gemini</code> or <code>--backend codex</code> to use a different backend (default is Claude).</p>
       </div>

@@ -372,6 +372,14 @@ fn build_app_with_librarian(
             "/ui/admin/auto-update/apply",
             post(apply_auto_update_from_ui),
         )
+        .route(
+            "/ui/admin/auto-update/check-json",
+            post(check_auto_update_json),
+        )
+        .route(
+            "/ui/admin/auto-update/apply-json",
+            post(apply_auto_update_json),
+        )
         .route("/ui/{project}", axum::routing::get(project_page))
         .route("/ui/{project}/context", post(update_agent_context_from_ui))
         .route("/ui/{project}/rename", post(rename_project_from_ui))
@@ -3492,6 +3500,60 @@ async fn apply_auto_update_from_ui(
         "Already%20up%20to%20date"
     };
     Ok(Redirect::to(&format!("/ui/admin?flash={flash}")))
+}
+
+async fn check_auto_update_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AutoUpdateCheckUiForm>,
+) -> ApiResult<Json<AutoUpdateStatusSummary>> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let status = run_auto_update_check(&state).await?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "check auto update",
+        None,
+        Some(format!(
+            "latest={}",
+            status.latest_version.as_deref().unwrap_or("unknown")
+        )),
+    )?;
+    Ok(Json(auto_update_status_summary(&status)))
+}
+
+async fn apply_auto_update_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AutoUpdateApplyUiForm>,
+) -> ApiResult<Json<AutoUpdateStatusSummary>> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let status = run_auto_update_apply(&state).await?;
+    let applied = status.applied;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        if applied {
+            "critical: server update applied"
+        } else {
+            "server update check (already up to date)"
+        },
+        None,
+        Some(status.detail.clone()),
+    )?;
+    let summary = auto_update_status_summary(&status);
+    if applied {
+        schedule_server_restart();
+    }
+    Ok(Json(summary))
 }
 
 async fn project_page(
