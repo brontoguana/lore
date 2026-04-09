@@ -41,6 +41,8 @@ pub struct NewSession {
 pub struct StoredAgentToken {
     pub name: String,
     pub token_hash: String,
+    #[serde(default)]
+    pub owner: Option<UserName>,
     pub grants: Vec<ProjectGrant>,
     pub created_at: OffsetDateTime,
 }
@@ -48,6 +50,7 @@ pub struct StoredAgentToken {
 #[derive(Debug, Clone)]
 pub struct NewAgentToken {
     pub name: String,
+    pub owner: UserName,
     pub grants: Vec<ProjectGrant>,
 }
 
@@ -81,6 +84,7 @@ pub struct CreatedAgentToken {
 pub struct AuthenticatedAgent {
     pub token: String,
     pub name: String,
+    pub owner: Option<UserName>,
     pub grants: Vec<ProjectGrant>,
 }
 
@@ -454,8 +458,11 @@ impl LocalAuthStore {
     pub fn create_agent_token(&self, token: NewAgentToken) -> Result<CreatedAgentToken> {
         token.validate()?;
         let mut tokens = self.load_agent_tokens()?;
-        if tokens.iter().any(|existing| existing.name == token.name) {
-            return Err(LoreError::Validation("agent token already exists".into()));
+        if tokens.iter().any(|existing| {
+            existing.name == token.name
+                && existing.owner.as_ref() == Some(&token.owner)
+        }) {
+            return Err(LoreError::Validation("agent already exists".into()));
         }
 
         let mut grants = token.grants;
@@ -464,6 +471,7 @@ impl LocalAuthStore {
         let stored = StoredAgentToken {
             name: token.name,
             token_hash: hash_agent_token(&raw_token),
+            owner: Some(token.owner),
             grants,
             created_at: OffsetDateTime::now_utc(),
         };
@@ -476,13 +484,15 @@ impl LocalAuthStore {
         })
     }
 
-    pub fn rotate_agent_token(&self, name: &str) -> Result<CreatedAgentToken> {
+    pub fn rotate_agent_token(&self, name: &str, owner: &UserName) -> Result<CreatedAgentToken> {
         validate_agent_token_name(name)?;
         let mut tokens = self.load_agent_tokens()?;
         let index = tokens
             .iter()
-            .position(|existing| existing.name == name)
-            .ok_or_else(|| LoreError::Validation("agent token does not exist".into()))?;
+            .position(|existing| {
+                existing.name == name && existing.owner.as_ref() == Some(owner)
+            })
+            .ok_or_else(|| LoreError::Validation("agent does not exist".into()))?;
         let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         tokens[index].token_hash = hash_agent_token(&raw_token);
         tokens[index].created_at = OffsetDateTime::now_utc();
@@ -494,16 +504,91 @@ impl LocalAuthStore {
         })
     }
 
-    pub fn revoke_agent_token(&self, name: &str) -> Result<()> {
+    pub fn revoke_agent_token(&self, name: &str, owner: &UserName) -> Result<()> {
+        validate_agent_token_name(name)?;
+        let mut tokens = self.load_agent_tokens()?;
+        let original_len = tokens.len();
+        tokens.retain(|token| {
+            !(token.name == name && token.owner.as_ref() == Some(owner))
+        });
+        if tokens.len() == original_len {
+            return Err(LoreError::Validation("agent does not exist".into()));
+        }
+        self.save_agent_tokens(&tokens)?;
+        Ok(())
+    }
+
+    pub fn revoke_agent_token_by_name(&self, name: &str) -> Result<()> {
         validate_agent_token_name(name)?;
         let mut tokens = self.load_agent_tokens()?;
         let original_len = tokens.len();
         tokens.retain(|token| token.name != name);
         if tokens.len() == original_len {
-            return Err(LoreError::Validation("agent token does not exist".into()));
+            return Err(LoreError::Validation("agent does not exist".into()));
         }
         self.save_agent_tokens(&tokens)?;
         Ok(())
+    }
+
+    pub fn rotate_agent_token_by_name(&self, name: &str) -> Result<CreatedAgentToken> {
+        validate_agent_token_name(name)?;
+        let mut tokens = self.load_agent_tokens()?;
+        let index = tokens
+            .iter()
+            .position(|existing| existing.name == name)
+            .ok_or_else(|| LoreError::Validation("agent does not exist".into()))?;
+        let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
+        tokens[index].token_hash = hash_agent_token(&raw_token);
+        tokens[index].created_at = OffsetDateTime::now_utc();
+        let stored = tokens[index].clone();
+        self.save_agent_tokens(&tokens)?;
+        Ok(CreatedAgentToken {
+            token: raw_token,
+            stored,
+        })
+    }
+
+    pub fn list_agent_tokens_for_user(&self, owner: &UserName) -> Result<Vec<StoredAgentToken>> {
+        Ok(self
+            .load_agent_tokens()?
+            .into_iter()
+            .filter(|token| token.owner.as_ref() == Some(owner))
+            .collect())
+    }
+
+    pub fn update_agent_token_grants(
+        &self,
+        name: &str,
+        owner: &UserName,
+        grants: Vec<ProjectGrant>,
+    ) -> Result<StoredAgentToken> {
+        validate_agent_token_name(name)?;
+        if grants.is_empty() {
+            return Err(LoreError::Validation(
+                "agent must grant at least one project permission".into(),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for grant in &grants {
+            if !seen.insert(grant.project.clone()) {
+                return Err(LoreError::Validation(
+                    "agent cannot contain duplicate project grants".into(),
+                ));
+            }
+        }
+        let mut tokens = self.load_agent_tokens()?;
+        let index = tokens
+            .iter()
+            .position(|existing| {
+                existing.name == name && existing.owner.as_ref() == Some(owner)
+            })
+            .ok_or_else(|| LoreError::Validation("agent does not exist".into()))?;
+        let mut sorted_grants = grants;
+        sorted_grants.sort_by(|a, b| a.project.cmp(&b.project));
+        tokens[index].grants = sorted_grants;
+        let stored = tokens[index].clone();
+        self.save_agent_tokens(&tokens)?;
+        Ok(stored)
     }
 
     pub fn authenticate_agent_token(&self, token: &str) -> Result<AuthenticatedAgent> {
@@ -519,6 +604,7 @@ impl LocalAuthStore {
         Ok(AuthenticatedAgent {
             token: token.to_string(),
             name: stored.name,
+            owner: stored.owner,
             grants: stored.grants,
         })
     }
@@ -999,6 +1085,7 @@ mod tests {
         let created = auth
             .create_agent_token(NewAgentToken {
                 name: "worker-alpha".into(),
+                owner: UserName::new("admin").unwrap(),
                 grants: vec![ProjectGrant {
                     project: ProjectName::new("alpha.docs").unwrap(),
                     permission: ProjectPermission::ReadWrite,

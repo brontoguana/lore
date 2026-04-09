@@ -292,6 +292,7 @@ pub struct ProjectListEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentTokenSummary {
     pub name: String,
+    pub owner: Option<String>,
     pub grants: Vec<ProjectGrant>,
     pub created_at: time::OffsetDateTime,
 }
@@ -304,14 +305,6 @@ pub struct UiUserSummary {
     pub disabled: bool,
     pub active_sessions: usize,
     pub created_at: time::OffsetDateTime,
-}
-
-pub struct UiAdminTokenDisplay {
-    pub summary: AgentTokenSummary,
-    pub token: String,
-    pub setup_instruction: String,
-    pub http_example: String,
-    pub mcp_example: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -766,7 +759,7 @@ pub fn render_admin_page(
     csrf_token: &str,
     roles: &[StoredRole],
     users: &[UiUserSummary],
-    agent_tokens: &[AgentTokenSummary],
+    user_agents: &std::collections::HashMap<String, Vec<AgentTokenSummary>>,
     server_config: &ServerConfig,
     external_auth_config: &ExternalAuthConfig,
     oidc_config: &OidcConfig,
@@ -776,12 +769,10 @@ pub fn render_admin_page(
     auto_update_status: Option<&AutoUpdateStatus>,
     provider_status: Option<ProviderCheckResult>,
     git_export_status: Option<&GitExportStatus>,
-    setup_instruction: &str,
     librarian_audit: &[UiLibrarianAnswer],
     pending_actions: &[UiPendingLibrarianAction],
     auth_audit: &[UiAuditEvent],
     projects: &[ProjectInfo],
-    latest_agent_token: Option<&UiAdminTokenDisplay>,
     flash: Option<&str>,
     active_section: &str,
 ) -> String {
@@ -799,49 +790,15 @@ pub fn render_admin_page(
     } else {
         users
             .iter()
-            .map(|user| render_user_card(user, csrf_token))
+            .map(|user| {
+                let agents = user_agents.get(&user.username);
+                render_user_card(user, agents.map(|v| v.as_slice()).unwrap_or(&[]), csrf_token)
+            })
             .collect::<Vec<_>>()
             .join("")
     };
-    let agent_tokens_html = if agent_tokens.is_empty() {
-        "<p class=\"hint padded\">No agent tokens exist yet.</p>".to_string()
-    } else {
-        agent_tokens
-            .iter()
-            .map(|token| render_agent_token_card(token, csrf_token))
-            .collect::<Vec<_>>()
-            .join("")
-    };
-    let latest_agent_token_html = latest_agent_token
-        .map(|token| render_latest_agent_token(token))
-        .unwrap_or_default();
     let role_grants_html = if projects.is_empty() {
         "<p class=\"hint\">No projects exist yet. Create a project first, then come back to assign grants.</p>".to_string()
-    } else {
-        let rows: Vec<String> = projects
-            .iter()
-            .map(|p| {
-                format!(
-                    r#"<div class="grant-row" data-project-grant="{}">
-                      <span class="grant-project-name">{}</span>
-                      <select>
-                        <option value="">No access</option>
-                        <option value="read">Read</option>
-                        <option value="read_write">Read/Write</option>
-                      </select>
-                    </div>"#,
-                    escape_attribute(p.slug.as_str()),
-                    escape_text(&p.display_name),
-                )
-            })
-            .collect();
-        format!(
-            r#"<fieldset class="grant-fieldset"><legend>Project access</legend>{}</fieldset>"#,
-            rows.join("")
-        )
-    };
-    let project_grants_html = if projects.is_empty() {
-        "<p class=\"hint\">No projects exist yet. Create a project first, then come back to grant access.</p>".to_string()
     } else {
         let rows: Vec<String> = projects
             .iter()
@@ -945,8 +902,7 @@ pub fn render_admin_page(
     let sections = [
         "users",
         "roles",
-        "agent-tokens",
-        "agent-setup",
+        "network",
         "librarian",
         "git-export",
         "oidc",
@@ -957,8 +913,7 @@ pub fn render_admin_page(
     let section_labels = [
         "Users",
         "Roles",
-        "Agent tokens",
-        "Agent setup",
+        "Network",
         "Librarian",
         "Git export",
         "OIDC",
@@ -1065,44 +1020,9 @@ pub fn render_admin_page(
         <div class="timeline">{roles_html}</div>
       </section>
 
-      <section class="panel" data-panel="agent-tokens"{agent_tokens_display}>
+      <section class="panel" data-panel="network"{network_display}>
         <div class="panel-header">
-          <h2>Agent tokens</h2>
-          <p>Create scoped agent tokens with per-project read or read/write access.</p>
-        </div>
-        {latest_agent_token_html}
-        <form method="post" action="/ui/admin/agent-tokens" id="agent-token-form">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label>
-            Token name
-            <input type="text" name="name" placeholder="worker-alpha" required>
-          </label>
-          {project_grants_html}
-          <textarea name="grants" style="display:none" id="agent-grants-field"></textarea>
-          <button type="submit">Create agent token</button>
-        </form>
-        <script>
-        (function() {{
-          var form = document.getElementById('agent-token-form');
-          form.addEventListener('submit', function() {{
-            var rows = form.querySelectorAll('[data-project-grant]');
-            var lines = [];
-            rows.forEach(function(row) {{
-              var sel = row.querySelector('select');
-              if (sel && sel.value) {{
-                lines.push(row.getAttribute('data-project-grant') + ':' + sel.value);
-              }}
-            }});
-            document.getElementById('agent-grants-field').value = lines.join('\\n');
-          }});
-        }})();
-        </script>
-        <div class="timeline">{agent_tokens_html}</div>
-      </section>
-
-      <section class="panel" data-panel="agent-setup"{agent_setup_display}>
-        <div class="panel-header">
-          <h2>Agent setup</h2>
+          <h2>Network</h2>
           <p>Set the externally reachable Lore address.</p>
         </div>
         <form method="post" action="/ui/admin/setup">
@@ -1122,23 +1042,11 @@ pub fn render_admin_page(
             External port
             <input type="number" name="external_port" min="1" max="65535" value="{external_port}" required>
           </label>
-          <label>
-            Default theme
-            <select name="default_theme">
-              {theme_options}
-            </select>
-          </label>
           <button type="submit">Save setup address</button>
         </form>
         <div class="meta-stack padded">
           <p><strong>Setup page</strong><br>{setup_url}</p>
           <p><strong>Plain text page</strong><br>{setup_text_url}</p>
-        </div>
-        <div class="padded">
-          <label>
-            Copy-paste for an agent
-            <textarea readonly style="min-height: 6rem;">{setup_instruction}</textarea>
-          </label>
         </div>
       </section>
 
@@ -1357,12 +1265,10 @@ pub fn render_admin_page(
         } else {
             ""
         },
-        theme_options = render_theme_options(Some(server_config.default_theme), false),
         external_host = escape_attribute(&server_config.external_host),
         external_port = server_config.external_port,
         setup_url = escape_text(&server_config.setup_url()),
         setup_text_url = escape_text(&server_config.setup_text_url()),
-        setup_instruction = escape_text(setup_instruction),
         librarian_endpoint_url = escape_attribute(&librarian_config.endpoint_url),
         librarian_model = escape_attribute(&librarian_config.model),
         librarian_key_placeholder = if librarian_config.has_api_key() {
@@ -1462,9 +1368,6 @@ pub fn render_admin_page(
             "Disabled"
         },
         provider_status_html = provider_status_html,
-        latest_agent_token_html = latest_agent_token_html,
-        agent_tokens_html = agent_tokens_html,
-        project_grants_html = project_grants_html,
         role_grants_html = role_grants_html,
         roles_html = roles_html,
         users_html = users_html,
@@ -1473,8 +1376,7 @@ pub fn render_admin_page(
         auth_audit_html = auth_audit_html,
         users_display = hidden("users"),
         roles_display = hidden("roles"),
-        agent_tokens_display = hidden("agent-tokens"),
-        agent_setup_display = hidden("agent-setup"),
+        network_display = hidden("network"),
         librarian_display = hidden("librarian"),
         git_export_display = hidden("git-export"),
         oidc_display = hidden("oidc"),
@@ -1577,30 +1479,352 @@ pub fn render_setup_page(config: &ServerConfig, setup_instruction: &str) -> Stri
     )
 }
 
+pub struct UserProjectAccess {
+    pub slug: String,
+    pub display_name: String,
+    pub max_permission: ProjectPermission,
+}
+
 pub fn render_agents_page(
     config: &ServerConfig,
     username: &str,
     is_admin: bool,
     theme: UiTheme,
     color_mode: ColorMode,
+    csrf_token: &str,
+    agents: &[AgentTokenSummary],
+    user_projects: &[UserProjectAccess],
+    selected_agent: Option<&str>,
+    created_token: Option<&str>,
     flash: Option<&str>,
 ) -> String {
     let base_url = config.base_url();
     let mcp_url = config.mcp_url();
     let install_script_url =
         "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh";
-    let mcp_config_placeholder = format!(
-        r#"{{
-  "transport": "streamable_http",
-  "url": "{mcp_url}",
-  "headers": {{
-    "Authorization": "Bearer YOUR_TOKEN",
-    "Accept": "application/json, text/event-stream",
-    "MCP-Protocol-Version": "2025-06-18"
-  }}
-}}"#,
+
+    // Agent list
+    let agent_list_html = if agents.is_empty() {
+        r#"<p class="hint padded">No agents yet. Create one below.</p>"#.to_string()
+    } else {
+        agents
+            .iter()
+            .map(|agent| {
+                let active = selected_agent == Some(agent.name.as_str());
+                let cls = if active { " active" } else { "" };
+                let grant_count = agent.grants.len();
+                let grant_label = if grant_count == 1 {
+                    "1 project".to_string()
+                } else {
+                    format!("{grant_count} projects")
+                };
+                format!(
+                    r#"<a href="/ui/agents?selected={}" class="agent-list-item{}">
+                      <span class="agent-list-name">{}</span>
+                      <span class="agent-list-meta">{}</span>
+                    </a>"#,
+                    escape_attribute(&agent.name),
+                    cls,
+                    escape_text(&agent.name),
+                    escape_text(&grant_label),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    // Create form project grants
+    let create_grants_html = if user_projects.is_empty() {
+        "<p class=\"hint\">No projects available. Create a project first.</p>".to_string()
+    } else {
+        let rows: Vec<String> = user_projects
+            .iter()
+            .map(|p| {
+                let rw_option = if p.max_permission.allows_write() {
+                    r#"<option value="read_write">Read/Write</option>"#
+                } else {
+                    ""
+                };
+                format!(
+                    r#"<div class="grant-row" data-project-grant="{}">
+                      <span class="grant-project-name">{}</span>
+                      <select>
+                        <option value="">No access</option>
+                        <option value="read">Read</option>
+                        {}
+                      </select>
+                    </div>"#,
+                    escape_attribute(&p.slug),
+                    escape_text(&p.display_name),
+                    rw_option,
+                )
+            })
+            .collect();
+        format!(
+            r#"<fieldset class="grant-fieldset"><legend>Project access</legend>{}</fieldset>"#,
+            rows.join("")
+        )
+    };
+
+    // Selected agent detail
+    let detail_html = if let Some(sel_name) = selected_agent {
+        if let Some(agent) = agents.iter().find(|a| a.name == sel_name) {
+            let token_for_instructions = created_token.unwrap_or("YOUR_TOKEN");
+            let setup_instruction = build_agent_setup_instruction_text(
+                &base_url,
+                &mcp_url,
+                install_script_url,
+                token_for_instructions,
+            );
+            let mcp_config_text = format!(
+                r#"{{"transport": "streamable_http","url": "{}","headers": {{"Authorization": "Bearer {}","Accept": "application/json, text/event-stream","MCP-Protocol-Version": "2025-06-18"}}}}"#,
+                escape_text(&mcp_url),
+                escape_text(token_for_instructions),
+            );
+            // Grants editor
+            let edit_grants_html = if user_projects.is_empty() {
+                "<p class=\"hint\">No projects available.</p>".to_string()
+            } else {
+                let rows: Vec<String> = user_projects
+                    .iter()
+                    .map(|p| {
+                        let current = agent.grants.iter().find(|g| g.project.as_str() == p.slug);
+                        let no_sel = if current.is_none() { " selected" } else { "" };
+                        let r_sel = if current
+                            .map(|g| g.permission == ProjectPermission::Read)
+                            .unwrap_or(false)
+                        {
+                            " selected"
+                        } else {
+                            ""
+                        };
+                        let rw_sel = if current
+                            .map(|g| g.permission == ProjectPermission::ReadWrite)
+                            .unwrap_or(false)
+                        {
+                            " selected"
+                        } else {
+                            ""
+                        };
+                        let rw_option = if p.max_permission.allows_write() {
+                            format!(r#"<option value="read_write"{rw_sel}>Read/Write</option>"#)
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            r#"<div class="grant-row" data-project-grant="{}">
+                              <span class="grant-project-name">{}</span>
+                              <select>
+                                <option value=""{no_sel}>No access</option>
+                                <option value="read"{r_sel}>Read</option>
+                                {rw_option}
+                              </select>
+                            </div>"#,
+                            escape_attribute(&p.slug),
+                            escape_text(&p.display_name),
+                        )
+                    })
+                    .collect();
+                format!(
+                    r#"<fieldset class="grant-fieldset"><legend>Project access</legend>{}</fieldset>"#,
+                    rows.join("")
+                )
+            };
+
+            // Token display
+            let token_section = if let Some(raw_token) = created_token {
+                format!(
+                    r##"<div class="panel-header"><h3>API key</h3><p>Copy this now. It will not be shown again.</p></div>
+                    <div class="padded">
+                      <textarea readonly id="agent-token" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">{}</textarea>
+                      <div style="margin-top: var(--s-2); text-align: right;">
+                        <button type="button" class="button-link" onclick="copyField('agent-token')">Copy token</button>
+                      </div>
+                    </div>"##,
+                    escape_text(raw_token),
+                )
+            } else {
+                format!(
+                    r##"<div class="panel-header"><h3>API key</h3><p>The raw token is hashed and cannot be shown. Regenerate to get a new one.</p></div>
+                    <div class="padded">
+                      <form method="post" action="/ui/agents/{}/rotate" class="inline-form">
+                        <input type="hidden" name="csrf_token" value="{}">
+                        <button type="submit">Regenerate token</button>
+                      </form>
+                    </div>"##,
+                    escape_attribute(&agent.name),
+                    escape_attribute(csrf_token),
+                )
+            };
+
+            format!(
+                r##"<section class="panel" style="margin-top: var(--s-5);">
+                <div class="panel-header"><h2>{name}</h2><p>{owner}-{name}</p></div>
+
+                <div class="panel-header"><h3>Configuration</h3></div>
+                <form method="post" action="/ui/agents/{name_attr}/grants" id="edit-grants-form">
+                  <input type="hidden" name="csrf_token" value="{csrf_token}">
+                  {edit_grants_html}
+                  <textarea name="grants" style="display:none" id="edit-grants-field"></textarea>
+                  <button type="submit">Save</button>
+                </form>
+                <script>
+                (function() {{
+                  var form = document.getElementById('edit-grants-form');
+                  form.addEventListener('submit', function() {{
+                    var rows = form.querySelectorAll('[data-project-grant]');
+                    var lines = [];
+                    rows.forEach(function(row) {{
+                      var sel = row.querySelector('select');
+                      if (sel && sel.value) {{
+                        lines.push(row.getAttribute('data-project-grant') + ':' + sel.value);
+                      }}
+                    }});
+                    document.getElementById('edit-grants-field').value = lines.join('\n');
+                  }});
+                }})();
+                </script>
+
+                {token_section}
+
+                <div class="panel-header"><h3>Setup instructions</h3><p>Copy and give to your agent.</p></div>
+                <div class="padded">
+                  <textarea readonly id="agent-instruction" style="height: 5rem; font-family: var(--font-mono); font-size: 0.85rem; resize: none; overflow: hidden;">{setup_instruction}</textarea>
+                  <div style="margin-top: var(--s-3); display: flex; justify-content: space-between; align-items: center;">
+                    <a href="#" id="expand-instructions" style="font-size: 0.85rem;" onclick="toggleInstructions(event)">Expand</a>
+                    <button type="button" class="button-link" onclick="copyField('agent-instruction')">Copy</button>
+                  </div>
+                </div>
+
+                <div class="panel-header"><h3>MCP config</h3></div>
+                <div class="padded">
+                  <textarea readonly id="mcp-config" style="min-height:8rem; font-family:var(--font-mono); font-size:0.85rem;">{mcp_config_text}</textarea>
+                  <div style="margin-top: var(--s-2); text-align: right;">
+                    <button type="button" class="button-link" onclick="copyField('mcp-config')">Copy</button>
+                  </div>
+                </div>
+
+                <div class="padded" style="border-top: 1px solid var(--line); margin-top: var(--s-4); padding-top: var(--s-4);">
+                  <form method="post" action="/ui/agents/{name_attr}/delete" class="inline-form">
+                    <input type="hidden" name="csrf_token" value="{csrf_token}">
+                    <button class="danger" type="submit">Delete agent</button>
+                  </form>
+                </div>
+              </section>"##,
+                name = escape_text(&agent.name),
+                owner = escape_text(username),
+                name_attr = escape_attribute(&agent.name),
+                csrf_token = escape_attribute(csrf_token),
+                edit_grants_html = edit_grants_html,
+                token_section = token_section,
+                setup_instruction = escape_text(&setup_instruction),
+                mcp_config_text = escape_text(&mcp_config_text),
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let content = format!(
+        r##"<h1 class="page-title">My Agents</h1>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Agents</h2>
+        <p>Each agent gets its own scoped token and project access.</p>
+      </div>
+      <div class="agent-list">{agent_list_html}</div>
+    </section>
+
+    <section class="panel" style="margin-top: var(--s-5);">
+      <div class="panel-header">
+        <h2>Create agent</h2>
+      </div>
+      <form method="post" action="/ui/agents" id="create-agent-form">
+        <input type="hidden" name="csrf_token" value="{csrf_token}">
+        <label>
+          Name
+          <input type="text" name="name" placeholder="my-assistant" required>
+        </label>
+        {create_grants_html}
+        <textarea name="grants" style="display:none" id="create-grants-field"></textarea>
+        <button type="submit">Create agent</button>
+      </form>
+      <script>
+      (function() {{
+        var form = document.getElementById('create-agent-form');
+        form.addEventListener('submit', function() {{
+          var rows = form.querySelectorAll('[data-project-grant]');
+          var lines = [];
+          rows.forEach(function(row) {{
+            var sel = row.querySelector('select');
+            if (sel && sel.value) {{
+              lines.push(row.getAttribute('data-project-grant') + ':' + sel.value);
+            }}
+          }});
+          document.getElementById('create-grants-field').value = lines.join('\n');
+        }});
+      }})();
+      </script>
+    </section>
+
+    {detail_html}
+
+    <script>
+    function toggleInstructions(e) {{
+      e.preventDefault();
+      var ta = document.getElementById('agent-instruction');
+      var link = document.getElementById('expand-instructions');
+      if (ta.style.height === '5rem') {{
+        ta.style.height = '20rem';
+        ta.style.overflow = 'auto';
+        ta.style.resize = 'vertical';
+        link.textContent = 'Collapse';
+      }} else {{
+        ta.style.height = '5rem';
+        ta.style.overflow = 'hidden';
+        ta.style.resize = 'none';
+        link.textContent = 'Expand';
+      }}
+    }}
+    function copyField(id) {{
+      var el = document.getElementById(id);
+      if (!el) return;
+      navigator.clipboard.writeText(el.value).then(function() {{
+        var btn = event && event.target && event.target.closest('button');
+        if (btn) {{ var orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(function(){{ btn.textContent = orig; }}, 1500); }}
+      }});
+    }}
+    </script>"##,
+        csrf_token = escape_attribute(csrf_token),
+        agent_list_html = agent_list_html,
+        create_grants_html = create_grants_html,
+        detail_html = detail_html,
     );
-    let agent_instruction = format!(
+
+    render_shell(
+        PageShell {
+            title: "Lore agents",
+            username: Some(username),
+            is_admin,
+            theme,
+            color_mode,
+            csrf_token: None,
+            flash,
+        },
+        content,
+    )
+}
+
+fn build_agent_setup_instruction_text(
+    base_url: &str,
+    mcp_url: &str,
+    install_script_url: &str,
+    token: &str,
+) -> String {
+    format!(
         r#"# Lore — shared project knowledge base
 
 Lore is a structured knowledge base your team uses to store and retrieve project documentation, decisions, and context. You can read and write project documents made up of ordered blocks (markdown, SVG, or images).
@@ -1612,12 +1836,10 @@ MCP endpoint: {mcp_url}
 
 ## Authentication
 
-All requests require an agent token. Ask the Lore admin for a scoped token with the appropriate project grants, then include it as:
-  Authorization: Bearer YOUR_TOKEN
+All requests require an agent token. Include it as:
+  Authorization: Bearer {token}
 
 ## How to connect
-
-You have two options:
 
 ### Option 1 — Lore CLI (recommended for code agents)
 
@@ -1627,7 +1849,7 @@ Install:
 On Windows, use WSL (Windows Subsystem for Linux) and run the Linux install command above.
 
 Configure (saves the URL and token so future commands just work):
-  lore config set --url {base_url} --token YOUR_TOKEN
+  lore config set --url {base_url} --token {token}
 
 Commands:
   lore projects                     — list projects
@@ -1648,7 +1870,7 @@ Add this to your MCP client config (Claude Desktop, Cursor, etc.):
   "transport": "streamable_http",
   "url": "{mcp_url}",
   "headers": {{
-    "Authorization": "Bearer YOUR_TOKEN",
+    "Authorization": "Bearer {token}",
     "Accept": "application/json, text/event-stream",
     "MCP-Protocol-Version": "2025-06-18"
   }}
@@ -1669,137 +1891,6 @@ Add the following to your memory or config file (CLAUDE.md, AGENTS.md, GEMINI.md
 - Use markdown blocks for text content
 - Use the librarian to ask questions about project context
 - Link between documents using lore:// links in standard markdown format"#,
-    );
-    let content = format!(
-        r##"<h1 class="page-title">Agents</h1>
-
-    <section class="panel" style="margin-bottom: var(--s-6);">
-      <div class="panel-header">
-        <h2>Setup instructions for your agent</h2>
-        <p>Copy this block and give it to your agent. It explains what Lore is, how to connect, and what commands are available.</p>
-      </div>
-      <div class="padded">
-        <textarea readonly id="agent-instruction" style="height: 5rem; font-family: var(--font-mono); font-size: 0.85rem; resize: none; overflow: hidden;">{agent_instruction}</textarea>
-        <div style="margin-top: var(--s-3); display: flex; justify-content: space-between; align-items: center;">
-          <a href="#" id="expand-instructions" style="font-size: 0.85rem;" onclick="toggleInstructions(event)">Expand to read full instructions</a>
-          <button type="button" class="button-link" onclick="copyField('agent-instruction')">Copy</button>
-        </div>
-      </div>
-    </section>
-
-    <div class="agents-options">
-      <section class="panel">
-        <div class="panel-header" style="display:flex; justify-content:space-between; align-items:flex-start;">
-          <div>
-            <h2>CLI</h2>
-            <p>Best for code agents like Claude Code, Cursor, Windsurf, Aider, or any tool that can run shell commands. Also works for human users who want a quick terminal interface.</p>
-          </div>
-        </div>
-        <div class="padded">
-          <h3 style="margin:0 0 var(--s-2);">Install</h3>
-          <p style="margin:0 0 var(--s-2);">macOS and Linux:</p>
-          <textarea readonly id="cli-install-unix" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">curl -fsSL {install_script_url} | sh</textarea>
-          <div style="margin-top: var(--s-2); text-align: right;">
-            <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('cli-install-unix')">Copy install command</button>
-          </div>
-          <p style="margin:var(--s-3) 0 var(--s-2);">On Windows, use WSL and run the same command above.</p>
-          <h3 style="margin:var(--s-4) 0 var(--s-2);">Configure</h3>
-          <textarea readonly id="cli-config" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">lore config set --url {base_url} --token YOUR_TOKEN</textarea>
-          <div style="margin-top: var(--s-2); text-align: right;">
-            <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('cli-config')">Copy config command</button>
-          </div>
-          <details>
-            <summary style="margin:var(--s-4) 0 var(--s-2); cursor:pointer; color:var(--accent); font-weight:600;">Show commands</summary>
-            <table class="agents-cmd-table">
-              <tr><td><code>lore projects</code></td><td>List all projects</td></tr>
-              <tr><td><code>lore blocks list &lt;project&gt;</code></td><td>List blocks in a project</td></tr>
-              <tr><td><code>lore blocks read &lt;project&gt;</code></td><td>Read all block content</td></tr>
-              <tr><td><code>lore grep &lt;project&gt; -q "query"</code></td><td>Search blocks</td></tr>
-              <tr><td><code>lore add &lt;project&gt; --type markdown --content "..."</code></td><td>Add a block</td></tr>
-              <tr><td><code>lore update &lt;block-id&gt; --content "..."</code></td><td>Update a block</td></tr>
-              <tr><td><code>lore move &lt;block-id&gt; --after &lt;other-id&gt;</code></td><td>Reorder a block</td></tr>
-              <tr><td><code>lore delete &lt;block-id&gt;</code></td><td>Delete a block</td></tr>
-              <tr><td><code>lore history list &lt;project&gt;</code></td><td>View project history</td></tr>
-              <tr><td><code>lore librarian answer &lt;project&gt; -q "question"</code></td><td>Ask the librarian</td></tr>
-            </table>
-          </details>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-header">
-          <h2>MCP</h2>
-          <p>Best for MCP-native hosts like Claude Desktop, Cursor (MCP mode), or any runtime that supports the Model Context Protocol tool server standard.</p>
-        </div>
-        <div class="padded">
-          <h3 style="margin:0 0 var(--s-2);">MCP config</h3>
-          <p style="margin:0 0 var(--s-2);">Add this to your MCP client configuration. Replace YOUR_TOKEN with an agent token from the Admin panel.</p>
-          <textarea readonly id="mcp-config" style="min-height:10rem; font-family:var(--font-mono); font-size:0.85rem;">{mcp_config}</textarea>
-          <div style="margin-top: var(--s-2); text-align: right;">
-            <button type="button" class="button-link" style="flex-shrink:0; white-space:nowrap;" onclick="copyField('mcp-config')">Copy MCP config</button>
-          </div>
-          <details>
-            <summary style="margin:var(--s-4) 0 var(--s-2); cursor:pointer; color:var(--accent); font-weight:600;">Show available tools</summary>
-            <table class="agents-cmd-table">
-              <tr><td><code>list_projects</code></td><td>List all accessible projects</td></tr>
-              <tr><td><code>list_blocks</code></td><td>List blocks in a project</td></tr>
-              <tr><td><code>read_block</code></td><td>Read a single block by ID</td></tr>
-              <tr><td><code>read_blocks_around</code></td><td>Read blocks near a given block</td></tr>
-              <tr><td><code>grep_blocks</code></td><td>Search block content</td></tr>
-              <tr><td><code>create_block</code></td><td>Add a new block to a project</td></tr>
-              <tr><td><code>update_block</code></td><td>Modify an existing block</td></tr>
-              <tr><td><code>move_block</code></td><td>Reorder a block within a project</td></tr>
-              <tr><td><code>delete_block</code></td><td>Remove a block</td></tr>
-            </table>
-          </details>
-        </div>
-      </section>
-    </div>
-
-    <script>
-    function toggleInstructions(e) {{
-      e.preventDefault();
-      var ta = document.getElementById('agent-instruction');
-      var link = document.getElementById('expand-instructions');
-      if (ta.style.height === '5rem') {{
-        ta.style.height = '20rem';
-        ta.style.overflow = 'auto';
-        ta.style.resize = 'vertical';
-        link.textContent = 'Collapse';
-      }} else {{
-        ta.style.height = '5rem';
-        ta.style.overflow = 'hidden';
-        ta.style.resize = 'none';
-        link.textContent = 'Expand to read full instructions';
-      }}
-    }}
-    function copyField(id) {{
-      var el = document.getElementById(id);
-      if (!el) return;
-      navigator.clipboard.writeText(el.value).then(function() {{
-        // Find the button that triggered this -- walk up from el to find the nearest copy trigger
-        var btn = event && event.target && event.target.closest('button');
-        if (btn) {{ var orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(function(){{ btn.textContent = orig; }}, 1500); }}
-      }});
-    }}
-    </script>"##,
-        agent_instruction = escape_text(&agent_instruction),
-        install_script_url = escape_text(install_script_url),
-        base_url = escape_text(&base_url),
-        mcp_config = escape_text(&mcp_config_placeholder),
-    );
-
-    render_shell(
-        PageShell {
-            title: "Lore agents",
-            username: Some(username),
-            is_admin,
-            theme,
-            color_mode,
-            csrf_token: None,
-            flash,
-        },
-        content,
     )
 }
 
@@ -3137,7 +3228,7 @@ fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectInfo
     )
 }
 
-fn render_user_card(user: &UiUserSummary, csrf_token: &str) -> String {
+fn render_user_card(user: &UiUserSummary, agents: &[AgentTokenSummary], csrf_token: &str) -> String {
     let roles = if user.role_names.is_empty() {
         "<li>No assigned roles</li>".to_string()
     } else {
@@ -3146,6 +3237,34 @@ fn render_user_card(user: &UiUserSummary, csrf_token: &str) -> String {
             .map(|role| format!(r#"<li class="meta-code">{}</li>"#, escape_text(role)))
             .collect::<Vec<_>>()
             .join("")
+    };
+
+    let agents_html = if agents.is_empty() {
+        r#"<p style="font-size:0.85rem; color:var(--fg-muted); margin:0;">No agents</p>"#.to_string()
+    } else {
+        let items: Vec<String> = agents
+            .iter()
+            .map(|agent| {
+                let grants = agent
+                    .grants
+                    .iter()
+                    .map(|g| {
+                        format!(
+                            "{} ({})",
+                            g.project.as_str(),
+                            if g.permission.allows_write() { "rw" } else { "r" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    r#"<li><span class="meta-code">{}</span> <span style="font-size:0.82rem; color:var(--fg-muted);">{}</span></li>"#,
+                    escape_text(&agent.name),
+                    escape_text(&grants),
+                )
+            })
+            .collect();
+        items.join("")
     };
 
     format!(
@@ -3159,6 +3278,10 @@ fn render_user_card(user: &UiUserSummary, csrf_token: &str) -> String {
     <span>{}</span>
   </div>
   <ul class="grant-list">{}</ul>
+  <div style="margin-top:var(--s-3); padding:0 var(--s-4);">
+    <strong style="font-size:0.85rem;">Agents</strong>
+    <ul class="grant-list" style="margin-top:var(--s-1);">{}</ul>
+  </div>
   <div class="inline-form">
     <form method="post" action="/ui/admin/users/{}/password">
       <input type="hidden" name="csrf_token" value="{}">
@@ -3182,6 +3305,7 @@ fn render_user_card(user: &UiUserSummary, csrf_token: &str) -> String {
         escape_text(&format_timestamp(user.created_at)),
         escape_text(&format!("{} active sessions", user.active_sessions)),
         roles,
+        agents_html,
         escape_attribute(&user.username),
         escape_attribute(csrf_token),
         escape_attribute(&user.username),
@@ -3194,78 +3318,6 @@ fn render_user_card(user: &UiUserSummary, csrf_token: &str) -> String {
         } else {
             "Disable user"
         }
-    )
-}
-
-fn render_agent_token_card(token: &AgentTokenSummary, csrf_token: &str) -> String {
-    let grants = token
-        .grants
-        .iter()
-        .map(|grant| {
-            format!(
-                r#"<li><span class="meta-code">{}</span> <span class="pill small">{}</span></li>"#,
-                escape_text(grant.project.as_str()),
-                escape_text(match grant.permission {
-                    ProjectPermission::Read => "read",
-                    ProjectPermission::ReadWrite => "read_write",
-                })
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-
-    format!(
-        r#"<article class="block">
-  <div class="block-meta">
-    <span class="pill">{}</span>
-    <span>{}</span>
-  </div>
-  <ul class="grant-list">{}</ul>
-  <form method="post" action="/ui/admin/agent-tokens/{}/delete" class="inline-form">
-    <input type="hidden" name="csrf_token" value="{}">
-    <button class="danger" type="submit">Revoke token</button>
-  </form>
-  <form method="post" action="/ui/admin/agent-tokens/{}/rotate" class="inline-form">
-    <input type="hidden" name="csrf_token" value="{}">
-    <button type="submit">Rotate token</button>
-  </form>
-</article>"#,
-        escape_text(&token.name),
-        escape_text(&format_timestamp(token.created_at)),
-        grants,
-        escape_attribute(&token.name),
-        escape_attribute(csrf_token),
-        escape_attribute(&token.name),
-        escape_attribute(csrf_token),
-    )
-}
-
-fn render_latest_agent_token(token: &UiAdminTokenDisplay) -> String {
-    format!(
-        r#"<div class="callout">
-  <p><strong>New token for {name}</strong><br>Copy it now. Lore stores only the hash after this response.</p>
-  <label>
-    Raw token
-    <textarea readonly>{raw_token}</textarea>
-  </label>
-  <label>
-    HTTP header
-    <textarea readonly>{http_example}</textarea>
-  </label>
-  <label>
-    MCP config
-    <textarea readonly>{mcp_example}</textarea>
-  </label>
-  <label>
-    Agent instruction
-    <textarea readonly>{setup_instruction}</textarea>
-  </label>
-</div>"#,
-        name = escape_text(&token.summary.name),
-        raw_token = escape_text(&token.token),
-        http_example = escape_text(&token.http_example),
-        mcp_example = escape_text(&token.mcp_example),
-        setup_instruction = escape_text(&token.setup_instruction),
     )
 }
 
@@ -4154,7 +4206,7 @@ fn theme_palette(theme: UiTheme, dark: bool) -> ThemePalette {
             shadow: "0 20px 60px rgba(71, 46, 31, 0.12)",
             radius: "22px",
             font_sans: "Inter, -apple-system, system-ui, sans-serif",
-            font_mono: "\"SFMono-Regular\", \"Cascadia Mono\", \"Liberation Mono\", monospace",
+            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
             body_background: "radial-gradient(circle at top left, rgba(214, 139, 96, 0.24), transparent 28rem), radial-gradient(circle at top right, rgba(96, 138, 173, 0.14), transparent 22rem), linear-gradient(180deg, #f7f2ea 0%, var(--bg) 100%)",
             button_background: "linear-gradient(135deg, #1f1a17, #7b3622)",
             button_text: "#fff8f2",
@@ -4191,7 +4243,7 @@ fn theme_palette(theme: UiTheme, dark: bool) -> ThemePalette {
             shadow: "0 20px 60px rgba(10, 5, 0, 0.5)",
             radius: "22px",
             font_sans: "Inter, -apple-system, system-ui, sans-serif",
-            font_mono: "\"SFMono-Regular\", \"Cascadia Mono\", \"Liberation Mono\", monospace",
+            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
             body_background: "radial-gradient(circle at top left, rgba(160, 90, 50, 0.2), transparent 28rem), radial-gradient(circle at top right, rgba(80, 110, 140, 0.12), transparent 22rem), linear-gradient(180deg, #1a1510 0%, var(--bg) 100%)",
             button_background: "linear-gradient(135deg, #c45a30, #8b3a18)",
             button_text: "#fff8f2",
@@ -4227,8 +4279,8 @@ fn theme_palette(theme: UiTheme, dark: bool) -> ThemePalette {
             accent_soft: "rgba(125, 211, 252, 0.16)",
             shadow: "0 20px 60px rgba(2, 8, 18, 0.45)",
             radius: "20px",
-            font_sans: "\"Avenir Next\", \"Segoe UI\", \"Helvetica Neue\", sans-serif",
-            font_mono: "\"SFMono-Regular\", \"Cascadia Code\", \"Liberation Mono\", monospace",
+            font_sans: "Inter, -apple-system, system-ui, sans-serif",
+            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
             body_background: "radial-gradient(circle at top left, rgba(46, 93, 131, 0.32), transparent 28rem), radial-gradient(circle at top right, rgba(125, 211, 252, 0.12), transparent 22rem), linear-gradient(180deg, #0c1117 0%, var(--bg) 100%)",
             button_background: "linear-gradient(135deg, #2563eb, #0f766e)",
             button_text: "#f8fbff",
@@ -4264,8 +4316,8 @@ fn theme_palette(theme: UiTheme, dark: bool) -> ThemePalette {
             accent_soft: "rgba(59, 130, 246, 0.12)",
             shadow: "0 20px 60px rgba(20, 40, 70, 0.1)",
             radius: "20px",
-            font_sans: "\"Avenir Next\", \"Segoe UI\", \"Helvetica Neue\", sans-serif",
-            font_mono: "\"SFMono-Regular\", \"Cascadia Code\", \"Liberation Mono\", monospace",
+            font_sans: "Inter, -apple-system, system-ui, sans-serif",
+            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
             body_background: "radial-gradient(circle at top left, rgba(59, 130, 246, 0.14), transparent 28rem), radial-gradient(circle at top right, rgba(99, 200, 220, 0.1), transparent 22rem), linear-gradient(180deg, #f3f6fb 0%, var(--bg) 100%)",
             button_background: "linear-gradient(135deg, #2563eb, #0f766e)",
             button_text: "#f8fbff",
@@ -4841,6 +4893,42 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       flex-direction: column;
       gap: var(--s-5);
       margin-top: var(--s-6);
+    }
+
+    .agent-list {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .agent-list-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: var(--s-3) var(--s-4);
+      border-bottom: 1px solid var(--line);
+      text-decoration: none;
+      color: var(--fg);
+      transition: background 0.1s;
+    }
+
+    .agent-list-item:hover {
+      background: var(--bg-hover);
+    }
+
+    .agent-list-item.active {
+      background: var(--bg-hover);
+      border-left: 3px solid var(--accent);
+    }
+
+    .agent-list-name {
+      font-weight: 600;
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+    }
+
+    .agent-list-meta {
+      font-size: 0.82rem;
+      color: var(--fg-muted);
     }
 
     .stack {

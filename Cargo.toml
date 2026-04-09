@@ -1,6 +1,6 @@
 [package]
 name = "lore-core"
-version = "0.1.36"
+version = "0.1.37"
 edition = "2024"
 autobins = false
 
@@ -34,6 +34,7 @@ tar = "0.4"
 tokio = { version = "1.45", features = ["macros", "rt-multi-thread"] }
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde", "serde-well-known"] }
+urlencoding = "2.1"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 v_htmlescape = "0.15"
 

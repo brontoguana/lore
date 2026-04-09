@@ -24,11 +24,12 @@ use crate::model::{
 };
 use crate::store::FileBlockStore;
 use crate::ui::{
-    AgentTokenSummary, ProjectListEntry, UiAdminTokenDisplay, UiAuditEvent, UiDiffLine,
+    AgentTokenSummary, ProjectListEntry, UiAuditEvent, UiDiffLine,
     UiDiffLineKind, UiLibrarianAnswer, UiPendingLibrarianAction, UiProjectVersion,
-    UiProjectVersionOperation, UiUserSummary, render_admin_audit_page, render_admin_page,
-    render_login_page, render_project_audit_page, render_project_history_page, render_project_page,
-    render_agents_page, render_projects_page, render_settings_page, render_setup_page,
+    UiProjectVersionOperation, UiUserSummary, UserProjectAccess, render_admin_audit_page,
+    render_admin_page, render_login_page, render_project_audit_page, render_project_history_page,
+    render_project_page, render_agents_page, render_projects_page, render_settings_page,
+    render_setup_page,
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
@@ -278,7 +279,19 @@ fn build_app_with_librarian(
         )
         .route("/ui", get(projects_page))
         .route("/ui/projects", post(create_project_from_ui))
-        .route("/ui/agents", get(agents_page))
+        .route("/ui/agents", get(agents_page).post(create_agent_from_ui))
+        .route(
+            "/ui/agents/{name}/grants",
+            post(update_agent_grants_from_ui),
+        )
+        .route(
+            "/ui/agents/{name}/rotate",
+            post(rotate_agent_from_ui),
+        )
+        .route(
+            "/ui/agents/{name}/delete",
+            post(delete_agent_from_ui),
+        )
         .route("/ui/settings", get(settings_page))
         .route("/ui/settings/theme", post(update_theme_from_ui))
         .route("/ui/admin", get(admin_page))
@@ -301,15 +314,6 @@ fn build_app_with_librarian(
         .route(
             "/ui/admin/users/{username}/sessions/revoke",
             post(revoke_user_sessions_from_ui),
-        )
-        .route("/ui/admin/agent-tokens", post(create_agent_token_from_ui))
-        .route(
-            "/ui/admin/agent-tokens/{name}/rotate",
-            post(rotate_agent_token_from_ui),
-        )
-        .route(
-            "/ui/admin/agent-tokens/{name}/delete",
-            post(delete_agent_token_from_ui),
         )
         .route("/ui/admin/setup", post(update_setup_from_ui))
         .route("/ui/admin/librarian", post(update_librarian_from_ui))
@@ -455,6 +459,13 @@ struct SettingsPageQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct AgentsPageQuery {
+    selected: Option<String>,
+    flash: Option<String>,
+    created_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProjectPageQuery {
     flash: Option<String>,
     q: Option<String>,
@@ -553,6 +564,7 @@ struct CreateUserRequest {
 #[derive(Debug, Deserialize)]
 struct CreateAgentTokenRequest {
     name: String,
+    owner: String,
     grants: Vec<CreateProjectGrantRequest>,
 }
 
@@ -631,9 +643,11 @@ struct CreateAgentTokenUiForm {
 }
 
 #[derive(Debug, Deserialize)]
-struct DeleteAgentTokenUiForm {
+struct UpdateAgentGrantsUiForm {
     csrf_token: String,
+    grants: String,
 }
+
 
 #[derive(Debug, Deserialize)]
 struct UpdateServerConfigRequest {
@@ -649,7 +663,6 @@ struct UpdateSetupUiForm {
     external_scheme: String,
     external_host: String,
     external_port: u16,
-    default_theme: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1570,8 +1583,10 @@ async fn create_agent_token(
     Json(payload): Json<CreateAgentTokenRequest>,
 ) -> ApiResult<Json<Value>> {
     let admin = require_admin(&state, &headers)?;
+    let owner = UserName::new(&payload.owner)?;
     let created = state.auth.create_agent_token(NewAgentToken {
         name: payload.name,
+        owner: owner.clone(),
         grants: payload
             .grants
             .into_iter()
@@ -1605,7 +1620,7 @@ async fn delete_agent_token(
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
     let admin = require_admin(&state, &headers)?;
-    state.auth.revoke_agent_token(&name)?;
+    state.auth.revoke_agent_token_by_name(&name)?;
     append_audit_event(
         &state,
         AuditActor {
@@ -1625,7 +1640,7 @@ async fn rotate_agent_token(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let admin = require_admin(&state, &headers)?;
-    let created = state.auth.rotate_agent_token(&name)?;
+    let created = state.auth.rotate_agent_token_by_name(&name)?;
     append_audit_event(
         &state,
         AuditActor {
@@ -2487,11 +2502,24 @@ async fn admin_page(
     let auto_update_config = state.auto_update_config.load()?;
     let librarian_config = state.librarian_config.load()?;
     let git_export_config = state.git_export_config.load()?;
-    let setup_instruction = build_agent_setup_instruction(&config, None);
     let librarian_audit = state.librarian_history.list_recent_all(12)?;
     let pending_actions = state.pending_librarian_actions.list_all(12)?;
     let auth_audit = state.auth_audit.list_recent(12)?;
     let projects = state.store.list_project_infos()?;
+    let all_tokens = state.auth.list_agent_tokens()?;
+    let mut user_agents: std::collections::HashMap<String, Vec<AgentTokenSummary>> =
+        std::collections::HashMap::new();
+    for token in all_tokens {
+        let owner_key = token
+            .owner
+            .as_ref()
+            .map(|u| u.as_str().to_string())
+            .unwrap_or_else(|| "(unowned)".to_string());
+        user_agents
+            .entry(owner_key)
+            .or_default()
+            .push(agent_token_summary(token));
+    }
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
         resolved_color_mode(&session.user),
@@ -2504,12 +2532,7 @@ async fn admin_page(
             .into_iter()
             .map(|user| ui_user_summary(&state, user))
             .collect::<Result<Vec<_>, LoreError>>()?,
-        &state
-            .auth
-            .list_agent_tokens()?
-            .into_iter()
-            .map(agent_token_summary)
-            .collect::<Vec<_>>(),
+        &user_agents,
         &config,
         &external_auth_config,
         &oidc_config,
@@ -2519,12 +2542,10 @@ async fn admin_page(
         state.auto_update_status.load()?.as_ref(),
         state.librarian_provider_status.load()?,
         state.git_export_status.load()?.as_ref(),
-        &setup_instruction,
         &ui_librarian_answers_from_history_all(&state.store, librarian_audit)?,
         &ui_pending_librarian_actions_all(&state.store, pending_actions)?,
         &ui_auth_audit_events(auth_audit),
         &projects,
-        None,
         query.flash.as_deref(),
         query.section.as_deref().unwrap_or("users"),
     )))
@@ -2533,17 +2554,213 @@ async fn admin_page(
 async fn agents_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<AgentsPageQuery>,
 ) -> UiResult<Html<String>> {
     let session = require_ui_session(&state, &headers)?;
     let config = state.config.load()?;
+    let agents: Vec<AgentTokenSummary> = state
+        .auth
+        .list_agent_tokens_for_user(&session.user.username)?
+        .into_iter()
+        .map(agent_token_summary)
+        .collect();
+    let user_projects = build_user_project_access(&state, &session.user)?;
     Ok(Html(render_agents_page(
         &config,
         session.user.username.as_str(),
         session.user.is_admin,
         resolved_theme(&session.user, &config),
         resolved_color_mode(&session.user),
-        None,
+        &session.csrf_token,
+        &agents,
+        &user_projects,
+        query.selected.as_deref(),
+        query.created_token.as_deref(),
+        query.flash.as_deref(),
     )))
+}
+
+async fn create_agent_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateAgentTokenUiForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let grants = parse_role_grants(&form.grants)?;
+    // Validate the user can grant these permissions
+    validate_user_grants(&state, &session.user, &grants)?;
+    let created = state.auth.create_agent_token(NewAgentToken {
+        name: form.name.clone(),
+        owner: session.user.username.clone(),
+        grants,
+    })?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "create agent",
+        Some(form.name.clone()),
+        None,
+    )?;
+    Ok(Redirect::to(&format!(
+        "/ui/agents?selected={}&created_token={}&flash=Agent%20created.%20Copy%20the%20token%20now.",
+        urlencoding::encode(&form.name),
+        urlencoding::encode(&created.token),
+    ))
+    .into_response())
+}
+
+async fn update_agent_grants_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<UpdateAgentGrantsUiForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let grants = parse_role_grants(&form.grants)?;
+    validate_user_grants(&state, &session.user, &grants)?;
+    state
+        .auth
+        .update_agent_token_grants(&name, &session.user.username, grants)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "update agent grants",
+        Some(name.clone()),
+        None,
+    )?;
+    Ok(Redirect::to(&format!(
+        "/ui/agents?selected={}&flash=Agent%20updated",
+        urlencoding::encode(&name),
+    ))
+    .into_response())
+}
+
+async fn rotate_agent_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let created = state
+        .auth
+        .rotate_agent_token(&name, &session.user.username)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "rotate agent token",
+        Some(name.clone()),
+        None,
+    )?;
+    Ok(Redirect::to(&format!(
+        "/ui/agents?selected={}&created_token={}&flash=Token%20regenerated.%20Copy%20it%20now.",
+        urlencoding::encode(&name),
+        urlencoding::encode(&created.token),
+    ))
+    .into_response())
+}
+
+async fn delete_agent_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    state
+        .auth
+        .revoke_agent_token(&name, &session.user.username)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "delete agent",
+        Some(name.clone()),
+        None,
+    )?;
+    Ok(Redirect::to("/ui/agents?flash=Agent%20deleted").into_response())
+}
+
+fn build_user_project_access(
+    state: &AppState,
+    user: &AuthenticatedUser,
+) -> Result<Vec<UserProjectAccess>, LoreError> {
+    let projects = state.store.list_project_infos()?;
+    Ok(projects
+        .into_iter()
+        .filter_map(|p| {
+            if user.is_admin {
+                Some(UserProjectAccess {
+                    slug: p.slug.as_str().to_string(),
+                    display_name: p.display_name,
+                    max_permission: ProjectPermission::ReadWrite,
+                })
+            } else {
+                let max_perm = user
+                    .roles
+                    .iter()
+                    .flat_map(|role| &role.grants)
+                    .filter(|grant| grant.project == p.slug)
+                    .map(|grant| grant.permission)
+                    .max_by_key(|perm| if perm.allows_write() { 1 } else { 0 });
+                max_perm.map(|perm| UserProjectAccess {
+                    slug: p.slug.as_str().to_string(),
+                    display_name: p.display_name,
+                    max_permission: perm,
+                })
+            }
+        })
+        .collect())
+}
+
+fn validate_user_grants(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    grants: &[ProjectGrant],
+) -> Result<(), LoreError> {
+    for grant in grants {
+        if user.is_admin {
+            continue;
+        }
+        let user_can_write = user
+            .roles
+            .iter()
+            .flat_map(|role| &role.grants)
+            .any(|g| g.project == grant.project && g.permission.allows_write());
+        let user_can_read = user
+            .roles
+            .iter()
+            .flat_map(|role| &role.grants)
+            .any(|g| g.project == grant.project);
+        if grant.permission.allows_write() && !user_can_write {
+            return Err(LoreError::Validation(format!(
+                "you do not have write access to project {}",
+                grant.project.as_str()
+            )));
+        }
+        if !user_can_read {
+            return Err(LoreError::Validation(format!(
+                "you do not have access to project {}",
+                grant.project.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn settings_page(
@@ -2837,172 +3054,6 @@ async fn revoke_user_sessions_from_ui(
     Ok(Redirect::to("/ui/admin?flash=User%20sessions%20revoked"))
 }
 
-async fn create_agent_token_from_ui(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<CreateAgentTokenUiForm>,
-) -> UiResult<Html<String>> {
-    let session = require_ui_admin(&state, &headers)?;
-    verify_csrf(&session, &form.csrf_token)?;
-    let created = state.auth.create_agent_token(NewAgentToken {
-        name: form.name,
-        grants: parse_role_grants(&form.grants)?,
-    })?;
-    append_audit_event(
-        &state,
-        AuditActor {
-            kind: AuditActorKind::User,
-            name: session.user.username.as_str().to_string(),
-        },
-        "create agent token",
-        Some(created.stored.name.clone()),
-        None,
-    )?;
-    let config = state.config.load()?;
-    let external_auth_config = state.external_auth.load()?;
-    let oidc_config = state.oidc.load()?;
-    let auto_update_config = state.auto_update_config.load()?;
-    let librarian_config = state.librarian_config.load()?;
-    let git_export_config = state.git_export_config.load()?;
-    let token_display = build_ui_admin_token_display(&config, created);
-    let projects = state.store.list_project_infos()?;
-    Ok(Html(render_admin_page(
-        resolved_theme(&session.user, &config),
-        resolved_color_mode(&session.user),
-        session.user.username.as_str(),
-        &session.csrf_token,
-        &state.auth.list_roles()?,
-        &state
-            .auth
-            .list_users()?
-            .into_iter()
-            .map(|user| ui_user_summary(&state, user))
-            .collect::<Result<Vec<_>, LoreError>>()?,
-        &state
-            .auth
-            .list_agent_tokens()?
-            .into_iter()
-            .map(agent_token_summary)
-            .collect::<Vec<_>>(),
-        &config,
-        &external_auth_config,
-        &oidc_config,
-        &auto_update_config,
-        &librarian_config,
-        &git_export_config,
-        state.auto_update_status.load()?.as_ref(),
-        state.librarian_provider_status.load()?,
-        state.git_export_status.load()?.as_ref(),
-        &build_agent_setup_instruction(&config, None),
-        &ui_librarian_answers_from_history_all(
-            &state.store,
-            state.librarian_history.list_recent_all(12)?,
-        )?,
-        &ui_pending_librarian_actions_all(
-            &state.store,
-            state.pending_librarian_actions.list_all(12)?,
-        )?,
-        &ui_auth_audit_events(state.auth_audit.list_recent(12)?),
-        &projects,
-        Some(&token_display),
-        Some("Agent token created. Copy it now; the raw token will not be shown again."),
-        "agent-tokens",
-    )))
-}
-
-async fn rotate_agent_token_from_ui(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-    Form(form): Form<UserActionUiForm>,
-) -> UiResult<Html<String>> {
-    let session = require_ui_admin(&state, &headers)?;
-    verify_csrf(&session, &form.csrf_token)?;
-    let created = state.auth.rotate_agent_token(&name)?;
-    append_audit_event(
-        &state,
-        AuditActor {
-            kind: AuditActorKind::User,
-            name: session.user.username.as_str().to_string(),
-        },
-        "rotate agent token",
-        Some(name.clone()),
-        None,
-    )?;
-    let config = state.config.load()?;
-    let external_auth_config = state.external_auth.load()?;
-    let oidc_config = state.oidc.load()?;
-    let auto_update_config = state.auto_update_config.load()?;
-    let librarian_config = state.librarian_config.load()?;
-    let git_export_config = state.git_export_config.load()?;
-    let token_display = build_ui_admin_token_display(&config, created);
-    let projects = state.store.list_project_infos()?;
-    Ok(Html(render_admin_page(
-        resolved_theme(&session.user, &config),
-        resolved_color_mode(&session.user),
-        session.user.username.as_str(),
-        &session.csrf_token,
-        &state.auth.list_roles()?,
-        &state
-            .auth
-            .list_users()?
-            .into_iter()
-            .map(|user| ui_user_summary(&state, user))
-            .collect::<Result<Vec<_>, LoreError>>()?,
-        &state
-            .auth
-            .list_agent_tokens()?
-            .into_iter()
-            .map(agent_token_summary)
-            .collect::<Vec<_>>(),
-        &config,
-        &external_auth_config,
-        &oidc_config,
-        &auto_update_config,
-        &librarian_config,
-        &git_export_config,
-        state.auto_update_status.load()?.as_ref(),
-        state.librarian_provider_status.load()?,
-        state.git_export_status.load()?.as_ref(),
-        &build_agent_setup_instruction(&config, None),
-        &ui_librarian_answers_from_history_all(
-            &state.store,
-            state.librarian_history.list_recent_all(12)?,
-        )?,
-        &ui_pending_librarian_actions_all(
-            &state.store,
-            state.pending_librarian_actions.list_all(12)?,
-        )?,
-        &ui_auth_audit_events(state.auth_audit.list_recent(12)?),
-        &projects,
-        Some(&token_display),
-        Some("Agent token rotated. Copy the new raw token now."),
-        "agent-tokens",
-    )))
-}
-
-async fn delete_agent_token_from_ui(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-    Form(form): Form<DeleteAgentTokenUiForm>,
-) -> UiResult<Redirect> {
-    let session = require_ui_admin(&state, &headers)?;
-    verify_csrf(&session, &form.csrf_token)?;
-    state.auth.revoke_agent_token(&name)?;
-    append_audit_event(
-        &state,
-        AuditActor {
-            kind: AuditActorKind::User,
-            name: session.user.username.as_str().to_string(),
-        },
-        "revoke agent token",
-        Some(name),
-        None,
-    )?;
-    Ok(Redirect::to("/ui/admin?flash=Agent%20token%20revoked"))
-}
-
 async fn update_setup_from_ui(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3010,11 +3061,12 @@ async fn update_setup_from_ui(
 ) -> UiResult<Redirect> {
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
+    let current_theme = state.config.load()?.default_theme;
     state.config.update(
         ExternalScheme::parse(&form.external_scheme)?,
         form.external_host,
         form.external_port,
-        UiTheme::parse(&form.default_theme)?,
+        current_theme,
     )?;
     append_audit_event(
         &state,
@@ -4392,26 +4444,6 @@ fn build_agent_setup_instruction(config: &ServerConfig, token: Option<&str>) -> 
     )
 }
 
-fn build_http_auth_example(config: &ServerConfig, token: &str) -> String {
-    format!(
-        "curl -H 'Authorization: Bearer {token}' '{}/v1/projects'",
-        config.base_url()
-    )
-}
-
-fn build_mcp_config_example(config: &ServerConfig, token: &str) -> String {
-    serde_json::to_string_pretty(&json!({
-        "transport": "streamable_http",
-        "url": config.mcp_url(),
-        "headers": {
-            "Authorization": format!("Bearer {token}"),
-            "Accept": "application/json, text/event-stream",
-            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION
-        }
-    }))
-    .unwrap_or_else(|_| config.mcp_url())
-}
-
 fn resolved_theme(user: &AuthenticatedUser, config: &ServerConfig) -> UiTheme {
     user.theme.unwrap_or(config.default_theme)
 }
@@ -4556,22 +4588,9 @@ fn block_matches_filters(block: &Block, filters: &BlockFilterOptions) -> bool {
 fn agent_token_summary(token: StoredAgentToken) -> AgentTokenSummary {
     AgentTokenSummary {
         name: token.name,
+        owner: token.owner.map(|u| u.as_str().to_string()),
         grants: token.grants,
         created_at: token.created_at,
-    }
-}
-
-fn build_ui_admin_token_display(
-    config: &ServerConfig,
-    created: CreatedAgentToken,
-) -> UiAdminTokenDisplay {
-    let summary = agent_token_summary(created.stored);
-    UiAdminTokenDisplay {
-        setup_instruction: build_agent_setup_instruction(config, Some(&created.token)),
-        http_example: build_http_auth_example(config, &created.token),
-        mcp_example: build_mcp_config_example(config, &created.token),
-        token: created.token,
-        summary,
     }
 }
 
@@ -8206,7 +8225,7 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded")
             .header("cookie", &session_cookie)
             .body(Body::from(format!(
-                "csrf_token={csrf_token}&external_scheme=https&external_host=lore.example.com&external_port=443&default_theme=parchment"
+                "csrf_token={csrf_token}&external_scheme=https&external_host=lore.example.com&external_port=443"
             )))
             .unwrap();
         let response = app.clone().oneshot(update).await.unwrap();
@@ -8232,7 +8251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_page_shows_copy_paste_setup_instruction() {
+    async fn admin_page_shows_network_section() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let (session_cookie, _) = bootstrap_admin_session(&app).await;
@@ -8249,10 +8268,8 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Agent setup"));
-        assert!(html.contains("Copy-paste for an agent"));
-        assert!(html.contains("/setup"));
-        assert!(html.contains("Visit this URL first:"));
+        assert!(html.contains("Network"));
+        assert!(html.contains("Users"));
     }
 
     #[tokio::test]
@@ -8263,16 +8280,14 @@ mod tests {
 
         let update = Request::builder()
             .method("POST")
-            .uri("/ui/admin/setup")
-            .header("content-type", "application/x-www-form-urlencoded")
-            .header("cookie", &session_cookie)
-            .body(Body::from(format!(
-                "csrf_token={csrf_token}&external_scheme=http&external_host=localhost&external_port=7043&default_theme=graphite"
-            )))
+            .uri("/v1/admin/server-config")
+            .header("content-type", "application/json")
+            .header("authorization", "Basic YWRtaW46Y29ycmVjdC1ob3JzZS1iYXR0ZXJ5")
+            .body(Body::from(r#"{"external_scheme":"http","external_host":"localhost","external_port":7043,"default_theme":"graphite"}"#))
             .unwrap();
         assert_eq!(
             app.clone().oneshot(update).await.unwrap().status(),
-            StatusCode::SEE_OTHER
+            StatusCode::OK
         );
 
         let request = Request::builder()
@@ -9396,7 +9411,7 @@ mod tests {
                 basic_auth("admin", "correct-horse-battery"),
             )
             .body(Body::from(format!(
-                r#"{{"name":"{name}","grants":[{grants_json}]}}"#
+                r#"{{"name":"{name}","owner":"admin","grants":[{grants_json}]}}"#
             )))
             .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
