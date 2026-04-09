@@ -1433,7 +1433,7 @@ fn read_password_hidden(prompt: &str) -> io::Result<String> {
 fn read_password_hidden(prompt: &str) -> io::Result<String> {
     use std::io::BufRead;
     eprint!("{}", prompt);
-    extern "system" {
+    unsafe extern "system" {
         fn GetStdHandle(nStdHandle: u32) -> isize;
         fn GetConsoleMode(hConsoleHandle: isize, lpMode: *mut u32) -> i32;
         fn SetConsoleMode(hConsoleHandle: isize, dwMode: u32) -> i32;

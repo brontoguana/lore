@@ -288,7 +288,7 @@ fn read_password_no_echo() -> String {
 
 #[cfg(windows)]
 fn read_password_no_echo() -> String {
-    extern "system" {
+    unsafe extern "system" {
         fn GetStdHandle(nStdHandle: u32) -> isize;
         fn GetConsoleMode(hConsoleHandle: isize, lpMode: *mut u32) -> i32;
         fn SetConsoleMode(hConsoleHandle: isize, dwMode: u32) -> i32;
