@@ -14,8 +14,9 @@ pub mod versioning;
 pub use api::build_app;
 pub use audit::{AuditActor, AuditActorKind, AuditStore, StoredAuditEvent};
 pub use auth::{
-    AuthenticatedAgent, AuthenticatedUser, CreatedAgentToken, LocalAuthStore, NewAgentToken,
-    NewRole, NewUser, ProjectGrant, ProjectPermission, RoleName, StoredAgentToken, UserName,
+    AgentBackend, AuthenticatedAgent, AuthenticatedMachine, AuthenticatedUser, CreatedAgentToken,
+    LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant, ProjectPermission, RoleName,
+    StoredAgentToken, StoredMachine, UserName,
 };
 pub use config::{
     ExternalAuthConfig, ExternalAuthSecretUpdate, ExternalAuthStore, ExternalScheme, OidcConfig,

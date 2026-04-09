@@ -1,7 +1,8 @@
 use crate::audit::{AuditActor, AuditActorKind, AuditStore, StoredAuditEvent};
 use crate::auth::{
-    AuthenticatedAgent, AuthenticatedUser, CreatedAgentToken, LocalAuthStore, NewAgentToken,
-    NewRole, NewSession, NewUser, ProjectGrant, ProjectPermission, RoleName, StoredAgentToken,
+    AgentBackend, AgentChatStatus, AuthenticatedAgent, AuthenticatedUser, ChatMessage, ChatRole,
+    ChatStore, PinnedChatItem, CreatedAgentToken, LocalAuthStore, NewAgentToken, NewRole,
+    NewSession, NewUser, ProjectGrant, ProjectPermission, RoleName, StoredAgentToken, StoredMachine,
     UserName, hash_agent_token,
 };
 use crate::config::{
@@ -24,12 +25,12 @@ use crate::model::{
 };
 use crate::store::FileBlockStore;
 use crate::ui::{
-    AgentTokenSummary, ProjectListEntry, UiAuditEvent, UiDiffLine,
+    AgentTokenSummary, ChatAgentSummary, ProjectListEntry, UiAuditEvent, UiDiffLine,
     UiDiffLineKind, UiLibrarianAnswer, UiPendingLibrarianAction, UiProjectVersion,
     UiProjectVersionOperation, UiUserSummary, UserProjectAccess, render_admin_audit_page,
-    render_admin_page, render_login_page, render_project_audit_page, render_project_history_page,
-    render_project_page, render_agents_page, render_projects_page, render_settings_page,
-    render_setup_page,
+    render_admin_page, render_chat_page, render_login_page, render_project_audit_page,
+    render_project_history_page, render_project_page, render_agents_page, render_projects_page,
+    render_settings_page, render_setup_page,
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
@@ -99,12 +100,23 @@ pub struct AppState {
     agent_auth_rate_limits: Arc<Mutex<Vec<OffsetDateTime>>>,
     global_librarian_rate_limits: Arc<Mutex<Vec<OffsetDateTime>>>,
     mcp_sessions: Arc<Mutex<HashMap<String, McpSessionEntry>>>,
+    chat: Arc<ChatStore>,
+    chat_senders: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ChatEvent>>>>,
+    chat_agent_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
 }
 
 #[derive(Debug, Clone)]
 struct McpSessionEntry {
     agent: AuthenticatedAgent,
     token_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatEvent {
+    event_type: String,
+    agent: String,
+    owner: String,
+    data: Value,
 }
 
 impl AppState {
@@ -120,6 +132,7 @@ impl AppState {
         let root = store.root().to_path_buf();
         let provider_status_root = root.clone();
         let auto_update_root = root.clone();
+        let chat_root = root.clone();
         let auth = LocalAuthStore::new(root.clone());
         let config = ServerConfigStore::new(root.clone(), default_port);
         Self {
@@ -150,6 +163,9 @@ impl AppState {
             agent_auth_rate_limits: Arc::new(Mutex::new(Vec::new())),
             global_librarian_rate_limits: Arc::new(Mutex::new(Vec::new())),
             mcp_sessions: Arc::new(Mutex::new(HashMap::new())),
+            chat: Arc::new(ChatStore::new(chat_root)),
+            chat_senders: Arc::new(Mutex::new(HashMap::new())),
+            chat_agent_notifiers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -237,6 +253,14 @@ fn build_app_with_librarian(
         .route("/v1/admin/librarian-runs", get(list_admin_librarian_runs))
         .route("/v1/projects", get(list_projects))
         .route("/v1/context", get(get_all_agent_context))
+        .route("/v1/machines/register", post(register_machine))
+        .route("/v1/agents/provision", post(provision_agent_with_body))
+        .route("/v1/chat/poll", get(chat_agent_poll))
+        .route("/v1/chat/respond", post(chat_agent_respond))
+        .route("/v1/chat/status", post(chat_agent_update_status))
+        .route("/v1/chat/history", get(chat_agent_history))
+        .route("/v1/chat/compact", post(chat_agent_compact))
+        .route("/v1/chat/config", get(chat_agent_config))
         .route(
             "/v1/projects/{project}/blocks",
             get(list_project_blocks).post(create_project_block),
@@ -280,7 +304,11 @@ fn build_app_with_librarian(
         )
         .route("/ui", get(projects_page))
         .route("/ui/projects", post(create_project_from_ui))
-        .route("/ui/agents", get(agents_page).post(create_agent_from_ui))
+        .route("/ui/agents", get(agents_page))
+        .route(
+            "/ui/agents/machines/{name}/revoke",
+            post(revoke_machine_from_ui),
+        )
         .route(
             "/ui/agents/{name}/grants",
             post(update_agent_grants_from_ui),
@@ -293,6 +321,10 @@ fn build_app_with_librarian(
             "/ui/agents/{name}/delete",
             post(delete_agent_from_ui),
         )
+        .route("/ui/chat", get(chat_page))
+        .route("/ui/chat/stream", get(chat_sse_stream))
+        .route("/ui/chat/{agent}/send", post(chat_send_message))
+        .route("/ui/chat/{agent}/command", post(chat_slash_command))
         .route("/ui/settings", get(settings_page))
         .route("/ui/settings/theme", post(update_theme_from_ui))
         .route("/ui/admin", get(admin_page))
@@ -464,7 +496,6 @@ struct SettingsPageQuery {
 struct AgentsPageQuery {
     selected: Option<String>,
     flash: Option<String>,
-    created_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -567,6 +598,8 @@ struct CreateUserRequest {
 struct CreateAgentTokenRequest {
     name: String,
     owner: String,
+    #[serde(default)]
+    backend: Option<String>,
     grants: Vec<CreateProjectGrantRequest>,
 }
 
@@ -645,16 +678,23 @@ struct UserActionUiForm {
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateAgentTokenUiForm {
+struct UpdateAgentGrantsUiForm {
     csrf_token: String,
-    name: String,
     grants: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct UpdateAgentGrantsUiForm {
-    csrf_token: String,
-    grants: String,
+struct RegisterMachineRequest {
+    username: String,
+    password: String,
+    machine_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisionAgentRequest {
+    name: String,
+    #[serde(default)]
+    backend: String,
 }
 
 
@@ -1612,6 +1652,7 @@ async fn create_agent_token(
 ) -> ApiResult<Json<Value>> {
     let admin = require_admin(&state, &headers)?;
     let owner = UserName::new(&payload.owner)?;
+    let backend = payload.backend.as_deref().and_then(|b| b.parse().ok()).unwrap_or_default();
     let created = state.auth.create_agent_token(NewAgentToken {
         display_name: payload.name,
         owner: owner.clone(),
@@ -1625,6 +1666,7 @@ async fn create_agent_token(
                 })
             })
             .collect::<Result<Vec<_>, LoreError>>()?,
+        backend,
     })?;
     append_audit_event(
         &state,
@@ -2548,6 +2590,15 @@ async fn admin_page(
             .or_default()
             .push(agent_token_summary(token));
     }
+    let all_machines = state.auth.list_all_machines()?;
+    let mut user_machines: std::collections::HashMap<String, Vec<StoredMachine>> =
+        std::collections::HashMap::new();
+    for machine in all_machines {
+        user_machines
+            .entry(machine.username.as_str().to_string())
+            .or_default()
+            .push(machine);
+    }
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
         resolved_color_mode(&session.user),
@@ -2561,6 +2612,7 @@ async fn admin_page(
             .map(|user| ui_user_summary(&state, user))
             .collect::<Result<Vec<_>, LoreError>>()?,
         &user_agents,
+        &user_machines,
         &config,
         &external_auth_config,
         &oidc_config,
@@ -2592,6 +2644,9 @@ async fn agents_page(
         .into_iter()
         .map(agent_token_summary)
         .collect();
+    let machines = state
+        .auth
+        .list_machines_for_user(&session.user.username)?;
     let user_projects = build_user_project_access(&state, &session.user)?;
     Ok(Html(render_agents_page(
         &config,
@@ -2601,44 +2656,11 @@ async fn agents_page(
         resolved_color_mode(&session.user),
         &session.csrf_token,
         &agents,
+        &machines,
         &user_projects,
         query.selected.as_deref(),
-        query.created_token.as_deref(),
         query.flash.as_deref(),
     )))
-}
-
-async fn create_agent_from_ui(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<CreateAgentTokenUiForm>,
-) -> UiResult<Response> {
-    let session = require_ui_session(&state, &headers)?;
-    verify_csrf(&session, &form.csrf_token)?;
-    let grants = parse_role_grants(&form.grants)?;
-    // Validate the user can grant these permissions
-    validate_user_grants(&state, &session.user, &grants)?;
-    let created = state.auth.create_agent_token(NewAgentToken {
-        display_name: form.name.clone(),
-        owner: session.user.username.clone(),
-        grants,
-    })?;
-    append_audit_event(
-        &state,
-        AuditActor {
-            kind: AuditActorKind::User,
-            name: session.user.username.as_str().to_string(),
-        },
-        "create agent",
-        Some(created.stored.name.clone()),
-        None,
-    )?;
-    Ok(Redirect::to(&format!(
-        "/ui/agents?selected={}&created_token={}&flash=Agent%20created.%20Copy%20the%20token%20now.",
-        urlencoding::encode(&created.stored.name),
-        urlencoding::encode(&created.token),
-    ))
-    .into_response())
 }
 
 async fn update_agent_grants_from_ui(
@@ -4643,6 +4665,7 @@ fn agent_token_summary(token: StoredAgentToken) -> AgentTokenSummary {
         display_name,
         owner: token.owner.map(|u| u.as_str().to_string()),
         grants: token.grants,
+        backend: token.backend.to_string(),
         created_at: token.created_at,
     }
 }
@@ -7366,6 +7389,843 @@ fn grep_preview(content: &str, needle: &str) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+// --- Chat handlers ---
+
+#[derive(Debug, Deserialize)]
+struct ChatPageQuery {
+    agent: Option<String>,
+}
+
+async fn chat_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChatPageQuery>,
+) -> UiResult<Html<String>> {
+    let session = require_ui_session(&state, &headers)?;
+    let config = state.config.load()?;
+
+    let agents: Vec<StoredAgentToken> =
+        state.auth.list_agent_tokens_for_user(&session.user.username)?;
+
+    let mut chat_agents: Vec<ChatAgentSummary> = Vec::new();
+    for agent in &agents {
+        let owner = agent
+            .owner
+            .as_ref()
+            .map(|o| o.as_str())
+            .unwrap_or("");
+        let conv = state.chat.load_conversation(owner, &agent.name)?;
+        let last_msg = conv.messages.last();
+        let snippet = last_msg.map(|m| {
+            m.content.chars().take(60).collect::<String>()
+        });
+        let time_str = last_msg.map(|m| format_chat_time(m.timestamp));
+        chat_agents.push(ChatAgentSummary {
+            name: agent.name.clone(),
+            display_name: agent
+                .display_name
+                .clone()
+                .unwrap_or_else(|| agent.name.clone()),
+            owner: owner.to_string(),
+            status: match conv.agent_status {
+                AgentChatStatus::Idle => "idle".to_string(),
+                AgentChatStatus::Thinking => "thinking".to_string(),
+                AgentChatStatus::Offline => "offline".to_string(),
+            },
+            last_message: snippet,
+            last_message_time: time_str,
+        });
+    }
+
+    let (messages_json, selected) = if let Some(ref agent_name) = query.agent {
+        let owner = session.user.username.as_str();
+        let conv = state.chat.load_conversation(owner, agent_name)?;
+        let msgs: Vec<Value> = conv
+            .messages
+            .iter()
+            .map(|m| {
+                json!({
+                    "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant" },
+                    "content": m.content,
+                })
+            })
+            .collect();
+        (serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()), Some(agent_name.as_str()))
+    } else {
+        ("[]".to_string(), None)
+    };
+
+    Ok(Html(render_chat_page(
+        resolved_theme(&session.user, &config),
+        resolved_color_mode(&session.user),
+        session.user.username.as_str(),
+        &session.csrf_token,
+        session.user.is_admin,
+        &chat_agents,
+        selected,
+        &messages_json,
+        None,
+    )))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatSendForm {
+    csrf_token: String,
+    message: String,
+}
+
+async fn chat_send_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent_name): Path<String>,
+    Form(form): Form<ChatSendForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let owner = session.user.username.as_str();
+
+    // Verify the user owns this agent
+    let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
+    if !agents.iter().any(|a| a.name == agent_name) {
+        return Err(LoreError::PermissionDenied.into());
+    }
+
+    let msg = state.chat.append_message(
+        owner,
+        &agent_name,
+        ChatRole::User,
+        form.message.clone(),
+    )?;
+
+    // Notify the agent if it's polling
+    let notifier_key = format!("{owner}_{agent_name}");
+    if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+        notify.notify_one();
+    }
+
+    // Push SSE event to the user
+    push_chat_event(&state, owner, ChatEvent {
+        event_type: "message_sent".into(),
+        agent: agent_name.clone(),
+        owner: owner.to_string(),
+        data: json!({ "id": msg.id, "content": msg.content }),
+    });
+
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn chat_sse_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    let owner = session.user.username.as_str().to_string();
+
+    let rx = {
+        let mut senders = state.chat_senders.lock().unwrap();
+        let sender = senders
+            .entry(owner.clone())
+            .or_insert_with(|| {
+                let (tx, _) = tokio::sync::broadcast::channel(64);
+                tx
+            });
+        sender.subscribe()
+    };
+
+    let stream = async_stream::stream! {
+        let mut rx = rx;
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        yield Ok::<_, std::convert::Infallible>(
+                            format!("data: {json}\n\n")
+                        );
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    let body = Body::from_stream(stream);
+    Ok(Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(body)
+        .unwrap())
+}
+
+// --- Agent-facing chat endpoints ---
+
+#[derive(Debug, Deserialize)]
+struct ChatRespondBody {
+    text: Option<String>,
+    complete: Option<bool>,
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatStatusBody {
+    status: String,
+}
+
+async fn chat_agent_poll(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    // Update status to idle
+    let _ = state.chat.update_agent_status(owner_str, &agent.name, AgentChatStatus::Idle);
+
+    // Push status update to user
+    push_chat_event(&state, owner_str, ChatEvent {
+        event_type: "status".into(),
+        agent: agent.name.clone(),
+        owner: owner_str.to_string(),
+        data: json!({ "status": "idle" }),
+    });
+
+    // Check for unprocessed user messages
+    let conv = state.chat.load_conversation(owner_str, &agent.name)?;
+    let last_assistant_idx = conv.messages.iter().rposition(|m| m.role == ChatRole::Assistant);
+    let pending: Vec<&ChatMessage> = match last_assistant_idx {
+        Some(idx) => conv.messages[idx + 1..]
+            .iter()
+            .filter(|m| m.role == ChatRole::User)
+            .collect(),
+        None => conv.messages.iter().filter(|m| m.role == ChatRole::User).collect(),
+    };
+
+    if !pending.is_empty() {
+        let msgs: Vec<Value> = pending
+            .iter()
+            .map(|m| json!({ "id": m.id, "content": m.content, "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() }))
+            .collect();
+        return Ok(Json(json!({ "messages": msgs })));
+    }
+
+    // No messages — long-poll up to 30 seconds
+    let notifier_key = format!("{owner_str}_{}", agent.name);
+    let notify = {
+        let mut notifiers = state.chat_agent_notifiers.lock().unwrap();
+        notifiers
+            .entry(notifier_key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        notify.notified(),
+    )
+    .await;
+
+    // Re-check for messages after waking
+    if result.is_ok() {
+        let conv = state.chat.load_conversation(owner_str, &agent.name)?;
+        let last_assistant_idx = conv.messages.iter().rposition(|m| m.role == ChatRole::Assistant);
+        let pending: Vec<&ChatMessage> = match last_assistant_idx {
+            Some(idx) => conv.messages[idx + 1..]
+                .iter()
+                .filter(|m| m.role == ChatRole::User)
+                .collect(),
+            None => conv.messages.iter().filter(|m| m.role == ChatRole::User).collect(),
+        };
+        if !pending.is_empty() {
+            let msgs: Vec<Value> = pending
+                .iter()
+                .map(|m| json!({ "id": m.id, "content": m.content, "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() }))
+                .collect();
+            return Ok(Json(json!({ "messages": msgs })));
+        }
+    }
+
+    Ok(Json(json!({ "messages": [] })))
+}
+
+async fn chat_agent_respond(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRespondBody>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    if let Some(text) = &body.text {
+        // Streaming chunk
+        push_chat_event(&state, owner_str, ChatEvent {
+            event_type: "chunk".into(),
+            agent: agent.name.clone(),
+            owner: owner_str.to_string(),
+            data: json!({ "text": text }),
+        });
+    }
+
+    if body.complete.unwrap_or(false) {
+        // Full response — store the message
+        let content = body.content.clone().or(body.text.clone()).unwrap_or_default();
+        let msg = state.chat.append_message(
+            owner_str,
+            &agent.name,
+            ChatRole::Assistant,
+            content.clone(),
+        )?;
+
+        push_chat_event(&state, owner_str, ChatEvent {
+            event_type: "response_complete".into(),
+            agent: agent.name.clone(),
+            owner: owner_str.to_string(),
+            data: json!({ "id": msg.id, "content": content }),
+        });
+
+        // Update status back to idle
+        let _ = state.chat.update_agent_status(owner_str, &agent.name, AgentChatStatus::Idle);
+        push_chat_event(&state, owner_str, ChatEvent {
+            event_type: "status".into(),
+            agent: agent.name.clone(),
+            owner: owner_str.to_string(),
+            data: json!({ "status": "idle" }),
+        });
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn chat_agent_update_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatStatusBody>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    let status = match body.status.as_str() {
+        "idle" => AgentChatStatus::Idle,
+        "thinking" => AgentChatStatus::Thinking,
+        _ => AgentChatStatus::Offline,
+    };
+    state.chat.update_agent_status(owner_str, &agent.name, status)?;
+
+    push_chat_event(&state, owner_str, ChatEvent {
+        event_type: "status".into(),
+        agent: agent.name.clone(),
+        owner: owner_str.to_string(),
+        data: json!({ "status": body.status }),
+    });
+
+    Ok(StatusCode::OK)
+}
+
+async fn chat_agent_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    let conv = state.chat.load_conversation(owner_str, &agent.name)?;
+    let msgs: Vec<Value> = conv
+        .messages
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant" },
+                "content": m.content,
+                "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "messages": msgs,
+        "summary": conv.summary,
+        "window_size": conv.window_size,
+        "pins": conv.pins.iter().map(|p| json!({"id": p.id, "text": p.text})).collect::<Vec<_>>(),
+        "model": conv.model,
+        "effort": conv.effort,
+    })))
+}
+
+// --- Agent compact endpoint ---
+
+#[derive(Debug, Deserialize)]
+struct ChatCompactBody {
+    summary: String,
+    keep_message_ids: Vec<u64>,
+}
+
+async fn chat_agent_compact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatCompactBody>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    let conv = state.chat.load_conversation(owner_str, &agent.name)?;
+    let kept_messages: Vec<ChatMessage> = conv
+        .messages
+        .into_iter()
+        .filter(|m| body.keep_message_ids.contains(&m.id))
+        .collect();
+
+    state.chat.set_messages(owner_str, &agent.name, kept_messages, body.summary)?;
+    Ok(StatusCode::OK)
+}
+
+async fn chat_agent_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    Ok(Json(serde_json::json!({
+        "backend": agent.backend.to_string(),
+    })))
+}
+
+// --- Slash command handler ---
+
+#[derive(Debug, Deserialize)]
+struct ChatCommandForm {
+    csrf_token: String,
+    command: String,
+}
+
+async fn chat_slash_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent_name): Path<String>,
+    Form(form): Form<ChatCommandForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let owner = session.user.username.as_str();
+
+    // Verify the user owns this agent
+    let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
+    if !agents.iter().any(|a| a.name == agent_name) {
+        return Err(LoreError::PermissionDenied.into());
+    }
+
+    let trimmed = form.command.trim();
+    let (cmd, args) = match trimmed.split_once(char::is_whitespace) {
+        Some((c, a)) => (c.to_lowercase(), a.trim().to_string()),
+        None => (trimmed.to_lowercase(), String::new()),
+    };
+
+    let response_text = match cmd.as_str() {
+        "/help" => {
+            "STATUS\n  /help -- show this message\n  /status -- show current config\n  /context -- show summary, pins, window\n\nCONTEXT\n  /pin <text> -- pin context that survives compaction\n  /pins -- list all pins\n  /unpin <id> -- remove a pin\n  /window <n> -- set conversation window size\n  /compact -- force context compaction\n  /forget -- clear all context and restart\n\nMODEL\n  /model <name> -- switch model\n  /effort <level> -- low/medium/high/max/default\n\nAGENT\n  /stop -- cancel current request\n  /restart -- restart the agent".to_string()
+        }
+        "/status" => {
+            let conv = state.chat.load_conversation(owner, &agent_name)?;
+            let status_str = match conv.agent_status {
+                AgentChatStatus::Idle => "idle",
+                AgentChatStatus::Thinking => "thinking",
+                AgentChatStatus::Offline => "offline",
+            };
+            format!(
+                "Agent: {}\nStatus: {}\nModel: {}\nEffort: {}\nMessages: {}\nPins: {}\nWindow: {}",
+                agent_name, status_str,
+                conv.model.as_deref().unwrap_or("default"),
+                conv.effort.as_deref().unwrap_or("default"),
+                conv.messages.len(), conv.pins.len(), conv.window_size
+            )
+        }
+        "/context" => {
+            let conv = state.chat.load_conversation(owner, &agent_name)?;
+            let mut parts = Vec::new();
+
+            if conv.pins.is_empty() {
+                parts.push("No pinned items.".to_string());
+            } else {
+                parts.push("Pinned items:".to_string());
+                for pin in &conv.pins {
+                    parts.push(format!("  #{}: {}", pin.id, pin.text));
+                }
+            }
+
+            if conv.summary.is_empty() {
+                parts.push("\nNo summary yet.".to_string());
+            } else {
+                parts.push(format!("\nSummary:\n{}", conv.summary));
+            }
+
+            parts.push(format!(
+                "\n{} messages in window (max {}).",
+                conv.messages.len(),
+                conv.window_size
+            ));
+            parts.join("\n")
+        }
+        "/pin" => {
+            if args.is_empty() {
+                "Usage: /pin <text to pin>".to_string()
+            } else {
+                let pin_text = format!("IMPORTANT: {args}");
+                let mut conv = state.chat.load_conversation(owner, &agent_name)?;
+                let pin = PinnedChatItem {
+                    id: conv.next_id,
+                    text: pin_text,
+                    timestamp: OffsetDateTime::now_utc(),
+                };
+                conv.next_id += 1;
+                conv.pins.push(pin);
+                state.chat.save_conversation(owner, &agent_name, &conv)?;
+                let mut lines = vec!["Pinned.".to_string(), String::new()];
+                for p in &conv.pins {
+                    lines.push(format!("  #{}: {}", p.id, p.text));
+                }
+                lines.push(String::new());
+                lines.push("Use /unpin <id> to remove.".to_string());
+                lines.join("\n")
+            }
+        }
+        "/pins" => {
+            let conv = state.chat.load_conversation(owner, &agent_name)?;
+            if conv.pins.is_empty() {
+                "No pins.".to_string()
+            } else {
+                let mut lines = Vec::new();
+                for p in &conv.pins {
+                    lines.push(format!("  #{}: {}", p.id, p.text));
+                }
+                lines.push(String::new());
+                lines.push("Use /unpin <id> to remove.".to_string());
+                lines.join("\n")
+            }
+        }
+        "/unpin" => {
+            let id: u64 = match args.parse() {
+                Ok(n) => n,
+                Err(_) => return Ok(Json(json!({"response": "Usage: /unpin <id>"})).into_response()),
+            };
+            let mut conv = state.chat.load_conversation(owner, &agent_name)?;
+            let idx = conv.pins.iter().position(|p| p.id == id);
+            match idx {
+                Some(i) => {
+                    let removed = conv.pins.remove(i);
+                    state.chat.save_conversation(owner, &agent_name, &conv)?;
+                    let preview: String = removed.text.chars().take(80).collect();
+                    format!("Removed pin #{id}: {preview}")
+                }
+                None => format!("Pin #{id} not found. Use /pins to see current pins."),
+            }
+        }
+        "/window" => {
+            if args.is_empty() {
+                let conv = state.chat.load_conversation(owner, &agent_name)?;
+                format!(
+                    "Window: {} messages\nCompaction at: {} messages (down to {})\nCurrent: {} messages in window\n\nUsage: /window <n> (e.g. /window 22)",
+                    conv.window_size,
+                    conv.window_size,
+                    conv.window_size.saturating_sub(7).max(1),
+                    conv.messages.len()
+                )
+            } else {
+                match args.parse::<usize>() {
+                    Ok(n) if n >= 3 => {
+                        state.chat.update_window_size(owner, &agent_name, n)?;
+                        format!("Window set to {n} messages. Auto-compact at {n}.")
+                    }
+                    _ => "Window size must be a number >= 3.".to_string(),
+                }
+            }
+        }
+        "/model" => {
+            if args.is_empty() {
+                let conv = state.chat.load_conversation(owner, &agent_name)?;
+                let current = conv.model.as_deref().unwrap_or("default");
+                // Get backend for this agent
+                let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
+                let backend = agents.iter().find(|a| a.name == agent_name)
+                    .map(|a| a.backend.to_string()).unwrap_or_default();
+                let options = match backend.as_str() {
+                    "gemini" => format!(
+                        "Current model: {current}\n\nOptions:\n  /model gemini-2.5-pro\n  /model gemini-2.5-flash\n  /model gemini-3-pro-preview\n  /model default"
+                    ),
+                    "claude" => format!(
+                        "Current model: {current}\n\nOptions:\n  /model opus (claude-opus-4-6)\n  /model sonnet (claude-sonnet-4-6)\n  /model haiku (claude-haiku-4-5)\n  /model <full-model-id>\n  /model default"
+                    ),
+                    _ => format!(
+                        "Current model: {current}\n\nUsage: /model <model-name>\n  /model default"
+                    ),
+                };
+                options
+            } else {
+                let lower = args.to_lowercase();
+                let new_model = if lower == "default" || lower == "off" || lower == "none" {
+                    None
+                } else {
+                    Some(args.clone())
+                };
+                let conv = state.chat.load_conversation(owner, &agent_name)?;
+                if conv.model == new_model {
+                    format!("Already using {} model.", new_model.as_deref().unwrap_or("default"))
+                } else {
+                    state.chat.update_model(owner, &agent_name, new_model.clone())?;
+                    let label = new_model.as_deref().unwrap_or("default");
+                    format!("Model set to {label}. Next message will use it.")
+                }
+            }
+        }
+        "/effort" => {
+            let conv = state.chat.load_conversation(owner, &agent_name)?;
+            // Check backend supports effort
+            let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
+            let backend = agents.iter().find(|a| a.name == agent_name)
+                .map(|a| a.backend.to_string()).unwrap_or_default();
+            if backend != "claude" {
+                "Effort is only supported for Claude backend.".to_string()
+            } else if args.is_empty() {
+                let current = conv.effort.as_deref().unwrap_or("default");
+                format!(
+                    "Current effort: {current}\n\nOptions:\n  /effort low -- minimal thinking\n  /effort medium -- balanced\n  /effort high -- deeper reasoning\n  /effort max -- maximum thinking\n  /effort default -- reset to default"
+                )
+            } else {
+                let lower = args.to_lowercase();
+                if lower == "default" || lower == "off" || lower == "none" {
+                    if conv.effort.is_none() {
+                        "Already using default effort.".to_string()
+                    } else {
+                        state.chat.update_effort(owner, &agent_name, None)?;
+                        "Effort reset to default. Next message will use it.".to_string()
+                    }
+                } else if ["low", "medium", "high", "max"].contains(&lower.as_str()) {
+                    if conv.effort.as_deref() == Some(&lower) {
+                        format!("Already using {lower} effort.")
+                    } else {
+                        state.chat.update_effort(owner, &agent_name, Some(lower.clone()))?;
+                        format!("Effort set to {lower}. Next message will use it.")
+                    }
+                } else {
+                    "Invalid effort level. Options: low, medium, high, max, default".to_string()
+                }
+            }
+        }
+        "/forget" | "/clear" => {
+            state.chat.clear_messages(owner, &agent_name)?;
+            "Context cleared. Starting fresh.".to_string()
+        }
+        "/compact" => {
+            // Queue a compact command for the agent to pick up
+            let msg = state.chat.append_message(
+                owner,
+                &agent_name,
+                ChatRole::User,
+                "/compact".to_string(),
+            )?;
+            let notifier_key = format!("{owner}_{agent_name}");
+            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                notify.notify_one();
+            }
+            "Compacting context...".to_string()
+        }
+        "/stop" => {
+            // Queue a stop command for the agent
+            let _ = state.chat.append_message(
+                owner,
+                &agent_name,
+                ChatRole::User,
+                "/stop".to_string(),
+            )?;
+            let notifier_key = format!("{owner}_{agent_name}");
+            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                notify.notify_one();
+            }
+            "Stop requested.".to_string()
+        }
+        "/restart" => {
+            let _ = state.chat.append_message(
+                owner,
+                &agent_name,
+                ChatRole::User,
+                "/restart".to_string(),
+            )?;
+            let notifier_key = format!("{owner}_{agent_name}");
+            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                notify.notify_one();
+            }
+            "Restart requested.".to_string()
+        }
+        _ => format!("Unknown command: {}. Type /help for available commands.", cmd),
+    };
+
+    // Push the command response as a system message via SSE
+    push_chat_event(&state, owner, ChatEvent {
+        event_type: "command_response".into(),
+        agent: agent_name.clone(),
+        owner: owner.to_string(),
+        data: json!({ "response": response_text }),
+    });
+
+    Ok(Json(json!({"response": response_text})).into_response())
+}
+
+fn push_chat_event(state: &AppState, owner: &str, event: ChatEvent) {
+    let senders = state.chat_senders.lock().unwrap();
+    if let Some(sender) = senders.get(owner) {
+        let _ = sender.send(event);
+    }
+}
+
+fn format_chat_time(ts: OffsetDateTime) -> String {
+    let now = OffsetDateTime::now_utc();
+    let diff = now - ts;
+    if diff.whole_minutes() < 1 {
+        "just now".to_string()
+    } else if diff.whole_minutes() < 60 {
+        format!("{}m ago", diff.whole_minutes())
+    } else if diff.whole_hours() < 24 {
+        format!("{}h ago", diff.whole_hours())
+    } else {
+        format!("{}d ago", diff.whole_days())
+    }
+}
+
+// --- Machine registration & agent provisioning ---
+
+async fn register_machine(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterMachineRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let (token, machine) = state.auth.register_machine(
+        &req.username,
+        &req.password,
+        &req.machine_name,
+    )?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: req.username.clone(),
+        },
+        "register machine",
+        Some(machine.name.clone()),
+        None,
+    )?;
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "machine_name": machine.name,
+    })))
+}
+
+async fn provision_agent_with_body(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ProvisionAgentRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let machine_token = headers
+        .get("x-lore-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let machine = state.auth.authenticate_machine_token(machine_token)?;
+
+    let backend = req.backend.parse().unwrap_or_default();
+
+    // Compute grants: all projects the user has access to
+    let grants = build_user_all_grants(&state, &machine.user)?;
+
+    let created = state.auth.provision_agent(
+        &machine.user.username,
+        &req.name,
+        backend,
+        grants,
+    )?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: machine.user.username.as_str().to_string(),
+        },
+        "provision agent",
+        Some(created.stored.name.clone()),
+        None,
+    )?;
+    Ok(Json(serde_json::json!({
+        "token": created.token,
+        "name": created.stored.name,
+        "display_name": created.stored.display_name,
+    })))
+}
+
+fn build_user_all_grants(
+    state: &AppState,
+    user: &AuthenticatedUser,
+) -> std::result::Result<Vec<ProjectGrant>, LoreError> {
+    let projects = state.store.list_projects()?;
+    if user.is_admin {
+        // Admin gets ReadWrite to all projects
+        return Ok(projects
+            .into_iter()
+            .map(|project| ProjectGrant {
+                project,
+                permission: ProjectPermission::ReadWrite,
+            })
+            .collect());
+    }
+    // Regular user: collect grants from all their roles
+    let mut grants_map = std::collections::BTreeMap::new();
+    for role in &user.roles {
+        for grant in &role.grants {
+            let entry = grants_map
+                .entry(grant.project.clone())
+                .or_insert(grant.permission);
+            if grant.permission.allows_write() {
+                *entry = ProjectPermission::ReadWrite;
+            }
+        }
+    }
+    Ok(grants_map
+        .into_iter()
+        .map(|(project, permission)| ProjectGrant {
+            project,
+            permission,
+        })
+        .collect())
+}
+
+async fn revoke_machine_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    state
+        .auth
+        .revoke_machine(&name, &session.user.username)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "revoke machine",
+        Some(name),
+        None,
+    )?;
+    Ok(Redirect::to("/ui/agents?flash=Machine%20revoked").into_response())
 }
 
 #[cfg(test)]

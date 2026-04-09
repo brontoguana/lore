@@ -38,6 +38,20 @@ pub struct NewSession {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredMachine {
+    pub name: String,
+    pub username: UserName,
+    pub token_hash: String,
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthenticatedMachine {
+    pub machine_name: String,
+    pub user: AuthenticatedUser,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredAgentToken {
     pub name: String,
     #[serde(default)]
@@ -46,6 +60,8 @@ pub struct StoredAgentToken {
     #[serde(default)]
     pub owner: Option<UserName>,
     pub grants: Vec<ProjectGrant>,
+    #[serde(default)]
+    pub backend: AgentBackend,
     pub created_at: OffsetDateTime,
 }
 
@@ -54,6 +70,7 @@ pub struct NewAgentToken {
     pub display_name: String,
     pub owner: UserName,
     pub grants: Vec<ProjectGrant>,
+    pub backend: AgentBackend,
 }
 
 impl NewAgentToken {
@@ -82,6 +99,46 @@ impl NewAgentToken {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentBackend {
+    Claude,
+    Gemini,
+    Codex,
+    #[serde(rename = "openai")]
+    OpenAi,
+}
+
+impl Default for AgentBackend {
+    fn default() -> Self {
+        Self::Claude
+    }
+}
+
+impl Display for AgentBackend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Claude => write!(f, "claude"),
+            Self::Gemini => write!(f, "gemini"),
+            Self::Codex => write!(f, "codex"),
+            Self::OpenAi => write!(f, "openai"),
+        }
+    }
+}
+
+impl std::str::FromStr for AgentBackend {
+    type Err = LoreError;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "claude" => Ok(Self::Claude),
+            "gemini" => Ok(Self::Gemini),
+            "codex" => Ok(Self::Codex),
+            "openai" => Ok(Self::OpenAi),
+            _ => Err(LoreError::Validation(format!("unknown backend: {s}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CreatedAgentToken {
     pub token: String,
@@ -94,6 +151,7 @@ pub struct AuthenticatedAgent {
     pub name: String,
     pub owner: Option<UserName>,
     pub grants: Vec<ProjectGrant>,
+    pub backend: AgentBackend,
 }
 
 impl AuthenticatedAgent {
@@ -483,6 +541,7 @@ impl LocalAuthStore {
             token_hash: hash_agent_token(&raw_token),
             owner: Some(token.owner),
             grants,
+            backend: token.backend,
             created_at: OffsetDateTime::now_utc(),
         };
         tokens.push(stored.clone());
@@ -616,6 +675,145 @@ impl LocalAuthStore {
             name: stored.name,
             owner: stored.owner,
             grants: stored.grants,
+            backend: stored.backend,
+        })
+    }
+
+    // --- Machine registration ---
+
+    pub fn register_machine(
+        &self,
+        username: &str,
+        password: &str,
+        machine_name: &str,
+    ) -> Result<(String, StoredMachine)> {
+        let user = self.authenticate(username, password)?;
+        let machine_name = machine_name.trim().to_string();
+        if machine_name.is_empty() || machine_name.len() > 64 {
+            return Err(LoreError::Validation(
+                "machine name must be 1..=64 characters".into(),
+            ));
+        }
+        let mut machines = self.load_machines()?;
+        // If machine already exists for this user, rotate its token
+        if let Some(idx) = machines
+            .iter()
+            .position(|m| m.name == machine_name && m.username == user.username)
+        {
+            let raw_token = format!("lore_mt_{}_{}", Uuid::new_v4(), Uuid::new_v4());
+            machines[idx].token_hash = hash_agent_token(&raw_token);
+            machines[idx].created_at = OffsetDateTime::now_utc();
+            let stored = machines[idx].clone();
+            self.save_machines(&machines)?;
+            return Ok((raw_token, stored));
+        }
+        let raw_token = format!("lore_mt_{}_{}", Uuid::new_v4(), Uuid::new_v4());
+        let stored = StoredMachine {
+            name: machine_name,
+            username: user.username,
+            token_hash: hash_agent_token(&raw_token),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        machines.push(stored.clone());
+        self.save_machines(&machines)?;
+        Ok((raw_token, stored))
+    }
+
+    pub fn authenticate_machine_token(&self, token: &str) -> Result<AuthenticatedMachine> {
+        if token.trim().is_empty() {
+            return Err(LoreError::PermissionDenied);
+        }
+        let token_hash = hash_agent_token(token);
+        let machine = self
+            .load_machines()?
+            .into_iter()
+            .find(|m| m.token_hash == token_hash)
+            .ok_or(LoreError::PermissionDenied)?;
+        let user = self.user_from_stored(&self.stored_user(&machine.username)?)?;
+        Ok(AuthenticatedMachine {
+            machine_name: machine.name,
+            user,
+        })
+    }
+
+    pub fn list_machines_for_user(&self, username: &UserName) -> Result<Vec<StoredMachine>> {
+        Ok(self
+            .load_machines()?
+            .into_iter()
+            .filter(|m| &m.username == username)
+            .collect())
+    }
+
+    pub fn list_all_machines(&self) -> Result<Vec<StoredMachine>> {
+        self.load_machines()
+    }
+
+    pub fn revoke_machine(&self, name: &str, username: &UserName) -> Result<()> {
+        let mut machines = self.load_machines()?;
+        let original_len = machines.len();
+        machines.retain(|m| !(m.name == name && &m.username == username));
+        if machines.len() == original_len {
+            return Err(LoreError::Validation("machine does not exist".into()));
+        }
+        self.save_machines(&machines)?;
+        Ok(())
+    }
+
+    pub fn revoke_machine_by_name(&self, name: &str, username: &UserName) -> Result<()> {
+        self.revoke_machine(name, username)
+    }
+
+    pub fn provision_agent(
+        &self,
+        username: &UserName,
+        display_name: &str,
+        backend: AgentBackend,
+        grants: Vec<ProjectGrant>,
+    ) -> Result<CreatedAgentToken> {
+        validate_agent_display_name(display_name)?;
+        let slug = slugify_agent_name(display_name);
+        validate_agent_token_name(&slug)?;
+        if grants.is_empty() {
+            return Err(LoreError::Validation(
+                "agent must have at least one project grant".into(),
+            ));
+        }
+        let mut tokens = self.load_agent_tokens()?;
+        // If agent already exists for this user, re-provision (rotate token + update backend)
+        if let Some(idx) = tokens
+            .iter()
+            .position(|t| t.name == slug && t.owner.as_ref() == Some(username))
+        {
+            let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
+            tokens[idx].token_hash = hash_agent_token(&raw_token);
+            tokens[idx].backend = backend;
+            tokens[idx].display_name = Some(display_name.to_string());
+            tokens[idx].created_at = OffsetDateTime::now_utc();
+            let stored = tokens[idx].clone();
+            self.save_agent_tokens(&tokens)?;
+            return Ok(CreatedAgentToken {
+                token: raw_token,
+                stored,
+            });
+        }
+        let mut sorted_grants = grants;
+        sorted_grants.sort_by(|a, b| a.project.cmp(&b.project));
+        let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
+        let stored = StoredAgentToken {
+            name: slug,
+            display_name: Some(display_name.to_string()),
+            token_hash: hash_agent_token(&raw_token),
+            owner: Some(username.clone()),
+            grants: sorted_grants,
+            backend,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        tokens.push(stored.clone());
+        tokens.sort_by(|a, b| a.name.cmp(&b.name));
+        self.save_agent_tokens(&tokens)?;
+        Ok(CreatedAgentToken {
+            token: raw_token,
+            stored,
         })
     }
 
@@ -790,6 +988,10 @@ impl LocalAuthStore {
         self.auth_dir().join("agent_tokens.json")
     }
 
+    fn machines_path(&self) -> PathBuf {
+        self.auth_dir().join("machines.json")
+    }
+
     fn session_path(&self, token_hash: &str) -> PathBuf {
         self.sessions_dir().join(format!("{token_hash}.json"))
     }
@@ -806,6 +1008,10 @@ impl LocalAuthStore {
         read_json(self.agent_tokens_path())
     }
 
+    fn load_machines(&self) -> Result<Vec<StoredMachine>> {
+        read_json(self.machines_path())
+    }
+
     fn save_users(&self, users: &[StoredUser]) -> Result<()> {
         self.ensure_layout()?;
         write_json_atomic(self.users_path(), users)
@@ -819,6 +1025,11 @@ impl LocalAuthStore {
     fn save_agent_tokens(&self, tokens: &[StoredAgentToken]) -> Result<()> {
         self.ensure_layout()?;
         write_json_atomic(self.agent_tokens_path(), tokens)
+    }
+
+    fn save_machines(&self, machines: &[StoredMachine]) -> Result<()> {
+        self.ensure_layout()?;
+        write_json_atomic(self.machines_path(), machines)
     }
 
     fn ensure_layout(&self) -> Result<()> {
@@ -1014,11 +1225,194 @@ fn lock_down_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// --- Chat types and storage ---
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub id: u64,
+    pub role: ChatRole,
+    pub content: String,
+    pub timestamp: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinnedChatItem {
+    pub id: u64,
+    pub text: String,
+    pub timestamp: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentChatStatus {
+    Offline,
+    Idle,
+    Thinking,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatConversation {
+    pub messages: Vec<ChatMessage>,
+    pub pins: Vec<PinnedChatItem>,
+    pub summary: String,
+    pub window_size: usize,
+    pub next_id: u64,
+    pub agent_status: AgentChatStatus,
+    pub last_seen: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+impl Default for ChatConversation {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+            pins: Vec::new(),
+            summary: String::new(),
+            window_size: 22,
+            next_id: 1,
+            agent_status: AgentChatStatus::Offline,
+            last_seen: None,
+            model: None,
+            effort: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatStore {
+    root: PathBuf,
+}
+
+impl ChatStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn chat_dir(&self) -> PathBuf {
+        self.root.join("chat")
+    }
+
+    fn conversation_path(&self, owner: &str, agent: &str) -> PathBuf {
+        self.chat_dir().join(format!("{owner}_{agent}.json"))
+    }
+
+    fn ensure_dir(&self) -> Result<()> {
+        fs::create_dir_all(self.chat_dir())?;
+        lock_down_dir(&self.chat_dir())?;
+        Ok(())
+    }
+
+    pub fn load_conversation(&self, owner: &str, agent: &str) -> Result<ChatConversation> {
+        let path = self.conversation_path(owner, agent);
+        if !path.exists() {
+            return Ok(ChatConversation::default());
+        }
+        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    }
+
+    pub fn save_conversation(
+        &self,
+        owner: &str,
+        agent: &str,
+        conv: &ChatConversation,
+    ) -> Result<()> {
+        self.ensure_dir()?;
+        write_json_atomic(self.conversation_path(owner, agent), conv)
+    }
+
+    pub fn append_message(
+        &self,
+        owner: &str,
+        agent: &str,
+        role: ChatRole,
+        content: String,
+    ) -> Result<ChatMessage> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        let msg = ChatMessage {
+            id: conv.next_id,
+            role,
+            content,
+            timestamp: OffsetDateTime::now_utc(),
+        };
+        conv.next_id += 1;
+        conv.messages.push(msg.clone());
+        self.save_conversation(owner, agent, &conv)?;
+        Ok(msg)
+    }
+
+    pub fn update_agent_status(
+        &self,
+        owner: &str,
+        agent: &str,
+        status: AgentChatStatus,
+    ) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        conv.agent_status = status;
+        conv.last_seen = Some(OffsetDateTime::now_utc());
+        self.save_conversation(owner, agent, &conv)
+    }
+
+    pub fn update_summary(&self, owner: &str, agent: &str, summary: String) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        conv.summary = summary;
+        self.save_conversation(owner, agent, &conv)
+    }
+
+    pub fn update_window_size(&self, owner: &str, agent: &str, size: usize) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        conv.window_size = size;
+        self.save_conversation(owner, agent, &conv)
+    }
+
+    pub fn clear_messages(&self, owner: &str, agent: &str) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        conv.messages.clear();
+        conv.summary.clear();
+        conv.next_id = 1;
+        self.save_conversation(owner, agent, &conv)
+    }
+
+    pub fn set_messages(
+        &self,
+        owner: &str,
+        agent: &str,
+        messages: Vec<ChatMessage>,
+        summary: String,
+    ) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        conv.messages = messages;
+        conv.summary = summary;
+        self.save_conversation(owner, agent, &conv)
+    }
+
+    pub fn update_model(&self, owner: &str, agent: &str, model: Option<String>) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        conv.model = model;
+        self.save_conversation(owner, agent, &conv)
+    }
+
+    pub fn update_effort(&self, owner: &str, agent: &str, effort: Option<String>) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        conv.effort = effort;
+        self.save_conversation(owner, agent, &conv)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant, ProjectPermission, RoleName,
-        UserName,
+        AgentBackend, LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant,
+        ProjectPermission, RoleName, UserName,
     };
     use crate::config::{ColorMode, UiTheme};
     use crate::model::ProjectName;
@@ -1145,6 +1539,7 @@ mod tests {
                     project: ProjectName::new("alpha.docs").unwrap(),
                     permission: ProjectPermission::ReadWrite,
                 }],
+                backend: AgentBackend::default(),
             })
             .unwrap();
 

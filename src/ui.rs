@@ -1,5 +1,5 @@
 use crate::audit::{AuditActor, AuditActorKind};
-use crate::auth::{ProjectGrant, ProjectPermission, StoredRole};
+use crate::auth::{ProjectGrant, ProjectPermission, StoredMachine, StoredRole};
 use crate::config::{ColorMode, ExternalAuthConfig, ExternalScheme, OidcConfig, ServerConfig, UiTheme};
 use crate::librarian::{
     LibrarianActor, LibrarianActorKind, LibrarianConfig, LibrarianRunKind, LibrarianRunStatus,
@@ -54,6 +54,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     <div class="top-nav-links" id="top-nav-links">
       <a href="/ui">Projects</a>
       <a href="/ui/agents">Agents</a>
+      <a href="/ui/chat">Chat</a>
       {admin_link}
       <a href="/ui/settings">Settings</a>
       <form method="post" action="/logout">
@@ -315,6 +316,7 @@ pub struct AgentTokenSummary {
     pub display_name: String,
     pub owner: Option<String>,
     pub grants: Vec<ProjectGrant>,
+    pub backend: String,
     pub created_at: time::OffsetDateTime,
 }
 
@@ -781,6 +783,7 @@ pub fn render_admin_page(
     roles: &[StoredRole],
     users: &[UiUserSummary],
     user_agents: &std::collections::HashMap<String, Vec<AgentTokenSummary>>,
+    user_machines: &std::collections::HashMap<String, Vec<StoredMachine>>,
     server_config: &ServerConfig,
     external_auth_config: &ExternalAuthConfig,
     oidc_config: &OidcConfig,
@@ -813,7 +816,13 @@ pub fn render_admin_page(
             .iter()
             .map(|user| {
                 let agents = user_agents.get(&user.username);
-                render_user_card(user, agents.map(|v| v.as_slice()).unwrap_or(&[]), csrf_token)
+                let machines = user_machines.get(&user.username);
+                render_user_card(
+                    user,
+                    agents.map(|v| v.as_slice()).unwrap_or(&[]),
+                    machines.map(|v| v.as_slice()).unwrap_or(&[]),
+                    csrf_token,
+                )
             })
             .collect::<Vec<_>>()
             .join("")
@@ -1514,9 +1523,9 @@ pub fn render_agents_page(
     color_mode: ColorMode,
     csrf_token: &str,
     agents: &[AgentTokenSummary],
+    machines: &[StoredMachine],
     user_projects: &[UserProjectAccess],
     selected_agent: Option<&str>,
-    created_token: Option<&str>,
     flash: Option<&str>,
 ) -> String {
     let base_url = config.base_url();
@@ -1526,7 +1535,7 @@ pub fn render_agents_page(
 
     // Agent list
     let agent_list_html = if agents.is_empty() {
-        r#"<p class="hint padded">No agents yet. Create one below.</p>"#.to_string()
+        r#"<p class="hint padded">No agents yet. Use <code>lore setup</code> and <code>lore agent</code> from the CLI to create one.</p>"#.to_string()
     } else {
         agents
             .iter()
@@ -1542,65 +1551,59 @@ pub fn render_agents_page(
                 format!(
                     r#"<a href="/ui/agents?selected={}" class="agent-list-item{}">
                       <span class="agent-list-name">{}</span>
-                      <span class="agent-list-meta">{}</span>
+                      <span class="agent-list-meta">{} &middot; {}</span>
                     </a>"#,
                     escape_attribute(&agent.name),
                     cls,
                     escape_text(&agent.display_name),
                     escape_text(&grant_label),
+                    escape_text(&agent.backend),
                 )
             })
             .collect::<Vec<_>>()
             .join("")
     };
 
-    // Create form project grants
-    let create_grants_html = if user_projects.is_empty() {
-        "<p class=\"hint\">No projects available. Create a project first.</p>".to_string()
+    // Machines list
+    let machines_html = if machines.is_empty() {
+        r#"<p class="hint padded">No machines registered.</p>"#.to_string()
     } else {
-        let rows: Vec<String> = user_projects
+        machines
             .iter()
-            .map(|p| {
-                let rw_option = if p.max_permission.allows_write() {
-                    r#"<option value="read_write">Read/Write</option>"#
-                } else {
-                    ""
-                };
+            .map(|m| {
                 format!(
-                    r#"<div class="grant-row" data-project-grant="{}">
-                      <span class="grant-project-name">{}</span>
-                      <select>
-                        <option value="">No access</option>
-                        <option value="read">Read</option>
-                        {}
-                      </select>
+                    r#"<div class="agent-list-item" style="display:flex; justify-content:space-between; align-items:center;">
+                      <div>
+                        <span class="agent-list-name">{}</span>
+                        <span class="agent-list-meta">{}</span>
+                      </div>
+                      <form method="post" action="/ui/agents/machines/{}/revoke" class="inline-form" style="margin:0;">
+                        <input type="hidden" name="csrf_token" value="{}">
+                        <button class="danger" type="submit" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Revoke</button>
+                      </form>
                     </div>"#,
-                    escape_attribute(&p.slug),
-                    escape_text(&p.display_name),
-                    rw_option,
+                    escape_text(&m.name),
+                    escape_text(&format_timestamp(m.created_at)),
+                    escape_attribute(&m.name),
+                    escape_attribute(csrf_token),
                 )
             })
-            .collect();
-        format!(
-            r#"<fieldset class="grant-fieldset"><legend>Project access</legend>{}</fieldset>"#,
-            rows.join("")
-        )
+            .collect::<Vec<_>>()
+            .join("")
     };
 
     // Selected agent detail
     let detail_html = if let Some(sel_name) = selected_agent {
         if let Some(agent) = agents.iter().find(|a| a.name == sel_name) {
-            let token_for_instructions = created_token.unwrap_or("YOUR_TOKEN");
             let setup_instruction = build_agent_setup_instruction_text(
                 &base_url,
                 &mcp_url,
                 install_script_url,
-                token_for_instructions,
+                "YOUR_TOKEN",
             );
             let mcp_config_text = format!(
-                r#"{{"transport": "streamable_http","url": "{}","headers": {{"Authorization": "Bearer {}","Accept": "application/json, text/event-stream","MCP-Protocol-Version": "2025-06-18"}}}}"#,
+                r#"{{"transport": "streamable_http","url": "{}","headers": {{"Authorization": "Bearer YOUR_TOKEN","Accept": "application/json, text/event-stream","MCP-Protocol-Version": "2025-06-18"}}}}"#,
                 escape_text(&mcp_url),
-                escape_text(token_for_instructions),
             );
             // Grants editor
             let edit_grants_html = if user_projects.is_empty() {
@@ -1653,34 +1656,21 @@ pub fn render_agents_page(
             };
 
             // Token display
-            let token_section = if let Some(raw_token) = created_token {
-                format!(
-                    r##"<div class="panel-header"><h3>API key</h3><p>Copy this now. It will not be shown again.</p></div>
-                    <div class="padded">
-                      <textarea readonly id="agent-token" style="min-height:2.5rem; font-family:var(--font-mono); font-size:0.85rem;">{}</textarea>
-                      <div style="margin-top: var(--s-2); text-align: right;">
-                        <button type="button" class="button-link" onclick="copyField('agent-token')">Copy token</button>
-                      </div>
-                    </div>"##,
-                    escape_text(raw_token),
-                )
-            } else {
-                format!(
-                    r##"<div class="panel-header"><h3>API key</h3><p>The raw token is hashed and cannot be shown. Regenerate to get a new one.</p></div>
-                    <div class="padded">
-                      <form method="post" action="/ui/agents/{}/rotate" class="inline-form">
-                        <input type="hidden" name="csrf_token" value="{}">
-                        <button type="submit">Regenerate token</button>
-                      </form>
-                    </div>"##,
-                    escape_attribute(&agent.name),
-                    escape_attribute(csrf_token),
-                )
-            };
+            let token_section = format!(
+                r##"<div class="panel-header"><h3>API key</h3><p>Managed via CLI. Regenerate to invalidate the current token.</p></div>
+                <div class="padded">
+                  <form method="post" action="/ui/agents/{}/rotate" class="inline-form">
+                    <input type="hidden" name="csrf_token" value="{}">
+                    <button type="submit">Regenerate token</button>
+                  </form>
+                </div>"##,
+                escape_attribute(&agent.name),
+                escape_attribute(csrf_token),
+            );
 
             format!(
                 r##"<section class="panel" style="margin-top: var(--s-5);">
-                <div class="panel-header"><h2>{display_name}</h2><p>{owner}-{slug}</p></div>
+                <div class="panel-header"><h2>{display_name}</h2><p>{owner}-{slug} &middot; {backend}</p></div>
 
                 <div class="panel-header"><h3>Configuration</h3></div>
                 <form method="post" action="/ui/agents/{name_attr}/grants" id="edit-grants-form">
@@ -1735,6 +1725,7 @@ pub fn render_agents_page(
                 display_name = escape_text(&agent.display_name),
                 slug = escape_text(&agent.name),
                 owner = escape_text(username),
+                backend = escape_text(&agent.backend),
                 name_attr = escape_attribute(&agent.name),
                 csrf_token = escape_attribute(csrf_token),
                 edit_grants_html = edit_grants_html,
@@ -1762,34 +1753,10 @@ pub fn render_agents_page(
 
     <section class="panel" style="margin-top: var(--s-5);">
       <div class="panel-header">
-        <h2>Create agent</h2>
+        <h2>Machines</h2>
+        <p>Registered machines that can provision agents for your account.</p>
       </div>
-      <form method="post" action="/ui/agents" id="create-agent-form">
-        <input type="hidden" name="csrf_token" value="{csrf_token}">
-        <label>
-          Name
-          <input type="text" name="name" placeholder="my-assistant" required>
-        </label>
-        {create_grants_html}
-        <textarea name="grants" style="display:none" id="create-grants-field"></textarea>
-        <button type="submit">Create agent</button>
-      </form>
-      <script>
-      (function() {{
-        var form = document.getElementById('create-agent-form');
-        form.addEventListener('submit', function() {{
-          var rows = form.querySelectorAll('[data-project-grant]');
-          var lines = [];
-          rows.forEach(function(row) {{
-            var sel = row.querySelector('select');
-            if (sel && sel.value) {{
-              lines.push(row.getAttribute('data-project-grant') + ':' + sel.value);
-            }}
-          }});
-          document.getElementById('create-grants-field').value = lines.join('\n');
-        }});
-      }})();
-      </script>
+      <div class="agent-list">{machines_html}</div>
     </section>
 
     {detail_html}
@@ -1820,9 +1787,8 @@ pub fn render_agents_page(
       }});
     }}
     </script>"##,
-        csrf_token = escape_attribute(csrf_token),
         agent_list_html = agent_list_html,
-        create_grants_html = create_grants_html,
+        machines_html = machines_html,
         detail_html = detail_html,
     );
 
@@ -2050,6 +2016,299 @@ pub fn render_settings_page(
     render_shell(
         PageShell {
             title: "Lore settings",
+            username: Some(username),
+            is_admin,
+            theme,
+            color_mode,
+            csrf_token: Some(csrf_token),
+            flash,
+        },
+        content,
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatAgentSummary {
+    pub name: String,
+    pub display_name: String,
+    pub owner: String,
+    pub status: String,
+    pub last_message: Option<String>,
+    pub last_message_time: Option<String>,
+}
+
+pub fn render_chat_page(
+    theme: UiTheme,
+    color_mode: ColorMode,
+    username: &str,
+    csrf_token: &str,
+    is_admin: bool,
+    agents: &[ChatAgentSummary],
+    selected_agent: Option<&str>,
+    messages_json: &str,
+    flash: Option<&str>,
+) -> String {
+    let agent_list_html: String = agents
+        .iter()
+        .map(|agent| {
+            let active_class = if selected_agent == Some(agent.name.as_str()) {
+                " chat-agent-active"
+            } else {
+                ""
+            };
+            let status_class = match agent.status.as_str() {
+                "idle" => "chat-status-online",
+                "thinking" => "chat-status-thinking",
+                _ => "chat-status-offline",
+            };
+            let snippet = agent
+                .last_message
+                .as_deref()
+                .unwrap_or("No messages yet");
+            let snippet_escaped = escape_text(
+                &snippet.chars().take(60).collect::<String>(),
+            );
+            let time_str = agent
+                .last_message_time
+                .as_deref()
+                .unwrap_or("");
+            format!(
+                r#"<div class="chat-agent-item{active_class}" data-agent="{name}" onclick="selectAgent('{name}')">
+  <div class="chat-agent-header">
+    <span class="chat-agent-name">{display_name}</span>
+    <span class="chat-status-dot {status_class}"></span>
+  </div>
+  <div class="chat-agent-snippet">{snippet_escaped}</div>
+  <div class="chat-agent-time">{time_str}</div>
+</div>"#,
+                active_class = active_class,
+                name = escape_attribute(&agent.name),
+                display_name = escape_text(&agent.display_name),
+                status_class = status_class,
+                snippet_escaped = snippet_escaped,
+                time_str = escape_text(time_str),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let chat_area_html = if let Some(agent_name) = selected_agent {
+        let display = agents
+            .iter()
+            .find(|a| a.name == agent_name)
+            .map(|a| a.display_name.as_str())
+            .unwrap_or(agent_name);
+        format!(
+            r#"<div class="chat-header">
+  <button class="chat-back-btn" onclick="showAgentList()">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
+  </button>
+  <span class="chat-header-name">{display_name}</span>
+  <span class="chat-header-status" id="chat-agent-status"></span>
+</div>
+<div class="chat-messages" id="chat-messages"></div>
+<form class="chat-input-form" id="chat-input-form" onsubmit="return sendMessage(event)">
+  <input type="hidden" name="csrf_token" value="{csrf_token}">
+  <textarea class="chat-input" id="chat-input" placeholder="Type a message..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
+  <button type="submit" class="chat-send-btn">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+  </button>
+</form>"#,
+            display_name = escape_text(display),
+            csrf_token = escape_attribute(csrf_token),
+        )
+    } else {
+        r#"<div class="chat-empty">
+  <div class="chat-empty-text">Select an agent to start chatting</div>
+</div>"#
+            .to_string()
+    };
+
+    let selected_agent_js = selected_agent
+        .map(|a| format!("'{}'", escape_attribute(a)))
+        .unwrap_or_else(|| "null".to_string());
+
+    let layout_class = if selected_agent.is_some() {
+        "chat-layout chat-has-agent"
+    } else {
+        "chat-layout"
+    };
+
+    let content = format!(
+        r#"<div class="{layout_class}">
+  <div class="chat-sidebar" id="chat-sidebar">
+    <div class="chat-sidebar-header">
+      <span class="heading-3">Agents</span>
+    </div>
+    <div class="chat-agent-list">
+      {agent_list_html}
+    </div>
+  </div>
+  <div class="chat-main" id="chat-main">
+    {chat_area_html}
+  </div>
+</div>
+<script>
+var currentAgent = {selected_agent_js};
+var csrfToken = '{csrf_token}';
+var chatMessages = {messages_json};
+var eventSource = null;
+var streamingContent = '';
+
+function selectAgent(name) {{
+  window.location.href = '/ui/chat?agent=' + encodeURIComponent(name);
+}}
+
+function showAgentList() {{
+  var layout = document.querySelector('.chat-layout');
+  if (layout) layout.classList.add('chat-sidebar-show');
+}}
+
+function renderMessages() {{
+  var container = document.getElementById('chat-messages');
+  if (!container) return;
+  var html = '';
+  for (var i = 0; i < chatMessages.length; i++) {{
+    var msg = chatMessages[i];
+    var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : 'chat-msg-assistant';
+    html += '<div class="chat-msg ' + cls + '">';
+    html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
+    html += '</div>';
+  }}
+  container.innerHTML = html;
+  container.scrollTop = container.scrollHeight;
+}}
+
+function escapeHtml(text) {{
+  var div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML.replace(/\\n/g, '<br>');
+}}
+
+function handleChatKey(e) {{
+  if (e.key === 'Enter' && !e.shiftKey) {{
+    e.preventDefault();
+    sendMessage(e);
+    return false;
+  }}
+  return true;
+}}
+
+function sendMessage(e) {{
+  e.preventDefault();
+  var input = document.getElementById('chat-input');
+  var text = input.value.trim();
+  if (!text) return false;
+  input.value = '';
+
+  // Slash commands go to the command endpoint
+  if (text.startsWith('/')) {{
+    chatMessages.push({{ role: 'user', content: text }});
+    renderMessages();
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/ui/chat/' + encodeURIComponent(currentAgent) + '/command');
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    xhr.onload = function() {{
+      try {{
+        var resp = JSON.parse(xhr.responseText);
+        if (resp.response) {{
+          chatMessages.push({{ role: 'system', content: resp.response }});
+          renderMessages();
+        }}
+      }} catch(err) {{}}
+    }};
+    xhr.send('csrf_token=' + encodeURIComponent(csrfToken) + '&command=' + encodeURIComponent(text));
+    return false;
+  }}
+
+  chatMessages.push({{ role: 'user', content: text }});
+  renderMessages();
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/ui/chat/' + encodeURIComponent(currentAgent) + '/send');
+  xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+  xhr.send('csrf_token=' + encodeURIComponent(csrfToken) + '&message=' + encodeURIComponent(text));
+  return false;
+}}
+
+function connectSSE() {{
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource('/ui/chat/stream');
+  eventSource.onmessage = function(e) {{
+    try {{
+      var evt = JSON.parse(e.data);
+      if (evt.agent !== currentAgent) return;
+      if (evt.event_type === 'chunk') {{
+        streamingContent += evt.data.text;
+        var lastMsg = chatMessages[chatMessages.length - 1];
+        if (lastMsg && lastMsg.role === 'assistant' && lastMsg.streaming) {{
+          lastMsg.content = streamingContent;
+        }} else {{
+          chatMessages.push({{ role: 'assistant', content: streamingContent, streaming: true }});
+        }}
+        renderMessages();
+      }} else if (evt.event_type === 'response_complete') {{
+        var lastMsg = chatMessages[chatMessages.length - 1];
+        if (lastMsg && lastMsg.streaming) {{
+          lastMsg.streaming = false;
+          lastMsg.content = evt.data.content || lastMsg.content;
+        }}
+        streamingContent = '';
+        renderMessages();
+      }} else if (evt.event_type === 'command_response') {{
+        chatMessages.push({{ role: 'system', content: evt.data.response }});
+        renderMessages();
+      }} else if (evt.event_type === 'status') {{
+        var el = document.getElementById('chat-agent-status');
+        if (el) el.textContent = evt.data.status || '';
+      }}
+    }} catch(err) {{}}
+  }};
+  eventSource.onerror = function() {{
+    setTimeout(connectSSE, 3000);
+  }};
+}}
+
+// Mobile swipe: right to show agent list, left to show chat
+(function() {{
+  var touchStartX = 0;
+  var touchStartY = 0;
+  document.addEventListener('touchstart', function(e) {{
+    touchStartX = e.touches[0].clientX;
+    touchStartY = e.touches[0].clientY;
+  }}, {{ passive: true }});
+  document.addEventListener('touchend', function(e) {{
+    var dx = e.changedTouches[0].clientX - touchStartX;
+    var dy = e.changedTouches[0].clientY - touchStartY;
+    if (Math.abs(dx) < 60 || Math.abs(dy) > Math.abs(dx)) return;
+    var layout = document.querySelector('.chat-layout');
+    if (!layout) return;
+    if (dx > 0) {{
+      // Swipe right: show agent list
+      layout.classList.add('chat-sidebar-show');
+    }} else {{
+      // Swipe left: show chat
+      layout.classList.remove('chat-sidebar-show');
+    }}
+  }}, {{ passive: true }});
+}})();
+
+if (currentAgent) {{
+  renderMessages();
+  connectSSE();
+}}
+</script>"#,
+        layout_class = layout_class,
+        agent_list_html = agent_list_html,
+        chat_area_html = chat_area_html,
+        selected_agent_js = selected_agent_js,
+        csrf_token = escape_attribute(csrf_token),
+        messages_json = messages_json,
+    );
+
+    render_shell(
+        PageShell {
+            title: "Chat",
             username: Some(username),
             is_admin,
             theme,
@@ -3309,7 +3568,7 @@ fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectInfo
     )
 }
 
-fn render_user_card(user: &UiUserSummary, agents: &[AgentTokenSummary], csrf_token: &str) -> String {
+fn render_user_card(user: &UiUserSummary, agents: &[AgentTokenSummary], machines: &[StoredMachine], csrf_token: &str) -> String {
     let roles = if user.role_names.is_empty() {
         "<li>No assigned roles</li>".to_string()
     } else {
@@ -3348,6 +3607,22 @@ fn render_user_card(user: &UiUserSummary, agents: &[AgentTokenSummary], csrf_tok
         items.join("")
     };
 
+    let machines_html = if machines.is_empty() {
+        r#"<p style="font-size:0.85rem; color:var(--fg-muted); margin:0;">No machines</p>"#.to_string()
+    } else {
+        let items: Vec<String> = machines
+            .iter()
+            .map(|m| {
+                format!(
+                    r#"<li><span class="meta-code">{}</span> <span style="font-size:0.82rem; color:var(--fg-muted);">{}</span></li>"#,
+                    escape_text(&m.name),
+                    escape_text(&format_timestamp(m.created_at)),
+                )
+            })
+            .collect();
+        items.join("")
+    };
+
     format!(
         r#"<article class="block">
   <div class="block-meta">
@@ -3361,6 +3636,10 @@ fn render_user_card(user: &UiUserSummary, agents: &[AgentTokenSummary], csrf_tok
   <ul class="grant-list">{}</ul>
   <div style="margin-top:var(--s-3); padding:0 var(--s-4);">
     <strong style="font-size:0.85rem;">Agents</strong>
+    <ul class="grant-list" style="margin-top:var(--s-1);">{}</ul>
+  </div>
+  <div style="margin-top:var(--s-3); padding:0 var(--s-4);">
+    <strong style="font-size:0.85rem;">Machines</strong>
     <ul class="grant-list" style="margin-top:var(--s-1);">{}</ul>
   </div>
   <div class="inline-form">
@@ -3387,6 +3666,7 @@ fn render_user_card(user: &UiUserSummary, agents: &[AgentTokenSummary], csrf_tok
         escape_text(&format!("{} active sessions", user.active_sessions)),
         roles,
         agents_html,
+        machines_html,
         escape_attribute(&user.username),
         escape_attribute(csrf_token),
         escape_attribute(&user.username),
@@ -5012,6 +5292,178 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: var(--fg-muted);
     }
 
+    /* Chat */
+    .chat-layout {
+      display: flex;
+      height: calc(100vh - 60px);
+      overflow: hidden;
+    }
+    .chat-sidebar {
+      width: 280px;
+      min-width: 280px;
+      border-right: 1px solid var(--line);
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+    .chat-sidebar-header {
+      padding: var(--s-4);
+      border-bottom: 1px solid var(--line);
+    }
+    .chat-agent-list {
+      flex: 1;
+      overflow-y: auto;
+    }
+    .chat-agent-item {
+      padding: var(--s-3) var(--s-4);
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+    }
+    .chat-agent-item:hover {
+      background: var(--bg-hover);
+    }
+    .chat-agent-active {
+      background: var(--bg-hover);
+      border-left: 3px solid var(--accent);
+    }
+    .chat-agent-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .chat-agent-name {
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+    .chat-status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .chat-status-online { background: #22c55e; }
+    .chat-status-thinking { background: #eab308; }
+    .chat-status-offline { background: var(--fg-muted); }
+    .chat-agent-snippet {
+      font-size: 0.82rem;
+      color: var(--fg-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-top: 2px;
+    }
+    .chat-agent-time {
+      font-size: 0.75rem;
+      color: var(--fg-muted);
+    }
+    .chat-main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    .chat-header {
+      padding: var(--s-3) var(--s-4);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      gap: var(--s-3);
+    }
+    .chat-header-name {
+      font-weight: 600;
+      font-size: 1rem;
+    }
+    .chat-header-status {
+      font-size: 0.82rem;
+      color: var(--fg-muted);
+    }
+    .chat-back-btn {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--fg);
+      cursor: pointer;
+      padding: var(--s-2);
+    }
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: var(--s-4);
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-3);
+    }
+    .chat-msg {
+      max-width: 80%;
+      padding: var(--s-3) var(--s-4);
+      border-radius: 8px;
+      font-size: 0.92rem;
+      line-height: 1.5;
+      word-wrap: break-word;
+    }
+    .chat-msg-user {
+      align-self: flex-end;
+      background: var(--accent);
+      color: #fff;
+    }
+    .chat-msg-assistant {
+      align-self: flex-start;
+      background: var(--bg-hover);
+      color: var(--fg);
+    }
+    .chat-msg-system {
+      align-self: center;
+      background: var(--bg);
+      color: var(--fg-muted);
+      border: 1px solid var(--line);
+      font-size: 0.85rem;
+      max-width: 90%;
+      font-family: var(--font-mono);
+    }
+    .chat-msg-content { white-space: pre-wrap; }
+    .chat-input-form {
+      display: flex;
+      gap: var(--s-2);
+      padding: var(--s-3) var(--s-4);
+      border-top: 1px solid var(--line);
+      align-items: flex-end;
+    }
+    .chat-input {
+      flex: 1;
+      padding: var(--s-3);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--font-sans);
+      font-size: 0.92rem;
+      resize: none;
+      min-height: 38px;
+      max-height: 120px;
+    }
+    .chat-send-btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: var(--s-3);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .chat-send-btn:hover { opacity: 0.85; }
+    .chat-empty {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .chat-empty-text {
+      color: var(--fg-muted);
+      font-size: 1rem;
+    }
+
     .stack {
       display: grid;
       gap: var(--s-4);
@@ -6009,6 +6461,22 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       #document {
         position: relative;
       }
+
+      /* Chat mobile */
+      .chat-layout { flex-direction: column; }
+      .chat-sidebar {
+        width: 100%;
+        min-width: 100%;
+        border-right: none;
+        max-height: none;
+      }
+      .chat-main { display: none; }
+      .chat-has-agent .chat-sidebar { display: none; }
+      .chat-has-agent .chat-main { display: flex; flex: 1; }
+      .chat-sidebar-show .chat-sidebar { display: flex !important; }
+      .chat-sidebar-show .chat-main { display: none !important; }
+      .chat-back-btn { display: flex; }
+      .chat-msg { max-width: 90%; }
 
     }
     "#;
