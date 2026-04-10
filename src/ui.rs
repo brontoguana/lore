@@ -2315,7 +2315,11 @@ function renderMessages() {{
     var msg = chatMessages[i];
     var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : 'chat-msg-assistant';
     html += '<div class="chat-msg ' + cls + '">';
-    html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
+    if (msg.role === 'assistant') {{
+      html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
+    }} else {{
+      html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
+    }}
     html += '</div>';
   }}
   container.innerHTML = html;
@@ -2323,10 +2327,177 @@ function renderMessages() {{
 }}
 
 function escapeHtml(text) {{
-  var div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML.replace(/\\n/g, '<br>');
+  var d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML.replace(/\n/g, '<br>');
 }}
+
+function escapeHtmlRaw(text) {{
+  var d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML;
+}}
+
+function renderMarkdown(text) {{
+  if (!text) return '';
+  var svgs = [];
+  text = text.replace(/<svg[\s\S]*?<\/svg>/gi, function(m) {{
+    svgs.push(m);
+    return '__SVG_' + (svgs.length - 1) + '__';
+  }});
+  var codeBlocks = [];
+  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, function(m, lang, code) {{
+    codeBlocks.push('<pre><code>' + escapeHtmlRaw(code.replace(/\n$/, '')) + '</code></pre>');
+    return '\n__CODE_' + (codeBlocks.length - 1) + '__\n';
+  }});
+  var lines = text.split('\n');
+  var html = '';
+  var inList = null;
+  var inBq = false;
+  var inTable = false;
+  var tableHead = true;
+  var tableSep = false;
+  for (var i = 0; i < lines.length; i++) {{
+    var line = lines[i];
+    var cm = line.match(/^__CODE_(\d+)__$/);
+    if (cm) {{
+      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      if (inBq) {{ html += '</blockquote>'; inBq = false; }}
+      if (inTable) {{ html += '</table></div>'; inTable = false; tableHead = false; tableSep = false; }}
+      html += codeBlocks[parseInt(cm[1])];
+      continue;
+    }}
+    var sm = line.match(/^__SVG_(\d+)__$/);
+    if (sm) {{
+      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      if (inBq) {{ html += '</blockquote>'; inBq = false; }}
+      if (inTable) {{ html += '</table></div>'; inTable = false; tableHead = false; tableSep = false; }}
+      html += '<div class="chat-svg-wrap" onclick="expandSvg(this)">' + svgs[parseInt(sm[1])] + '<div class="chat-svg-hint">Click to expand</div></div>';
+      continue;
+    }}
+    line = escapeHtmlRaw(line);
+    var hm = line.match(/^(#{{1,6}})\s+(.+)$/);
+    if (hm) {{
+      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      if (inBq) {{ html += '</blockquote>'; inBq = false; }}
+      var lvl = hm[1].length;
+      html += '<h' + lvl + '>' + inlineMd(hm[2]) + '</h' + lvl + '>';
+      continue;
+    }}
+    if (/^-{{3,}}$/.test(line) || /^\*{{3,}}$/.test(line)) {{
+      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      if (inBq) {{ html += '</blockquote>'; inBq = false; }}
+      html += '<hr>';
+      continue;
+    }}
+    var bm = line.match(/^&gt;\s?(.*)$/);
+    if (bm) {{
+      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      if (!inBq) {{ html += '<blockquote>'; inBq = true; }}
+      html += inlineMd(bm[1]) + '<br>';
+      continue;
+    }} else if (inBq) {{
+      html += '</blockquote>'; inBq = false;
+    }}
+    var ul = line.match(/^[-*]\s+(.+)$/);
+    if (ul) {{
+      if (inBq) {{ html += '</blockquote>'; inBq = false; }}
+      if (inList !== 'ul') {{
+        if (inList) html += '</' + inList + '>';
+        html += '<ul>'; inList = 'ul';
+      }}
+      html += '<li>' + inlineMd(ul[1]) + '</li>';
+      continue;
+    }}
+    var ol = line.match(/^\d+\.\s+(.+)$/);
+    if (ol) {{
+      if (inBq) {{ html += '</blockquote>'; inBq = false; }}
+      if (inList !== 'ol') {{
+        if (inList) html += '</' + inList + '>';
+        html += '<ol>'; inList = 'ol';
+      }}
+      html += '<li>' + inlineMd(ol[1]) + '</li>';
+      continue;
+    }}
+    if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+    var tm = line.match(/^\|(.+)\|$/);
+    if (tm) {{
+      if (!inTable) {{
+        if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+        if (inBq) {{ html += '</blockquote>'; inBq = false; }}
+        html += '<div class="chat-table-wrap"><table>';
+        inTable = true; tableHead = true; tableSep = false;
+      }}
+      if (/^\|[\s\-:|]+\|$/.test(line)) {{
+        tableSep = true;
+        continue;
+      }}
+      var cells = tm[1].split('|').map(function(c) {{ return c.trim(); }});
+      var tag = (tableHead && !tableSep) ? 'th' : 'td';
+      html += '<tr>';
+      for (var ci = 0; ci < cells.length; ci++) {{
+        html += '<' + tag + '>' + inlineMd(cells[ci]) + '</' + tag + '>';
+      }}
+      html += '</tr>';
+      if (tableSep) tableHead = false;
+      continue;
+    }}
+    if (inTable) {{ html += '</table></div>'; inTable = false; tableHead = false; tableSep = false; }}
+    if (line.trim() === '') continue;
+    html += '<p>' + inlineMd(line) + '</p>';
+  }}
+  if (inList) html += '</' + inList + '>';
+  if (inBq) html += '</blockquote>';
+  if (inTable) html += '</table></div>';
+  return html;
+}}
+
+function inlineMd(t) {{
+  var codes = [];
+  t = t.replace(/`([^`]+)`/g, function(m, c) {{
+    codes.push('<code>' + c + '</code>');
+    return '__IC_' + (codes.length - 1) + '__';
+  }});
+  t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  for (var i = 0; i < codes.length; i++) {{
+    t = t.replace('__IC_' + i + '__', codes[i]);
+  }}
+  return t;
+}}
+
+function expandSvg(container) {{
+  var svg = container.querySelector('svg');
+  if (!svg) return;
+  var overlay = document.createElement('div');
+  overlay.className = 'svg-overlay';
+  overlay.onclick = function() {{ overlay.remove(); }};
+  var close = document.createElement('button');
+  close.className = 'svg-overlay-close';
+  close.innerHTML = '&#x2715;';
+  close.onclick = function(e) {{ e.stopPropagation(); overlay.remove(); }};
+  overlay.appendChild(close);
+  var wrapper = document.createElement('div');
+  wrapper.innerHTML = svg.outerHTML;
+  wrapper.onclick = function(e) {{ e.stopPropagation(); }};
+  var bigSvg = wrapper.querySelector('svg');
+  if (bigSvg) {{
+    bigSvg.removeAttribute('width');
+    bigSvg.removeAttribute('height');
+    bigSvg.style.maxWidth = '90vw';
+    bigSvg.style.maxHeight = '90vh';
+  }}
+  overlay.appendChild(wrapper);
+  document.body.appendChild(overlay);
+}}
+
+document.addEventListener('keydown', function(e) {{
+  if (e.key === 'Escape') {{
+    var ov = document.querySelector('.svg-overlay');
+    if (ov) ov.remove();
+  }}
+}});
 
 function handleChatKey(e) {{
   if (e.key === 'Enter' && !e.shiftKey) {{
@@ -5640,7 +5811,135 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       max-width: 90%;
       font-family: var(--font-mono);
     }
-    .chat-msg-content { white-space: pre-wrap; }
+    .chat-msg-user .chat-msg-content,
+    .chat-msg-system .chat-msg-content { white-space: pre-wrap; }
+    .chat-msg-assistant .chat-msg-content p { margin: 0.3em 0; }
+    .chat-msg-assistant .chat-msg-content p:first-child { margin-top: 0; }
+    .chat-msg-assistant .chat-msg-content p:last-child { margin-bottom: 0; }
+    .chat-msg-assistant .chat-msg-content h1,
+    .chat-msg-assistant .chat-msg-content h2,
+    .chat-msg-assistant .chat-msg-content h3,
+    .chat-msg-assistant .chat-msg-content h4 {
+      margin: 0.6em 0 0.3em;
+      line-height: 1.3;
+    }
+    .chat-msg-assistant .chat-msg-content h1 { font-size: 1.15em; }
+    .chat-msg-assistant .chat-msg-content h2 { font-size: 1.05em; }
+    .chat-msg-assistant .chat-msg-content h3 { font-size: 1em; font-weight: 600; }
+    .chat-msg-assistant .chat-msg-content h4 { font-size: 0.95em; font-weight: 600; }
+    .chat-msg-assistant .chat-msg-content ul,
+    .chat-msg-assistant .chat-msg-content ol {
+      margin: 0.3em 0;
+      padding-left: 1.4em;
+    }
+    .chat-msg-assistant .chat-msg-content li { margin: 0.15em 0; }
+    .chat-msg-assistant .chat-msg-content blockquote {
+      border-left: 3px solid var(--accent);
+      margin: 0.3em 0;
+      padding: 0.15em 0.7em;
+      color: var(--muted);
+    }
+    .chat-msg-assistant .chat-msg-content hr {
+      border: none;
+      border-top: 1px solid var(--line);
+      margin: 0.5em 0;
+    }
+    .chat-msg-assistant .chat-msg-content pre {
+      background: var(--code-bg);
+      color: var(--code-ink);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 0.5em 0.7em;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 0.85em;
+      margin: 0.4em 0;
+      white-space: pre;
+    }
+    .chat-msg-assistant .chat-msg-content code {
+      font-family: var(--font-mono);
+      font-size: 0.88em;
+    }
+    .chat-msg-assistant .chat-msg-content :not(pre) > code {
+      background: var(--code-bg);
+      color: var(--code-ink);
+      border-radius: 3px;
+      padding: 0.1em 0.3em;
+    }
+    .chat-msg-assistant .chat-msg-content a {
+      color: var(--accent);
+      text-decoration: underline;
+    }
+    .chat-table-wrap {
+      overflow-x: auto;
+      margin: 0.4em 0;
+    }
+    .chat-table-wrap table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.88em;
+    }
+    .chat-table-wrap th, .chat-table-wrap td {
+      border: 1px solid var(--line);
+      padding: 0.35em 0.6em;
+      text-align: left;
+    }
+    .chat-table-wrap th {
+      background: var(--surface);
+      font-weight: 600;
+    }
+    .chat-svg-wrap {
+      cursor: pointer;
+      margin: 0.4em 0;
+      max-width: 100%;
+      border-radius: 4px;
+      border: 1px solid var(--line);
+      padding: 0.5em;
+      position: relative;
+    }
+    .chat-svg-wrap svg { max-width: 100%; height: auto; display: block; }
+    .chat-svg-wrap:hover { border-color: var(--accent); }
+    .chat-svg-hint {
+      font-size: 0.72em;
+      color: var(--muted);
+      text-align: center;
+      margin-top: 0.3em;
+    }
+    .svg-overlay {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: rgba(0,0,0,0.85);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      cursor: pointer;
+      padding: 2rem;
+      box-sizing: border-box;
+    }
+    .svg-overlay svg {
+      max-width: 90vw;
+      max-height: 90vh;
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .svg-overlay-close {
+      position: fixed;
+      top: 1rem; right: 1rem;
+      background: rgba(255,255,255,0.15);
+      border: none;
+      color: #fff;
+      font-size: 1.5rem;
+      cursor: pointer;
+      z-index: 10000;
+      width: 36px; height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+    }
+    .svg-overlay-close:hover { background: rgba(255,255,255,0.3); }
     .chat-input-form {
       display: flex;
       gap: var(--s-2);

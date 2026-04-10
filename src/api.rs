@@ -2293,6 +2293,7 @@ async fn apply_auto_update(
     headers: HeaderMap,
 ) -> ApiResult<Json<AutoUpdateStatusSummary>> {
     let admin = require_admin(&state, &headers)?;
+    let executable_path = std::env::current_exe().map_err(LoreError::Io)?;
     let status = run_auto_update_apply(&state).await?;
     let applied = status.applied;
     append_audit_event(
@@ -2311,7 +2312,7 @@ async fn apply_auto_update(
     )?;
     let summary = auto_update_status_summary(&status);
     if applied {
-        schedule_server_restart();
+        schedule_server_restart(executable_path);
     }
     Ok(Json(summary))
 }
@@ -3497,6 +3498,7 @@ async fn apply_auto_update_from_ui(
 ) -> UiResult<Redirect> {
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
+    let executable_path = std::env::current_exe().map_err(LoreError::Io)?;
     let status = run_auto_update_apply(&state).await?;
     let applied = status.applied;
     append_audit_event(
@@ -3514,7 +3516,7 @@ async fn apply_auto_update_from_ui(
         Some(status.detail.clone()),
     )?;
     let flash = if applied {
-        schedule_server_restart();
+        schedule_server_restart(executable_path);
         "Update%20applied%20—%20server%20restarting"
     } else {
         "Already%20up%20to%20date"
@@ -3553,6 +3555,7 @@ async fn apply_auto_update_json(
 ) -> ApiResult<Json<AutoUpdateStatusSummary>> {
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
+    let executable_path = std::env::current_exe().map_err(LoreError::Io)?;
     let status = run_auto_update_apply(&state).await?;
     let applied = status.applied;
     append_audit_event(
@@ -3571,7 +3574,7 @@ async fn apply_auto_update_json(
     )?;
     let summary = auto_update_status_summary(&status);
     if applied {
-        schedule_server_restart();
+        schedule_server_restart(executable_path);
     }
     Ok(Json(summary))
 }
@@ -4940,14 +4943,27 @@ async fn run_auto_update_apply(state: &AppState) -> Result<AutoUpdateStatus, Lor
     }
 }
 
-fn schedule_server_restart() {
-    tokio::spawn(async {
+fn schedule_server_restart(executable_path: std::path::PathBuf) {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let executable_path = match std::env::current_exe() {
-            Ok(path) => path,
-            Err(_) => std::process::exit(1),
-        };
-        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        // If running as a systemd service, restart through systemd so the
+        // service manager tracks the new process and dependent services
+        // (like Caddy) are not disrupted.
+        if std::path::Path::new("/etc/systemd/system/lore-server.service").exists() {
+            let status = std::process::Command::new("sudo")
+                .args(["systemctl", "restart", "lore-server"])
+                .status();
+            match status {
+                Ok(s) if s.success() => std::process::exit(0),
+                Ok(s) => {
+                    eprintln!("warning: systemctl restart failed (exit {}), falling back to exec", s.code().unwrap_or(-1));
+                }
+                Err(err) => {
+                    eprintln!("warning: systemctl restart failed ({err}), falling back to exec");
+                }
+            }
+        }
         let mut command = std::process::Command::new(&executable_path);
         command.args(args);
         #[cfg(unix)]

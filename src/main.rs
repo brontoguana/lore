@@ -533,7 +533,7 @@ WantedBy=multi-user.target
 [Unit]
 Description=Caddy reverse proxy for Lore
 After=network.target {SERVICE_NAME}.service
-BindsTo={SERVICE_NAME}.service
+Wants={SERVICE_NAME}.service
 
 [Service]
 Type=simple
@@ -864,6 +864,18 @@ async fn maybe_update_server(data_root: &PathBuf) -> lore_core::Result<()> {
 }
 
 fn relaunch_current_process(executable_path: &std::path::Path) {
+    // If running as a systemd service, restart through systemd
+    if std::path::Path::new("/etc/systemd/system/lore-server.service").exists() {
+        let status = std::process::Command::new("sudo")
+            .args(["systemctl", "restart", SERVICE_NAME])
+            .status();
+        match status {
+            Ok(s) if s.success() => std::process::exit(0),
+            Ok(_) | Err(_) => {
+                eprintln!("warning: systemctl restart failed, falling back to exec");
+            }
+        }
+    }
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let mut command = std::process::Command::new(executable_path);
     command.args(args);
