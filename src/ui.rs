@@ -1255,87 +1255,87 @@ pub fn render_admin_page(
 
     <script>
     (function() {{
-      var nav = document.getElementById(‘admin-nav’);
-      var panels = document.getElementById(‘admin-panels’);
-      var links = nav.querySelectorAll(‘a[data-section]’);
-      var sections = panels.querySelectorAll(‘[data-panel]’);
+      var nav = document.getElementById('admin-nav');
+      var panels = document.getElementById('admin-panels');
+      var links = nav.querySelectorAll('a[data-section]');
+      var sections = panels.querySelectorAll('[data-panel]');
       function show(id) {{
-        sections.forEach(function(s) {{ s.style.display = s.getAttribute(‘data-panel’) === id ? ‘’ : ‘none’; }});
-        links.forEach(function(a) {{ a.classList.toggle(‘active’, a.getAttribute(‘data-section’) === id); }});
+        sections.forEach(function(s) {{ s.style.display = s.getAttribute('data-panel') === id ? '' : 'none'; }});
+        links.forEach(function(a) {{ a.classList.toggle('active', a.getAttribute('data-section') === id); }});
       }}
       var params = new URLSearchParams(window.location.search);
-      var initial = params.get(‘section’) || ‘users’;
+      var initial = params.get('section') || 'users';
       show(initial);
       links.forEach(function(a) {{
-        a.addEventListener(‘click’, function(e) {{
+        a.addEventListener('click', function(e) {{
           e.preventDefault();
-          var id = a.getAttribute(‘data-section’);
+          var id = a.getAttribute('data-section');
           show(id);
-          history.replaceState(null, ‘’, ‘/ui/admin?section=’ + id);
+          history.replaceState(null, '', '/ui/admin?section=' + id);
         }});
       }});
 
-      var ubtn = document.getElementById(‘update-btn’);
+      var ubtn = document.getElementById('update-btn');
       if (ubtn) {{
         function resetBtn() {{
-          ubtn.textContent = ‘Check for updates’;
-          ubtn.setAttribute(‘data-state’, ‘check’);
+          ubtn.textContent = 'Check for updates';
+          ubtn.setAttribute('data-state', 'check');
           ubtn.disabled = false;
         }}
-        ubtn.addEventListener(‘click’, function() {{
-          var state = ubtn.getAttribute(‘data-state’);
-          var csrf = ubtn.getAttribute(‘data-csrf’);
-          if (state === ‘check’) {{
+        ubtn.addEventListener('click', function() {{
+          var state = ubtn.getAttribute('data-state');
+          var csrf = ubtn.getAttribute('data-csrf');
+          if (state === 'check') {{
             ubtn.disabled = true;
-            ubtn.textContent = ‘Checking\u2026’;
+            ubtn.textContent = 'Checking\u2026';
             var ac = new AbortController();
             setTimeout(function() {{ ac.abort(); }}, 20000);
-            fetch(‘/ui/admin/auto-update/check-json’, {{
-              method: ‘POST’,
-              headers: {{‘Content-Type’: ‘application/x-www-form-urlencoded’}},
-              body: ‘csrf_token=’ + encodeURIComponent(csrf),
+            fetch('/ui/admin/auto-update/check-json', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+              body: 'csrf_token=' + encodeURIComponent(csrf),
               signal: ac.signal
             }}).then(function(r) {{
-              if (!r.ok) throw new Error(‘server returned ‘ + r.status);
+              if (!r.ok) throw new Error('server returned ' + r.status);
               return r.json();
             }}).then(function(d) {{
               if (d.latest_version && d.latest_version !== d.current_version) {{
-                ubtn.textContent = ‘Update to v’ + d.latest_version;
-                ubtn.setAttribute(‘data-state’, ‘apply’);
+                ubtn.textContent = 'Update to v' + d.latest_version;
+                ubtn.setAttribute('data-state', 'apply');
                 ubtn.disabled = false;
               }} else {{
-                ubtn.textContent = ‘Up to date (v’ + d.current_version + ‘)’;
+                ubtn.textContent = 'Up to date (v' + d.current_version + ')';
                 ubtn.disabled = true;
                 setTimeout(resetBtn, 4000);
               }}
             }}).catch(function(e) {{
-              ubtn.textContent = ‘Check failed’;
-              console.error(‘update check:’, e);
+              ubtn.textContent = 'Check failed';
+              console.error('update check:', e);
               setTimeout(resetBtn, 3000);
             }});
-          }} else if (state === ‘apply’) {{
+          }} else if (state === 'apply') {{
             ubtn.disabled = true;
-            ubtn.textContent = ‘Applying update\u2026’;
+            ubtn.textContent = 'Applying update\u2026';
             var ac2 = new AbortController();
             setTimeout(function() {{ ac2.abort(); }}, 30000);
-            fetch(‘/ui/admin/auto-update/apply-json’, {{
-              method: ‘POST’,
-              headers: {{‘Content-Type’: ‘application/x-www-form-urlencoded’}},
-              body: ‘csrf_token=’ + encodeURIComponent(csrf),
+            fetch('/ui/admin/auto-update/apply-json', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+              body: 'csrf_token=' + encodeURIComponent(csrf),
               signal: ac2.signal
             }}).then(function(r) {{
-              if (!r.ok) throw new Error(‘server returned ‘ + r.status);
+              if (!r.ok) throw new Error('server returned ' + r.status);
               return r.json();
             }}).then(function(d) {{
               if (d.applied) {{
-                ubtn.textContent = ‘Restarting\u2026’;
+                ubtn.textContent = 'Restarting\u2026';
               }} else {{
-                ubtn.textContent = ‘Up to date (v’ + d.current_version + ‘)’;
+                ubtn.textContent = 'Up to date (v' + d.current_version + ')';
                 ubtn.disabled = true;
                 setTimeout(resetBtn, 4000);
               }}
             }}).catch(function() {{
-              ubtn.textContent = ‘Update failed’;
+              ubtn.textContent = 'Update failed';
               setTimeout(resetBtn, 3000);
             }});
           }}
@@ -2461,7 +2461,7 @@ if (currentAgent) {{
 
     render_shell(
         PageShell {
-            title: "Chat",
+            title: "Lore chat",
             username: Some(username),
             is_admin,
             theme,
