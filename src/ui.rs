@@ -5666,11 +5666,15 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: #fff;
       border: none;
       border-radius: 6px;
-      padding: var(--s-3);
+      width: 38px;
+      height: 38px;
+      min-width: 38px;
+      padding: 0;
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
+      flex-shrink: 0;
     }
     .chat-send-btn:hover { opacity: 0.85; }
     .chat-empty {
