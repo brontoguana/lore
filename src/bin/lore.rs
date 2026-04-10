@@ -22,10 +22,13 @@ const CLI_AUTO_UPDATE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 #[command(name = "lore")]
 #[command(about = "Lore CLI")]
 struct Cli {
+    /// Server URL (overrides config)
     #[arg(long, global = true)]
     url: Option<String>,
+    /// API token (overrides config)
     #[arg(long, global = true)]
     token: Option<String>,
+    /// Project slug (overrides config)
     #[arg(long, global = true)]
     project: Option<String>,
     #[command(subcommand)]
@@ -34,41 +37,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage CLI configuration (url, token, project)
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// List all projects
     Projects,
+    /// Read and list blocks
     Blocks {
         #[command(subcommand)]
         command: BlocksCommand,
     },
+    /// Search blocks by content
     Grep(GrepArgs),
+    /// Add a new block to the current project
     Add(WriteBlockArgs),
+    /// Update an existing block
     Update(UpdateBlockArgs),
+    /// Move a block to a new position
     Move(MoveBlockArgs),
+    /// Delete a block
     Delete(DeleteBlockArgs),
+    /// Ask the librarian a question or request an action
     Librarian {
         #[command(subcommand)]
         command: LibrarianCommand,
     },
+    /// View and manage block version history
     History {
         #[command(subcommand)]
         command: HistoryCommand,
     },
+    /// Check for and apply CLI updates
     SelfUpdate {
         #[command(subcommand)]
         command: UpdateCommand,
     },
+    /// Show the current project's agent context
     Context,
+    /// Connect to a Lore server (interactive setup)
     Setup(SetupArgs),
+    /// Run an agent daemon
     Agent(AgentArgs),
 }
 
 #[derive(Subcommand)]
 enum ConfigCommand {
+    /// Show current configuration
     Show,
+    /// Set configuration values
     Set(ConfigSetArgs),
+    /// Clear configuration values
     Clear(ConfigClearArgs),
 }
 
@@ -94,8 +114,11 @@ struct ConfigClearArgs {
 
 #[derive(Subcommand)]
 enum BlocksCommand {
+    /// List blocks in the current project
     List(ListBlocksArgs),
+    /// Read a single block by ID
     Read(ReadBlockArgs),
+    /// Read a block with surrounding context
     Around(AroundArgs),
 }
 
@@ -169,7 +192,9 @@ struct SetupArgs {
 
 #[derive(Subcommand)]
 enum LibrarianCommand {
+    /// Ask the librarian a question
     Answer(LibrarianAnswerArgs),
+    /// Request the librarian to perform an action
     Action(LibrarianActionArgs),
 }
 
@@ -197,17 +222,25 @@ struct LibrarianActionArgs {
 
 #[derive(Subcommand)]
 enum HistoryCommand {
+    /// List recent block changes
     List(HistoryListArgs),
+    /// Show a specific version
     Show(HistoryShowArgs),
+    /// Revert a block to a previous version
     Revert(HistoryRevertArgs),
 }
 
 #[derive(Subcommand)]
 enum UpdateCommand {
+    /// Show current update configuration
     Status,
+    /// Check for available updates
     Check,
+    /// Apply a pending update
     Apply,
+    /// Enable automatic updates
     Enable(UpdateEnableArgs),
+    /// Disable automatic updates
     Disable,
 }
 

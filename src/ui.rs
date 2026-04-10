@@ -1658,17 +1658,13 @@ pub fn render_agents_page(
             .map(|m| {
                 format!(
                     r#"<div class="agent-list-item" style="display:flex; justify-content:space-between; align-items:center;">
-                      <div>
-                        <span class="agent-list-name">{}</span>
-                        <span class="agent-list-meta">{}</span>
-                      </div>
+                      <span class="agent-list-name">{}</span>
                       <form method="post" action="/ui/agents/machines/{}/revoke" class="inline-form" style="margin:0;">
                         <input type="hidden" name="csrf_token" value="{}">
                         <button class="danger" type="submit" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Revoke</button>
                       </form>
                     </div>"#,
                     escape_text(&m.name),
-                    escape_text(&format_timestamp(m.created_at)),
                     escape_attribute(&m.name),
                     escape_attribute(csrf_token),
                 )
@@ -1891,8 +1887,8 @@ Install (Linux/macOS):
 Install (Windows PowerShell):
   irm {install_ps1_url} | iex
 
-Configure (saves the URL and token so future commands just work):
-  lore config set --url {base_url} --token {token}
+Configure (registers this machine and saves credentials):
+  lore setup {base_url}
 
 Commands:
   lore projects                     — list projects
@@ -2374,6 +2370,16 @@ function sendMessage(e) {{
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/ui/chat/' + encodeURIComponent(currentAgent) + '/send');
   xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+  xhr.onerror = function() {{
+    chatMessages.push({{ role: 'system', content: 'Failed to send message (network error)' }});
+    renderMessages();
+  }};
+  xhr.onload = function() {{
+    if (xhr.status !== 200) {{
+      chatMessages.push({{ role: 'system', content: 'Failed to send message (HTTP ' + xhr.status + ')' }});
+      renderMessages();
+    }}
+  }};
   xhr.send('csrf_token=' + encodeURIComponent(csrfToken) + '&message=' + encodeURIComponent(text));
   return false;
 }}
@@ -5497,10 +5503,19 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       padding: var(--s-4) 0;
     }
 
-    /* Chat */
+    /* Chat — full-viewport layout, no page scroll */
+    body:has(.chat-layout) { overflow: hidden; }
+    .shell:has(.chat-layout) {
+      width: 100%;
+      max-width: 100%;
+      padding: 0;
+      margin: 0;
+      overflow: hidden;
+    }
+    .top-nav:has(~ .shell .chat-layout) { margin-bottom: 0; }
     .chat-layout {
       display: flex;
-      height: calc(100vh - 60px);
+      height: calc(100vh - 65px);
       overflow: hidden;
     }
     .chat-sidebar {

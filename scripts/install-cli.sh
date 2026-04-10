@@ -144,11 +144,10 @@ else
   esac
 
   echo "quick start:"
-  echo "  lore config set --url https://your-server.com --token YOUR_TOKEN"
+  echo "  lore setup https://your-server.com"
   echo "  lore projects                # list projects"
-  echo "  lore blocks <project>        # list blocks in a project"
-  echo "  lore read <project>          # read all blocks"
-  echo "  lore add <project> --type markdown --content '...'  # add a block"
+  echo "  lore blocks list             # list blocks in a project"
+  echo "  lore grep \"query\"             # search blocks"
   echo ""
   echo "run lore --help for all commands."
 fi
