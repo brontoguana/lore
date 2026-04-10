@@ -445,7 +445,7 @@ async fn add_security_headers(mut response: Response) -> Response {
     headers.insert(
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
         ),
     );
     headers.insert(
@@ -7557,6 +7557,7 @@ async fn chat_page(
             },
             last_message: snippet,
             last_message_time: time_str,
+            profile_url: conv.profile_url.clone(),
         });
     }
 
@@ -7818,6 +7819,27 @@ async fn chat_agent_respond(
             owner: owner_str.to_string(),
             data: json!({ "status": "idle" }),
         });
+
+        // Auto-repeat: if set, queue the auto_message as a user message
+        let conv = state.chat.load_conversation(owner_str, &agent.name)?;
+        if let Some(auto_msg) = &conv.auto_message {
+            let auto_stored = state.chat.append_message(
+                owner_str,
+                &agent.name,
+                ChatRole::User,
+                auto_msg.clone(),
+            )?;
+            push_chat_event(&state, owner_str, ChatEvent {
+                event_type: "auto_message".into(),
+                agent: agent.name.clone(),
+                owner: owner_str.to_string(),
+                data: json!({ "id": auto_stored.id, "content": auto_stored.content }),
+            });
+            let notifier_key = format!("{owner_str}_{}", agent.name);
+            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                notify.notify_one();
+            }
+        }
     }
 
     Ok(StatusCode::OK)
@@ -7955,7 +7977,7 @@ async fn chat_slash_command(
 
     let response_text = match cmd.as_str() {
         "/help" => {
-            "STATUS\n  /help -- show this message\n  /status -- show current config\n  /context -- show summary, pins, window\n\nCONTEXT\n  /pin <text> -- pin context that survives compaction\n  /pins -- list all pins\n  /unpin <id> -- remove a pin\n  /window <n> -- set conversation window size\n  /compact -- force context compaction\n  /forget -- clear all context and restart\n\nMODEL\n  /model <name> -- switch model\n  /effort <level> -- low/medium/high/max/default\n\nAGENT\n  /stop -- cancel current request\n  /restart -- restart the agent".to_string()
+            "STATUS\n  /help -- show this message\n  /status -- show current config\n  /context -- show summary, pins, window\n  /report -- status of all your agents\n\nCONTEXT\n  /pin <text> -- pin context that survives compaction\n  /pins -- list all pins\n  /unpin <id> -- remove a pin\n  /window <n> -- set conversation window size\n  /compact -- force context compaction\n  /forget -- clear all context and restart\n\nMODEL\n  /model <name> -- switch model\n  /effort <level> -- low/medium/high/max/default\n\nAGENT\n  /stop -- cancel current request\n  /restart -- restart the agent\n  /rename <name> -- change agent display name\n  /profile <url> -- set agent profile picture\n  /btw <message> -- inject a side message\n  /auto [message] -- repeat message after each response (no args to clear)\n  /boop -- ping the agent\n  /hi -- say hello".to_string()
         }
         "/status" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
@@ -8187,6 +8209,119 @@ async fn chat_slash_command(
                 notify.notify_one();
             }
             "Restart requested.".to_string()
+        }
+        "/rename" => {
+            if args.is_empty() {
+                "Usage: /rename <new display name>".to_string()
+            } else {
+                match state.auth.update_agent_display_name(
+                    &agent_name,
+                    &session.user.username,
+                    &args,
+                ) {
+                    Ok(()) => format!("Agent renamed to \"{}\".", args),
+                    Err(e) => format!("Rename failed: {e}"),
+                }
+            }
+        }
+        "/profile" => {
+            if args.is_empty() {
+                let conv = state.chat.load_conversation(owner, &agent_name)?;
+                match &conv.profile_url {
+                    Some(url) => format!("Current profile: {url}\n\nUsage: /profile <image-url>\n  /profile clear -- remove profile picture"),
+                    None => "No profile picture set.\n\nUsage: /profile <image-url>".to_string(),
+                }
+            } else if args.to_lowercase() == "clear" || args.to_lowercase() == "none" {
+                state.chat.update_profile_url(owner, &agent_name, None)?;
+                "Profile picture cleared.".to_string()
+            } else {
+                state.chat.update_profile_url(owner, &agent_name, Some(args.clone()))?;
+                "Profile picture set.".to_string()
+            }
+        }
+        "/btw" => {
+            if args.is_empty() {
+                "Usage: /btw <message> -- inject a side message to the agent".to_string()
+            } else {
+                let content = format!("[btw] {args}");
+                let _ = state.chat.append_message(
+                    owner,
+                    &agent_name,
+                    ChatRole::User,
+                    content,
+                )?;
+                let notifier_key = format!("{owner}_{agent_name}");
+                if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                    notify.notify_one();
+                }
+                format!("Sent: [btw] {args}")
+            }
+        }
+        "/auto" => {
+            if args.is_empty() {
+                let conv = state.chat.load_conversation(owner, &agent_name)?;
+                match &conv.auto_message {
+                    Some(msg) => {
+                        state.chat.update_auto_message(owner, &agent_name, None)?;
+                        format!("Auto-repeat cleared (was: \"{msg}\").")
+                    }
+                    None => "No auto-repeat set.\n\nUsage: /auto <message> -- repeat after each response\n  /auto -- clear auto-repeat".to_string(),
+                }
+            } else {
+                state.chat.update_auto_message(owner, &agent_name, Some(args.clone()))?;
+                format!("Auto-repeat set: \"{args}\"\nAgent will receive this after each response. Use /auto to clear.")
+            }
+        }
+        "/boop" => {
+            let _ = state.chat.append_message(
+                owner,
+                &agent_name,
+                ChatRole::User,
+                "*boop*".to_string(),
+            )?;
+            let notifier_key = format!("{owner}_{agent_name}");
+            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                notify.notify_one();
+            }
+            "*boop* sent.".to_string()
+        }
+        "/hi" => {
+            let _ = state.chat.append_message(
+                owner,
+                &agent_name,
+                ChatRole::User,
+                "hi".to_string(),
+            )?;
+            let notifier_key = format!("{owner}_{agent_name}");
+            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                notify.notify_one();
+            }
+            "Said hi.".to_string()
+        }
+        "/report" => {
+            let all_agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
+            let mut lines = Vec::new();
+            for a in &all_agents {
+                let conv = state.chat.load_conversation(owner, &a.name)?;
+                let status_str = match conv.agent_status {
+                    AgentChatStatus::Idle => "idle",
+                    AgentChatStatus::Thinking => "thinking",
+                    AgentChatStatus::Offline => "offline",
+                };
+                let display = a.display_name.as_deref().unwrap_or(&a.name);
+                let msg_count = conv.messages.len();
+                let auto_str = match &conv.auto_message {
+                    Some(m) => format!(" auto=\"{}\"", m.chars().take(30).collect::<String>()),
+                    None => String::new(),
+                };
+                let last = conv.last_seen.map(|t| format_chat_time(t)).unwrap_or_else(|| "never".to_string());
+                lines.push(format!("{display}: {status_str}, {msg_count} msgs, seen {last}{auto_str}"));
+            }
+            if lines.is_empty() {
+                "No agents found.".to_string()
+            } else {
+                lines.join("\n")
+            }
         }
         _ => format!("Unknown command: {}. Type /help for available commands.", cmd),
     };
@@ -11065,7 +11200,7 @@ mod tests {
             .unwrap();
         assert!(csp.contains("script-src 'unsafe-inline'"));
         assert!(csp.contains("frame-ancestors 'none'"));
-        assert!(csp.contains("img-src 'self' data:"));
+        assert!(csp.contains("img-src 'self' data: https:"));
 
         let xcto = resp
             .headers()

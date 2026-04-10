@@ -2086,6 +2086,7 @@ pub struct ChatAgentSummary {
     pub status: String,
     pub last_message: Option<String>,
     pub last_message_time: Option<String>,
+    pub profile_url: Option<String>,
 }
 
 pub fn render_agent_guide_page(
@@ -2215,10 +2216,18 @@ pub fn render_chat_page(
                 .last_message_time
                 .as_deref()
                 .unwrap_or("");
+            let avatar_html = if let Some(ref url) = agent.profile_url {
+                format!(
+                    r#"<img class="chat-avatar-sm" src="{}" alt="">"#,
+                    escape_attribute(url)
+                )
+            } else {
+                String::new()
+            };
             format!(
                 r#"<div class="chat-agent-item{active_class}" data-agent="{name}" onclick="selectAgent('{name}')">
   <div class="chat-agent-header">
-    <span class="chat-agent-name">{display_name}</span>
+    {avatar_html}<span class="chat-agent-name">{display_name}</span>
     <span class="chat-status-dot {status_class}"></span>
   </div>
   <div class="chat-agent-snippet">{snippet_escaped}</div>
@@ -2226,6 +2235,7 @@ pub fn render_chat_page(
 </div>"#,
                 active_class = active_class,
                 name = escape_attribute(&agent.name),
+                avatar_html = avatar_html,
                 display_name = escape_text(&agent.display_name),
                 status_class = status_class,
                 snippet_escaped = snippet_escaped,
@@ -2236,17 +2246,25 @@ pub fn render_chat_page(
         .join("\n");
 
     let chat_area_html = if let Some(agent_name) = selected_agent {
-        let display = agents
+        let selected_agent_data = agents
             .iter()
-            .find(|a| a.name == agent_name)
+            .find(|a| a.name == agent_name);
+        let display = selected_agent_data
             .map(|a| a.display_name.as_str())
             .unwrap_or(agent_name);
+        let header_avatar = selected_agent_data
+            .and_then(|a| a.profile_url.as_ref())
+            .map(|url| format!(
+                r#"<img class="chat-avatar-header" src="{}" alt="">"#,
+                escape_attribute(url)
+            ))
+            .unwrap_or_default();
         format!(
             r#"<div class="chat-header">
   <button class="chat-back-btn" onclick="showAgentList()">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
   </button>
-  <span class="chat-header-name">{display_name}</span>
+  {header_avatar}<span class="chat-header-name">{display_name}</span>
   <span class="chat-header-status" id="chat-agent-status"></span>
 </div>
 <div class="chat-messages" id="chat-messages"></div>
@@ -2257,6 +2275,7 @@ pub fn render_chat_page(
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
   </button>
 </form>"#,
+            header_avatar = header_avatar,
             display_name = escape_text(display),
             csrf_token = escape_attribute(csrf_token),
         )
@@ -2269,6 +2288,12 @@ pub fn render_chat_page(
 
     let selected_agent_js = selected_agent
         .map(|a| format!("'{}'", escape_attribute(a)))
+        .unwrap_or_else(|| "null".to_string());
+
+    let profile_url_js = selected_agent
+        .and_then(|name| agents.iter().find(|a| a.name == name))
+        .and_then(|a| a.profile_url.as_ref())
+        .map(|url| format!("'{}'", escape_attribute(url)))
         .unwrap_or_else(|| "null".to_string());
 
     let layout_class = if selected_agent.is_some() {
@@ -2295,6 +2320,7 @@ pub fn render_chat_page(
 var currentAgent = {selected_agent_js};
 var csrfToken = '{csrf_token}';
 var chatMessages = {messages_json};
+var agentProfileUrl = {profile_url_js};
 var eventSource = null;
 var streamingContent = '';
 
@@ -2315,6 +2341,9 @@ function renderMessages() {{
     var msg = chatMessages[i];
     var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : 'chat-msg-assistant';
     html += '<div class="chat-msg ' + cls + '">';
+    if (msg.role === 'assistant' && agentProfileUrl) {{
+      html += '<img class="chat-avatar-msg" src="' + escapeHtmlRaw(agentProfileUrl) + '" alt="">';
+    }}
     if (msg.role === 'assistant') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
     }} else {{
@@ -2579,6 +2608,9 @@ function connectSSE() {{
         }}
         streamingContent = '';
         renderMessages();
+      }} else if (evt.event_type === 'auto_message') {{
+        chatMessages.push({{ role: 'user', content: evt.data.content }});
+        renderMessages();
       }} else if (evt.event_type === 'command_response') {{
         chatMessages.push({{ role: 'system', content: evt.data.response }});
         renderMessages();
@@ -2628,6 +2660,7 @@ if (currentAgent) {{
         selected_agent_js = selected_agent_js,
         csrf_token = escape_attribute(csrf_token),
         messages_json = messages_json,
+        profile_url_js = profile_url_js,
     );
 
     render_shell(
@@ -5768,6 +5801,29 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-size: 0.82rem;
       color: var(--fg-muted);
     }
+    .chat-avatar-sm {
+      width: 24px;
+      height: 24px;
+      border-radius: 4px;
+      object-fit: cover;
+      flex-shrink: 0;
+      margin-right: var(--s-2);
+    }
+    .chat-avatar-header {
+      width: 28px;
+      height: 28px;
+      border-radius: 5px;
+      object-fit: cover;
+      flex-shrink: 0;
+    }
+    .chat-avatar-msg {
+      width: 26px;
+      height: 26px;
+      border-radius: 4px;
+      object-fit: cover;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
     .chat-back-btn {
       display: none;
       background: none;
@@ -5801,6 +5857,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       align-self: flex-start;
       background: var(--bg-hover);
       color: var(--fg);
+      display: flex;
+      gap: var(--s-2);
+      align-items: flex-start;
     }
     .chat-msg-system {
       align-self: center;

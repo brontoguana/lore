@@ -625,6 +625,25 @@ impl LocalAuthStore {
             .collect())
     }
 
+    pub fn update_agent_display_name(
+        &self,
+        name: &str,
+        owner: &UserName,
+        new_display_name: &str,
+    ) -> Result<()> {
+        validate_agent_display_name(new_display_name)?;
+        let mut tokens = self.load_agent_tokens()?;
+        let index = tokens
+            .iter()
+            .position(|existing| {
+                existing.name == name && existing.owner.as_ref() == Some(owner)
+            })
+            .ok_or_else(|| LoreError::Validation("agent does not exist".into()))?;
+        tokens[index].display_name = Some(new_display_name.to_string());
+        self.save_agent_tokens(&tokens)?;
+        Ok(())
+    }
+
     pub fn update_agent_token_grants(
         &self,
         name: &str,
@@ -1270,6 +1289,10 @@ pub struct ChatConversation {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub profile_url: Option<String>,
+    #[serde(default)]
+    pub auto_message: Option<String>,
 }
 
 impl Default for ChatConversation {
@@ -1284,6 +1307,8 @@ impl Default for ChatConversation {
             last_seen: None,
             model: None,
             effort: None,
+            profile_url: None,
+            auto_message: None,
         }
     }
 }
@@ -1404,6 +1429,28 @@ impl ChatStore {
     pub fn update_effort(&self, owner: &str, agent: &str, effort: Option<String>) -> Result<()> {
         let mut conv = self.load_conversation(owner, agent)?;
         conv.effort = effort;
+        self.save_conversation(owner, agent, &conv)
+    }
+
+    pub fn update_profile_url(
+        &self,
+        owner: &str,
+        agent: &str,
+        url: Option<String>,
+    ) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        conv.profile_url = url;
+        self.save_conversation(owner, agent, &conv)
+    }
+
+    pub fn update_auto_message(
+        &self,
+        owner: &str,
+        agent: &str,
+        msg: Option<String>,
+    ) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        conv.auto_message = msg;
         self.save_conversation(owner, agent, &conv)
     }
 }
