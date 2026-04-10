@@ -2842,15 +2842,17 @@ pub fn render_project_page(
             ""
         };
         format!(
-            r#"<div class="agent-context-section editline-row">
+            r#"<div class="agent-context-section">
+  <div class="section-tag">Agent Context</div>
   <div class="agent-context-panel">
-    <div class="section-tag">Agent Context</div>
-    <pre class="agent-context-preview" id="agent-context-preview">{preview}</pre>
-    <div class="agent-context-full" id="agent-context-full" style="display:none;">
-      <pre class="agent-context-full-text">{full_text}</pre>
-    </div>
-    {edit_form}
-  </div>{band_html}
+    <div class="agent-context-content">
+      <pre class="agent-context-preview" id="agent-context-preview">{preview}</pre>
+      <div class="agent-context-full" id="agent-context-full" style="display:none;">
+        <pre class="agent-context-full-text">{full_text}</pre>
+      </div>
+      {edit_form}
+    </div>{band_html}
+  </div>
 </div>"#,
             preview = if context_preview.is_empty() {
                 "<span class=\"hint\">No agent context set</span>".to_string()
@@ -2892,8 +2894,8 @@ pub fn render_project_page(
     <div class="layout">
       <div class="main-column">
         {agent_context_html}
+        <div class="section-tag">Document</div>
         <section class="panel" id="document">
-          <div class="section-tag">Document</div>
           {results_label}
           <div class="timeline">{blocks_html}</div>
         </section>
@@ -2965,7 +2967,7 @@ fn render_librarian_panel(
         .map(|answer| escape_attribute(&answer.question))
         .unwrap_or_default();
     let history_html = if librarian_history.is_empty() {
-        "<p class=\"hint\">No previous librarian answers for this project yet.</p>".to_string()
+        "<p class=\"hint\">No previous answers.</p>".to_string()
     } else {
         librarian_history
             .iter()
@@ -2974,7 +2976,7 @@ fn render_librarian_panel(
             .join("")
     };
     let pending_html = if pending_actions.is_empty() {
-        "<p class=\"hint\">No pending librarian actions.</p>".to_string()
+        "<p class=\"hint\">No pending actions.</p>".to_string()
     } else {
         pending_actions
             .iter()
@@ -2991,8 +2993,8 @@ fn render_librarian_panel(
     };
     let compact_html = if can_write {
         format!(
-            r#"<div class="stack" style="border-top:1px solid var(--line);padding-top:var(--s-3)">
-    <p class="hint">Tools</p>
+            r#"<div class="stack">
+    <h3 class="panel-subheading">Tools</h3>
     <form method="post" action="/ui/{project}/compact" onsubmit="return confirm('Merge all consecutive markdown blocks into single blocks?')">
       <input type="hidden" name="csrf_token" value="{csrf_token}">
       <button type="submit" class="button-link" title="Merge consecutive markdown blocks into single blocks">
@@ -3025,11 +3027,11 @@ fn render_librarian_panel(
   </form>
   {answer_html}
   <div class="stack">
-    <p class="hint">Recent history</p>
+    <h3 class="panel-subheading">Recent history</h3>
     {history_html}
   </div>
   <div class="stack">
-    <p class="hint">Pending actions</p>
+    <h3 class="panel-subheading">Pending actions</h3>
     {pending_html}
   </div>
   {compact_html}
@@ -5860,11 +5862,18 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
 
     .agent-context-panel {
-      flex: 1;
-      min-width: 0;
+      display: flex;
+      align-items: stretch;
       background: var(--surface-hover);
       border-radius: var(--radius);
-      padding: var(--s-3) var(--s-4);
+      padding: var(--s-3) 0 var(--s-3) var(--s-4);
+      overflow: hidden;
+    }
+
+    .agent-context-content {
+      flex: 1;
+      min-width: 0;
+      padding-right: var(--s-4);
     }
 
     .agent-context-preview,
@@ -6102,6 +6111,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       padding: var(--s-5) var(--s-5) 0;
       display: grid;
       gap: var(--s-2);
+    }
+
+    .panel-subheading {
+      font-size: 0.85em;
+      font-weight: 600;
+      color: var(--muted);
+      margin: 0;
+      padding: 0;
     }
 
     .composer {
