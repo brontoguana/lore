@@ -2087,6 +2087,7 @@ pub struct ChatAgentSummary {
     pub last_message: Option<String>,
     pub last_message_time: Option<String>,
     pub profile_url: Option<String>,
+    pub cwd: Option<String>,
 }
 
 pub fn render_agent_guide_page(
@@ -2259,6 +2260,21 @@ pub fn render_chat_page(
                 escape_attribute(url)
             ))
             .unwrap_or_default();
+        let cwd_html = selected_agent_data
+            .and_then(|a| a.cwd.as_ref())
+            .map(|cwd| {
+                let parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
+                let short = if parts.len() > 3 {
+                    format!(".../{}", parts[parts.len()-3..].join("/"))
+                } else {
+                    parts.join("/")
+                };
+                format!(
+                    r#"<span class="chat-header-cwd" id="chat-agent-cwd">{}</span>"#,
+                    escape_text(&short)
+                )
+            })
+            .unwrap_or_else(|| r#"<span class="chat-header-cwd" id="chat-agent-cwd"></span>"#.to_string());
         format!(
             r#"<div class="chat-header">
   <button class="chat-back-btn" onclick="showAgentList()">
@@ -2266,6 +2282,7 @@ pub fn render_chat_page(
   </button>
   {header_avatar}<span class="chat-header-name">{display_name}</span>
   <span class="chat-header-status" id="chat-agent-status"></span>
+  {cwd_html}
 </div>
 <div class="chat-messages" id="chat-messages"></div>
 <form class="chat-input-form" id="chat-input-form" onsubmit="return sendMessage(event)">
@@ -2277,6 +2294,7 @@ pub fn render_chat_page(
 </form>"#,
             header_avatar = header_avatar,
             display_name = escape_text(display),
+            cwd_html = cwd_html,
             csrf_token = escape_attribute(csrf_token),
         )
     } else {
@@ -5800,6 +5818,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-header-status {
       font-size: 0.82rem;
       color: var(--fg-muted);
+    }
+    .chat-header-cwd {
+      margin-left: auto;
+      font-size: 0.82rem;
+      color: var(--fg-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .chat-avatar-sm {
       width: 24px;

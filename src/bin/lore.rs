@@ -1686,10 +1686,14 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, backend:
     let token = context.token.as_deref().ok_or("no token configured")?;
 
     // Long-poll for messages
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let resp = context
         .client
         .get(format!("{}/v1/chat/poll", context.url))
         .header("x-lore-key", token)
+        .header("x-lore-cwd", &cwd)
         .timeout(std::time::Duration::from_secs(35))
         .send()
         .await;

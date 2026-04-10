@@ -7558,6 +7558,7 @@ async fn chat_page(
             last_message: snippet,
             last_message_time: time_str,
             profile_url: conv.profile_url.clone(),
+            cwd: conv.cwd.clone(),
         });
     }
 
@@ -7704,6 +7705,11 @@ async fn chat_agent_poll(
         .ok_or(LoreError::PermissionDenied)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
+
+    // Update cwd if provided
+    if let Some(cwd) = headers.get("x-lore-cwd").and_then(|v| v.to_str().ok()) {
+        let _ = state.chat.update_cwd(owner_str, &agent.name, cwd);
+    }
 
     // Update status to idle
     let _ = state.chat.update_agent_status(owner_str, &agent.name, AgentChatStatus::Idle);

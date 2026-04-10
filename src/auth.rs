@@ -1293,6 +1293,8 @@ pub struct ChatConversation {
     pub profile_url: Option<String>,
     #[serde(default)]
     pub auto_message: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 impl Default for ChatConversation {
@@ -1309,6 +1311,7 @@ impl Default for ChatConversation {
             effort: None,
             profile_url: None,
             auto_message: None,
+            cwd: None,
         }
     }
 }
@@ -1385,6 +1388,16 @@ impl ChatStore {
         conv.agent_status = status;
         conv.last_seen = Some(OffsetDateTime::now_utc());
         self.save_conversation(owner, agent, &conv)
+    }
+
+    pub fn update_cwd(&self, owner: &str, agent: &str, cwd: &str) -> Result<()> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        let new_cwd = Some(cwd.to_string());
+        if conv.cwd != new_cwd {
+            conv.cwd = new_cwd;
+            self.save_conversation(owner, agent, &conv)?;
+        }
+        Ok(())
     }
 
     pub fn update_summary(&self, owner: &str, agent: &str, summary: String) -> Result<()> {
