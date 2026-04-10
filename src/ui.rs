@@ -904,17 +904,7 @@ pub fn render_admin_page(
         r#"<button type="button" id="update-btn" data-csrf="{csrf_token}" data-state="check">Check for updates</button>"#,
         csrf_token = csrf_token,
     );
-    let auto_update_status_html = if let Some(status) = auto_update_status {
-        let latest = status.latest_version.as_deref().unwrap_or("unknown");
-        format!(
-            "<p><strong>Last check</strong><br>{}<br>Latest: v{}<br>{}</p>",
-            escape_text(&format_timestamp(status.checked_at)),
-            escape_text(latest),
-            escape_text(&status.detail),
-        )
-    } else {
-        "<p><strong>Last check</strong><br>Not run yet.</p>".to_string()
-    };
+    let _ = auto_update_status; // no longer rendered
 
     let sections = [
         "users",
@@ -1218,9 +1208,6 @@ pub fn render_admin_page(
         <div style="padding:0 var(--s-5)">
           {update_now_button}
         </div>
-        <div class="meta-stack padded">
-          {auto_update_status_html}
-        </div>
 
         <div class="panel-header" style="margin-top:var(--s-5)">
           <h2>Auto Update</h2>
@@ -1270,6 +1257,11 @@ pub fn render_admin_page(
 
       var ubtn = document.getElementById(‘update-btn’);
       if (ubtn) {{
+        function resetBtn() {{
+          ubtn.textContent = ‘Check for updates’;
+          ubtn.setAttribute(‘data-state’, ‘check’);
+          ubtn.disabled = false;
+        }}
         ubtn.addEventListener(‘click’, function() {{
           var state = ubtn.getAttribute(‘data-state’);
           var csrf = ubtn.getAttribute(‘data-csrf’);
@@ -1280,19 +1272,22 @@ pub fn render_admin_page(
               method: ‘POST’,
               headers: {{‘Content-Type’: ‘application/x-www-form-urlencoded’}},
               body: ‘csrf_token=’ + encodeURIComponent(csrf)
-            }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+            }}).then(function(r) {{
+              if (!r.ok) throw new Error(‘request failed’);
+              return r.json();
+            }}).then(function(d) {{
               if (d.latest_version && d.latest_version !== d.current_version) {{
-                ubtn.textContent = ‘Apply Update v’ + d.latest_version;
+                ubtn.textContent = ‘Update to v’ + d.latest_version;
                 ubtn.setAttribute(‘data-state’, ‘apply’);
                 ubtn.disabled = false;
               }} else {{
-                ubtn.textContent = ‘Up to date’;
-                ubtn.setAttribute(‘data-state’, ‘uptodate’);
+                ubtn.textContent = ‘Up to date (v’ + d.current_version + ‘)’;
+                ubtn.disabled = true;
+                setTimeout(resetBtn, 4000);
               }}
             }}).catch(function() {{
               ubtn.textContent = ‘Check failed’;
-              ubtn.setAttribute(‘data-state’, ‘check’);
-              ubtn.disabled = false;
+              setTimeout(resetBtn, 3000);
             }});
           }} else if (state === ‘apply’) {{
             ubtn.disabled = true;
@@ -1301,17 +1296,20 @@ pub fn render_admin_page(
               method: ‘POST’,
               headers: {{‘Content-Type’: ‘application/x-www-form-urlencoded’}},
               body: ‘csrf_token=’ + encodeURIComponent(csrf)
-            }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+            }}).then(function(r) {{
+              if (!r.ok) throw new Error(‘request failed’);
+              return r.json();
+            }}).then(function(d) {{
               if (d.applied) {{
                 ubtn.textContent = ‘Restarting\u2026’;
               }} else {{
-                ubtn.textContent = ‘Up to date’;
-                ubtn.setAttribute(‘data-state’, ‘uptodate’);
+                ubtn.textContent = ‘Up to date (v’ + d.current_version + ‘)’;
+                ubtn.disabled = true;
+                setTimeout(resetBtn, 4000);
               }}
             }}).catch(function() {{
               ubtn.textContent = ‘Update failed’;
-              ubtn.setAttribute(‘data-state’, ‘check’);
-              ubtn.disabled = false;
+              setTimeout(resetBtn, 3000);
             }});
           }}
         }});
@@ -1419,7 +1417,6 @@ pub fn render_admin_page(
         },
         current_version = current_version,
         update_now_button = update_now_button,
-        auto_update_status_html = auto_update_status_html,
         external_auth_enabled_checked = if external_auth_config.enabled {
             " checked"
         } else {
