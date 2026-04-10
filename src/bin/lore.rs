@@ -2800,6 +2800,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         svc_state.check_agents();
         svc_state.restart_crashed_agents(context);
 
+        let poll_start = std::time::Instant::now();
         match service_poll_and_execute(context, machine_token, &mut svc_state).await {
             Ok(should_update) => {
                 if should_update {
@@ -2845,7 +2846,15 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             Err(e) => {
                 eprintln!("[service] Error: {e}");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
             }
+        }
+
+        // If the server held us for >5s (long-poll timeout, no command), re-poll
+        // immediately so there's always an open connection ready for commands.
+        // If it returned fast (<5s, had a command), brief pause to avoid tight loops.
+        if poll_start.elapsed() < std::time::Duration::from_secs(5) {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
 }
@@ -2864,7 +2873,7 @@ async fn service_poll_and_execute(
         .header("x-lore-key", machine_token)
         .header("x-lore-version", env!("CARGO_PKG_VERSION"))
         .json(&serde_json::json!({ "agent_statuses": agent_statuses }))
-        .timeout(std::time::Duration::from_secs(35))
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await;
 

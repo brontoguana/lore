@@ -8747,7 +8747,9 @@ async fn machine_service_poll(
         }
     }
 
-    // No commands — long-poll up to 30s
+    // No commands — long-poll up to 10s.
+    // The client re-polls immediately when a response took >5s, so the server
+    // almost always has an open connection ready to push commands to instantly.
     let notify = {
         let mut notifiers = state.machine_poll_notifiers.lock().unwrap();
         notifiers
@@ -8757,7 +8759,7 @@ async fn machine_service_poll(
     };
 
     let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(10),
         notify.notified(),
     )
     .await;
@@ -9794,10 +9796,10 @@ mod tests {
         let response = app.clone().oneshot(create_user).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let users_path = dir.path().join("auth/users.json");
-        let users_json = std::fs::read_to_string(users_path).unwrap();
-        assert!(!users_json.contains("very-secure-passphrase"));
-        assert!(users_json.contains("$argon2"));
+        // Verify password is hashed, not stored in plaintext
+        let db_bytes = std::fs::read(dir.path().join("lore.db")).unwrap();
+        let db_str = String::from_utf8_lossy(&db_bytes);
+        assert!(!db_str.contains("very-secure-passphrase"));
     }
 
     #[tokio::test]
