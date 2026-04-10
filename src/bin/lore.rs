@@ -313,6 +313,8 @@ struct CliConfig {
     token: Option<String>,
     project: Option<String>,
     #[serde(default)]
+    machine_name: Option<String>,
+    #[serde(default)]
     agent_tokens: std::collections::HashMap<String, String>,
     #[serde(default)]
     auto_update_enabled: bool,
@@ -539,6 +541,7 @@ async fn run() -> CliResult<()> {
                 .to_string();
             config.url = Some(url.clone());
             config.token = Some(token);
+            config.machine_name = Some(machine_name.clone());
             save_cli_config(&config)?;
             println!("Registered machine \"{}\" on {}", machine_name, url);
             return Ok(());
@@ -1547,6 +1550,7 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
             .client
             .post(format!("{}/v1/agents/provision", context.url))
             .header("x-lore-key", machine_token)
+            .header("x-lore-version", env!("CARGO_PKG_VERSION"))
             .json(&serde_json::json!({
                 "name": args.name,
                 "backend": backend_str,
@@ -1689,11 +1693,29 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, backend:
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let resp = context
+    // Detect git branch if in a git repo
+    let git_branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        });
+    let mut req = context
         .client
         .get(format!("{}/v1/chat/poll", context.url))
         .header("x-lore-key", token)
         .header("x-lore-cwd", &cwd)
+        .header("x-lore-version", env!("CARGO_PKG_VERSION"));
+    if let Some(ref machine) = load_cli_config().ok().and_then(|c| c.machine_name) {
+        req = req.header("x-lore-machine", machine);
+    }
+    if let Some(ref branch) = git_branch {
+        req = req.header("x-lore-git-branch", branch);
+    }
+    let resp = req
         .timeout(std::time::Duration::from_secs(35))
         .send()
         .await;
@@ -1705,6 +1727,20 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, backend:
     };
 
     let body: serde_json::Value = resp.error_for_status()?.json().await?;
+
+    // Check if server is requesting a CLI update
+    if let Some(update_version) = body["update_to"].as_str() {
+        eprintln!("[agent] Server requested update to v{update_version}, updating...");
+        let mut cfg = load_cli_config()?;
+        match apply_cli_update(&mut cfg).await {
+            Ok(()) => {
+                eprintln!("[agent] Updated CLI, restarting...");
+                std::process::exit(0);
+            }
+            Err(e) => eprintln!("[agent] Update failed: {e}"),
+        }
+    }
+
     let messages = body["messages"].as_array();
 
     if messages.is_none() || messages.unwrap().is_empty() {

@@ -143,23 +143,20 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     toggleBlockEdit(blockId);
   }}
   function toggleAgentContext() {{
-    var preview = document.getElementById('agent-context-preview');
-    var full = document.getElementById('agent-context-full');
+    var body = document.getElementById('agent-context-body');
     var editPanel = document.getElementById('agent-context-edit');
     var band = document.querySelector('.agent-context-band');
     var block = document.querySelector('.agent-context-block');
     if (!editPanel) return;
     if (editPanel.style.display === 'none') {{
-      if (preview) preview.style.display = 'none';
-      if (full) full.style.display = 'none';
+      if (body) body.style.display = 'none';
       editPanel.style.display = '';
       if (band) band.classList.add('editline-band-active');
       if (block) block.classList.add('editing');
       var ta = editPanel.querySelector('textarea');
       if (ta) {{ ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }}
     }} else {{
-      if (preview) preview.style.display = '';
-      if (full) full.style.display = 'none';
+      if (body) body.style.display = '';
       editPanel.style.display = 'none';
       if (band) band.classList.remove('editline-band-active');
       if (block) block.classList.remove('editing');
@@ -1240,6 +1237,14 @@ pub fn render_admin_page(
           <input type="checkbox" id="auto-update-toggle" data-csrf="{csrf_token}"{auto_update_enabled_checked}>
           <span>Enable automatic server self-update on restart</span>
         </label>
+
+        <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>Connected Machines</h2>
+          <p>Signal all connected CLI machines to update on their next poll.</p>
+        </div>
+        <div style="padding:0 var(--s-5) var(--s-5)">
+          <button type="button" id="update-all-machines-btn" data-csrf="{csrf_token}">Update all machines</button>
+        </div>
       </section>
 
       <section class="panel" data-panel="audit"{audit_display}>
@@ -1395,6 +1400,32 @@ pub fn render_admin_page(
             method: 'POST',
             headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
             body: 'csrf_token=' + encodeURIComponent(csrf) + '&enabled=' + autoCb.checked
+          }});
+        }});
+      }}
+
+      var uamBtn = document.getElementById('update-all-machines-btn');
+      if (uamBtn) {{
+        uamBtn.addEventListener('click', function() {{
+          var csrf = uamBtn.getAttribute('data-csrf');
+          uamBtn.disabled = true;
+          uamBtn.textContent = 'Queuing\u2026';
+          fetch('/ui/admin/update-all-machines-json', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+            body: 'csrf_token=' + encodeURIComponent(csrf)
+          }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+            uamBtn.textContent = d.count + ' machine' + (d.count === 1 ? '' : 's') + ' queued';
+            setTimeout(function() {{
+              uamBtn.textContent = 'Update all machines';
+              uamBtn.disabled = false;
+            }}, 3000);
+          }}).catch(function() {{
+            uamBtn.textContent = 'Failed';
+            setTimeout(function() {{
+              uamBtn.textContent = 'Update all machines';
+              uamBtn.disabled = false;
+            }}, 3000);
           }});
         }});
       }}
@@ -1695,23 +1726,50 @@ pub fn render_agents_page(
     };
 
     // Machines list
+    let server_version = env!("CARGO_PKG_VERSION");
     let machines_html = if machines.is_empty() {
         r#"<p class="hint padded">No machines registered.</p>"#.to_string()
     } else {
         machines
             .iter()
             .map(|m| {
+                let version_display = m.cli_version.as_deref().unwrap_or("unknown");
+                let is_outdated = m.cli_version.as_deref().map(|v| v.trim_start_matches('v') != server_version).unwrap_or(true);
+                let update_btn = if is_outdated && !m.pending_update {
+                    format!(
+                        r#"<form method="post" action="/ui/agents/machines/{}/update" class="inline-form" style="margin:0;">
+                          <input type="hidden" name="csrf_token" value="{}">
+                          <button type="submit" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Update</button>
+                        </form>"#,
+                        escape_attribute(&m.name),
+                        escape_attribute(csrf_token),
+                    )
+                } else if m.pending_update {
+                    r#"<span class="hint" style="font-size:0.8rem;">Update queued</span>"#.to_string()
+                } else {
+                    String::new()
+                };
+                let version_class = if is_outdated { r#" style="color:var(--danger)""# } else { "" };
                 format!(
-                    r#"<div class="agent-list-item" style="display:flex; justify-content:space-between; align-items:center;">
-                      <span class="agent-list-name">{}</span>
-                      <form method="post" action="/ui/agents/machines/{}/revoke" class="inline-form" style="margin:0;">
-                        <input type="hidden" name="csrf_token" value="{}">
-                        <button class="danger" type="submit" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Revoke</button>
-                      </form>
+                    r#"<div class="agent-list-item" style="display:flex; justify-content:space-between; align-items:center; gap:var(--s-2);">
+                      <div style="min-width:0;">
+                        <span class="agent-list-name">{name}</span>
+                        <span class="agent-list-meta"{version_class}>v{version}</span>
+                      </div>
+                      <div style="display:flex; gap:var(--s-2); align-items:center; flex-shrink:0;">
+                        {update_btn}
+                        <form method="post" action="/ui/agents/machines/{name_attr}/revoke" class="inline-form" style="margin:0;">
+                          <input type="hidden" name="csrf_token" value="{csrf}">
+                          <button class="danger" type="submit" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Revoke</button>
+                        </form>
+                      </div>
                     </div>"#,
-                    escape_text(&m.name),
-                    escape_attribute(&m.name),
-                    escape_attribute(csrf_token),
+                    name = escape_text(&m.name),
+                    version = escape_text(version_display),
+                    version_class = version_class,
+                    update_btn = update_btn,
+                    name_attr = escape_attribute(&m.name),
+                    csrf = escape_attribute(csrf_token),
                 )
             })
             .collect::<Vec<_>>()
@@ -1727,6 +1785,7 @@ pub fn render_agents_page(
                 install_script_url,
                 install_ps1_url,
                 "YOUR_TOKEN",
+                server_version,
             );
             let mcp_config_text = format!(
                 r#"{{"transport": "streamable_http","url": "{}","headers": {{"Authorization": "Bearer YOUR_TOKEN","Accept": "application/json, text/event-stream","MCP-Protocol-Version": "2025-06-18"}}}}"#,
@@ -1906,6 +1965,7 @@ fn build_agent_setup_instruction_text(
     install_script_url: &str,
     install_ps1_url: &str,
     token: &str,
+    server_version: &str,
 ) -> String {
     format!(
         r#"# Lore — shared project knowledge base
@@ -1927,10 +1987,10 @@ All requests require an agent token. Include it as:
 ### Option 1 — Lore CLI (recommended for code agents)
 
 Install (Linux/macOS):
-  curl -fsSL {install_script_url} | sh
+  LORE_VERSION=v{server_version} curl -fsSL {install_script_url} | sh
 
 Install (Windows PowerShell):
-  irm {install_ps1_url} | iex
+  $env:LORE_VERSION='v{server_version}'; irm {install_ps1_url} | iex
 
 Configure (registers this machine and saves credentials):
   lore setup {base_url}
@@ -2133,6 +2193,7 @@ pub struct ChatAgentSummary {
     pub last_message_time: Option<String>,
     pub profile_url: Option<String>,
     pub cwd: Option<String>,
+    pub git_branch: Option<String>,
 }
 
 pub fn render_agent_guide_page(
@@ -2160,15 +2221,15 @@ pub fn render_agent_guide_page(
       <div class="padded">
         <p class="hint" style="margin-bottom:var(--s-2);"><strong>Linux / macOS</strong></p>
         <div style="display:flex; align-items:stretch; gap:var(--s-2);">
-          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">curl -fsSL {install_script_url} | sh</code>
-          <button class="button-link" onclick="navigator.clipboard.writeText('curl -fsSL {install_script_url} | sh')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">LORE_VERSION=v{server_version} curl -fsSL {install_script_url} | sh</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('LORE_VERSION=v{server_version} curl -fsSL {install_script_url} | sh')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
         </div>
         <p class="hint" style="margin-top:var(--s-4); margin-bottom:var(--s-2);"><strong>Windows</strong> (PowerShell)</p>
         <div style="display:flex; align-items:stretch; gap:var(--s-2);">
-          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">irm {install_ps1_url} | iex</code>
-          <button class="button-link" onclick="navigator.clipboard.writeText('irm {install_ps1_url} | iex')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">$env:LORE_VERSION='v{server_version}'; irm {install_ps1_url} | iex</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText(&quot;$env:LORE_VERSION=&apos;v{server_version}&apos;; irm {install_ps1_url} | iex&quot;)" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
         </div>
@@ -2211,6 +2272,7 @@ pub fn render_agent_guide_page(
     <p style="margin-top:var(--s-5);"><a href="/ui/agents">&larr; Back to Agents</a></p>"#,
         install_script_url = escape_attribute(install_script_url),
         base_url = escape_text(&base_url),
+        server_version = env!("CARGO_PKG_VERSION"),
     );
 
     render_shell(
@@ -2264,11 +2326,15 @@ pub fn render_chat_page(
                 .unwrap_or("");
             let avatar_html = if let Some(ref url) = agent.profile_url {
                 format!(
-                    r#"<img class="chat-avatar-sm" src="{}" alt="">"#,
+                    r#"<div class="chat-avatar-sm-wrap" data-agent="{}" onclick="event.stopPropagation(); openProfilePic(this)" title="Change profile picture"><img class="chat-avatar-sm" src="{}" alt=""></div>"#,
+                    escape_attribute(&agent.name),
                     escape_attribute(url)
                 )
             } else {
-                String::new()
+                format!(
+                    r#"<div class="chat-avatar-sm-wrap chat-avatar-empty" data-agent="{}" onclick="event.stopPropagation(); openProfilePic(this)" title="Set profile picture"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.4"><circle cx="12" cy="8" r="4"/><path d="M5.5 21a7.5 7.5 0 0 1 13 0"/></svg></div>"#,
+                    escape_attribute(&agent.name)
+                )
             };
             format!(
                 r#"<div class="chat-agent-item{active_class}" data-agent="{name}" onclick="selectAgent('{name}')">
@@ -2305,21 +2371,39 @@ pub fn render_chat_page(
                 escape_attribute(url)
             ))
             .unwrap_or_default();
-        let cwd_html = selected_agent_data
-            .and_then(|a| a.cwd.as_ref())
-            .map(|cwd| {
-                let parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
-                let short = if parts.len() > 3 {
-                    format!(".../{}", parts[parts.len()-3..].join("/"))
+        let cwd_html = {
+            let cwd_short = selected_agent_data
+                .and_then(|a| a.cwd.as_ref())
+                .map(|cwd| {
+                    let parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
+                    if parts.len() > 3 {
+                        format!(".../{}", parts[parts.len()-3..].join("/"))
+                    } else {
+                        parts.join("/")
+                    }
+                })
+                .unwrap_or_default();
+            let branch = selected_agent_data
+                .and_then(|a| a.git_branch.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let mut label = cwd_short;
+            if !branch.is_empty() {
+                if !label.is_empty() {
+                    label = format!("{} ({})", label, branch);
                 } else {
-                    parts.join("/")
-                };
+                    label = format!("({})", branch);
+                }
+            }
+            if label.is_empty() {
+                r#"<span class="chat-header-cwd" id="chat-agent-cwd"></span>"#.to_string()
+            } else {
                 format!(
                     r#"<span class="chat-header-cwd" id="chat-agent-cwd">{}</span>"#,
-                    escape_text(&short)
+                    escape_text(&label)
                 )
-            })
-            .unwrap_or_else(|| r#"<span class="chat-header-cwd" id="chat-agent-cwd"></span>"#.to_string());
+            }
+        };
         format!(
             r#"<div class="chat-header">
   <button class="chat-back-btn" onclick="showAgentList()">
@@ -2394,6 +2478,66 @@ function selectAgent(name) {{
 function showAgentList() {{
   var layout = document.querySelector('.chat-layout');
   if (layout) layout.classList.add('chat-sidebar-show');
+}}
+
+function openProfilePic(el) {{
+  var agent = el.getAttribute('data-agent');
+  var inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = 'image/*';
+  inp.style.display = 'none';
+  inp.addEventListener('change', function() {{
+    if (!inp.files || !inp.files[0]) return;
+    resizeAndUpload(inp.files[0], agent, el);
+  }});
+  document.body.appendChild(inp);
+  inp.click();
+  setTimeout(function() {{ document.body.removeChild(inp); }}, 60000);
+}}
+
+function resizeAndUpload(file, agent, el) {{
+  var reader = new FileReader();
+  reader.onload = function(e) {{
+    var img = new Image();
+    img.onload = function() {{
+      var sz = 96;
+      var c = document.createElement('canvas');
+      c.width = sz; c.height = sz;
+      var ctx = c.getContext('2d');
+      var side = Math.min(img.width, img.height);
+      var sx = (img.width - side) / 2;
+      var sy = (img.height - side) / 2;
+      ctx.drawImage(img, sx, sy, side, side, 0, 0, sz, sz);
+      var dataUrl = c.toDataURL('image/png');
+      fetch('/ui/chat/' + encodeURIComponent(agent) + '/profile-pic', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+        body: 'csrf_token=' + encodeURIComponent(csrfToken) + '&data_url=' + encodeURIComponent(dataUrl)
+      }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+        if (d.ok) {{
+          el.classList.remove('chat-avatar-empty');
+          el.innerHTML = '<img class="chat-avatar-sm" src="' + escapeHtmlRaw(dataUrl) + '" alt="">';
+          if (agent === currentAgent) {{
+            agentProfileUrl = dataUrl;
+            var hdr = document.querySelector('.chat-avatar-header');
+            if (hdr) hdr.src = dataUrl;
+            else {{
+              var nameEl = document.querySelector('.chat-header-name');
+              if (nameEl) {{
+                var img2 = document.createElement('img');
+                img2.className = 'chat-avatar-header';
+                img2.src = dataUrl;
+                nameEl.parentNode.insertBefore(img2, nameEl);
+              }}
+            }}
+            renderMessages();
+          }}
+        }}
+      }});
+    }};
+    img.src = e.target.result;
+  }};
+  reader.readAsDataURL(file);
 }}
 
 function renderMessages() {{
@@ -2680,6 +2824,17 @@ function connectSSE() {{
       }} else if (evt.event_type === 'status') {{
         var el = document.getElementById('chat-agent-status');
         if (el) el.textContent = evt.data.status || '';
+        if (evt.data.cwd) {{
+          var cwdEl = document.getElementById('chat-agent-cwd');
+          if (cwdEl) {{
+            var parts = evt.data.cwd.split('/').filter(function(s){{ return s.length > 0; }});
+            var short = parts.length > 3 ? '.../' + parts.slice(-3).join('/') : parts.join('/');
+            var branch = evt.data.git_branch || '';
+            var label = short;
+            if (branch) label = label ? label + ' (' + branch + ')' : '(' + branch + ')';
+            cwdEl.textContent = label;
+          }}
+        }}
       }}
     }} catch(err) {{}}
   }};
@@ -3082,15 +3237,6 @@ pub fn render_project_page(
     let search_btn_class = if search_active { " active" } else { "" };
 
     let context_text = agent_context.unwrap_or_default();
-    let context_lines: Vec<&str> = context_text.lines().collect();
-    let context_truncated = context_lines.len() > 8;
-    let context_preview: String = if context_truncated {
-        let mut preview = context_lines[..8].join("\n");
-        preview.push_str("\n...");
-        preview
-    } else {
-        context_text.to_string()
-    };
     let agent_context_html = {
         let edit_form = if can_write {
             format!(
@@ -3114,27 +3260,22 @@ pub fn render_project_page(
         } else {
             ""
         };
+        let rendered_body = if context_text.trim().is_empty() {
+            "<span class=\"hint\">No agent context set</span>".to_string()
+        } else {
+            render_markdown(context_text)
+        };
         format!(
             r#"<div class="agent-context-section">
   <div class="section-tag">Agent Context</div>
   <div class="editline-row">
     <article class="block agent-context-block">
-      <div class="block-body">
-        <pre class="agent-context-preview" id="agent-context-preview">{preview}</pre>
-        <div class="agent-context-full" id="agent-context-full" style="display:none;">
-          <pre class="agent-context-full-text">{full_text}</pre>
-        </div>
-      </div>
+      <div class="block-body" id="agent-context-body">{rendered_body}</div>
       <div class="block-edit-panel" id="agent-context-edit" style="display:none;">{edit_form}</div>
     </article>{band_html}
   </div>
 </div>"#,
-            preview = if context_preview.is_empty() {
-                "<span class=\"hint\">No agent context set</span>".to_string()
-            } else {
-                escape_text(&context_preview)
-            },
-            full_text = escape_text(context_text),
+            rendered_body = rendered_body,
             edit_form = edit_form,
             band_html = band_html,
         )
@@ -5874,13 +6015,31 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    .chat-avatar-sm-wrap {
+      width: 24px;
+      height: 24px;
+      border-radius: 4px;
+      flex-shrink: 0;
+      margin-right: var(--s-2);
+      cursor: pointer;
+      position: relative;
+      overflow: hidden;
+    }
+    .chat-avatar-sm-wrap:hover {
+      opacity: 0.8;
+    }
+    .chat-avatar-empty {
+      background: var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
     .chat-avatar-sm {
       width: 24px;
       height: 24px;
       border-radius: 4px;
       object-fit: cover;
       flex-shrink: 0;
-      margin-right: var(--s-2);
     }
     .chat-avatar-header {
       width: 28px;
@@ -6309,19 +6468,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 
     .agent-context-section {
       margin-bottom: 0;
-    }
-
-    .agent-context-preview,
-    .agent-context-full-text {
-      margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      color: var(--fg);
-      background: transparent;
-      padding: 0;
-      border-radius: 0;
-      font-size: inherit;
-      font-family: inherit;
     }
 
     .agent-context-textarea {

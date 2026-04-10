@@ -312,6 +312,10 @@ fn build_app_with_librarian(
             post(revoke_machine_from_ui),
         )
         .route(
+            "/ui/agents/machines/{name}/update",
+            post(update_machine_from_ui),
+        )
+        .route(
             "/ui/agents/{name}/grants",
             post(update_agent_grants_from_ui),
         )
@@ -384,6 +388,14 @@ fn build_app_with_librarian(
         .route(
             "/ui/admin/auto-update/apply-json",
             post(apply_auto_update_json),
+        )
+        .route(
+            "/ui/admin/update-all-machines-json",
+            post(update_all_machines_json),
+        )
+        .route(
+            "/ui/chat/{agent}/profile-pic",
+            post(upload_profile_pic),
         )
         .route("/ui/{project}", axum::routing::get(project_page))
         .route("/ui/{project}/context", post(update_agent_context_from_ui))
@@ -3582,6 +3594,56 @@ async fn apply_auto_update_json(
         schedule_server_restart(executable_path);
     }
     Ok(Json(summary))
+}
+
+async fn update_all_machines_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AutoUpdateCheckUiForm>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let count = state.auth.set_all_machines_pending_update()?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "update all machines",
+        None,
+        Some(format!("{count} machines queued for update")),
+    )?;
+    Ok(Json(serde_json::json!({ "count": count })))
+}
+
+#[derive(Deserialize)]
+struct ProfilePicForm {
+    csrf_token: String,
+    data_url: String,
+}
+
+async fn upload_profile_pic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent): Path<String>,
+    Form(form): Form<ProfilePicForm>,
+) -> UiResult<Json<serde_json::Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let owner = session.user.username.as_str();
+
+    // Validate it's a data URL with an image content type
+    if !form.data_url.starts_with("data:image/") {
+        return Err(LoreError::Validation("Invalid image data".into()).into());
+    }
+    // Cap at ~200KB to keep chat store reasonable
+    if form.data_url.len() > 200_000 {
+        return Err(LoreError::Validation("Image too large (max ~150KB)".into()).into());
+    }
+
+    state.chat.update_profile_url(owner, &agent, Some(form.data_url))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn project_page(
@@ -7564,6 +7626,7 @@ async fn chat_page(
             last_message_time: time_str,
             profile_url: conv.profile_url.clone(),
             cwd: conv.cwd.clone(),
+            git_branch: conv.git_branch.clone(),
         });
     }
 
@@ -7711,20 +7774,36 @@ async fn chat_agent_poll(
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
-    // Update cwd if provided
-    if let Some(cwd) = headers.get("x-lore-cwd").and_then(|v| v.to_str().ok()) {
-        let _ = state.chat.update_cwd(owner_str, &agent.name, cwd);
+    // Track CLI version and machine name for update signaling
+    let cli_version = headers.get("x-lore-version").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let machine_name = headers.get("x-lore-machine").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    if let (Some(mname), Some(ver)) = (&machine_name, &cli_version) {
+        let _ = state.auth.update_machine_version(mname, owner, ver);
+    }
+
+    // Update cwd and git branch if provided
+    let cwd_val = headers.get("x-lore-cwd").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let branch_val = headers.get("x-lore-git-branch").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    if let Some(ref cwd) = cwd_val {
+        let _ = state.chat.update_cwd(owner_str, &agent.name, cwd, branch_val.as_deref());
     }
 
     // Update status to idle
     let _ = state.chat.update_agent_status(owner_str, &agent.name, AgentChatStatus::Idle);
 
-    // Push status update to user
+    // Push status update to user (include cwd/branch so UI updates live)
+    let mut status_data = json!({ "status": "idle" });
+    if let Some(ref cwd) = cwd_val {
+        status_data["cwd"] = json!(cwd);
+    }
+    if let Some(ref branch) = branch_val {
+        status_data["git_branch"] = json!(branch);
+    }
     push_chat_event(&state, owner_str, ChatEvent {
         event_type: "status".into(),
         agent: agent.name.clone(),
         owner: owner_str.to_string(),
-        data: json!({ "status": "idle" }),
+        data: status_data,
     });
 
     // Check for unprocessed user messages
@@ -7738,12 +7817,32 @@ async fn chat_agent_poll(
         None => conv.messages.iter().filter(|m| m.role == ChatRole::User).collect(),
     };
 
+    // Check if machine has a pending update
+    let server_version = env!("CARGO_PKG_VERSION");
+    let update_to = machine_name.as_ref().and_then(|mname| {
+        state.auth.get_machine(mname, owner).ok().flatten()
+    }).and_then(|m| {
+        if m.pending_update {
+            Some(server_version.to_string())
+        } else {
+            None
+        }
+    });
+
+    let build_poll_response = |msgs: Vec<Value>| -> Json<Value> {
+        let mut resp = json!({ "messages": msgs });
+        if let Some(ref ver) = update_to {
+            resp["update_to"] = json!(ver);
+        }
+        Json(resp)
+    };
+
     if !pending.is_empty() {
         let msgs: Vec<Value> = pending
             .iter()
             .map(|m| json!({ "id": m.id, "content": m.content, "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() }))
             .collect();
-        return Ok(Json(json!({ "messages": msgs })));
+        return Ok(build_poll_response(msgs));
     }
 
     // No messages — long-poll up to 30 seconds
@@ -7778,11 +7877,11 @@ async fn chat_agent_poll(
                 .iter()
                 .map(|m| json!({ "id": m.id, "content": m.content, "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() }))
                 .collect();
-            return Ok(Json(json!({ "messages": msgs })));
+            return Ok(build_poll_response(msgs));
         }
     }
 
-    Ok(Json(json!({ "messages": [] })))
+    Ok(build_poll_response(vec![]))
 }
 
 async fn chat_agent_respond(
@@ -8407,6 +8506,11 @@ async fn provision_agent_with_body(
         .unwrap_or("");
     let machine = state.auth.authenticate_machine_token(machine_token)?;
 
+    // Track CLI version on the machine
+    if let Some(version) = headers.get("x-lore-version").and_then(|v| v.to_str().ok()) {
+        let _ = state.auth.update_machine_version(&machine.machine_name, &machine.user.username, version);
+    }
+
     let backend = req.backend.parse().unwrap_or_default();
 
     // Compute grants: all projects the user has access to
@@ -8493,6 +8597,18 @@ async fn revoke_machine_from_ui(
         None,
     )?;
     Ok(Redirect::to("/ui/agents?flash=Machine%20revoked").into_response())
+}
+
+async fn update_machine_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    state.auth.set_machine_pending_update(&name, &session.user.username, true)?;
+    Ok(Redirect::to("/ui/agents?flash=Update%20queued%20—%20machine%20will%20update%20on%20next%20poll").into_response())
 }
 
 #[cfg(test)]

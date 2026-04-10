@@ -43,6 +43,10 @@ pub struct StoredMachine {
     pub username: UserName,
     pub token_hash: String,
     pub created_at: OffsetDateTime,
+    #[serde(default)]
+    pub cli_version: Option<String>,
+    #[serde(default)]
+    pub pending_update: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -732,6 +736,8 @@ impl LocalAuthStore {
             username: user.username,
             token_hash: hash_agent_token(&raw_token),
             created_at: OffsetDateTime::now_utc(),
+            cli_version: None,
+            pending_update: false,
         };
         machines.push(stored.clone());
         self.save_machines(&machines)?;
@@ -780,6 +786,50 @@ impl LocalAuthStore {
 
     pub fn revoke_machine_by_name(&self, name: &str, username: &UserName) -> Result<()> {
         self.revoke_machine(name, username)
+    }
+
+    pub fn update_machine_version(&self, name: &str, username: &UserName, version: &str) -> Result<()> {
+        let mut machines = self.load_machines()?;
+        if let Some(m) = machines.iter_mut().find(|m| m.name == name && &m.username == username) {
+            m.cli_version = Some(version.to_string());
+            // Auto-clear pending_update if version now matches server
+            if m.pending_update {
+                let server_version = env!("CARGO_PKG_VERSION");
+                if version.trim_start_matches('v') == server_version {
+                    m.pending_update = false;
+                }
+            }
+            self.save_machines(&machines)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_machine_pending_update(&self, name: &str, username: &UserName, pending: bool) -> Result<()> {
+        let mut machines = self.load_machines()?;
+        if let Some(m) = machines.iter_mut().find(|m| m.name == name && &m.username == username) {
+            m.pending_update = pending;
+            self.save_machines(&machines)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_all_machines_pending_update(&self) -> Result<usize> {
+        let mut machines = self.load_machines()?;
+        let server_version = env!("CARGO_PKG_VERSION");
+        let mut count = 0;
+        for m in machines.iter_mut() {
+            let current = m.cli_version.as_deref().unwrap_or("");
+            if current.trim_start_matches('v') != server_version {
+                m.pending_update = true;
+                count += 1;
+            }
+        }
+        self.save_machines(&machines)?;
+        Ok(count)
+    }
+
+    pub fn get_machine(&self, name: &str, username: &UserName) -> Result<Option<StoredMachine>> {
+        Ok(self.load_machines()?.into_iter().find(|m| m.name == name && &m.username == username))
     }
 
     pub fn provision_agent(
@@ -1295,6 +1345,8 @@ pub struct ChatConversation {
     pub auto_message: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
 }
 
 impl Default for ChatConversation {
@@ -1312,6 +1364,7 @@ impl Default for ChatConversation {
             profile_url: None,
             auto_message: None,
             cwd: None,
+            git_branch: None,
         }
     }
 }
@@ -1390,11 +1443,13 @@ impl ChatStore {
         self.save_conversation(owner, agent, &conv)
     }
 
-    pub fn update_cwd(&self, owner: &str, agent: &str, cwd: &str) -> Result<()> {
+    pub fn update_cwd(&self, owner: &str, agent: &str, cwd: &str, git_branch: Option<&str>) -> Result<()> {
         let mut conv = self.load_conversation(owner, agent)?;
         let new_cwd = Some(cwd.to_string());
-        if conv.cwd != new_cwd {
+        let new_branch = git_branch.map(|s| s.to_string());
+        if conv.cwd != new_cwd || conv.git_branch != new_branch {
             conv.cwd = new_cwd;
+            conv.git_branch = new_branch;
             self.save_conversation(owner, agent, &conv)?;
         }
         Ok(())
