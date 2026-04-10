@@ -189,6 +189,7 @@ fn build_app_with_librarian(
         .route("/setup", get(setup_page))
         .route("/setup.txt", get(setup_text))
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
+        .route("/v1/health", get(health_check))
         .route("/v1/blocks", post(create_block).get(list_blocks))
         .route("/v1/search", axum::routing::get(search_blocks))
         .route("/v1/blocks/{id}", delete(delete_block).patch(update_block))
@@ -1424,6 +1425,10 @@ async fn setup_page(State(state): State<AppState>) -> UiResult<Html<String>> {
     let config = state.config.load()?;
     let setup_instruction = build_agent_setup_instruction(&config, None);
     Ok(Html(render_setup_page(&config, &setup_instruction)))
+}
+
+async fn health_check() -> axum::response::Json<serde_json::Value> {
+    axum::response::Json(serde_json::json!({"status": "ok"}))
 }
 
 async fn setup_text(State(state): State<AppState>) -> UiResult<Response> {

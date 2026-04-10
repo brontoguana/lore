@@ -1329,14 +1329,56 @@ pub fn render_admin_page(
             }}).then(function(d) {{
               if (d.applied) {{
                 ubtn.textContent = 'Restarting\u2026';
+                (function pollRestart() {{
+                  var dots = 0;
+                  var iv = setInterval(function() {{
+                    dots = (dots + 1) % 4;
+                    ubtn.textContent = 'Restarting' + '.'.repeat(dots || 1);
+                  }}, 400);
+                  function tryReach() {{
+                    fetch('/v1/health', {{method: 'GET', cache: 'no-store'}}).then(function(r) {{
+                      if (r.ok) {{
+                        clearInterval(iv);
+                        ubtn.textContent = 'Updated! Reloading\u2026';
+                        setTimeout(function() {{ location.reload(); }}, 500);
+                      }} else {{
+                        setTimeout(tryReach, 1500);
+                      }}
+                    }}).catch(function() {{
+                      setTimeout(tryReach, 1500);
+                    }});
+                  }}
+                  setTimeout(tryReach, 2000);
+                }})();
               }} else {{
                 ubtn.textContent = 'Up to date (v' + d.current_version + ')';
                 ubtn.disabled = true;
                 setTimeout(resetBtn, 4000);
               }}
             }}).catch(function() {{
-              ubtn.textContent = 'Update failed';
-              setTimeout(resetBtn, 3000);
+              ubtn.textContent = 'Restarting\u2026';
+              ubtn.disabled = true;
+              (function pollAfterCrash() {{
+                var dots = 0;
+                var iv = setInterval(function() {{
+                  dots = (dots + 1) % 4;
+                  ubtn.textContent = 'Restarting' + '.'.repeat(dots || 1);
+                }}, 400);
+                function tryReach() {{
+                  fetch('/v1/health', {{method: 'GET', cache: 'no-store'}}).then(function(r) {{
+                    if (r.ok) {{
+                      clearInterval(iv);
+                      ubtn.textContent = 'Updated! Reloading\u2026';
+                      setTimeout(function() {{ location.reload(); }}, 500);
+                    }} else {{
+                      setTimeout(tryReach, 1500);
+                    }}
+                  }}).catch(function() {{
+                    setTimeout(tryReach, 1500);
+                  }});
+                }}
+                setTimeout(tryReach, 2000);
+              }})();
             }});
           }}
         }});
