@@ -145,21 +145,24 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
   function toggleAgentContext() {{
     var preview = document.getElementById('agent-context-preview');
     var full = document.getElementById('agent-context-full');
-    var form = document.getElementById('agent-context-form');
+    var editPanel = document.getElementById('agent-context-edit');
     var band = document.querySelector('.agent-context-band');
-    if (!form) return;
-    if (form.style.display === 'none') {{
+    var block = document.querySelector('.agent-context-block');
+    if (!editPanel) return;
+    if (editPanel.style.display === 'none') {{
       if (preview) preview.style.display = 'none';
       if (full) full.style.display = 'none';
-      form.style.display = '';
+      editPanel.style.display = '';
       if (band) band.classList.add('editline-band-active');
-      var ta = form.querySelector('textarea');
+      if (block) block.classList.add('editing');
+      var ta = editPanel.querySelector('textarea');
       if (ta) {{ ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }}
     }} else {{
       if (preview) preview.style.display = '';
       if (full) full.style.display = 'none';
-      form.style.display = 'none';
+      editPanel.style.display = 'none';
       if (band) band.classList.remove('editline-band-active');
+      if (block) block.classList.remove('editing');
     }}
   }}
   function toggleEditlineInserter(btn) {{
@@ -3091,10 +3094,10 @@ pub fn render_project_page(
     let agent_context_html = {
         let edit_form = if can_write {
             format!(
-                r#"<form id="agent-context-form" method="post" action="/ui/{project_slug}/context" style="display:none;">
+                r#"<form id="agent-context-form" method="post" action="/ui/{project_slug}/context">
+    <textarea name="agent_context" class="block-edit-textarea agent-context-textarea">{content_escaped}</textarea>
     <input type="hidden" name="csrf_token" value="{csrf}">
-    <textarea name="agent_context" class="agent-context-textarea">{content_escaped}</textarea>
-    <div style="display:flex; gap:var(--s-3); margin-top:var(--s-2);">
+    <div style="display:flex; gap:var(--s-3);">
       <button type="submit" class="button-link">Save</button>
       <button type="button" class="button-link" onclick="toggleAgentContext()">Cancel</button>
     </div>
@@ -3114,14 +3117,16 @@ pub fn render_project_page(
         format!(
             r#"<div class="agent-context-section">
   <div class="section-tag">Agent Context</div>
-  <div class="agent-context-panel">
-    <div class="agent-context-content">
-      <pre class="agent-context-preview" id="agent-context-preview">{preview}</pre>
-      <div class="agent-context-full" id="agent-context-full" style="display:none;">
-        <pre class="agent-context-full-text">{full_text}</pre>
+  <div class="editline-row">
+    <article class="block agent-context-block">
+      <div class="block-body">
+        <pre class="agent-context-preview" id="agent-context-preview">{preview}</pre>
+        <div class="agent-context-full" id="agent-context-full" style="display:none;">
+          <pre class="agent-context-full-text">{full_text}</pre>
+        </div>
       </div>
-      {edit_form}
-    </div>{band_html}
+      <div class="block-edit-panel" id="agent-context-edit" style="display:none;">{edit_form}</div>
+    </article>{band_html}
   </div>
 </div>"#,
             preview = if context_preview.is_empty() {
@@ -6306,47 +6311,21 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       margin-bottom: 0;
     }
 
-    .agent-context-panel {
-      display: flex;
-      align-items: stretch;
-      background: var(--surface-hover);
-      border-radius: var(--radius);
-      padding: var(--s-3) 0 var(--s-3) var(--s-4);
-      overflow: hidden;
-    }
-
-    .agent-context-content {
-      flex: 1;
-      min-width: 0;
-      padding-right: var(--s-4);
-    }
-
     .agent-context-preview,
     .agent-context-full-text {
       margin: 0;
-      font-size: 0.85em;
       white-space: pre-wrap;
       word-break: break-word;
       color: var(--fg);
-      opacity: 0.8;
+      background: transparent;
+      padding: 0;
+      border-radius: 0;
+      font-size: inherit;
+      font-family: inherit;
     }
 
     .agent-context-textarea {
-      width: 100%;
       min-height: 120px;
-      max-height: 400px;
-      font-family: var(--font-mono);
-      font-size: 0.85em;
-      padding: var(--s-3);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--bg);
-      color: var(--fg);
-      resize: vertical;
-    }
-
-    .agent-context-band {
-      align-self: stretch;
     }
 
     .block {
