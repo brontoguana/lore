@@ -77,7 +77,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>{title}</title>
   <style>{styles}</style>
 </head>
@@ -5926,6 +5926,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-layout {
       display: flex;
       height: calc(100vh - 65px);
+      height: calc(100dvh - 65px);
       overflow: hidden;
     }
     .chat-sidebar {
@@ -6234,7 +6235,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-input-form {
       display: flex;
       gap: var(--s-2);
-      padding: var(--s-3) var(--s-4);
+      padding: var(--s-3) var(--s-4) calc(var(--s-3) + env(safe-area-inset-bottom));
       border-top: 1px solid var(--line);
       align-items: flex-end;
     }
