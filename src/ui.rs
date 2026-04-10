@@ -7277,7 +7277,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       }
       .chat-main { display: none; }
       .chat-has-agent .chat-sidebar { display: none; }
-      .chat-has-agent .chat-main { display: flex; flex: 1; }
+      .chat-has-agent .chat-main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
       .chat-sidebar-show .chat-sidebar { display: flex !important; }
       .chat-sidebar-show .chat-main { display: none !important; }
       .chat-back-btn { display: flex; }
