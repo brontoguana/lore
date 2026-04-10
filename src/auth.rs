@@ -66,6 +66,8 @@ pub struct StoredAgentToken {
     pub grants: Vec<ProjectGrant>,
     #[serde(default)]
     pub backend: AgentBackend,
+    #[serde(default)]
+    pub machine_name: Option<String>,
     pub created_at: OffsetDateTime,
 }
 
@@ -156,6 +158,7 @@ pub struct AuthenticatedAgent {
     pub owner: Option<UserName>,
     pub grants: Vec<ProjectGrant>,
     pub backend: AgentBackend,
+    pub machine_name: Option<String>,
 }
 
 impl AuthenticatedAgent {
@@ -546,6 +549,7 @@ impl LocalAuthStore {
             owner: Some(token.owner),
             grants,
             backend: token.backend,
+            machine_name: None,
             created_at: OffsetDateTime::now_utc(),
         };
         tokens.push(stored.clone());
@@ -699,6 +703,7 @@ impl LocalAuthStore {
             owner: stored.owner,
             grants: stored.grants,
             backend: stored.backend,
+            machine_name: stored.machine_name,
         })
     }
 
@@ -838,6 +843,7 @@ impl LocalAuthStore {
         display_name: &str,
         backend: AgentBackend,
         grants: Vec<ProjectGrant>,
+        machine_name: Option<&str>,
     ) -> Result<CreatedAgentToken> {
         validate_agent_display_name(display_name)?;
         let slug = slugify_agent_name(display_name);
@@ -857,6 +863,9 @@ impl LocalAuthStore {
             tokens[idx].token_hash = hash_agent_token(&raw_token);
             tokens[idx].backend = backend;
             tokens[idx].display_name = Some(display_name.to_string());
+            if let Some(mn) = machine_name {
+                tokens[idx].machine_name = Some(mn.to_string());
+            }
             tokens[idx].created_at = OffsetDateTime::now_utc();
             let stored = tokens[idx].clone();
             self.save_agent_tokens(&tokens)?;
@@ -875,6 +884,7 @@ impl LocalAuthStore {
             owner: Some(username.clone()),
             grants: sorted_grants,
             backend,
+            machine_name: machine_name.map(|s| s.to_string()),
             created_at: OffsetDateTime::now_utc(),
         };
         tokens.push(stored.clone());

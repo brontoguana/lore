@@ -18,6 +18,10 @@ use pulldown_cmark::{Options, Parser, html};
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 
+// Lucide-style SVG icons for agent controls (14x14)
+const ICON_STOP: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>"#;
+const ICON_RESTART: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>"#;
+
 pub struct PageShell<'a> {
     pub title: &'a str,
     pub username: Option<&'a str>,
@@ -317,6 +321,8 @@ pub struct AgentTokenSummary {
     pub owner: Option<String>,
     pub grants: Vec<ProjectGrant>,
     pub backend: String,
+    pub machine_name: Option<String>,
+    pub process_status: Option<String>,
     pub created_at: time::OffsetDateTime,
 }
 
@@ -1230,6 +1236,14 @@ pub fn render_admin_page(
         </div>
 
         <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>Connected Machines</h2>
+          <p>Signal all connected CLI machines to update on their next poll.</p>
+        </div>
+        <div style="padding:0 var(--s-5) var(--s-5)">
+          <button type="button" id="update-all-machines-btn" data-csrf="{csrf_token}">Update all machines</button>
+        </div>
+
+        <div class="panel-header" style="margin-top:var(--s-5)">
           <h2>Auto Update</h2>
           <p>Configure automatic updates on server restart.</p>
         </div>
@@ -1237,14 +1251,6 @@ pub fn render_admin_page(
           <input type="checkbox" id="auto-update-toggle" data-csrf="{csrf_token}"{auto_update_enabled_checked}>
           <span>Enable automatic server self-update on restart</span>
         </label>
-
-        <div class="panel-header" style="margin-top:var(--s-5)">
-          <h2>Connected Machines</h2>
-          <p>Signal all connected CLI machines to update on their next poll.</p>
-        </div>
-        <div style="padding:0 var(--s-5) var(--s-5)">
-          <button type="button" id="update-all-machines-btn" data-csrf="{csrf_token}">Update all machines</button>
-        </div>
       </section>
 
       <section class="panel" data-panel="audit"{audit_display}>
@@ -1401,6 +1407,27 @@ pub fn render_admin_page(
             headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
             body: 'csrf_token=' + encodeURIComponent(csrf) + '&enabled=' + autoCb.checked
           }});
+        }});
+      }}
+
+      function updateMachine(btn, name) {{
+        var csrf = btn.getAttribute('data-csrf');
+        btn.disabled = true;
+        btn.textContent = 'Queuing\u2026';
+        fetch('/ui/agents/machines/' + encodeURIComponent(name) + '/update-json', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+          body: 'csrf_token=' + encodeURIComponent(csrf)
+        }}).then(function(r) {{ return r.json(); }}).then(function() {{
+          var span = document.createElement('span');
+          span.className = 'hint';
+          span.style.fontSize = '0.8rem';
+          span.textContent = 'Update queued';
+          btn.parentNode.replaceChild(span, btn);
+        }}).catch(function() {{
+          btn.textContent = 'Failed';
+          btn.disabled = false;
+          setTimeout(function() {{ btn.textContent = 'Update'; }}, 3000);
         }});
       }}
 
@@ -1696,7 +1723,7 @@ pub fn render_agents_page(
 
     // Agent list
     let agent_list_html = if agents.is_empty() {
-        r#"<p class="hint padded">No agents yet. Use <code>lore setup</code> and <code>lore agent</code> from the CLI to create one.</p>"#.to_string()
+        r#"<p class="hint padded">No agents yet. Use the Create button on a machine, or run <code>lore agent</code> from the CLI.</p>"#.to_string()
     } else {
         agents
             .iter()
@@ -1709,16 +1736,50 @@ pub fn render_agents_page(
                 } else {
                     format!("{grant_count} projects")
                 };
+                let status_badge = match agent.process_status.as_deref() {
+                    Some("running") => r#"<span class="agent-status-badge running" title="Running">&#x25cf;</span>"#,
+                    Some("stopped") => r#"<span class="agent-status-badge stopped" title="Stopped">&#x25cf;</span>"#,
+                    _ => "",
+                };
+                let machine_controls = if agent.machine_name.is_some() && agent.process_status.is_some() {
+                    let mname = agent.machine_name.as_deref().unwrap_or("");
+                    let is_running = agent.process_status.as_deref() == Some("running");
+                    let stop_btn = if is_running {
+                        format!(
+                            r#"<button type="button" class="agent-ctrl-btn" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('stop', '{}', '{}')" title="Stop">{}</button>"#,
+                            escape_attribute(&agent.name),
+                            escape_attribute(mname),
+                            ICON_STOP,
+                        )
+                    } else { String::new() };
+                    let restart_btn = format!(
+                        r#"<button type="button" class="agent-ctrl-btn" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('restart', '{}', '{}')" title="Restart">{}</button>"#,
+                        escape_attribute(&agent.name),
+                        escape_attribute(mname),
+                        ICON_RESTART,
+                    );
+                    format!(r#"<span class="agent-controls">{stop_btn}{restart_btn}</span>"#)
+                } else {
+                    String::new()
+                };
                 format!(
                     r#"<a href="/ui/agents?selected={}" class="agent-list-item{}">
-                      <span class="agent-list-name">{}</span>
-                      <span class="agent-list-meta">{} &middot; {}</span>
+                      <div style="display:flex; align-items:center; gap:var(--s-2); min-width:0;">
+                        {status_badge}
+                        <div style="min-width:0;">
+                          <span class="agent-list-name">{}</span>
+                          <span class="agent-list-meta">{} &middot; {}</span>
+                        </div>
+                      </div>
+                      {machine_controls}
                     </a>"#,
                     escape_attribute(&agent.name),
                     cls,
                     escape_text(&agent.display_name),
                     escape_text(&grant_label),
                     escape_text(&agent.backend),
+                    status_badge = status_badge,
+                    machine_controls = machine_controls,
                 )
             })
             .collect::<Vec<_>>()
@@ -1737,10 +1798,7 @@ pub fn render_agents_page(
                 let is_outdated = m.cli_version.as_deref().map(|v| v.trim_start_matches('v') != server_version).unwrap_or(true);
                 let update_btn = if is_outdated && !m.pending_update {
                     format!(
-                        r#"<form method="post" action="/ui/agents/machines/{}/update" class="inline-form" style="margin:0;">
-                          <input type="hidden" name="csrf_token" value="{}">
-                          <button type="submit" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Update</button>
-                        </form>"#,
+                        r#"<button type="button" onclick="updateMachine(this, '{}')" data-csrf="{}" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Update</button>"#,
                         escape_attribute(&m.name),
                         escape_attribute(csrf_token),
                     )
@@ -1751,17 +1809,50 @@ pub fn render_agents_page(
                 };
                 let version_class = if is_outdated { r#" style="color:var(--danger)""# } else { "" };
                 format!(
-                    r#"<div class="agent-list-item" style="display:flex; justify-content:space-between; align-items:center; gap:var(--s-2);">
-                      <div style="min-width:0;">
-                        <span class="agent-list-name">{name}</span>
-                        <span class="agent-list-meta"{version_class}>v{version}</span>
+                    r#"<div class="machine-item" data-machine="{name_attr}">
+                      <div class="agent-list-item" style="display:flex; justify-content:space-between; align-items:center; gap:var(--s-2);">
+                        <div style="min-width:0;">
+                          <span class="agent-list-name">{name}</span>
+                          <span class="agent-list-meta"{version_class}>v{version}</span>
+                        </div>
+                        <div style="display:flex; gap:var(--s-2); align-items:center; flex-shrink:0;">
+                          <button type="button" onclick="toggleCreateAgent(this, '{name_attr}')" data-csrf="{csrf}" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Create</button>
+                          {update_btn}
+                          <form method="post" action="/ui/agents/machines/{name_attr}/revoke" class="inline-form" style="margin:0;">
+                            <input type="hidden" name="csrf_token" value="{csrf}">
+                            <button class="danger" type="submit" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Revoke</button>
+                          </form>
+                        </div>
                       </div>
-                      <div style="display:flex; gap:var(--s-2); align-items:center; flex-shrink:0;">
-                        {update_btn}
-                        <form method="post" action="/ui/agents/machines/{name_attr}/revoke" class="inline-form" style="margin:0;">
-                          <input type="hidden" name="csrf_token" value="{csrf}">
-                          <button class="danger" type="submit" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Revoke</button>
-                        </form>
+                      <div class="create-agent-panel" id="create-panel-{name_attr}" style="display:none; padding:var(--s-3); border-top:1px solid var(--line);">
+                        <div style="display:flex; gap:var(--s-3); flex-wrap:wrap; align-items:end;">
+                          <label style="flex:1; min-width:150px;">
+                            <span style="font-size:0.8rem; color:var(--fg-2);">Agent name</span>
+                            <input type="text" id="create-name-{name_attr}" placeholder="my-agent" style="width:100%; margin-top:var(--s-1);">
+                          </label>
+                          <label style="flex:0 0 auto;">
+                            <span style="font-size:0.8rem; color:var(--fg-2);">Backend</span>
+                            <select id="create-backend-{name_attr}" style="margin-top:var(--s-1);">
+                              <option value="claude">Claude</option>
+                              <option value="gemini">Gemini</option>
+                              <option value="codex">Codex</option>
+                            </select>
+                          </label>
+                        </div>
+                        <div style="margin-top:var(--s-3);">
+                          <span style="font-size:0.8rem; color:var(--fg-2);">Working directory</span>
+                          <div id="create-folder-{name_attr}" class="folder-browser" style="margin-top:var(--s-1); border:1px solid var(--line); border-radius:var(--radius); max-height:240px; overflow-y:auto;">
+                            <div class="folder-loading hint" style="padding:var(--s-2);">Loading...</div>
+                          </div>
+                          <div style="display:flex; align-items:center; gap:var(--s-2); margin-top:var(--s-2);">
+                            <input type="text" id="create-path-{name_attr}" style="flex:1; font-size:0.85rem; font-family:var(--font-mono);" readonly>
+                            <button type="button" id="create-mkdir-{name_attr}" onclick="promptMkdir('{name_attr}')" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">New folder</button>
+                          </div>
+                        </div>
+                        <div style="margin-top:var(--s-3); display:flex; gap:var(--s-2);">
+                          <button type="button" onclick="submitCreateAgent('{name_attr}')" style="font-size:0.8rem; padding:var(--s-1) var(--s-3);">Create agent</button>
+                          <span id="create-status-{name_attr}" class="hint" style="font-size:0.8rem; align-self:center;"></span>
+                        </div>
                       </div>
                     </div>"#,
                     name = escape_text(&m.name),
@@ -1937,6 +2028,147 @@ pub fn render_agents_page(
       navigator.clipboard.writeText(el.value).then(function() {{
         var btn = event && event.target && event.target.closest('button');
         if (btn) {{ var orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(function(){{ btn.textContent = orig; }}, 1500); }}
+      }});
+    }}
+
+    function toggleCreateAgent(btn, machine) {{
+      var panel = document.getElementById('create-panel-' + machine);
+      if (!panel) return;
+      if (panel.style.display === 'none') {{
+        panel.style.display = 'block';
+        loadFolder(machine, '~');
+      }} else {{
+        panel.style.display = 'none';
+      }}
+    }}
+
+    function getCsrf(machine) {{
+      var item = document.querySelector('.machine-item[data-machine="' + machine + '"]');
+      if (!item) return '';
+      var btn = item.querySelector('[data-csrf]');
+      return btn ? btn.getAttribute('data-csrf') : '';
+    }}
+
+    function loadFolder(machine, path) {{
+      var browser = document.getElementById('create-folder-' + machine);
+      var pathInput = document.getElementById('create-path-' + machine);
+      if (!browser) return;
+      browser.innerHTML = '<div class="hint" style="padding:var(--s-2);">Loading\u2026</div>';
+      fetch('/ui/agents/machines/' + encodeURIComponent(machine) + '/list-dir', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{ csrf_token: getCsrf(machine), path: path }})
+      }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+        if (data.error) {{
+          browser.innerHTML = '<div class="hint" style="padding:var(--s-2); color:var(--danger);">' + escapeHtml(data.error) + '</div>';
+          return;
+        }}
+        var currentPath = data.path || path;
+        if (pathInput) pathInput.value = currentPath;
+        var html = '';
+        // Parent directory link
+        if (currentPath !== '/') {{
+          var parts = currentPath.replace(/\/+$/, '').split('/');
+          parts.pop();
+          var parent = parts.join('/') || '/';
+          html += '<div class="folder-entry" onclick="loadFolder(\'' + machine + '\', \'' + escapeAttr(parent) + '\')" style="padding:var(--s-1) var(--s-2); cursor:pointer; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:var(--s-2);">';
+          html += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>';
+          html += '<span style="font-family:var(--font-mono); font-size:0.85rem;">..</span></div>';
+        }}
+        var entries = data.entries || [];
+        for (var i = 0; i < entries.length; i++) {{
+          var e = entries[i];
+          if (!e.is_dir) continue;
+          var fullPath = currentPath === '/' ? '/' + e.name : currentPath + '/' + e.name;
+          html += '<div class="folder-entry" onclick="loadFolder(\'' + machine + '\', \'' + escapeAttr(fullPath) + '\')" style="padding:var(--s-1) var(--s-2); cursor:pointer; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:var(--s-2);">';
+          html += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+          html += '<span style="font-family:var(--font-mono); font-size:0.85rem;">' + escapeHtml(e.name) + '</span></div>';
+        }}
+        if (!html) html = '<div class="hint" style="padding:var(--s-2);">Empty directory</div>';
+        browser.innerHTML = html;
+      }}).catch(function(err) {{
+        browser.innerHTML = '<div class="hint" style="padding:var(--s-2); color:var(--danger);">Failed to list directory</div>';
+      }});
+    }}
+
+    function escapeHtml(s) {{
+      var d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }}
+
+    function escapeAttr(s) {{
+      return s.replace(/\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+    }}
+
+    function promptMkdir(machine) {{
+      var pathInput = document.getElementById('create-path-' + machine);
+      var currentPath = pathInput ? pathInput.value : '';
+      var name = prompt('New folder name:');
+      if (!name || !name.trim()) return;
+      name = name.trim();
+      if (name.indexOf('/') !== -1 || name.indexOf('..') !== -1) {{
+        alert('Invalid folder name');
+        return;
+      }}
+      var newPath = currentPath === '/' ? '/' + name : currentPath + '/' + name;
+      // We'll create it when the agent is created. For now just navigate to the typed path.
+      if (pathInput) pathInput.value = newPath;
+      // Also try to load it (will show empty or error, which is fine)
+      loadFolder(machine, newPath);
+    }}
+
+    function agentCommand(action, agentName, machine) {{
+      var btn = event && event.target && event.target.closest('button');
+      if (btn) btn.disabled = true;
+      var csrf = getCsrf(machine);
+      fetch('/ui/agents/machines/' + encodeURIComponent(machine) + '/' + action + '-agent', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{ csrf_token: csrf, agent_name: agentName }})
+      }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+        if (data.error) {{
+          alert(data.error);
+          if (btn) btn.disabled = false;
+        }} else {{
+          setTimeout(function() {{ window.location.reload(); }}, 1000);
+        }}
+      }}).catch(function(err) {{
+        alert('Failed: ' + err);
+        if (btn) btn.disabled = false;
+      }});
+    }}
+
+    function submitCreateAgent(machine) {{
+      var nameInput = document.getElementById('create-name-' + machine);
+      var pathInput = document.getElementById('create-path-' + machine);
+      var backendSelect = document.getElementById('create-backend-' + machine);
+      var statusEl = document.getElementById('create-status-' + machine);
+      var agentName = nameInput ? nameInput.value.trim() : '';
+      var folder = pathInput ? pathInput.value.trim() : '';
+      var backend = backendSelect ? backendSelect.value : 'claude';
+      if (!agentName) {{
+        if (statusEl) {{ statusEl.textContent = 'Enter an agent name'; statusEl.style.color = 'var(--danger)'; }}
+        return;
+      }}
+      if (!folder) {{
+        if (statusEl) {{ statusEl.textContent = 'Select a folder'; statusEl.style.color = 'var(--danger)'; }}
+        return;
+      }}
+      if (statusEl) {{ statusEl.textContent = 'Creating\u2026'; statusEl.style.color = ''; }}
+      fetch('/ui/agents/machines/' + encodeURIComponent(machine) + '/create-agent', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{ csrf_token: getCsrf(machine), agent_name: agentName, folder: folder, backend: backend }})
+      }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+        if (data.error) {{
+          if (statusEl) {{ statusEl.textContent = data.error; statusEl.style.color = 'var(--danger)'; }}
+        }} else {{
+          if (statusEl) {{ statusEl.textContent = 'Agent created!'; statusEl.style.color = 'var(--success, green)'; }}
+          setTimeout(function() {{ window.location.reload(); }}, 1500);
+        }}
+      }}).catch(function(err) {{
+        if (statusEl) {{ statusEl.textContent = 'Failed to create agent'; statusEl.style.color = 'var(--danger)'; }}
       }});
     }}
     </script>"##,
@@ -2266,6 +2498,23 @@ pub fn render_agent_guide_page(
         </div>
         <p class="hint" style="margin-top:var(--s-3);">The agent is automatically provisioned on the server and starts polling for messages. Use the Chat tab to talk to it.</p>
         <p class="hint" style="margin-top:var(--s-2);">Options: <code>--backend gemini</code> or <code>--backend codex</code> to use a different backend (default is Claude).</p>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top: var(--s-5);">
+      <div class="panel-header">
+        <h2>Optional: Start the machine service</h2>
+        <p>The machine service lets you create and manage agents remotely from the Lore web UI.</p>
+      </div>
+      <div class="padded">
+        <div style="display:flex; align-items:stretch; gap:var(--s-2);">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">lore service</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('lore service')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
+        <p class="hint" style="margin-top:var(--s-3);">Once running, use the Create button next to machines on the Agents tab to create agents remotely and browse folders on the machine.</p>
+        <p class="hint" style="margin-top:var(--s-2);">Use <code>--fg</code> to run in the foreground instead of daemonizing.</p>
       </div>
     </section>
 
@@ -5854,9 +6103,43 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-size: 0.9rem;
     }
 
+    .folder-entry:hover {
+      background: var(--bg-hover);
+    }
+    .folder-entry:last-child {
+      border-bottom: none !important;
+    }
+
     .agent-list-meta {
       font-size: 0.82rem;
       color: var(--fg-muted);
+    }
+
+    .agent-status-badge {
+      font-size: 0.7rem;
+      flex-shrink: 0;
+    }
+    .agent-status-badge.running { color: var(--success, #22c55e); }
+    .agent-status-badge.stopped { color: var(--fg-muted); }
+
+    .agent-controls {
+      display: flex;
+      gap: var(--s-1);
+      flex-shrink: 0;
+    }
+    .agent-ctrl-btn {
+      background: none;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 2px 4px;
+      cursor: pointer;
+      color: var(--fg-muted);
+      display: flex;
+      align-items: center;
+    }
+    .agent-ctrl-btn:hover {
+      background: var(--bg-hover);
+      color: var(--fg);
     }
 
     .user-list {
@@ -6059,6 +6342,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .chat-back-btn {
       display: none;
+      align-items: center;
+      justify-content: center;
       background: none;
       border: none;
       color: var(--fg);
@@ -6241,13 +6526,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .chat-input {
       flex: 1;
+      min-width: 0;
       padding: var(--s-3);
       border: 1px solid var(--line);
       border-radius: 6px;
       background: var(--bg);
       color: var(--fg);
       font-family: var(--font-sans);
-      font-size: 0.92rem;
+      font-size: 1rem;
       resize: none;
       min-height: 38px;
       max-height: 120px;
@@ -6258,7 +6544,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border: none;
       border-radius: 6px;
       width: 38px;
-      height: 38px;
       min-width: 38px;
       padding: 0;
       cursor: pointer;
@@ -6266,6 +6551,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       align-items: center;
       justify-content: center;
       flex-shrink: 0;
+      align-self: stretch;
     }
     .chat-send-btn:hover { opacity: 0.85; }
     .chat-empty {

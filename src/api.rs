@@ -74,6 +74,14 @@ const AGENT_AUTH_RATE_LIMIT_ATTEMPTS: usize = 20;
 const AGENT_AUTH_RATE_LIMIT_WINDOW_SECS: i64 = 60;
 const GLOBAL_LIBRARIAN_RATE_LIMIT: usize = 30;
 const GLOBAL_LIBRARIAN_RATE_LIMIT_WINDOW_SECS: i64 = 60;
+const MACHINE_COMMAND_TIMEOUT_SECS: u64 = 15;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MachineCommand {
+    id: String,
+    command_type: String,
+    params: Value,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -103,6 +111,11 @@ pub struct AppState {
     chat: Arc<ChatStore>,
     chat_senders: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ChatEvent>>>>,
     chat_agent_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    machine_commands: Arc<Mutex<HashMap<String, Vec<MachineCommand>>>>,
+    machine_command_results: Arc<Mutex<HashMap<String, Value>>>,
+    machine_poll_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    machine_result_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    machine_agent_statuses: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +179,11 @@ impl AppState {
             chat: Arc::new(ChatStore::new(chat_root)),
             chat_senders: Arc::new(Mutex::new(HashMap::new())),
             chat_agent_notifiers: Arc::new(Mutex::new(HashMap::new())),
+            machine_commands: Arc::new(Mutex::new(HashMap::new())),
+            machine_command_results: Arc::new(Mutex::new(HashMap::new())),
+            machine_poll_notifiers: Arc::new(Mutex::new(HashMap::new())),
+            machine_result_notifiers: Arc::new(Mutex::new(HashMap::new())),
+            machine_agent_statuses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -255,6 +273,11 @@ fn build_app_with_librarian(
         .route("/v1/projects", get(list_projects))
         .route("/v1/context", get(get_all_agent_context))
         .route("/v1/machines/register", post(register_machine))
+        .route("/v1/machines/poll", post(machine_service_poll))
+        .route(
+            "/v1/machines/command/{id}/result",
+            post(machine_command_result),
+        )
         .route("/v1/agents/provision", post(provision_agent_with_body))
         .route("/v1/chat/poll", get(chat_agent_poll))
         .route("/v1/chat/respond", post(chat_agent_respond))
@@ -392,6 +415,26 @@ fn build_app_with_librarian(
         .route(
             "/ui/admin/update-all-machines-json",
             post(update_all_machines_json),
+        )
+        .route(
+            "/ui/agents/machines/{name}/update-json",
+            post(update_machine_json),
+        )
+        .route(
+            "/ui/agents/machines/{name}/list-dir",
+            post(machine_list_dir_json),
+        )
+        .route(
+            "/ui/agents/machines/{name}/create-agent",
+            post(machine_create_agent_json),
+        )
+        .route(
+            "/ui/agents/machines/{name}/stop-agent",
+            post(machine_stop_agent_json),
+        )
+        .route(
+            "/ui/agents/machines/{name}/restart-agent",
+            post(machine_restart_agent_json),
         )
         .route(
             "/ui/chat/{agent}/profile-pic",
@@ -2669,7 +2712,7 @@ async fn agents_page(
 ) -> UiResult<Html<String>> {
     let session = require_ui_session(&state, &headers)?;
     let config = state.config.load()?;
-    let agents: Vec<AgentTokenSummary> = state
+    let mut agents: Vec<AgentTokenSummary> = state
         .auth
         .list_agent_tokens_for_user(&session.user.username)?
         .into_iter()
@@ -2678,6 +2721,24 @@ async fn agents_page(
     let machines = state
         .auth
         .list_machines_for_user(&session.user.username)?;
+
+    // Enrich agents with process status from machine service reports
+    {
+        let statuses = state.machine_agent_statuses.lock().unwrap();
+        for agent in &mut agents {
+            if let Some(ref mname) = agent.machine_name {
+                let machine_key = format!("{}_{}", session.user.username, mname);
+                if let Some(agent_list) = statuses.get(&machine_key) {
+                    for a in agent_list {
+                        if a["name"].as_str() == Some(&agent.name) {
+                            agent.process_status = a["status"].as_str().map(|s| s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let user_projects = build_user_project_access(&state, &session.user)?;
     Ok(Html(render_agents_page(
         &config,
@@ -4835,6 +4896,8 @@ fn agent_token_summary(token: StoredAgentToken) -> AgentTokenSummary {
         owner: token.owner.map(|u| u.as_str().to_string()),
         grants: token.grants,
         backend: token.backend.to_string(),
+        machine_name: token.machine_name,
+        process_status: None,
         created_at: token.created_at,
     }
 }
@@ -7776,7 +7839,8 @@ async fn chat_agent_poll(
 
     // Track CLI version and machine name for update signaling
     let cli_version = headers.get("x-lore-version").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    let machine_name = headers.get("x-lore-machine").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let machine_name = headers.get("x-lore-machine").and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+        .or_else(|| agent.machine_name.clone());
     if let (Some(mname), Some(ver)) = (&machine_name, &cli_version) {
         let _ = state.auth.update_machine_version(mname, owner, ver);
     }
@@ -8087,7 +8151,7 @@ async fn chat_slash_command(
 
     let response_text = match cmd.as_str() {
         "/help" => {
-            "STATUS\n  /help -- show this message\n  /status -- show current config\n  /context -- show summary, pins, window\n  /report -- status of all your agents\n\nCONTEXT\n  /pin <text> -- pin context that survives compaction\n  /pins -- list all pins\n  /unpin <id> -- remove a pin\n  /window <n> -- set conversation window size\n  /compact -- force context compaction\n  /forget -- clear all context and restart\n\nMODEL\n  /model <name> -- switch model\n  /effort <level> -- low/medium/high/max/default\n\nAGENT\n  /stop -- cancel current request\n  /restart -- restart the agent\n  /rename <name> -- change agent display name\n  /profile <url> -- set agent profile picture\n  /btw <message> -- inject a side message\n  /auto [message] -- repeat message after each response (no args to clear)\n  /boop -- ping the agent\n  /hi -- say hello".to_string()
+            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /context -- show summary, pins, window\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- pin context that survives compaction\n    /pins -- list all pins\n    /unpin <id> -- remove a pin\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /forget -- clear all context and restart\n\n  MODEL\n    /model <name> -- switch model\n    /effort <level> -- low/medium/high/max/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- inject a side message\n    /auto [message] -- repeat after each response (no args to clear)\n    /boop -- ping the agent\n    /hi -- say hello".to_string()
         }
         "/status" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
@@ -8521,6 +8585,7 @@ async fn provision_agent_with_body(
         &req.name,
         backend,
         grants,
+        Some(&machine.machine_name),
     )?;
     append_audit_event(
         &state,
@@ -8609,6 +8674,292 @@ async fn update_machine_from_ui(
     verify_csrf(&session, &form.csrf_token)?;
     state.auth.set_machine_pending_update(&name, &session.user.username, true)?;
     Ok(Redirect::to("/ui/agents?flash=Update%20queued%20—%20machine%20will%20update%20on%20next%20poll").into_response())
+}
+
+async fn update_machine_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    state.auth.set_machine_pending_update(&name, &session.user.username, true)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// --- Machine service poll/command infrastructure ---
+
+#[derive(Deserialize, Default)]
+struct MachinePollBody {
+    #[serde(default)]
+    agent_statuses: Option<Vec<Value>>,
+}
+
+async fn machine_service_poll(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<MachinePollBody>>,
+) -> Result<Json<Value>, ApiError> {
+    let machine_token = headers
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let machine = state.auth.authenticate_machine_token(machine_token)?;
+    let machine_key = format!("{}_{}", machine.user.username, machine.machine_name);
+
+    // Report CLI version
+    if let Some(version) = headers.get("x-lore-version").and_then(|v| v.to_str().ok()) {
+        let _ = state.auth.update_machine_version(&machine.machine_name, &machine.user.username, version);
+    }
+
+    // Store agent process statuses reported by the service
+    if let Some(Json(ref poll_body)) = body {
+        if let Some(ref statuses) = poll_body.agent_statuses {
+            let mut agent_statuses = state.machine_agent_statuses.lock().unwrap();
+            agent_statuses.insert(machine_key.clone(), statuses.clone());
+        }
+    }
+
+    // Check if machine should self-update
+    let server_version = env!("CARGO_PKG_VERSION");
+    let update_to = state.auth.get_machine(&machine.machine_name, &machine.user.username)
+        .ok()
+        .flatten()
+        .and_then(|m| if m.pending_update { Some(server_version.to_string()) } else { None });
+
+    let build_response = |commands: Vec<MachineCommand>| -> Json<Value> {
+        let mut resp = json!({ "commands": commands });
+        if let Some(ref ver) = update_to {
+            resp["update_to"] = json!(ver);
+        }
+        Json(resp)
+    };
+
+    // Check for pending commands
+    {
+        let mut cmds = state.machine_commands.lock().unwrap();
+        if let Some(pending) = cmds.get_mut(&machine_key) {
+            if !pending.is_empty() {
+                let batch: Vec<MachineCommand> = pending.drain(..).collect();
+                return Ok(build_response(batch));
+            }
+        }
+    }
+
+    // No commands — long-poll up to 30s
+    let notify = {
+        let mut notifiers = state.machine_poll_notifiers.lock().unwrap();
+        notifiers
+            .entry(machine_key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
+    };
+
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        notify.notified(),
+    )
+    .await;
+
+    // Re-check after waking
+    let mut cmds = state.machine_commands.lock().unwrap();
+    if let Some(pending) = cmds.get_mut(&machine_key) {
+        if !pending.is_empty() {
+            let batch: Vec<MachineCommand> = pending.drain(..).collect();
+            return Ok(build_response(batch));
+        }
+    }
+
+    Ok(build_response(vec![]))
+}
+
+#[derive(Deserialize)]
+struct MachineCommandResultBody {
+    data: Value,
+}
+
+async fn machine_command_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(command_id): Path<String>,
+    Json(body): Json<MachineCommandResultBody>,
+) -> Result<Json<Value>, ApiError> {
+    let machine_token = headers
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let _machine = state.auth.authenticate_machine_token(machine_token)?;
+
+    // Store result and notify waiting handler
+    {
+        let mut results = state.machine_command_results.lock().unwrap();
+        results.insert(command_id.clone(), body.data);
+    }
+    {
+        let notifiers = state.machine_result_notifiers.lock().unwrap();
+        if let Some(notify) = notifiers.get(&command_id) {
+            notify.notify_one();
+        }
+    }
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Queue a command for a machine and wait for the result (long-poll).
+async fn queue_machine_command_and_wait(
+    state: &AppState,
+    machine_key: &str,
+    command_type: &str,
+    params: Value,
+) -> std::result::Result<Value, LoreError> {
+    let command_id = Uuid::new_v4().to_string();
+    let cmd = MachineCommand {
+        id: command_id.clone(),
+        command_type: command_type.to_string(),
+        params,
+    };
+
+    // Set up the result notifier before queuing (avoid race)
+    let notify = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut notifiers = state.machine_result_notifiers.lock().unwrap();
+        notifiers.insert(command_id.clone(), notify.clone());
+    }
+
+    // Queue the command
+    {
+        let mut cmds = state.machine_commands.lock().unwrap();
+        cmds.entry(machine_key.to_string()).or_default().push(cmd);
+    }
+
+    // Wake the machine's poll
+    {
+        let notifiers = state.machine_poll_notifiers.lock().unwrap();
+        if let Some(mn) = notifiers.get(machine_key) {
+            mn.notify_one();
+        }
+    }
+
+    // Wait for result
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(MACHINE_COMMAND_TIMEOUT_SECS),
+        notify.notified(),
+    )
+    .await;
+
+    // Clean up notifier
+    {
+        let mut notifiers = state.machine_result_notifiers.lock().unwrap();
+        notifiers.remove(&command_id);
+    }
+
+    if result.is_err() {
+        return Err(LoreError::Validation(
+            "machine did not respond in time — is the Lore service running?".into(),
+        ));
+    }
+
+    // Retrieve and remove the result
+    let data = {
+        let mut results = state.machine_command_results.lock().unwrap();
+        results.remove(&command_id)
+    };
+
+    data.ok_or_else(|| LoreError::Validation("no result from machine".into()))
+}
+
+#[derive(Deserialize)]
+struct MachineListDirRequest {
+    csrf_token: String,
+    path: Option<String>,
+}
+
+async fn machine_list_dir_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(machine_name): Path<String>,
+    Json(req): Json<MachineListDirRequest>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &req.csrf_token)?;
+    let machine_key = format!("{}_{}", session.user.username, machine_name);
+
+    let params = json!({ "path": req.path });
+    match queue_machine_command_and_wait(&state, &machine_key, "list_dir", params).await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct MachineCreateAgentRequest {
+    csrf_token: String,
+    agent_name: String,
+    folder: String,
+    backend: Option<String>,
+}
+
+async fn machine_create_agent_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(machine_name): Path<String>,
+    Json(req): Json<MachineCreateAgentRequest>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &req.csrf_token)?;
+    let machine_key = format!("{}_{}", session.user.username, machine_name);
+
+    let backend = req.backend.as_deref().unwrap_or("claude");
+    let params = json!({
+        "agent_name": req.agent_name,
+        "folder": req.folder,
+        "backend": backend,
+    });
+    match queue_machine_command_and_wait(&state, &machine_key, "create_agent", params).await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct MachineAgentCommandRequest {
+    csrf_token: String,
+    agent_name: String,
+}
+
+async fn machine_stop_agent_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(machine_name): Path<String>,
+    Json(req): Json<MachineAgentCommandRequest>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &req.csrf_token)?;
+    let machine_key = format!("{}_{}", session.user.username, machine_name);
+
+    let params = json!({ "agent_name": req.agent_name });
+    match queue_machine_command_and_wait(&state, &machine_key, "stop_agent", params).await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+async fn machine_restart_agent_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(machine_name): Path<String>,
+    Json(req): Json<MachineAgentCommandRequest>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &req.csrf_token)?;
+    let machine_key = format!("{}_{}", session.user.username, machine_name);
+
+    let params = json!({ "agent_name": req.agent_name });
+    match queue_machine_command_and_wait(&state, &machine_key, "restart_agent", params).await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+    }
 }
 
 #[cfg(test)]

@@ -80,6 +80,8 @@ enum Command {
     Setup(SetupArgs),
     /// Run an agent daemon
     Agent(AgentArgs),
+    /// Run the machine service daemon (manages agents, responds to server commands)
+    Service(ServiceArgs),
 }
 
 #[derive(Subcommand)]
@@ -286,6 +288,13 @@ struct AgentArgs {
     /// Override the backend (claude, gemini, codex). If not set, uses server config.
     #[arg(long)]
     backend: Option<String>,
+}
+
+#[derive(Args)]
+struct ServiceArgs {
+    /// Run in foreground (don't daemonize)
+    #[arg(long)]
+    fg: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -540,10 +549,50 @@ async fn run() -> CliResult<()> {
                 .ok_or("server did not return a token")?
                 .to_string();
             config.url = Some(url.clone());
-            config.token = Some(token);
+            config.token = Some(token.clone());
             config.machine_name = Some(machine_name.clone());
             save_cli_config(&config)?;
             println!("Registered machine \"{}\" on {}", machine_name, url);
+
+            // Auto-start the machine service daemon
+            println!("Starting machine service...");
+            let exe = env::current_exe()?;
+            let lore_dir = env::var("HOME").map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("lore-service");
+            fs::create_dir_all(&lore_dir)?;
+            let log_path = lore_dir.join("service.log");
+            let pid_path = lore_dir.join("service.pid");
+
+            // Kill existing service if running
+            if pid_path.exists() {
+                if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        if is_process_running(pid) {
+                            kill_process(pid);
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+                let _ = fs::remove_file(&pid_path);
+            }
+
+            let log_file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?;
+            let child = std::process::Command::new(&exe)
+                .args(["--url", &url, "--token", &token, "service", "--fg"])
+                .env(LORE_SERVICE_DAEMON_ENV, "1")
+                .stdout(log_file.try_clone()?)
+                .stderr(log_file)
+                .stdin(std::process::Stdio::null())
+                .spawn()?;
+            let pid = child.id();
+            fs::write(&pid_path, pid.to_string())?;
+            println!("Service started (pid {})", pid);
+            println!("  Log: {}", log_path.display());
+
             return Ok(());
         }
         _ => {}
@@ -564,6 +613,7 @@ async fn run() -> CliResult<()> {
         Command::Librarian { command } => librarian_command(&context, command).await?,
         Command::History { command } => history_command(&context, command).await?,
         Command::Agent(args) => agent_command(&context, args).await?,
+        Command::Service(args) => service_command(&context, args).await?,
         Command::Config { .. } | Command::SelfUpdate { .. } | Command::Setup(_) => {}
     }
     Ok(())
@@ -1377,6 +1427,34 @@ fn format_time(value: OffsetDateTime) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
+fn format_relative_time(timestamp_str: &str, now: OffsetDateTime) -> String {
+    let parsed = time::OffsetDateTime::parse(
+        timestamp_str,
+        &time::format_description::well_known::Rfc3339,
+    );
+    match parsed {
+        Ok(ts) => {
+            let diff = now - ts;
+            let secs = diff.whole_seconds();
+            if secs < 0 {
+                "just now".to_string()
+            } else if secs < 60 {
+                "just now".to_string()
+            } else if secs < 3600 {
+                let mins = secs / 60;
+                if mins == 1 { "1 min ago".to_string() } else { format!("{mins} mins ago") }
+            } else if secs < 86400 {
+                let hours = secs / 3600;
+                if hours == 1 { "1 hour ago".to_string() } else { format!("{hours} hours ago") }
+            } else {
+                let days = secs / 86400;
+                if days == 1 { "1 day ago".to_string() } else { format!("{days} days ago") }
+            }
+        }
+        Err(_) => "unknown time".to_string(),
+    }
+}
+
 fn one_line_preview(value: &str, max_chars: usize) -> String {
     let trimmed = value.lines().next().unwrap_or("").trim();
     truncate_chars(trimmed, max_chars)
@@ -1797,7 +1875,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, backend:
         .error_for_status()?;
     let history: serde_json::Value = history_resp.json().await?;
 
-    // Build the prompt: summary + pins + recent messages + new message
+    // Build rich prompt with system context, git info, conversation history
     let summary = history["summary"].as_str().unwrap_or("");
     let window_size = history["window_size"].as_u64().unwrap_or(22) as usize;
     let hist_messages = history["messages"].as_array();
@@ -1805,11 +1883,106 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, backend:
 
     let mut prompt_parts: Vec<String> = Vec::new();
 
-    if !summary.is_empty() {
-        prompt_parts.push(format!("## Conversation Summary\n\n{summary}"));
+    // Current date/time
+    let now = time::OffsetDateTime::now_utc();
+    let weekday = match now.weekday() {
+        time::Weekday::Monday => "Monday",
+        time::Weekday::Tuesday => "Tuesday",
+        time::Weekday::Wednesday => "Wednesday",
+        time::Weekday::Thursday => "Thursday",
+        time::Weekday::Friday => "Friday",
+        time::Weekday::Saturday => "Saturday",
+        time::Weekday::Sunday => "Sunday",
+    };
+    let month = match now.month() {
+        time::Month::January => "January",
+        time::Month::February => "February",
+        time::Month::March => "March",
+        time::Month::April => "April",
+        time::Month::May => "May",
+        time::Month::June => "June",
+        time::Month::July => "July",
+        time::Month::August => "August",
+        time::Month::September => "September",
+        time::Month::October => "October",
+        time::Month::November => "November",
+        time::Month::December => "December",
+    };
+    prompt_parts.push(format!(
+        "Current date and time: {weekday}, {month} {}, {} at {:02}:{:02} UTC",
+        now.day(), now.year(), now.hour(), now.minute()
+    ));
+
+    // Git repository context (gathered locally from the agent's working directory)
+    let mut git_section = String::new();
+    // Get the repo root directory name
+    let repo_name = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            std::path::Path::new(&s).file_name().map(|n| n.to_string_lossy().into_owned())
+        });
+    if let Some(ref repo) = repo_name {
+        let branch_display = git_branch.as_deref().unwrap_or("unknown");
+        git_section.push_str(&format!("## Git Repository\n\n{repo}/ (branch: {branch_display})\n"));
+
+        // Last commit
+        if let Some(last_commit) = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%h %s"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            git_section.push_str(&format!("  Last commit: {last_commit}\n"));
+        }
+
+        // Git status (modified/untracked files)
+        if let Some(status_output) = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            git_section.push_str("  Status:\n");
+            for line in status_output.lines().take(20) {
+                git_section.push_str(&format!("    {line}\n"));
+            }
+            let total = status_output.lines().count();
+            if total > 20 {
+                git_section.push_str(&format!("    ... and {} more files\n", total - 20));
+            }
+        }
+
+        // Recent commits (last 3)
+        if let Some(log_output) = std::process::Command::new("git")
+            .args(["log", "--oneline", "-3"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            git_section.push_str("  Recent commits:\n");
+            for line in log_output.lines() {
+                git_section.push_str(&format!("    {line}\n"));
+            }
+        }
+    }
+    if !git_section.is_empty() {
+        prompt_parts.push(git_section);
     }
 
-    // Include pinned context
+    // Working directory
+    prompt_parts.push(format!("## Working Directory\n\n{cwd}"));
+
+    // Pinned context
     if let Some(pins) = pins {
         if !pins.is_empty() {
             let mut pin_section = "## Pinned Context\n".to_string();
@@ -1822,20 +1995,28 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, backend:
         }
     }
 
+    // Conversation summary
+    if !summary.is_empty() {
+        prompt_parts.push(format!("## Conversation Summary\n\n{summary}"));
+    }
+
+    // Previous conversation with relative timestamps
     if let Some(msgs) = hist_messages {
-        // Take last window_size messages for context
         let start = msgs.len().saturating_sub(window_size);
         let recent = &msgs[start..];
         if !recent.is_empty() {
-            prompt_parts.push("## Previous Conversation\nThe following is recent conversation history.\n".to_string());
+            prompt_parts.push("## Previous Conversation\nThe following is recent conversation history. This is context only \u{2014} do not respond to these messages. Only respond to the new message the user sends.\n".to_string());
             for msg in recent {
                 let role = msg["role"].as_str().unwrap_or("user");
                 let content = msg["content"].as_str().unwrap_or("");
+                let timestamp = msg["timestamp"].as_str().unwrap_or("");
+                let time_label = format_relative_time(timestamp, now);
+                let role_label = if role == "user" { "User" } else { "You" };
                 if role == "user" {
-                    prompt_parts.push(format!("User: {content}"));
+                    prompt_parts.push(format!("\u{2500}\u{2500}\u{2500} {role_label} ({time_label}) \u{2500}\u{2500}\u{2500}\n{content}"));
                 } else {
                     let truncated: String = content.chars().take(4000).collect();
-                    prompt_parts.push(format!("Assistant: {truncated}"));
+                    prompt_parts.push(format!("\u{2500}\u{2500}\u{2500} {role_label} ({time_label}) \u{2500}\u{2500}\u{2500}\n{truncated}"));
                 }
             }
         }
@@ -2240,4 +2421,642 @@ async fn run_compaction(backend: AgentBackend, prompt: &str) -> CliResult<String
             Err("OpenAI backend is not yet implemented".into())
         }
     }
+}
+
+// --- Machine service daemon ---
+
+const LORE_SERVICE_DAEMON_ENV: &str = "LORE_SERVICE_DAEMON";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedAgent {
+    name: String,
+    pid: u32,
+    folder: String,
+    backend: String,
+    token: String,
+}
+
+struct ServiceState {
+    agents: Vec<ManagedAgent>,
+    state_dir: PathBuf,
+}
+
+impl ServiceState {
+    fn load(state_dir: &Path) -> Self {
+        let agents_file = state_dir.join("agents.json");
+        let agents = if agents_file.exists() {
+            fs::read(&agents_file)
+                .ok()
+                .and_then(|data| serde_json::from_slice(&data).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Self { agents, state_dir: state_dir.to_path_buf() }
+    }
+
+    fn save(&self) {
+        let _ = fs::create_dir_all(&self.state_dir);
+        let _ = fs::write(
+            self.state_dir.join("agents.json"),
+            serde_json::to_vec_pretty(&self.agents).unwrap_or_default(),
+        );
+    }
+
+    fn check_agents(&mut self) {
+        for agent in &mut self.agents {
+            if agent.pid != 0 && !is_process_running(agent.pid) {
+                eprintln!("[service] Agent '{}' (pid {}) is no longer running", agent.name, agent.pid);
+                agent.pid = 0;
+            }
+        }
+    }
+
+    fn restart_crashed_agents(&mut self, context: &CliContext) {
+        for agent in &mut self.agents {
+            if agent.pid == 0 {
+                match spawn_agent_process(context, agent) {
+                    Ok(pid) => {
+                        eprintln!("[service] Restarted agent '{}' (pid {})", agent.name, pid);
+                        agent.pid = pid;
+                    }
+                    Err(e) => {
+                        eprintln!("[service] Failed to restart agent '{}': {e}", agent.name);
+                    }
+                }
+            }
+        }
+        self.save();
+    }
+
+    fn agent_statuses(&self) -> Vec<serde_json::Value> {
+        self.agents.iter().map(|a| {
+            let status = if a.pid != 0 && is_process_running(a.pid) { "running" } else { "stopped" };
+            serde_json::json!({
+                "name": a.name,
+                "pid": a.pid,
+                "status": status,
+                "folder": a.folder,
+            })
+        }).collect()
+    }
+
+    fn stop_agent(&mut self, name: &str) -> serde_json::Value {
+        if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
+            if agent.pid != 0 && is_process_running(agent.pid) {
+                eprintln!("[service] Stopping agent '{}' (pid {})", name, agent.pid);
+                kill_process(agent.pid);
+                agent.pid = 0;
+                self.save();
+                serde_json::json!({ "ok": true, "agent_name": name })
+            } else {
+                agent.pid = 0;
+                self.save();
+                serde_json::json!({ "ok": true, "agent_name": name, "note": "agent was not running" })
+            }
+        } else {
+            serde_json::json!({ "error": format!("agent '{}' not managed by this service", name) })
+        }
+    }
+
+    fn restart_agent(&mut self, context: &CliContext, name: &str) -> serde_json::Value {
+        if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
+            // Stop if running
+            if agent.pid != 0 && is_process_running(agent.pid) {
+                kill_process(agent.pid);
+                // Brief wait for process to exit
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            // Restart
+            match spawn_agent_process(context, agent) {
+                Ok(pid) => {
+                    eprintln!("[service] Restarted agent '{}' (pid {})", name, pid);
+                    agent.pid = pid;
+                    self.save();
+                    serde_json::json!({ "ok": true, "agent_name": name, "pid": pid })
+                }
+                Err(e) => {
+                    agent.pid = 0;
+                    self.save();
+                    serde_json::json!({ "error": format!("restart failed: {e}") })
+                }
+            }
+        } else {
+            serde_json::json!({ "error": format!("agent '{}' not managed by this service", name) })
+        }
+    }
+
+    fn stop_all_agents(&mut self) {
+        for agent in &mut self.agents {
+            if agent.pid != 0 && is_process_running(agent.pid) {
+                eprintln!("[service] Stopping agent '{}' (pid {})", agent.name, agent.pid);
+                kill_process(agent.pid);
+                agent.pid = 0;
+            }
+        }
+        self.save();
+    }
+}
+
+fn spawn_agent_process(context: &CliContext, agent: &ManagedAgent) -> CliResult<u32> {
+    let exe = env::current_exe()?;
+    let lore_dir = PathBuf::from(&agent.folder).join(format!(".lore/{}", agent.name));
+    fs::create_dir_all(&lore_dir)?;
+
+    let log_path = lore_dir.join("lore.log");
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    let child = std::process::Command::new(&exe)
+        .current_dir(&agent.folder)
+        .args([
+            "--url", &context.url,
+            "--token", &agent.token,
+            "agent", &agent.name,
+            "--backend", &agent.backend,
+        ])
+        .env(LORE_DAEMON_ENV, "1")
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .stdin(std::process::Stdio::null())
+        .spawn()?;
+
+    let pid = child.id();
+    fs::write(lore_dir.join("lore.pid"), pid.to_string())?;
+    Ok(pid)
+}
+
+/// Migrate old-style standalone `lore agent` processes into the service's managed agents.
+/// Scans /proc for running `lore ... agent <name>` processes, adopts them (gets cwd, backend),
+/// kills them, and adds them to agents.json so the service can re-spawn them under supervision.
+fn migrate_old_agents(_context: &CliContext, svc_state: &mut ServiceState) {
+    let config = match load_cli_config() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    if config.agent_tokens.is_empty() {
+        return;
+    }
+
+    eprintln!("[service] Checking for old-style agents to migrate...");
+    let my_pid = std::process::id();
+
+    for (agent_name, agent_token) in &config.agent_tokens {
+        // Find a running process for this agent by scanning /proc
+        let found = find_old_agent_process(agent_name, my_pid);
+
+        let (folder, backend, old_pid) = match found {
+            Some(info) => info,
+            None => {
+                // Agent isn't running, but we know about it from config.
+                // Use HOME as default folder, claude as default backend.
+                let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                eprintln!(
+                    "[service] Agent '{}' not running, importing with folder={}",
+                    agent_name, home
+                );
+                (home, "claude".to_string(), None)
+            }
+        };
+
+        // Kill the old process if running
+        if let Some(pid) = old_pid {
+            eprintln!(
+                "[service] Killing old-style agent '{}' (pid {})",
+                agent_name, pid
+            );
+            kill_process(pid);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+
+        // Add to managed agents
+        let managed = ManagedAgent {
+            name: agent_name.clone(),
+            pid: 0, // will be spawned by restart_crashed_agents
+            folder,
+            backend,
+            token: agent_token.clone(),
+        };
+        svc_state.agents.push(managed);
+        eprintln!("[service] Migrated agent '{}'", agent_name);
+    }
+
+    svc_state.save();
+}
+
+/// Scan /proc for a running `lore ... agent <name>` process.
+/// Returns (cwd, backend, pid) if found.
+fn find_old_agent_process(agent_name: &str, exclude_pid: u32) -> Option<(String, String, Option<u32>)> {
+    #[cfg(target_os = "linux")]
+    {
+        let proc_dir = match fs::read_dir("/proc") {
+            Ok(d) => d,
+            Err(_) => return None,
+        };
+
+        for entry in proc_dir.flatten() {
+            let pid_str = entry.file_name().to_string_lossy().into_owned();
+            let pid: u32 = match pid_str.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if pid == exclude_pid || pid == std::process::id() {
+                continue;
+            }
+
+            // Read cmdline
+            let cmdline_path = format!("/proc/{}/cmdline", pid);
+            let cmdline = match fs::read(&cmdline_path) {
+                Ok(data) => data,
+                Err(_) => continue,
+            };
+
+            let args: Vec<String> = cmdline
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+
+            // Look for: ... lore ... agent <name>
+            let has_lore = args.first().map(|a| a.contains("lore")).unwrap_or(false);
+            let agent_idx = args.iter().position(|a| a == "agent");
+            let matches = has_lore
+                && agent_idx
+                    .and_then(|i| args.get(i + 1))
+                    .map(|n| n == agent_name)
+                    .unwrap_or(false);
+
+            if !matches {
+                continue;
+            }
+
+            // Get cwd
+            let cwd_link = format!("/proc/{}/cwd", pid);
+            let cwd = fs::read_link(&cwd_link)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| {
+                    env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
+                });
+
+            // Parse backend from args (--backend <value>)
+            let backend = args
+                .iter()
+                .position(|a| a == "--backend")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+                .unwrap_or_else(|| "claude".to_string());
+
+            return Some((cwd, backend, Some(pid)));
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (agent_name, exclude_pid);
+        None
+    }
+}
+
+async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<()> {
+    let is_daemon = env::var(LORE_SERVICE_DAEMON_ENV).unwrap_or_default() == "1";
+    let machine_token = context.token.as_deref().ok_or(
+        "no machine token configured. Run 'lore setup <url>' first.",
+    )?;
+
+    if !args.fg && !is_daemon {
+        // Daemonize
+        let lore_dir = env::var("HOME").map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("lore-service");
+        fs::create_dir_all(&lore_dir)?;
+        let log_path = lore_dir.join("service.log");
+        let pid_path = lore_dir.join("service.pid");
+
+        // Kill existing service if running
+        if pid_path.exists() {
+            if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    if is_process_running(pid) {
+                        eprintln!("Stopping existing service (pid {})", pid);
+                        kill_process(pid);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+            let _ = fs::remove_file(&pid_path);
+        }
+
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let exe = env::current_exe()?;
+        let child = std::process::Command::new(&exe)
+            .args(["--url", &context.url, "--token", machine_token, "service", "--fg"])
+            .env(LORE_SERVICE_DAEMON_ENV, "1")
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file)
+            .stdin(std::process::Stdio::null())
+            .spawn()?;
+        let pid = child.id();
+        fs::write(&pid_path, pid.to_string())?;
+        println!("Lore service started (pid {})", pid);
+        println!("  Log: {}", log_path.display());
+        return Ok(());
+    }
+
+    // Write PID file for daemon mode
+    let lore_dir = env::var("HOME").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("lore-service");
+    fs::create_dir_all(&lore_dir)?;
+    if is_daemon {
+        fs::write(lore_dir.join("service.pid"), std::process::id().to_string())?;
+    }
+
+    eprintln!("[service] Machine service starting (version {})", env!("CARGO_PKG_VERSION"));
+
+    // Load managed agents state
+    let mut svc_state = ServiceState::load(&lore_dir);
+
+    // Migrate old-style standalone agents if this is the first service run
+    if svc_state.agents.is_empty() {
+        migrate_old_agents(context, &mut svc_state);
+    }
+
+    eprintln!("[service] Loaded {} managed agent(s)", svc_state.agents.len());
+
+    // Check and restart any crashed agents on startup
+    svc_state.check_agents();
+    svc_state.restart_crashed_agents(context);
+
+    loop {
+        // Check agent health before each poll
+        svc_state.check_agents();
+        svc_state.restart_crashed_agents(context);
+
+        match service_poll_and_execute(context, machine_token, &mut svc_state).await {
+            Ok(should_update) => {
+                if should_update {
+                    eprintln!("[service] Self-update requested, stopping all agents...");
+                    svc_state.stop_all_agents();
+                    // Download and apply update
+                    let mut cfg = load_cli_config()?;
+                    match apply_cli_update(&mut cfg).await {
+                        Ok(()) => {
+                            eprintln!("[service] Updated CLI binary, re-launching service...");
+                            // Re-exec self — the new binary will restart agents from agents.json
+                            let exe = env::current_exe()?;
+                            let args_vec: Vec<String> = env::args().skip(1).collect();
+                            let mut cmd = std::process::Command::new(&exe);
+                            cmd.args(&args_vec);
+                            cmd.env(LORE_SERVICE_DAEMON_ENV, "1");
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::process::CommandExt;
+                                let err = cmd.exec();
+                                eprintln!("[service] Failed to re-exec: {err}");
+                                std::process::exit(1);
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                match cmd.spawn() {
+                                    Ok(_) => std::process::exit(0),
+                                    Err(e) => {
+                                        eprintln!("[service] Failed to re-exec: {e}");
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[service] Update failed: {e}");
+                            // Restart agents that were stopped
+                            svc_state.restart_crashed_agents(context);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[service] Error: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+/// Returns true if the service should self-update.
+async fn service_poll_and_execute(
+    context: &CliContext,
+    machine_token: &str,
+    svc_state: &mut ServiceState,
+) -> CliResult<bool> {
+    let agent_statuses = svc_state.agent_statuses();
+
+    let resp = context
+        .client
+        .post(format!("{}/v1/machines/poll", context.url))
+        .header("x-lore-key", machine_token)
+        .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+        .json(&serde_json::json!({ "agent_statuses": agent_statuses }))
+        .timeout(std::time::Duration::from_secs(35))
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+
+    let body: serde_json::Value = resp.error_for_status()?.json().await?;
+
+    // Check for self-update request
+    if body["update_to"].as_str().is_some() {
+        return Ok(true);
+    }
+
+    let commands = match body["commands"].as_array() {
+        Some(c) if !c.is_empty() => c.clone(),
+        _ => return Ok(false),
+    };
+
+    for cmd in &commands {
+        let cmd_id = cmd["id"].as_str().unwrap_or("");
+        let cmd_type = cmd["command_type"].as_str().unwrap_or("");
+        let params = &cmd["params"];
+
+        eprintln!("[service] Executing command: {} ({})", cmd_type, cmd_id);
+
+        let result = match cmd_type {
+            "list_dir" => service_handle_list_dir(params).await,
+            "create_agent" => {
+                let r = service_handle_create_agent(context, machine_token, params, svc_state).await;
+                svc_state.save();
+                r
+            }
+            "stop_agent" => {
+                let name = params["agent_name"].as_str().unwrap_or("");
+                Ok(svc_state.stop_agent(name))
+            }
+            "restart_agent" => {
+                let name = params["agent_name"].as_str().unwrap_or("");
+                Ok(svc_state.restart_agent(context, name))
+            }
+            other => Ok(serde_json::json!({ "error": format!("unknown command: {other}") })),
+        };
+
+        let result_data = match result {
+            Ok(data) => data,
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        };
+
+        // Post result back to server
+        let _ = context
+            .client
+            .post(format!("{}/v1/machines/command/{}/result", context.url, cmd_id))
+            .header("x-lore-key", machine_token)
+            .json(&serde_json::json!({ "data": result_data }))
+            .send()
+            .await;
+    }
+
+    Ok(false)
+}
+
+async fn service_handle_list_dir(params: &serde_json::Value) -> CliResult<serde_json::Value> {
+    let path_str = params["path"].as_str().unwrap_or("~");
+    let path = if path_str == "~" || path_str.is_empty() {
+        env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+    } else {
+        PathBuf::from(path_str)
+    };
+
+    if !path.exists() {
+        return Ok(serde_json::json!({
+            "error": format!("path does not exist: {}", path.display()),
+        }));
+    }
+
+    if !path.is_dir() {
+        return Ok(serde_json::json!({
+            "error": format!("not a directory: {}", path.display()),
+        }));
+    }
+
+    let mut entries = Vec::new();
+    match fs::read_dir(&path) {
+        Ok(read_dir) => {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                entries.push(serde_json::json!({
+                    "name": name,
+                    "is_dir": is_dir,
+                }));
+            }
+        }
+        Err(e) => {
+            return Ok(serde_json::json!({ "error": format!("cannot read directory: {e}") }));
+        }
+    }
+
+    entries.sort_by(|a, b| {
+        let a_dir = a["is_dir"].as_bool().unwrap_or(false);
+        let b_dir = b["is_dir"].as_bool().unwrap_or(false);
+        match (a_dir, b_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                let a_name = a["name"].as_str().unwrap_or("");
+                let b_name = b["name"].as_str().unwrap_or("");
+                a_name.to_lowercase().cmp(&b_name.to_lowercase())
+            }
+        }
+    });
+
+    Ok(serde_json::json!({
+        "path": path.to_string_lossy(),
+        "entries": entries,
+    }))
+}
+
+async fn service_handle_create_agent(
+    context: &CliContext,
+    machine_token: &str,
+    params: &serde_json::Value,
+    svc_state: &mut ServiceState,
+) -> CliResult<serde_json::Value> {
+    let agent_name = params["agent_name"].as_str().ok_or("missing agent_name")?;
+    let folder = params["folder"].as_str().ok_or("missing folder")?;
+    let backend = params["backend"].as_str().unwrap_or("claude");
+
+    fs::create_dir_all(folder)?;
+
+    // Provision the agent via the API
+    let resp = context
+        .client
+        .post(format!("{}/v1/agents/provision", context.url))
+        .header("x-lore-key", machine_token)
+        .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+        .json(&serde_json::json!({
+            "name": agent_name,
+            "backend": backend,
+        }))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Ok(serde_json::json!({
+            "error": format!("provisioning failed ({}): {}", status, body),
+        }));
+    }
+
+    let prov_body: serde_json::Value = resp.json().await?;
+    let agent_token = prov_body["token"].as_str().unwrap_or("");
+    let agent_slug = prov_body["name"].as_str().unwrap_or(agent_name);
+
+    // Save agent token in CLI config
+    let mut config = load_cli_config()?;
+    config.agent_tokens.insert(agent_slug.to_string(), agent_token.to_string());
+    save_cli_config(&config)?;
+
+    // Create managed agent entry
+    let mut managed = ManagedAgent {
+        name: agent_slug.to_string(),
+        pid: 0,
+        folder: folder.to_string(),
+        backend: backend.to_string(),
+        token: agent_token.to_string(),
+    };
+
+    // Start the agent process
+    match spawn_agent_process(context, &managed) {
+        Ok(pid) => {
+            managed.pid = pid;
+            eprintln!("[service] Agent '{}' started in {} (pid {})", agent_slug, folder, pid);
+        }
+        Err(e) => {
+            eprintln!("[service] Failed to start agent '{}': {e}", agent_slug);
+        }
+    }
+
+    svc_state.agents.push(managed.clone());
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "agent_name": agent_slug,
+        "folder": folder,
+        "pid": managed.pid,
+    }))
 }
