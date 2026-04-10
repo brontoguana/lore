@@ -1268,12 +1268,15 @@ pub fn render_admin_page(
           if (state === ‘check’) {{
             ubtn.disabled = true;
             ubtn.textContent = ‘Checking\u2026’;
+            var ac = new AbortController();
+            setTimeout(function() {{ ac.abort(); }}, 20000);
             fetch(‘/ui/admin/auto-update/check-json’, {{
               method: ‘POST’,
               headers: {{‘Content-Type’: ‘application/x-www-form-urlencoded’}},
-              body: ‘csrf_token=’ + encodeURIComponent(csrf)
+              body: ‘csrf_token=’ + encodeURIComponent(csrf),
+              signal: ac.signal
             }}).then(function(r) {{
-              if (!r.ok) throw new Error(‘request failed’);
+              if (!r.ok) throw new Error(‘server returned ‘ + r.status);
               return r.json();
             }}).then(function(d) {{
               if (d.latest_version && d.latest_version !== d.current_version) {{
@@ -1285,19 +1288,23 @@ pub fn render_admin_page(
                 ubtn.disabled = true;
                 setTimeout(resetBtn, 4000);
               }}
-            }}).catch(function() {{
+            }}).catch(function(e) {{
               ubtn.textContent = ‘Check failed’;
+              console.error(‘update check:’, e);
               setTimeout(resetBtn, 3000);
             }});
           }} else if (state === ‘apply’) {{
             ubtn.disabled = true;
             ubtn.textContent = ‘Applying update\u2026’;
+            var ac2 = new AbortController();
+            setTimeout(function() {{ ac2.abort(); }}, 30000);
             fetch(‘/ui/admin/auto-update/apply-json’, {{
               method: ‘POST’,
               headers: {{‘Content-Type’: ‘application/x-www-form-urlencoded’}},
-              body: ‘csrf_token=’ + encodeURIComponent(csrf)
+              body: ‘csrf_token=’ + encodeURIComponent(csrf),
+              signal: ac2.signal
             }}).then(function(r) {{
-              if (!r.ok) throw new Error(‘request failed’);
+              if (!r.ok) throw new Error(‘server returned ‘ + r.status);
               return r.json();
             }}).then(function(d) {{
               if (d.applied) {{

@@ -4871,7 +4871,10 @@ fn git_export_status_summary(status: GitExportStatus) -> GitExportStatusSummary 
 
 async fn run_auto_update_check(state: &AppState) -> Result<AutoUpdateStatus, LoreError> {
     let config = state.auto_update_config.load()?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| LoreError::ExternalService(e.to_string()))?;
     let check = check_for_update(
         &client,
         "lore-server",
@@ -4901,7 +4904,10 @@ async fn run_auto_update_check(state: &AppState) -> Result<AutoUpdateStatus, Lor
 async fn run_auto_update_apply(state: &AppState) -> Result<AutoUpdateStatus, LoreError> {
     let config = state.auto_update_config.load()?;
     let executable_path = std::env::current_exe().map_err(LoreError::Io)?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| LoreError::ExternalService(e.to_string()))?;
     match maybe_apply_self_update(
         &client,
         "lore-server",
