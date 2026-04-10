@@ -809,24 +809,43 @@ pub fn render_admin_page(
             .collect::<Vec<_>>()
             .join("")
     };
-    let users_html = if users.is_empty() {
+    let users_list_html = if users.is_empty() {
         "<p class=\"hint padded\">No users exist yet.</p>".to_string()
     } else {
-        users
+        let items: Vec<String> = users
             .iter()
             .map(|user| {
-                let agents = user_agents.get(&user.username);
-                let machines = user_machines.get(&user.username);
-                render_user_card(
-                    user,
-                    agents.map(|v| v.as_slice()).unwrap_or(&[]),
-                    machines.map(|v| v.as_slice()).unwrap_or(&[]),
-                    csrf_token,
+                let badge = if user.is_admin { "admin" } else { "user" };
+                let disabled_badge = if user.disabled { r#" <span class="pill" style="background:var(--danger);color:#fff;font-size:0.7rem;">disabled</span>"# } else { "" };
+                format!(
+                    r#"<div class="user-list-item" data-username="{username_attr}">
+                      <span class="user-list-name">{username}</span>
+                      <span class="user-list-meta"><span class="pill">{badge}</span>{disabled} &middot; {sessions} sessions</span>
+                    </div>"#,
+                    username_attr = escape_attribute(&user.username),
+                    username = escape_text(&user.username),
+                    badge = badge,
+                    disabled = disabled_badge,
+                    sessions = user.active_sessions,
                 )
             })
-            .collect::<Vec<_>>()
-            .join("")
+            .collect();
+        format!(r#"<div class="user-list">{}</div>"#, items.join(""))
     };
+    let users_detail_html: String = users
+        .iter()
+        .map(|user| {
+            let agents = user_agents.get(&user.username);
+            let machines = user_machines.get(&user.username);
+            render_user_detail(
+                user,
+                agents.map(|v| v.as_slice()).unwrap_or(&[]),
+                machines.map(|v| v.as_slice()).unwrap_or(&[]),
+                csrf_token,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
     let role_grants_html = if projects.is_empty() {
         "<p class=\"hint\">No projects exist yet. Create a project first, then come back to assign grants.</p>".to_string()
     } else {
@@ -988,8 +1007,9 @@ pub fn render_admin_page(
           </label>
           <button type="submit">Create user</button>
         </form>
-        <div class="panel-header"><h2>Users</h2><p>Passwords are stored as Argon2 hashes on disk.</p></div>
-        <div class="timeline">{users_html}</div>
+        <div class="panel-header"><h2>Users</h2></div>
+        {users_list_html}
+        <div id="user-detail-container">{users_detail_html}</div>
       </section>
 
       <section class="panel" data-panel="roles"{roles_display}>
@@ -1333,6 +1353,22 @@ pub fn render_admin_page(
           }});
         }});
       }}
+
+      var userItems = document.querySelectorAll('.user-list-item');
+      var userDetails = document.querySelectorAll('.user-detail');
+      userItems.forEach(function(item) {{
+        item.addEventListener('click', function() {{
+          var name = item.getAttribute('data-username');
+          var wasActive = item.classList.contains('active');
+          userItems.forEach(function(i) {{ i.classList.remove('active'); }});
+          userDetails.forEach(function(d) {{ d.style.display = 'none'; }});
+          if (!wasActive) {{
+            item.classList.add('active');
+            var detail = document.querySelector('.user-detail[data-user-detail="' + name + '"]');
+            if (detail) detail.style.display = '';
+          }}
+        }});
+      }});
     }})();
     </script>"#,
         nav_items = nav_items,
@@ -1446,7 +1482,8 @@ pub fn render_admin_page(
         provider_status_html = provider_status_html,
         role_grants_html = role_grants_html,
         roles_html = roles_html,
-        users_html = users_html,
+        users_list_html = users_list_html,
+        users_detail_html = users_detail_html,
         pending_actions_html = pending_actions_html,
         audit_html = audit_html,
         auth_audit_html = auth_audit_html,
@@ -3680,7 +3717,7 @@ fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectInfo
     )
 }
 
-fn render_user_card(user: &UiUserSummary, agents: &[AgentTokenSummary], machines: &[StoredMachine], csrf_token: &str) -> String {
+fn render_user_detail(user: &UiUserSummary, agents: &[AgentTokenSummary], machines: &[StoredMachine], csrf_token: &str) -> String {
     let roles = if user.role_names.is_empty() {
         "<li>No assigned roles</li>".to_string()
     } else {
@@ -3736,61 +3773,53 @@ fn render_user_card(user: &UiUserSummary, agents: &[AgentTokenSummary], machines
     };
 
     format!(
-        r#"<article class="block">
+        r#"<div class="user-detail" data-user-detail="{username_attr}" style="display:none;">
   <div class="block-meta">
-    <span class="pill">{}</span>
-    <span>{}</span>
-    <span class="meta-separator">•</span>
-    <span>{}</span>
-    <span class="meta-separator">•</span>
-    <span>{}</span>
+    <span class="pill">{badge}</span>
+    <span>{created}</span>
+    <span class="meta-separator">&middot;</span>
+    <span>{sessions}</span>
   </div>
-  <ul class="grant-list">{}</ul>
+  <div style="padding:0 var(--s-4);">
+    <strong style="font-size:0.85rem;">Roles</strong>
+    <ul class="grant-list" style="margin-top:var(--s-1);">{roles}</ul>
+  </div>
   <div style="margin-top:var(--s-3); padding:0 var(--s-4);">
     <strong style="font-size:0.85rem;">Agents</strong>
-    <ul class="grant-list" style="margin-top:var(--s-1);">{}</ul>
+    <ul class="grant-list" style="margin-top:var(--s-1);">{agents_html}</ul>
   </div>
   <div style="margin-top:var(--s-3); padding:0 var(--s-4);">
     <strong style="font-size:0.85rem;">Machines</strong>
-    <ul class="grant-list" style="margin-top:var(--s-1);">{}</ul>
+    <ul class="grant-list" style="margin-top:var(--s-1);">{machines_html}</ul>
   </div>
   <div class="inline-form">
-    <form method="post" action="/ui/admin/users/{}/password">
-      <input type="hidden" name="csrf_token" value="{}">
+    <form method="post" action="/ui/admin/users/{username_attr}/password">
+      <input type="hidden" name="csrf_token" value="{csrf}">
       <input type="password" name="password" placeholder="New password" autocomplete="new-password" required>
       <button type="submit">Reset password</button>
     </form>
   </div>
   <div class="inline-form">
-    <form method="post" action="/ui/admin/users/{}/sessions/revoke">
-      <input type="hidden" name="csrf_token" value="{}">
+    <form method="post" action="/ui/admin/users/{username_attr}/sessions/revoke">
+      <input type="hidden" name="csrf_token" value="{csrf}">
       <button type="submit">Revoke sessions</button>
     </form>
-    <form method="post" action="/ui/admin/users/{}/{}">
-      <input type="hidden" name="csrf_token" value="{}">
-      <button class="danger" type="submit">{}</button>
+    <form method="post" action="/ui/admin/users/{username_attr}/{action}">
+      <input type="hidden" name="csrf_token" value="{csrf}">
+      <button class="danger" type="submit">{action_label}</button>
     </form>
   </div>
-</article>"#,
-        escape_text(&user.username),
-        escape_text(if user.is_admin { "admin" } else { "user" }),
-        escape_text(&format_timestamp(user.created_at)),
-        escape_text(&format!("{} active sessions", user.active_sessions)),
-        roles,
-        agents_html,
-        machines_html,
-        escape_attribute(&user.username),
-        escape_attribute(csrf_token),
-        escape_attribute(&user.username),
-        escape_attribute(csrf_token),
-        escape_attribute(&user.username),
-        if user.disabled { "enable" } else { "disable" },
-        escape_attribute(csrf_token),
-        if user.disabled {
-            "Enable user"
-        } else {
-            "Disable user"
-        }
+</div>"#,
+        username_attr = escape_attribute(&user.username),
+        badge = escape_text(if user.is_admin { "admin" } else { "user" }),
+        created = escape_text(&format_timestamp(user.created_at)),
+        sessions = escape_text(&format!("{} active sessions", user.active_sessions)),
+        roles = roles,
+        agents_html = agents_html,
+        machines_html = machines_html,
+        csrf = escape_attribute(csrf_token),
+        action = if user.disabled { "enable" } else { "disable" },
+        action_label = if user.disabled { "Enable user" } else { "Disable user" },
     )
 }
 
@@ -5410,6 +5439,60 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .agent-list-meta {
       font-size: 0.82rem;
       color: var(--fg-muted);
+    }
+
+    .user-list {
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      margin: var(--s-3) var(--s-5) 0;
+      overflow: hidden;
+    }
+
+    .user-list-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: var(--s-3) var(--s-4);
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+
+    .user-list-item:last-child {
+      border-bottom: none;
+    }
+
+    .user-list-item:hover {
+      background: var(--bg-hover);
+    }
+
+    .user-list-item.active {
+      background: var(--bg-hover);
+      border-left: 3px solid var(--accent);
+    }
+
+    .user-list-name {
+      font-weight: 600;
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+    }
+
+    .user-list-meta {
+      font-size: 0.82rem;
+      color: var(--fg-muted);
+      display: flex;
+      align-items: center;
+      gap: var(--s-2);
+    }
+
+    .user-detail {
+      border: 1px solid var(--line);
+      border-top: none;
+      border-radius: 0 0 var(--radius) var(--radius);
+      margin: 0 var(--s-5) var(--s-5);
+      padding: var(--s-4) 0;
     }
 
     /* Chat */
