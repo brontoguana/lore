@@ -51,6 +51,8 @@ enum ServerCommand {
     Update,
     /// Remove all services and binaries but keep data (for a fresh reinstall)
     Clean,
+    /// Create the initial admin account (required before first run)
+    CreateAdmin,
 }
 
 #[tokio::main]
@@ -85,6 +87,10 @@ async fn main() {
         ServerCommand::Status => daemon_status(&data_root),
         ServerCommand::Update => run_update(),
         ServerCommand::Clean => run_clean(&data_root),
+        ServerCommand::CreateAdmin => {
+            ensure_data_dir(&data_root);
+            create_admin_interactive(&data_root);
+        }
     }
 }
 
@@ -195,10 +201,11 @@ fn prompt_initial_admin_if_needed(data_root: &str) {
         Err(_) => return, // can't check, let the server handle it
     }
 
-    // Only prompt if we have a tty
+    // Require a tty — never allow bootstrap via the web UI
     if !atty::is(atty::Stream::Stdin) {
-        eprintln!("no admin account exists — visit the web UI to create one");
-        return;
+        eprintln!("error: no admin account exists");
+        eprintln!("run `lore-server create-admin` to create one before starting the server");
+        std::process::exit(1);
     }
 
     eprintln!();
@@ -248,6 +255,79 @@ fn prompt_initial_admin_if_needed(data_root: &str) {
 
     match auth.bootstrap_admin(UserName::new(username.clone()).unwrap(), password) {
         Ok(_) => eprintln!("admin account '{}' created\n", username),
+        Err(err) => {
+            eprintln!("error creating admin account: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn create_admin_interactive(data_root: &str) {
+    let auth = LocalAuthStore::new(PathBuf::from(data_root));
+    match auth.has_users() {
+        Ok(true) => {
+            eprintln!("an admin account already exists — use the web UI to manage accounts");
+            return;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("error checking database: {err}");
+            std::process::exit(1);
+        }
+    }
+
+    if !atty::is(atty::Stream::Stdin) {
+        eprintln!("error: create-admin requires an interactive terminal");
+        std::process::exit(1);
+    }
+
+    eprintln!();
+    eprintln!("Create the initial admin account.");
+    eprintln!();
+
+    let username = {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        loop {
+            eprint!("Admin username: ");
+            io::stderr().flush().ok();
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                eprintln!("aborted");
+                std::process::exit(1);
+            }
+            let trimmed = line.trim().to_string();
+            if !trimmed.is_empty() {
+                break trimmed;
+            }
+            eprintln!("username cannot be empty");
+        }
+    };
+
+    let password = loop {
+        eprint!("Admin password: ");
+        io::stderr().flush().ok();
+        let pass = read_password_no_echo();
+        if pass.is_empty() {
+            eprintln!("aborted");
+            std::process::exit(1);
+        }
+        if pass.len() < 12 {
+            eprintln!("password must be at least 12 characters");
+            continue;
+        }
+        eprint!("Confirm password: ");
+        io::stderr().flush().ok();
+        let confirm = read_password_no_echo();
+        if pass != confirm {
+            eprintln!("passwords do not match — try again");
+            continue;
+        }
+        break pass;
+    };
+
+    match auth.bootstrap_admin(UserName::new(username.clone()).unwrap(), password) {
+        Ok(_) => eprintln!("admin account '{}' created — you can now start the server\n", username),
         Err(err) => {
             eprintln!("error creating admin account: {err}");
             std::process::exit(1);

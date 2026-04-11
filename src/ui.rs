@@ -430,19 +430,21 @@ pub fn render_login_page(
     let title = if has_users {
         "Sign in to Lore"
     } else {
-        "Create the first admin account"
+        "Lore"
     };
     let subtitle = if has_users {
         ""
     } else {
-        "Lore has no human accounts yet. Create the initial local administrator to unlock the UI."
+        ""
     };
-    let action = if has_users {
-        "/login"
+    let action = "/login";
+    let button = "Sign in";
+    let no_users_html = if !has_users {
+        r#"<p class="hint" style="margin-top:var(--s-4)">No admin account exists yet. Create one on the server console:<br><code style="display:inline-block;margin-top:var(--s-2);padding:var(--s-1) var(--s-2);background:var(--bg-2);border-radius:4px">lore-server create-admin</code></p>"#
+            .to_string()
     } else {
-        "/login/bootstrap"
+        String::new()
     };
-    let button = if has_users { "Sign in" } else { "Create admin" };
     let external_auth_html = if has_users && external_auth_enabled {
         r#"<form method="post" action="/login/external">
         <button type="submit">Sign in with external auth</button>
@@ -462,36 +464,40 @@ pub fn render_login_page(
         String::new()
     };
 
-    let content = format!(
-        r#"<section class="panel auth-panel">
-      <p class="eyebrow">Lore</p>
-      <h1>{title}</h1>
-      {subtitle_html}
-      <form method="post" action="{action}">
+    let form_html = if has_users {
+        format!(
+            r#"<form method="post" action="{action}">
         <label>
           Username
           <input type="text" name="username" autocomplete="username" required>
         </label>
         <label>
           Password
-          <input type="password" name="password" autocomplete="{autocomplete}" required>
+          <input type="password" name="password" autocomplete="current-password" required>
         </label>
         <button type="submit">{button}</button>
       </form>
       {oidc_html}
-      {external_auth_html}
+      {external_auth_html}"#,
+            action = action,
+            button = escape_text(button),
+            oidc_html = oidc_html,
+            external_auth_html = external_auth_html,
+        )
+    } else {
+        no_users_html.clone()
+    };
+
+    let content = format!(
+        r#"<section class="panel auth-panel">
+      <p class="eyebrow">Lore</p>
+      <h1>{title}</h1>
+      {subtitle_html}
+      {form_html}
     </section>"#,
         title = escape_text(title),
         subtitle_html = if subtitle.is_empty() { String::new() } else { format!("<p class=\"subtitle\">{}</p>", escape_text(subtitle)) },
-        action = action,
-        button = escape_text(button),
-        autocomplete = if has_users {
-            "current-password"
-        } else {
-            "new-password"
-        },
-        oidc_html = oidc_html,
-        external_auth_html = external_auth_html,
+        form_html = form_html,
     );
 
     render_shell(

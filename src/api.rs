@@ -202,7 +202,6 @@ fn build_app_with_librarian(
         .route("/login/oidc", get(oidc_login_start))
         .route("/login/oidc/callback", get(oidc_login_callback))
         .route("/login/external", post(external_login_submit))
-        .route("/login/bootstrap", post(bootstrap_submit))
         .route("/logout", post(logout_submit))
         .route("/setup", get(setup_page))
         .route("/setup.txt", get(setup_text))
@@ -211,7 +210,6 @@ fn build_app_with_librarian(
         .route("/v1/blocks", post(create_block).get(list_blocks))
         .route("/v1/search", axum::routing::get(search_blocks))
         .route("/v1/blocks/{id}", delete(delete_block).patch(update_block))
-        .route("/v1/admin/bootstrap", post(bootstrap_admin))
         .route("/v1/admin/roles", get(list_roles).post(create_role))
         .route("/v1/admin/roles/{name}", post(update_role))
         .route("/v1/admin/users", get(list_users).post(create_user))
@@ -630,12 +628,6 @@ struct ProjectBlockUpdateRequest {
 #[derive(Debug, Deserialize)]
 struct MoveBlockRequest {
     after_block_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BootstrapAdminRequest {
-    username: String,
-    password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1422,36 +1414,6 @@ async fn external_login_submit(
     ))
 }
 
-async fn bootstrap_submit(
-    State(state): State<AppState>,
-    Form(form): Form<LoginForm>,
-) -> UiResult<Response> {
-    enforce_login_rate_limit(&state, &form.username)?;
-    let password = form.password;
-    let user = state
-        .auth
-        .bootstrap_admin(UserName::new(form.username)?, password.clone())?;
-    let session = state
-        .auth
-        .create_session(user.username.as_str(), &password)?;
-    clear_login_rate_limit(&state, user.username.as_str());
-    append_audit_event(
-        &state,
-        AuditActor {
-            kind: AuditActorKind::System,
-            name: "bootstrap".into(),
-        },
-        "bootstrap admin",
-        Some(user.username.as_str().to_string()),
-        None,
-    )?;
-    Ok(session_redirect_response(
-        &state,
-        &session,
-        Redirect::to("/ui/admin?flash=Admin%20account%20created"),
-    ))
-}
-
 async fn logout_submit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1682,26 +1644,6 @@ async fn grep_blocks(
         })
         .collect();
     Ok(Json(matches))
-}
-
-async fn bootstrap_admin(
-    State(state): State<AppState>,
-    Json(payload): Json<BootstrapAdminRequest>,
-) -> ApiResult<Json<UserSummary>> {
-    let user = state
-        .auth
-        .bootstrap_admin(UserName::new(payload.username)?, payload.password)?;
-    append_audit_event(
-        &state,
-        AuditActor {
-            kind: AuditActorKind::System,
-            name: "bootstrap".into(),
-        },
-        "bootstrap admin",
-        Some(user.username.as_str().to_string()),
-        Some("api".into()),
-    )?;
-    Ok(Json(user_summary(&state, user)?))
 }
 
 async fn list_agent_tokens(
@@ -8987,7 +8929,7 @@ mod tests {
         ProviderCheckResult, RATE_LIMIT_REQUESTS,
     };
     use crate::store::FileBlockStore;
-    use crate::{BlockType, ProjectPermission};
+    use crate::{BlockType, LocalAuthStore, ProjectPermission, UserName};
 
     #[derive(Clone)]
     struct RecordingLibrarianClient {
@@ -9062,7 +9004,7 @@ mod tests {
     async fn creates_and_lists_blocks() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let agent_token = issue_agent_token(&app, "agent-main", ProjectPermission::ReadWrite).await;
+        let agent_token = issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
 
         let create = Request::builder()
             .method("POST")
@@ -9117,7 +9059,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token =
-            issue_agent_token(&app, "agent-search", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-search", ProjectPermission::ReadWrite).await;
 
         let create = Request::builder()
             .method("POST")
@@ -9153,9 +9095,9 @@ mod tests {
     async fn enforces_owner_on_delete() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let owner_token = issue_agent_token(&app, "owner-key", ProjectPermission::ReadWrite).await;
+        let owner_token = issue_agent_token(&app, dir.path(), "owner-key", ProjectPermission::ReadWrite).await;
         let intruder_token =
-            issue_agent_token(&app, "intruder-key", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "intruder-key", ProjectPermission::ReadWrite).await;
 
         let create = Request::builder()
             .method("POST")
@@ -9190,7 +9132,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let owner_token =
-            issue_agent_token(&app, "owner-update", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "owner-update", ProjectPermission::ReadWrite).await;
 
         let create = Request::builder()
             .method("POST")
@@ -9243,7 +9185,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token =
-            issue_agent_token(&app, "agent-invalid-order", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-invalid-order", ProjectPermission::ReadWrite).await;
 
         let request = Request::builder()
             .method("POST")
@@ -9269,9 +9211,9 @@ mod tests {
     async fn renders_project_page() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let (session_cookie, _) = bootstrap_admin_session(&app).await;
+        let (session_cookie, _) = bootstrap_admin_session(&app, dir.path()).await;
         let agent_token =
-            issue_agent_token(&app, "agent-render", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-render", ProjectPermission::ReadWrite).await;
 
         let create = Request::builder()
             .method("POST")
@@ -9314,9 +9256,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let boundary = "x-form-boundary";
-        let (session_cookie, csrf_token) = bootstrap_admin_session(&app).await;
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let agent_token =
-            issue_agent_token(&app, "agent-form-create", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-form-create", ProjectPermission::ReadWrite).await;
 
         let request = Request::builder()
             .method("POST")
@@ -9365,9 +9307,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let boundary = "x-form-boundary";
-        let (session_cookie, csrf_token) = bootstrap_admin_session(&app).await;
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let agent_token =
-            issue_agent_token(&app, "agent-form-update", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-form-update", ProjectPermission::ReadWrite).await;
 
         let create = Request::builder()
             .method("POST")
@@ -9433,7 +9375,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token =
-            issue_agent_token(&app, "agent-reposition", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-reposition", ProjectPermission::ReadWrite).await;
 
         let first = create_block_for_test(&app, &agent_token, "first").await;
         let second = create_block_for_test(&app, &agent_token, "second").await;
@@ -9474,9 +9416,9 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let boundary = "x-image-boundary";
         let image_bytes = b"not-a-real-png";
-        let (session_cookie, csrf_token) = bootstrap_admin_session(&app).await;
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let agent_token =
-            issue_agent_token(&app, "agent-image", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-image", ProjectPermission::ReadWrite).await;
 
         let request = Request::builder()
             .method("POST")
@@ -9553,6 +9495,7 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token = issue_agent_token_multi_project(
             &app,
+            dir.path(),
             "agent-project-list",
             &[
                 ("alpha.docs", ProjectPermission::ReadWrite),
@@ -9611,7 +9554,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token =
-            issue_agent_token(&app, "agent-read-window", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-read-window", ProjectPermission::ReadWrite).await;
 
         let first = create_block_for_test(&app, &agent_token, "first").await;
         let second = create_block_for_test(&app, &agent_token, "second").await;
@@ -9661,7 +9604,7 @@ mod tests {
     async fn greps_with_preview_via_agent_api() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let agent_token = issue_agent_token(&app, "agent-grep", ProjectPermission::ReadWrite).await;
+        let agent_token = issue_agent_token(&app, dir.path(), "agent-grep", ProjectPermission::ReadWrite).await;
 
         let request = Request::builder()
             .method("POST")
@@ -9702,7 +9645,7 @@ mod tests {
     async fn moves_block_via_agent_api() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let agent_token = issue_agent_token(&app, "agent-move", ProjectPermission::ReadWrite).await;
+        let agent_token = issue_agent_token(&app, dir.path(), "agent-move", ProjectPermission::ReadWrite).await;
 
         let first = create_block_for_test(&app, &agent_token, "first").await;
         let second = create_block_for_test(&app, &agent_token, "second").await;
@@ -9746,17 +9689,7 @@ mod tests {
     async fn bootstrap_admin_and_manage_local_accounts() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-
-        let bootstrap = Request::builder()
-            .method("POST")
-            .uri("/v1/admin/bootstrap")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"username":"admin","password":"correct-horse-battery"}"#,
-            ))
-            .unwrap();
-        let response = app.clone().oneshot(bootstrap).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        ensure_test_admin(dir.path());
 
         let create_role = Request::builder()
             .method("POST")
@@ -9806,10 +9739,10 @@ mod tests {
     async fn project_reader_can_read_but_not_write() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let agent_token = issue_agent_token(&app, "agent-seed", ProjectPermission::ReadWrite).await;
+        let agent_token = issue_agent_token(&app, dir.path(), "agent-seed", ProjectPermission::ReadWrite).await;
 
         create_block_for_test(&app, &agent_token, "seed").await;
-        bootstrap_admin_with_role_and_user(&app, "readers", "reader", ProjectPermission::Read)
+        bootstrap_admin_with_role_and_user(&app, dir.path(), "readers", "reader", ProjectPermission::Read)
             .await;
 
         let read = Request::builder()
@@ -9845,9 +9778,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token =
-            issue_agent_token(&app, "agent-human-edit", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-human-edit", ProjectPermission::ReadWrite).await;
 
-        bootstrap_admin_with_role_and_user(&app, "writers", "writer", ProjectPermission::ReadWrite)
+        bootstrap_admin_with_role_and_user(&app, dir.path(), "writers", "writer", ProjectPermission::ReadWrite)
             .await;
 
         let created = create_block_for_test(&app, &agent_token, "agent content").await;
@@ -9890,7 +9823,7 @@ mod tests {
     async fn setup_text_uses_saved_external_address() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let (session_cookie, csrf_token) = bootstrap_admin_session(&app).await;
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
 
         let update = Request::builder()
             .method("POST")
@@ -9927,7 +9860,7 @@ mod tests {
     async fn admin_page_shows_network_section() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let (session_cookie, _) = bootstrap_admin_session(&app).await;
+        let (session_cookie, _) = bootstrap_admin_session(&app, dir.path()).await;
 
         let request = Request::builder()
             .method("GET")
@@ -9949,7 +9882,7 @@ mod tests {
     async fn anonymous_pages_use_saved_default_theme() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let (session_cookie, csrf_token) = bootstrap_admin_session(&app).await;
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
 
         let update = Request::builder()
             .method("POST")
@@ -9982,7 +9915,7 @@ mod tests {
     async fn logged_in_user_can_override_theme_from_settings() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let (session_cookie, csrf_token) = bootstrap_admin_session(&app).await;
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
 
         let update = Request::builder()
             .method("POST")
@@ -10017,7 +9950,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
 
-        let token = issue_agent_token(&app, "worker-alpha", ProjectPermission::ReadWrite).await;
+        let token = issue_agent_token(&app, dir.path(), "worker-alpha", ProjectPermission::ReadWrite).await;
         assert!(token.starts_with("lore_at_"));
 
         let request = Request::builder()
@@ -10043,19 +9976,7 @@ mod tests {
     async fn admin_can_configure_answer_librarian_via_api() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-
-        let bootstrap = Request::builder()
-            .method("POST")
-            .uri("/v1/admin/bootstrap")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"username":"admin","password":"correct-horse-battery"}"#,
-            ))
-            .unwrap();
-        assert_eq!(
-            app.clone().oneshot(bootstrap).await.unwrap().status(),
-            StatusCode::OK
-        );
+        ensure_test_admin(dir.path());
 
         let update = Request::builder()
             .method("POST")
@@ -10100,6 +10021,7 @@ mod tests {
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock.clone()));
         let agent_token = issue_agent_token_multi_project(
             &app,
+            dir.path(),
             "agent-librarian",
             &[
                 ("alpha.docs", ProjectPermission::ReadWrite),
@@ -10108,7 +10030,7 @@ mod tests {
         )
         .await;
 
-        configure_librarian(&app).await;
+        configure_librarian(&app, dir.path()).await;
         create_block_in_project(&app, &agent_token, "alpha.docs", "alpha answer source").await;
         create_block_in_project(&app, &agent_token, "beta.docs", "beta secret").await;
 
@@ -10156,11 +10078,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let mock = RecordingLibrarianClient::new("Summary from librarian");
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
-        let (session_cookie, csrf_token) = bootstrap_admin_session(&app).await;
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let agent_token =
-            issue_agent_token(&app, "agent-ui-librarian", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-ui-librarian", ProjectPermission::ReadWrite).await;
 
-        configure_librarian(&app).await;
+        configure_librarian(&app, dir.path()).await;
         create_block_in_project(&app, &agent_token, "alpha.docs", "UI context block").await;
 
         let request = Request::builder()
@@ -10191,11 +10113,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let mock = RecordingLibrarianClient::new("Persisted librarian answer");
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
-        let (session_cookie, csrf_token) = bootstrap_admin_session(&app).await;
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let agent_token =
-            issue_agent_token(&app, "agent-history", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-history", ProjectPermission::ReadWrite).await;
 
-        configure_librarian(&app).await;
+        configure_librarian(&app, dir.path()).await;
         create_block_in_project(&app, &agent_token, "alpha.docs", "history source block").await;
 
         let ask = Request::builder()
@@ -10235,7 +10157,7 @@ mod tests {
         let mock = RecordingLibrarianClient::new("Provider ok");
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
 
-        configure_librarian(&app).await;
+        configure_librarian(&app, dir.path()).await;
 
         let request = Request::builder()
             .method("POST")
@@ -10273,8 +10195,8 @@ mod tests {
         );
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
         let seed_token =
-            issue_agent_token(&app, "agent-project-action", ProjectPermission::ReadWrite).await;
-        configure_librarian(&app).await;
+            issue_agent_token(&app, dir.path(), "agent-project-action", ProjectPermission::ReadWrite).await;
+        configure_librarian(&app, dir.path()).await;
         create_block_in_project(&app, &seed_token, "alpha.docs", "seed context").await;
 
         let request = Request::builder()
@@ -10340,8 +10262,8 @@ mod tests {
         );
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
         let seed_token =
-            issue_agent_token(&app, "agent-approval", ProjectPermission::ReadWrite).await;
-        configure_librarian_with_approval(&app, true).await;
+            issue_agent_token(&app, dir.path(), "agent-approval", ProjectPermission::ReadWrite).await;
+        configure_librarian_with_approval(&app, dir.path(),true).await;
         create_block_in_project(&app, &seed_token, "alpha.docs", "seed context").await;
 
         let request = Request::builder()
@@ -10429,9 +10351,9 @@ mod tests {
         let mock = RecordingLibrarianClient::new("Grounded answer");
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
         let agent_token =
-            issue_agent_token(&app, "agent-rate-limit", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-rate-limit", ProjectPermission::ReadWrite).await;
 
-        configure_librarian(&app).await;
+        configure_librarian(&app, dir.path()).await;
         create_block_in_project(&app, &agent_token, "alpha.docs", "rate limit source").await;
 
         for _ in 0..RATE_LIMIT_REQUESTS {
@@ -10477,6 +10399,7 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token = issue_agent_token_multi_project(
             &app,
+            dir.path(),
             "mcp-agent",
             &[("alpha.docs", ProjectPermission::ReadWrite)],
         )
@@ -10575,7 +10498,7 @@ mod tests {
     async fn admin_can_rotate_agent_token_and_old_token_stops_working() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let token = issue_agent_token(&app, "worker-rotate", ProjectPermission::ReadWrite).await;
+        let token = issue_agent_token(&app, dir.path(), "worker-rotate", ProjectPermission::ReadWrite).await;
 
         let rotate = Request::builder()
             .method("POST")
@@ -10622,7 +10545,7 @@ mod tests {
     async fn disabling_user_revokes_existing_ui_session() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        bootstrap_admin_with_role_and_user(&app, "writers", "writer", ProjectPermission::ReadWrite)
+        bootstrap_admin_with_role_and_user(&app, dir.path(), "writers", "writer", ProjectPermission::ReadWrite)
             .await;
 
         let login = Request::builder()
@@ -10676,9 +10599,9 @@ mod tests {
         let mock = RecordingLibrarianClient::new("Filtered answer");
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock.clone()));
         let agent_token =
-            issue_agent_token(&app, "agent-filter", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-filter", ProjectPermission::ReadWrite).await;
 
-        configure_librarian(&app).await;
+        configure_librarian(&app, dir.path()).await;
         let alpha_markdown =
             create_block_in_project(&app, &agent_token, "alpha.docs", "alpha plan").await;
         let alpha_id = alpha_markdown["id"].as_str().unwrap().to_string();
@@ -10747,9 +10670,9 @@ mod tests {
     async fn external_auth_headers_can_sign_in_existing_user() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        bootstrap_admin_with_role_and_user(&app, "writers", "writer", ProjectPermission::ReadWrite)
+        bootstrap_admin_with_role_and_user(&app, dir.path(), "writers", "writer", ProjectPermission::ReadWrite)
             .await;
-        configure_external_auth(&app).await;
+        configure_external_auth(&app, dir.path()).await;
 
         let request = Request::builder()
             .method("POST")
@@ -10790,10 +10713,10 @@ mod tests {
             }],
         );
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
-        let (session_cookie, _) = bootstrap_admin_session(&app).await;
+        let (session_cookie, _) = bootstrap_admin_session(&app, dir.path()).await;
         let seed_token =
-            issue_agent_token(&app, "agent-audit-pending", ProjectPermission::ReadWrite).await;
-        configure_librarian_with_approval(&app, true).await;
+            issue_agent_token(&app, dir.path(), "agent-audit-pending", ProjectPermission::ReadWrite).await;
+        configure_librarian_with_approval(&app, dir.path(),true).await;
         create_block_in_project(&app, &seed_token, "alpha.docs", "seed context").await;
 
         let request = Request::builder()
@@ -10834,7 +10757,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token =
-            issue_agent_token(&app, "agent-history", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-history", ProjectPermission::ReadWrite).await;
 
         let create = Request::builder()
             .method("POST")
@@ -10930,9 +10853,9 @@ mod tests {
 
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token =
-            issue_agent_token(&app, "agent-export", ProjectPermission::ReadWrite).await;
+            issue_agent_token(&app, dir.path(), "agent-export", ProjectPermission::ReadWrite).await;
         create_block_in_project(&app, &agent_token, "alpha.docs", "export me").await;
-        configure_admin_and_git_export(&app, &format!("file://{}", remote_dir.path().display()))
+        configure_admin_and_git_export(&app, dir.path(),&format!("file://{}", remote_dir.path().display()))
             .await;
 
         let sync = Request::builder()
@@ -11025,7 +10948,7 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
-    async fn issue_agent_token<S>(app: &S, name: &str, permission: ProjectPermission) -> String
+    async fn issue_agent_token<S>(app: &S, dir: &std::path::Path, name: &str, permission: ProjectPermission) -> String
     where
         S: tower::Service<
                 Request<Body>,
@@ -11034,11 +10957,12 @@ mod tests {
             > + Clone,
         S::Future: Send,
     {
-        issue_agent_token_multi_project(app, name, &[("alpha.docs", permission)]).await
+        issue_agent_token_multi_project(app, dir, name, &[("alpha.docs", permission)]).await
     }
 
     async fn issue_agent_token_multi_project<S>(
         app: &S,
+        dir: &std::path::Path,
         name: &str,
         grants: &[(&str, ProjectPermission)],
     ) -> String
@@ -11050,19 +10974,7 @@ mod tests {
             > + Clone,
         S::Future: Send,
     {
-        let bootstrap = Request::builder()
-            .method("POST")
-            .uri("/v1/admin/bootstrap")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"username":"admin","password":"correct-horse-battery"}"#,
-            ))
-            .unwrap();
-        let bootstrap_status = app.clone().oneshot(bootstrap).await.unwrap().status();
-        assert!(matches!(
-            bootstrap_status,
-            StatusCode::OK | StatusCode::FORBIDDEN
-        ));
+        ensure_test_admin(dir);
 
         let grants_json = grants
             .iter()
@@ -11098,6 +11010,7 @@ mod tests {
 
     async fn bootstrap_admin_with_role_and_user<S>(
         app: &S,
+        dir: &std::path::Path,
         role_name: &str,
         username: &str,
         permission: ProjectPermission,
@@ -11109,19 +11022,7 @@ mod tests {
             > + Clone,
         S::Future: Send,
     {
-        let bootstrap = Request::builder()
-            .method("POST")
-            .uri("/v1/admin/bootstrap")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"username":"admin","password":"correct-horse-battery"}"#,
-            ))
-            .unwrap();
-        let bootstrap_status = app.clone().oneshot(bootstrap).await.unwrap().status();
-        assert!(matches!(
-            bootstrap_status,
-            StatusCode::OK | StatusCode::FORBIDDEN
-        ));
+        ensure_test_admin(dir);
 
         let permission = match permission {
             ProjectPermission::Read => "read",
@@ -11156,7 +11057,7 @@ mod tests {
         );
     }
 
-    async fn configure_librarian<S>(app: &S)
+    async fn configure_librarian<S>(app: &S, dir: &std::path::Path)
     where
         S: tower::Service<
                 Request<Body>,
@@ -11165,10 +11066,10 @@ mod tests {
             > + Clone,
         S::Future: Send,
     {
-        configure_librarian_with_approval(app, false).await;
+        configure_librarian_with_approval(app, dir, false).await;
     }
 
-    async fn configure_librarian_with_approval<S>(app: &S, action_requires_approval: bool)
+    async fn configure_librarian_with_approval<S>(app: &S, dir: &std::path::Path, action_requires_approval: bool)
     where
         S: tower::Service<
                 Request<Body>,
@@ -11177,19 +11078,7 @@ mod tests {
             > + Clone,
         S::Future: Send,
     {
-        let bootstrap = Request::builder()
-            .method("POST")
-            .uri("/v1/admin/bootstrap")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"username":"admin","password":"correct-horse-battery"}"#,
-            ))
-            .unwrap();
-        let bootstrap_status = app.clone().oneshot(bootstrap).await.unwrap().status();
-        assert!(matches!(
-            bootstrap_status,
-            StatusCode::OK | StatusCode::FORBIDDEN
-        ));
+        ensure_test_admin(dir);
 
         let update = Request::builder()
             .method("POST")
@@ -11207,7 +11096,7 @@ mod tests {
         );
     }
 
-    async fn configure_external_auth<S>(app: &S)
+    async fn configure_external_auth<S>(app: &S, dir: &std::path::Path)
     where
         S: tower::Service<
                 Request<Body>,
@@ -11216,19 +11105,7 @@ mod tests {
             > + Clone,
         S::Future: Send,
     {
-        let bootstrap = Request::builder()
-            .method("POST")
-            .uri("/v1/admin/bootstrap")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"username":"admin","password":"correct-horse-battery"}"#,
-            ))
-            .unwrap();
-        let bootstrap_status = app.clone().oneshot(bootstrap).await.unwrap().status();
-        assert!(matches!(
-            bootstrap_status,
-            StatusCode::OK | StatusCode::FORBIDDEN
-        ));
+        ensure_test_admin(dir);
 
         let update = Request::builder()
             .method("POST")
@@ -11245,7 +11122,7 @@ mod tests {
         );
     }
 
-    async fn configure_admin_and_git_export<S>(app: &S, remote_url: &str)
+    async fn configure_admin_and_git_export<S>(app: &S, dir: &std::path::Path, remote_url: &str)
     where
         S: tower::Service<
                 Request<Body>,
@@ -11254,19 +11131,7 @@ mod tests {
             > + Clone,
         S::Future: Send,
     {
-        let bootstrap = Request::builder()
-            .method("POST")
-            .uri("/v1/admin/bootstrap")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"username":"admin","password":"correct-horse-battery"}"#,
-            ))
-            .unwrap();
-        let bootstrap_status = app.clone().oneshot(bootstrap).await.unwrap().status();
-        assert!(matches!(
-            bootstrap_status,
-            StatusCode::OK | StatusCode::FORBIDDEN
-        ));
+        ensure_test_admin(dir);
 
         let update = Request::builder()
             .method("POST")
@@ -11283,7 +11148,7 @@ mod tests {
         );
     }
 
-    async fn bootstrap_admin_session<S>(app: &S) -> (String, String)
+    async fn bootstrap_admin_session<S>(app: &S, dir: &std::path::Path) -> (String, String)
     where
         S: tower::Service<
                 Request<Body>,
@@ -11292,26 +11157,15 @@ mod tests {
             > + Clone,
         S::Future: Send,
     {
-        let bootstrap = Request::builder()
+        ensure_test_admin(dir);
+        let login = Request::builder()
             .method("POST")
-            .uri("/login/bootstrap")
+            .uri("/login")
             .header("content-type", "application/x-www-form-urlencoded")
             .body(Body::from("username=admin&password=correct-horse-battery"))
             .unwrap();
-        let response = app.clone().oneshot(bootstrap).await.unwrap();
-        let response = if response.status() == StatusCode::SEE_OTHER {
-            response
-        } else {
-            let login = Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from("username=admin&password=correct-horse-battery"))
-                .unwrap();
-            let login_response = app.clone().oneshot(login).await.unwrap();
-            assert_eq!(login_response.status(), StatusCode::SEE_OTHER);
-            login_response
-        };
+        let response = app.clone().oneshot(login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let cookie = response
             .headers()
             .get("set-cookie")
@@ -11337,6 +11191,17 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         let csrf = extract_hidden_value(&html, "csrf_token").unwrap();
         (cookie, csrf)
+    }
+
+    fn ensure_test_admin(dir: &std::path::Path) {
+        let auth = LocalAuthStore::new(dir.to_path_buf());
+        if !auth.has_users().unwrap() {
+            auth.bootstrap_admin(
+                UserName::new("admin".to_string()).unwrap(),
+                "correct-horse-battery".to_string(),
+            )
+            .unwrap();
+        }
     }
 
     fn basic_auth(username: &str, password: &str) -> String {
@@ -11389,7 +11254,7 @@ mod tests {
     async fn auto_update_repo_change_requires_password() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let _token = issue_agent_token(&app, "agent-upd", ProjectPermission::ReadWrite).await;
+        let _token = issue_agent_token(&app, dir.path(), "agent-upd", ProjectPermission::ReadWrite).await;
 
         // Save initial config (same default repo) without password - should succeed
         let request = Request::builder()
@@ -11479,18 +11344,7 @@ mod tests {
     async fn api_basic_auth_rate_limited() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let bootstrap = Request::builder()
-            .method("POST")
-            .uri("/v1/admin/bootstrap")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"username":"admin","password":"correct-horse-battery"}"#,
-            ))
-            .unwrap();
-        assert_eq!(
-            app.clone().oneshot(bootstrap).await.unwrap().status(),
-            StatusCode::OK
-        );
+        ensure_test_admin(dir.path());
 
         for _ in 0..LOGIN_RATE_LIMIT_ATTEMPTS {
             let req = Request::builder()
@@ -11521,6 +11375,7 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token = issue_agent_token_multi_project(
             &app,
+            dir.path(),
             "mcp-bound",
             &[("alpha.docs", ProjectPermission::ReadWrite)],
         )
@@ -11599,6 +11454,7 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let valid_token = issue_agent_token_multi_project(
             &app,
+            dir.path(),
             "rate-test",
             &[("alpha.docs", ProjectPermission::Read)],
         )
@@ -11790,8 +11646,8 @@ mod tests {
         );
         let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
         let seed_token =
-            issue_agent_token(&app, "agent-scope-test", ProjectPermission::ReadWrite).await;
-        configure_librarian(&app).await;
+            issue_agent_token(&app, dir.path(), "agent-scope-test", ProjectPermission::ReadWrite).await;
+        configure_librarian(&app, dir.path()).await;
         create_block_in_project(&app, &seed_token, "alpha.docs", "real block").await;
 
         let request = Request::builder()
