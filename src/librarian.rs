@@ -49,6 +49,17 @@ impl std::str::FromStr for EndpointKind {
     }
 }
 
+pub fn infer_kind_from_url(url: &str) -> EndpointKind {
+    let lower = url.to_lowercase();
+    if lower.contains("anthropic.com") {
+        EndpointKind::Anthropic
+    } else if lower.contains("googleapis.com") || lower.contains("generativelanguage") {
+        EndpointKind::Gemini
+    } else {
+        EndpointKind::OpenAi
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Endpoint {
     pub id: String,
@@ -981,6 +992,113 @@ impl AnswerLibrarianClient for HttpLibrarianClient {
         }
         parse_action_plan(content)
     }
+}
+
+pub async fn list_provider_models(
+    url: &str,
+    api_key: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Vec<String>> {
+    let kind = infer_kind_from_url(url);
+    let client = Client::builder().build().unwrap_or_else(|_| Client::new());
+    let base = url.trim_end_matches('/');
+
+    let req = match kind {
+        EndpointKind::Anthropic => {
+            let murl = if let Some(idx) = base.find("/v1/") {
+                format!("{}/v1/models", &base[..idx])
+            } else {
+                format!("{}/v1/models", base)
+            };
+            let mut r = client.get(&murl);
+            if let Some(key) = api_key {
+                r = r.header("x-api-key", key);
+            }
+            r.header("anthropic-version", "2023-06-01")
+        }
+        EndpointKind::OpenAi => {
+            let murl = if let Some(idx) = base.find("/v1/") {
+                format!("{}/v1/models", &base[..idx])
+            } else {
+                format!("{}/v1/models", base)
+            };
+            let mut r = client.get(&murl);
+            if let Some(key) = api_key {
+                r = r.bearer_auth(key);
+            }
+            r
+        }
+        EndpointKind::Gemini => {
+            let base_clean = base
+                .split("/v1beta")
+                .next()
+                .unwrap_or(base)
+                .split("/v1")
+                .next()
+                .unwrap_or(base);
+            let murl = if let Some(key) = api_key {
+                format!("{}/v1beta/models?key={}", base_clean, key)
+            } else {
+                format!("{}/v1beta/models", base_clean)
+            };
+            client.get(&murl)
+        }
+    };
+
+    let response = req
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .map_err(|e| LoreError::ExternalService(format!("models request failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(LoreError::ExternalService(format!(
+            "models endpoint returned {}",
+            response.status()
+        )));
+    }
+
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| LoreError::ExternalService(format!("invalid models response: {e}")))?;
+
+    let mut models = Vec::new();
+    match kind {
+        EndpointKind::Anthropic | EndpointKind::OpenAi => {
+            if let Some(data) = value.get("data").and_then(|d| d.as_array()) {
+                for item in data {
+                    if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                        models.push(id.to_string());
+                    }
+                }
+            }
+        }
+        EndpointKind::Gemini => {
+            if let Some(list) = value.get("models").and_then(|m| m.as_array()) {
+                for item in list {
+                    if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                        let model_name = name.strip_prefix("models/").unwrap_or(name);
+                        let methods = item
+                            .get("supportedGenerationMethods")
+                            .and_then(|m| m.as_array());
+                        let supports_generate = methods
+                            .map(|arr| {
+                                arr.iter()
+                                    .any(|v| v.as_str() == Some("generateContent"))
+                            })
+                            .unwrap_or(true);
+                        if supports_generate {
+                            models.push(model_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    models.sort();
+    Ok(models)
 }
 
 fn build_provider_request_body(

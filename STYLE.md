@@ -146,6 +146,82 @@ This matches the Lucide/Feather icon style. Use `currentColor` for stroke so ico
 
 ---
 
+## Selectable List (`.sel-list`)
+
+A standard pattern for any list where items can be selected and a detail panel appears below. Used for admin users, endpoints, agents, and any future list-with-detail UI.
+
+### Structure
+
+```html
+<div class="sel-list">
+  <div class="sel-item" data-sel-id="item-1">
+    <div>
+      <span class="sel-item-name">Item Name</span>
+      <span class="sel-item-meta"><span class="pill">badge</span> &middot; extra info</span>
+    </div>
+    <span class="sel-item-actions">
+      <button class="btn-sm" title="Action"><!-- SVG glyph --></button>
+    </span>
+  </div>
+</div>
+<div class="sel-detail" data-sel-id="item-1" style="display:none">
+  <!-- detail content shown when item is selected -->
+</div>
+```
+
+### Classes
+
+| Class | Purpose |
+|---|---|
+| `.sel-list` | Container. Bordered, rounded, column flex. Margin `var(--s-3) var(--s-5) 0`. |
+| `.sel-item` | Row. Flex between, padded `var(--s-3) var(--s-4)`, bottom border, hover highlight. |
+| `.sel-item.active` | Selected state: `var(--bg-hover)` background + 4px `var(--accent)` left border. |
+| `.sel-item-name` | Primary label. `font-weight: 600`, mono font, `0.9rem`. |
+| `.sel-item-meta` | Secondary text/badges. `0.82rem`, `var(--fg-muted)`, flex with gap. |
+| `.sel-item-actions` | Right-side button group. Flex, `gap: var(--s-1)`, no shrink. Use `btn-sm` buttons with SVG glyphs and `title` tooltips. |
+| `.sel-detail` | Detail panel below list. Connected visually (no top border, inherits border-radius bottom). Hidden by default (`display:none`), shown when parent `.sel-item` is active. |
+
+### Behaviour (JS)
+
+Use `data-sel-id` on both `.sel-item` and `.sel-detail` elements with matching values. The standard initialiser wires up click-to-toggle:
+
+```js
+function initSelList(scope) {
+  var items = scope.querySelectorAll('.sel-list .sel-item');
+  var details = scope.querySelectorAll('.sel-detail');
+  items.forEach(function(item) {
+    item.addEventListener('click', function() {
+      var id = item.getAttribute('data-sel-id');
+      var wasActive = item.classList.contains('active');
+      items.forEach(function(i) { i.classList.remove('active'); });
+      details.forEach(function(d) { d.style.display = 'none'; });
+      if (!wasActive) {
+        item.classList.add('active');
+        var detail = scope.querySelector('.sel-detail[data-sel-id="' + id + '"]');
+        if (detail) detail.style.display = '';
+      }
+    });
+  });
+}
+```
+
+Call `initSelList(scopeElement)` where `scopeElement` is the nearest container that holds both the list and its detail panels (e.g. a `[data-panel]` section). On the admin page this is auto-initialised for all `[data-panel]` sections.
+
+### Action buttons
+
+Buttons inside `.sel-item-actions` should use `btn-sm` (28x28 icon buttons) with:
+- Inline SVG glyphs (14x14, Lucide style)
+- A `title` attribute for the tooltip
+- `event.stopPropagation()` in onclick to prevent triggering item selection
+
+### Examples in codebase
+
+- **Admin users list** — username items with role badge, detail panel for password/session management
+- **Admin endpoints list** — provider endpoints with kind badge, detail panel for config/test/delete
+- **Agents page** — agent list with status badge and stop/restart buttons, detail panel for grants and setup
+
+---
+
 ## Layout Components
 
 ### `.block-meta`

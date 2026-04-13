@@ -832,9 +832,9 @@ pub fn render_admin_page(
                 let badge = if user.is_admin { "admin" } else { "user" };
                 let disabled_badge = if user.disabled { r#" <span class="pill" style="background:var(--danger);color:#fff;font-size:0.7rem;">disabled</span>"# } else { "" };
                 format!(
-                    r#"<div class="user-list-item" data-username="{username_attr}">
-                      <span class="user-list-name">{username}</span>
-                      <span class="user-list-meta"><span class="pill">{badge}</span>{disabled} &middot; {sessions} sessions</span>
+                    r#"<div class="sel-item" data-sel-id="{username_attr}">
+                      <span class="sel-item-name">{username}</span>
+                      <span class="sel-item-meta"><span class="pill">{badge}</span>{disabled} &middot; {sessions} sessions</span>
                     </div>"#,
                     username_attr = escape_attribute(&user.username),
                     username = escape_text(&user.username),
@@ -844,7 +844,7 @@ pub fn render_admin_page(
                 )
             })
             .collect();
-        format!(r#"<div class="user-list">{}</div>"#, items.join(""))
+        format!(r#"<div class="sel-list">{}</div>"#, items.join(""))
     };
     let users_detail_html: String = users
         .iter()
@@ -906,9 +906,9 @@ pub fn render_admin_page(
                     "incomplete"
                 };
                 format!(
-                    r#"<div class="user-list-item" data-endpoint-id="{id}">
-                      <span class="user-list-name">{name}</span>
-                      <span class="user-list-meta"><span class="pill">{kind}</span> &middot; {status}</span>
+                    r#"<div class="sel-item" data-sel-id="{id}">
+                      <span class="sel-item-name">{name}</span>
+                      <span class="sel-item-meta"><span class="pill">{kind}</span> &middot; {status}</span>
                     </div>"#,
                     id = escape_attribute(&ep.id),
                     name = escape_text(&ep.name),
@@ -917,34 +917,29 @@ pub fn render_admin_page(
                 )
             })
             .collect();
-        format!(r#"<div class="user-list">{}</div>"#, items.join(""))
+        format!(r#"<div class="sel-list">{}</div>"#, items.join(""))
     };
     let endpoints_detail_html: String = endpoints
         .iter()
         .map(|ep| {
-            let anthropic_sel = if ep.kind == crate::librarian::EndpointKind::Anthropic { " selected" } else { "" };
-            let gemini_sel = if ep.kind == crate::librarian::EndpointKind::Gemini { " selected" } else { "" };
-            let openai_sel = if ep.kind == crate::librarian::EndpointKind::OpenAi { " selected" } else { "" };
             let key_placeholder = if ep.has_api_key() {
                 "Stored. Leave blank to preserve."
             } else {
                 "Paste a provider secret"
             };
             format!(
-                r#"<div class="user-detail" data-endpoint-detail="{id}" style="display:none">
+                r#"<div class="sel-detail" data-sel-id="{id}" style="display:none">
                   <form method="post" action="/ui/admin/endpoints/{id}">
                     <input type="hidden" name="csrf_token" value="{csrf}">
                     <label>Name<input type="text" name="name" value="{name}" required></label>
-                    <label>Provider
-                      <select name="kind" class="endpoint-kind-select" data-endpoint-id="{id}">
-                        <option value="anthropic"{anthropic_sel}>Anthropic</option>
-                        <option value="gemini"{gemini_sel}>Gemini</option>
-                        <option value="openai"{openai_sel}>OpenAI</option>
-                      </select>
-                    </label>
                     <label>URL<input type="url" name="url" value="{url}" placeholder="https://api.example.com/..."></label>
-                    <label>Model<input type="text" name="model" value="{model}" required></label>
                     <label>API key<input type="password" name="api_key" placeholder="{key_placeholder}"></label>
+                    <label>Model
+                      <div style="display:flex;gap:var(--s-1);align-items:center">
+                        <input type="text" name="model" value="{model}" required style="flex:1;margin:0">
+                        <button type="button" class="btn-sm" title="Fetch available models" onclick="fetchModels(this)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21h5v-5"/></svg></button>
+                      </div>
+                    </label>
                     <div style="display:flex;gap:var(--s-2);flex-wrap:wrap">
                       <button type="submit">Save endpoint</button>
                     </div>
@@ -966,9 +961,6 @@ pub fn render_admin_page(
                 name = escape_attribute(&ep.name),
                 url = escape_attribute(&ep.url),
                 model = escape_attribute(&ep.model),
-                anthropic_sel = anthropic_sel,
-                gemini_sel = gemini_sel,
-                openai_sel = openai_sel,
                 key_placeholder = key_placeholder,
             )
         })
@@ -1212,16 +1204,14 @@ pub fn render_admin_page(
         <form method="post" action="/ui/admin/endpoints">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
           <label>Name<input type="text" name="name" placeholder="Production Anthropic" required></label>
-          <label>Provider
-            <select name="kind" id="new-endpoint-kind">
-              <option value="anthropic">Anthropic</option>
-              <option value="gemini">Gemini</option>
-              <option value="openai">OpenAI</option>
-            </select>
-          </label>
-          <label>URL<input type="url" name="url" id="new-endpoint-url" placeholder="https://api.anthropic.com/v1/messages"></label>
-          <label>Model<input type="text" name="model" id="new-endpoint-model" placeholder="claude-sonnet-4-20250514" required></label>
+          <label>URL<input type="url" name="url" placeholder="https://api.anthropic.com/v1/messages" required></label>
           <label>API key<input type="password" name="api_key"></label>
+          <label>Model
+            <div style="display:flex;gap:var(--s-1);align-items:center">
+              <input type="text" name="model" placeholder="claude-sonnet-4-20250514" required style="flex:1;margin:0">
+              <button type="button" class="btn-sm" title="Fetch available models" onclick="fetchModels(this)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21h5v-5"/></svg></button>
+            </div>
+          </label>
           <button type="submit">Add endpoint</button>
         </form>
         <div class="panel-header"><h2>Endpoints</h2></div>
@@ -1639,50 +1629,67 @@ pub fn render_admin_page(
         }});
       }}
 
-      var userItems = document.querySelectorAll('.user-list-item');
-      var userDetails = document.querySelectorAll('.user-detail');
-      userItems.forEach(function(item) {{
-        item.addEventListener('click', function() {{
-          var name = item.getAttribute('data-username');
-          var wasActive = item.classList.contains('active');
-          userItems.forEach(function(i) {{ i.classList.remove('active'); }});
-          userDetails.forEach(function(d) {{ d.style.display = 'none'; }});
-          if (!wasActive) {{
-            item.classList.add('active');
-            var detail = document.querySelector('.user-detail[data-user-detail="' + name + '"]');
-            if (detail) detail.style.display = '';
-          }}
-        }});
-      }});
-
-      var epItems = document.querySelectorAll('[data-endpoint-id]');
-      var epDetails = document.querySelectorAll('[data-endpoint-detail]');
-      epItems.forEach(function(item) {{
-        item.addEventListener('click', function() {{
-          var id = item.getAttribute('data-endpoint-id');
-          var wasActive = item.classList.contains('active');
-          epItems.forEach(function(i) {{ i.classList.remove('active'); }});
-          epDetails.forEach(function(d) {{ d.style.display = 'none'; }});
-          if (!wasActive) {{
-            item.classList.add('active');
-            var detail = document.querySelector('[data-endpoint-detail="' + id + '"]');
-            if (detail) detail.style.display = '';
-          }}
-        }});
-      }});
-
-      var defaultUrls = {{anthropic:'https://api.anthropic.com/v1/messages',gemini:'https://generativelanguage.googleapis.com',openai:'https://api.openai.com/v1/chat/completions'}};
-      var defaultModels = {{anthropic:'claude-sonnet-4-20250514',gemini:'gemini-2.0-flash',openai:'gpt-4o'}};
-      var newKind = document.getElementById('new-endpoint-kind');
-      var newUrl = document.getElementById('new-endpoint-url');
-      var newModel = document.getElementById('new-endpoint-model');
-      if (newKind) {{
-        newKind.addEventListener('change', function() {{
-          newUrl.placeholder = defaultUrls[newKind.value] || '';
-          newModel.placeholder = defaultModels[newKind.value] || '';
-          if (!newUrl.value) newUrl.value = defaultUrls[newKind.value] || '';
+      function initSelList(scope) {{
+        var items = scope.querySelectorAll('.sel-list .sel-item');
+        var details = scope.querySelectorAll('.sel-detail');
+        items.forEach(function(item) {{
+          item.addEventListener('click', function() {{
+            var id = item.getAttribute('data-sel-id');
+            var wasActive = item.classList.contains('active');
+            items.forEach(function(i) {{ i.classList.remove('active'); }});
+            details.forEach(function(d) {{ d.style.display = 'none'; }});
+            if (!wasActive) {{
+              item.classList.add('active');
+              var detail = scope.querySelector('.sel-detail[data-sel-id="' + id + '"]');
+              if (detail) detail.style.display = '';
+            }}
+          }});
         }});
       }}
+      document.querySelectorAll('[data-panel]').forEach(function(p) {{ initSelList(p); }});
+
+      window.fetchModels = function(btn) {{
+        var form = btn.closest('form');
+        var urlInput = form.querySelector('input[name="url"]');
+        var keyInput = form.querySelector('input[name="api_key"]');
+        var modelField = form.querySelector('[name="model"]');
+        var currentModel = modelField.value;
+        var detailDiv = form.closest('.sel-detail');
+        var endpointId = detailDiv ? detailDiv.getAttribute('data-sel-id') : null;
+        var body = {{}};
+        if (endpointId) body.endpoint_id = endpointId;
+        if (urlInput && urlInput.value) body.url = urlInput.value;
+        if (keyInput && keyInput.value) body.api_key = keyInput.value;
+        if (!body.url && !body.endpoint_id) return;
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+        fetch('/ui/admin/endpoints/list-models', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify(body)
+        }})
+        .then(function(r) {{ if (!r.ok) throw new Error('failed'); return r.json(); }})
+        .then(function(data) {{
+          if (!data.models || !data.models.length) throw new Error('empty');
+          var sel = document.createElement('select');
+          sel.name = 'model';
+          sel.required = true;
+          sel.style.flex = '1';
+          sel.style.margin = '0';
+          data.models.forEach(function(m) {{
+            var opt = document.createElement('option');
+            opt.value = m;
+            opt.textContent = m;
+            if (m === currentModel) opt.selected = true;
+            sel.appendChild(opt);
+          }});
+          modelField.replaceWith(sel);
+        }})
+        .catch(function() {{ btn.style.background = 'var(--danger)'; btn.style.color = '#fff';
+          setTimeout(function() {{ btn.style.background = ''; btn.style.color = ''; }}, 1200);
+        }})
+        .finally(function() {{ btn.disabled = false; btn.style.opacity = ''; }});
+      }};
     }})();
 
     document.querySelectorAll('[data-machine-update]').forEach(function(btn) {{
@@ -1972,17 +1979,17 @@ pub fn render_agents_page(
                         escape_attribute(mname),
                         ICON_RESTART,
                     );
-                    format!(r#"<span class="agent-controls">{stop_btn}{restart_btn}</span>"#)
+                    format!(r#"<span class="sel-item-actions">{stop_btn}{restart_btn}</span>"#)
                 } else {
                     String::new()
                 };
                 format!(
-                    r#"<a href="/ui/agents?selected={}" class="agent-list-item{}">
+                    r#"<a href="/ui/agents?selected={}" class="sel-item{}">
                       <div style="display:flex; align-items:center; gap:var(--s-2); min-width:0;">
                         {status_badge}
                         <div style="min-width:0;">
-                          <span class="agent-list-name">{}</span>
-                          <span class="agent-list-meta">{} &middot; {}</span>
+                          <span class="sel-item-name">{}</span>
+                          <span class="sel-item-meta">{} &middot; {}</span>
                         </div>
                       </div>
                       {machine_controls}
@@ -2028,10 +2035,10 @@ pub fn render_agents_page(
                 let version_class = if is_outdated { r#" style="color:var(--danger)""# } else { "" };
                 format!(
                     r#"<div class="machine-item" data-machine="{name_attr}">
-                      <div class="agent-list-item" style="display:flex; justify-content:space-between; align-items:center; gap:var(--s-2);">
+                      <div class="sel-item" style="display:flex; justify-content:space-between; align-items:center; gap:var(--s-2);">
                         <div style="min-width:0;">
-                          <span class="agent-list-name">{name}</span>
-                          <span class="agent-list-meta"{version_class}>v{version}</span>
+                          <span class="sel-item-name">{name}</span>
+                          <span class="sel-item-meta"{version_class}>v{version}</span>
                         </div>
                         <div style="display:flex; gap:var(--s-2); align-items:center; flex-shrink:0;">
                           {update_btn}
@@ -2244,7 +2251,7 @@ pub fn render_agents_page(
         <h2>Machines</h2>
         <p>Registered machines that can provision agents for your account. <a href="/ui/agents/guide">Setup guide</a></p>
       </div>
-      <div class="agent-list">{machines_html}</div>
+      <div class="sel-list">{machines_html}</div>
     </section>
 
     <section class="panel" style="margin-top: var(--s-5);">
@@ -2252,7 +2259,7 @@ pub fn render_agents_page(
         <h2>Agents</h2>
         <p>Each agent gets its own scoped token and project access.</p>
       </div>
-      <div class="agent-list">{agent_list_html}</div>
+      <div class="sel-list">{agent_list_html}</div>
     </section>
 
     {detail_html}
@@ -2405,7 +2412,7 @@ pub fn render_agents_page(
       }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
         if (d.up_to_date) {{
           btn.style.display = 'none';
-          var verSpan = btn.closest('.agent-list-item').querySelector('.agent-list-meta');
+          var verSpan = btn.closest('.sel-item').querySelector('.sel-item-meta');
           if (verSpan) {{
             verSpan.textContent = 'v' + d.version;
             verSpan.style.color = '';
@@ -4996,7 +5003,7 @@ fn render_user_detail(user: &UiUserSummary, agents: &[AgentTokenSummary], machin
     };
 
     format!(
-        r#"<div class="user-detail" data-user-detail="{username_attr}" style="display:none;">
+        r#"<div class="sel-detail" data-sel-id="{username_attr}" style="display:none;">
   <div class="block-meta">
     <span class="pill">{badge}</span>
     <span>{created}</span>
@@ -6619,16 +6626,16 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       margin-top: var(--s-6);
     }
 
-    .agent-list {
+    /* Selectable list — standard pattern for list + detail panel */
+    .sel-list {
       display: flex;
       flex-direction: column;
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      margin: var(--s-3) var(--s-5) var(--s-5);
+      margin: var(--s-3) var(--s-5) 0;
       overflow: hidden;
     }
-
-    .agent-list-item {
+    .sel-item {
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -6636,26 +6643,38 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border-bottom: 1px solid var(--line);
       text-decoration: none;
       color: var(--fg);
+      cursor: pointer;
       transition: background 0.1s;
     }
-
-    .agent-list-item:last-child {
-      border-bottom: none;
-    }
-
-    .agent-list-item:hover {
+    .sel-item:last-child { border-bottom: none; }
+    .sel-item:hover { background: var(--bg-hover); }
+    .sel-item.active {
       background: var(--bg-hover);
+      border-left: 4px solid var(--accent);
     }
-
-    .agent-list-item.active {
-      background: var(--bg-hover);
-      border-left: 3px solid var(--accent);
-    }
-
-    .agent-list-name {
+    .sel-item-name {
       font-weight: 600;
       font-family: var(--font-mono);
       font-size: 0.9rem;
+    }
+    .sel-item-meta {
+      font-size: 0.82rem;
+      color: var(--fg-muted);
+      display: flex;
+      align-items: center;
+      gap: var(--s-2);
+    }
+    .sel-item-actions {
+      display: flex;
+      gap: var(--s-1);
+      flex-shrink: 0;
+    }
+    .sel-detail {
+      border: 1px solid var(--line);
+      border-top: none;
+      border-radius: 0 0 var(--radius) var(--radius);
+      margin: 0 var(--s-5) var(--s-5);
+      padding: var(--s-4) 0;
     }
 
     .folder-entry:hover {
@@ -6665,76 +6684,12 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border-bottom: none !important;
     }
 
-    .agent-list-meta {
-      font-size: 0.82rem;
-      color: var(--fg-muted);
-    }
-
     .agent-status-badge {
       font-size: 0.7rem;
       flex-shrink: 0;
     }
     .agent-status-badge.running { color: var(--success, #22c55e); }
     .agent-status-badge.stopped { color: var(--fg-muted); }
-
-    .agent-controls {
-      display: flex;
-      gap: var(--s-1);
-      flex-shrink: 0;
-    }
-
-    .user-list {
-      display: flex;
-      flex-direction: column;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      margin: var(--s-3) var(--s-5) 0;
-      overflow: hidden;
-    }
-
-    .user-list-item {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: var(--s-3) var(--s-4);
-      border-bottom: 1px solid var(--line);
-      cursor: pointer;
-      transition: background 0.1s;
-    }
-
-    .user-list-item:last-child {
-      border-bottom: none;
-    }
-
-    .user-list-item:hover {
-      background: var(--bg-hover);
-    }
-
-    .user-list-item.active {
-      background: var(--bg-hover);
-      border-left: 3px solid var(--accent);
-    }
-
-    .user-list-name {
-      font-weight: 600;
-      font-family: var(--font-mono);
-      font-size: 0.9rem;
-    }
-
-    .user-list-meta {
-      font-size: 0.82rem;
-      color: var(--fg-muted);
-      display: flex;
-      align-items: center;
-      gap: var(--s-2);
-    }
-
-    .user-detail {
-      border: 1px solid var(--line);
-      border-top: none;
-      border-radius: 0 0 var(--radius) var(--radius);
-      margin: 0 var(--s-5) var(--s-5);
-      padding: var(--s-4) 0;
     }
 
     /* Chat — full-viewport layout, no page scroll */
@@ -6782,7 +6737,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .chat-agent-active {
       background: var(--bg-hover);
-      border-left: 3px solid var(--accent);
+      border-left: 4px solid var(--accent);
     }
     .chat-agent-header {
       display: flex;

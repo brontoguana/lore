@@ -415,6 +415,10 @@ fn build_app_with_librarian(
         .route("/ui/admin/setup", post(update_setup_from_ui))
         .route("/ui/admin/endpoints", post(create_endpoint_from_ui))
         .route(
+            "/ui/admin/endpoints/list-models",
+            post(list_models_from_ui),
+        )
+        .route(
             "/ui/admin/endpoints/{id}",
             post(update_endpoint_from_ui),
         )
@@ -883,7 +887,7 @@ struct UpdateLibrarianUiForm {
 #[derive(Debug, Deserialize)]
 struct CreateEndpointRequest {
     name: String,
-    kind: String,
+    kind: Option<String>,
     url: String,
     model: String,
     api_key: Option<String>,
@@ -892,7 +896,7 @@ struct CreateEndpointRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateEndpointRequest {
     name: String,
-    kind: String,
+    kind: Option<String>,
     url: String,
     model: String,
     api_key: Option<String>,
@@ -903,7 +907,6 @@ struct UpdateEndpointRequest {
 struct CreateEndpointUiForm {
     csrf_token: String,
     name: String,
-    kind: String,
     url: String,
     model: String,
     api_key: String,
@@ -913,11 +916,17 @@ struct CreateEndpointUiForm {
 struct UpdateEndpointUiForm {
     csrf_token: String,
     name: String,
-    kind: String,
     url: String,
     model: String,
     api_key: String,
     clear_api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListModelsRequest {
+    endpoint_id: Option<String>,
+    url: Option<String>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2177,7 +2186,10 @@ async fn create_endpoint(
     Json(payload): Json<CreateEndpointRequest>,
 ) -> ApiResult<Json<EndpointSummary>> {
     let admin = require_admin(&state, &headers)?;
-    let kind: EndpointKind = payload.kind.parse()?;
+    let kind: EndpointKind = match payload.kind {
+        Some(k) => k.parse()?,
+        None => crate::librarian::infer_kind_from_url(&payload.url),
+    };
     let ep = state.endpoint_store.create(
         payload.name,
         kind,
@@ -2205,7 +2217,10 @@ async fn update_endpoint(
     Json(payload): Json<UpdateEndpointRequest>,
 ) -> ApiResult<Json<EndpointSummary>> {
     let admin = require_admin(&state, &headers)?;
-    let kind: EndpointKind = payload.kind.parse()?;
+    let kind: EndpointKind = match payload.kind {
+        Some(k) => k.parse()?,
+        None => crate::librarian::infer_kind_from_url(&payload.url),
+    };
     let ep = state.endpoint_store.update(
         &id,
         payload.name,
@@ -3523,7 +3538,7 @@ async fn create_endpoint_from_ui(
 ) -> UiResult<Redirect> {
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    let kind: EndpointKind = form.kind.parse()?;
+    let kind = crate::librarian::infer_kind_from_url(&form.url);
     let api_key = if form.api_key.is_empty() {
         None
     } else {
@@ -3555,7 +3570,7 @@ async fn update_endpoint_from_ui(
 ) -> UiResult<Redirect> {
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    let kind: EndpointKind = form.kind.parse()?;
+    let kind = crate::librarian::infer_kind_from_url(&form.url);
     let ep = state.endpoint_store.update(
         &id,
         form.name,
@@ -3628,6 +3643,39 @@ async fn test_endpoint_from_ui(
     Ok(Redirect::to(&format!(
         "/ui/admin?section=endpoints&flash={flash}"
     )))
+}
+
+async fn list_models_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ListModelsRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_ui_admin(&state, &headers)?;
+    let config = state.librarian_config.load()?;
+    let timeout = config.request_timeout_secs;
+
+    let (url, api_key) = if let Some(ref eid) = payload.endpoint_id {
+        let ep = state
+            .endpoint_store
+            .get(eid)?
+            .ok_or_else(|| LoreError::Validation("endpoint not found".into()))?;
+        let url = payload.url.as_deref().unwrap_or(&ep.url).to_string();
+        let key = payload
+            .api_key
+            .clone()
+            .or_else(|| ep.api_key.clone());
+        (url, key)
+    } else {
+        let url = payload
+            .url
+            .clone()
+            .ok_or_else(|| LoreError::Validation("url is required".into()))?;
+        (url, payload.api_key.clone())
+    };
+
+    let models =
+        crate::librarian::list_provider_models(&url, api_key.as_deref(), timeout).await?;
+    Ok(Json(serde_json::json!({ "models": models })))
 }
 
 async fn update_git_export_from_ui(
