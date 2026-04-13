@@ -779,6 +779,23 @@ impl LocalAuthStore {
         Ok(())
     }
 
+    pub fn set_agent_backend(
+        &self,
+        name: &str,
+        owner: &UserName,
+        backend: AgentBackend,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let updated = conn.execute(
+            "UPDATE agent_tokens SET backend = ?1 WHERE name = ?2 AND owner = ?3",
+            params![backend.to_string(), name, owner.as_str()],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        if updated == 0 {
+            return Err(LoreError::Validation("agent does not exist".into()));
+        }
+        Ok(())
+    }
+
     pub fn update_agent_token_grants(
         &self,
         name: &str,

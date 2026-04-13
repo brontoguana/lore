@@ -21,6 +21,7 @@ use time::format_description::well_known::Rfc3339;
 // Lucide-style SVG icons for agent controls (14x14)
 const ICON_STOP: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>"#;
 const ICON_RESTART: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>"#;
+const ICON_SETTINGS: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 
 pub struct PageShell<'a> {
     pub title: &'a str,
@@ -1267,13 +1268,15 @@ pub fn render_admin_page(
           <input type="checkbox" id="auto-update-toggle" data-csrf="{csrf_token}"{auto_update_enabled_checked}>
           <span>Enable automatic server self-update on restart</span>
         </label>
-        <div style="padding:0 var(--s-5) var(--s-5);display:grid;gap:0.45rem;">
-          <label for="auto-update-stream"><strong>Release Stream</strong></label>
+        <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>Release Stream</h2>
+          <p>Machine-triggered CLI updates follow the server's selected stream.</p>
+        </div>
+        <div style="padding:0 var(--s-5) var(--s-5)">
           <select id="auto-update-stream" data-csrf="{csrf_token}">
             <option value="stable"{stable_selected}>Stable</option>
             <option value="prerelease"{prerelease_selected}>Prerelease</option>
           </select>
-          <p class="hint" style="margin:0;">Machine-triggered CLI updates follow the server's selected stream.</p>
         </div>
       </section>
 
@@ -1787,14 +1790,14 @@ pub fn render_agents_page(
                     let is_running = agent.process_status.as_deref() == Some("running");
                     let stop_btn = if is_running {
                         format!(
-                            r#"<button type="button" class="agent-ctrl-btn" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('stop', '{}', '{}')" title="Stop">{}</button>"#,
+                            r#"<button type="button" class="button-link" style="aspect-ratio:1; width:auto; padding:0; min-height:0; display:inline-flex; align-items:center; justify-content:center;" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('stop', '{}', '{}')" title="Stop">{}</button>"#,
                             escape_attribute(&agent.name),
                             escape_attribute(mname),
                             ICON_STOP,
                         )
                     } else { String::new() };
                     let restart_btn = format!(
-                        r#"<button type="button" class="agent-ctrl-btn" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('restart', '{}', '{}')" title="Restart">{}</button>"#,
+                        r#"<button type="button" class="button-link" style="aspect-ratio:1; width:auto; padding:0; min-height:0; display:inline-flex; align-items:center; justify-content:center;" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('restart', '{}', '{}')" title="Restart">{}</button>"#,
                         escape_attribute(&agent.name),
                         escape_attribute(mname),
                         ICON_RESTART,
@@ -1873,13 +1876,13 @@ pub fn render_agents_page(
                           </label>
                           <div style="display:flex; flex-direction:column; gap:var(--s-1);">
                             <span style="font-size:0.8rem; color:var(--fg-2);">Backend</span>
-                            <div style="display:flex; align-items:center; gap:var(--s-2);">
+                            <div style="display:flex; align-items:stretch; gap:var(--s-2);">
                               <select id="create-backend-{name_attr}">
                                 <option value="claude">Claude</option>
                                 <option value="gemini">Gemini</option>
                                 <option value="codex">Codex</option>
                               </select>
-                              <button type="button" onclick="toggleMkdir('{name_attr}')" title="Create folder" aria-label="Create folder" style="display:inline-flex; align-items:center; justify-content:center; width:2rem; height:2rem; padding:0; flex:0 0 auto;">
+                              <button type="button" onclick="toggleMkdir('{name_attr}')" title="Create folder" aria-label="Create folder" style="display:inline-flex; align-items:center; justify-content:center; aspect-ratio:1; padding:0; flex:0 0 auto;">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
                                   <path d="M12 11v6"/>
@@ -2764,8 +2767,25 @@ pub fn render_chat_page(
   {header_avatar}<span class="chat-header-name">{display_name}</span>
   <span class="chat-header-status" id="chat-agent-status"></span>
   {cwd_html}
+  <button type="button" class="button-link" id="chat-config-btn" style="aspect-ratio:1; width:auto; padding:0; min-height:0; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
 </div>
 <div class="chat-messages" id="chat-messages"></div>
+<div class="chat-config-panel" id="chat-config-panel" style="display:none;">
+  <div class="chat-config-inner">
+    <div class="chat-config-field">
+      <label class="chat-config-label">Backend</label>
+      <select id="cfg-backend" class="chat-config-select" onchange="onBackendChange()"></select>
+    </div>
+    <div class="chat-config-field">
+      <label class="chat-config-label">Model</label>
+      <select id="cfg-model" class="chat-config-select" onchange="onConfigChange()"></select>
+    </div>
+    <div class="chat-config-field" id="cfg-effort-field">
+      <label class="chat-config-label">Effort</label>
+      <select id="cfg-effort" class="chat-config-select" onchange="onConfigChange()"></select>
+    </div>
+  </div>
+</div>
 <form class="chat-input-form" id="chat-input-form" onsubmit="return sendMessage(event)">
   <input type="hidden" name="csrf_token" value="{csrf_token}">
   <textarea class="chat-input" id="chat-input" placeholder="Type a message..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
@@ -2776,6 +2796,7 @@ pub fn render_chat_page(
             header_avatar = header_avatar,
             display_name = escape_text(display),
             cwd_html = cwd_html,
+            settings_icon = ICON_SETTINGS,
             csrf_token = escape_attribute(csrf_token),
         )
     } else {
@@ -2805,7 +2826,7 @@ pub fn render_chat_page(
         r#"<div class="{layout_class}">
   <div class="chat-sidebar" id="chat-sidebar">
     <div class="chat-sidebar-header">
-      <span class="heading-3">Agents</span>
+      <span class="chat-header-name">Agents</span>
     </div>
     <div class="chat-agent-list">
       {agent_list_html}
@@ -2900,9 +2921,6 @@ function renderMessages() {{
     var msg = chatMessages[i];
     var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : 'chat-msg-assistant';
     html += '<div class="chat-msg ' + cls + '">';
-    if (msg.role === 'assistant' && agentProfileUrl) {{
-      html += '<img class="chat-avatar-msg" src="' + escapeHtmlRaw(agentProfileUrl) + '" alt="">';
-    }}
     if (msg.role === 'assistant') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
     }} else {{
@@ -3218,6 +3236,144 @@ function connectSSE() {{
     }}
   }}, {{ passive: true }});
 }})();
+
+var chatConfigOpen = false;
+var chatConfigData = null;
+var configSaveTimer = null;
+
+var backendModels = {{
+  claude: ['default', 'opus', 'sonnet', 'haiku'],
+  gemini: ['default', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-3-pro-preview'],
+  codex: ['default'],
+  openai: ['default']
+}};
+
+var backendEfforts = {{
+  claude: ['default', 'low', 'medium', 'high', 'max'],
+  gemini: [],
+  codex: [],
+  openai: []
+}};
+
+function toggleChatConfig() {{
+  var msgs = document.getElementById('chat-messages');
+  var cfg = document.getElementById('chat-config-panel');
+  var btn = document.getElementById('chat-config-btn');
+  var form = document.getElementById('chat-input-form');
+  if (!msgs || !cfg) return;
+  chatConfigOpen = !chatConfigOpen;
+  if (chatConfigOpen) {{
+    msgs.style.display = 'none';
+    cfg.style.display = '';
+    if (form) form.style.display = 'none';
+    if (btn) btn.classList.add('active');
+    loadChatConfig();
+  }} else {{
+    msgs.style.display = '';
+    cfg.style.display = 'none';
+    if (form) form.style.display = '';
+    if (btn) btn.classList.remove('active');
+  }}
+}}
+
+function loadChatConfig() {{
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config')
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      chatConfigData = data;
+      populateConfigDropdowns(data.backend, data.prefs);
+    }});
+}}
+
+function populateConfigDropdowns(backend, prefs) {{
+  var bSel = document.getElementById('cfg-backend');
+  var backends = ['claude', 'gemini', 'codex', 'openai'];
+  bSel.innerHTML = '';
+  for (var i = 0; i < backends.length; i++) {{
+    var opt = document.createElement('option');
+    opt.value = backends[i];
+    opt.textContent = backends[i].charAt(0).toUpperCase() + backends[i].slice(1);
+    if (backends[i] === backend) opt.selected = true;
+    bSel.appendChild(opt);
+  }}
+  populateModelEffort(backend, prefs);
+}}
+
+function populateModelEffort(backend, prefs) {{
+  var mSel = document.getElementById('cfg-model');
+  var eSel = document.getElementById('cfg-effort');
+  var eField = document.getElementById('cfg-effort-field');
+
+  var models = backendModels[backend] || ['default'];
+  var currentModel = (prefs && prefs[backend] && prefs[backend].model) || null;
+  mSel.innerHTML = '';
+  for (var i = 0; i < models.length; i++) {{
+    var opt = document.createElement('option');
+    opt.value = models[i] === 'default' ? '' : models[i];
+    opt.textContent = models[i];
+    if ((models[i] === 'default' && !currentModel) || models[i] === currentModel) opt.selected = true;
+    mSel.appendChild(opt);
+  }}
+  if (currentModel && models.indexOf(currentModel) === -1 && currentModel !== 'default') {{
+    var custom = document.createElement('option');
+    custom.value = currentModel;
+    custom.textContent = currentModel;
+    custom.selected = true;
+    mSel.appendChild(custom);
+  }}
+
+  var efforts = backendEfforts[backend] || [];
+  if (efforts.length === 0) {{
+    eField.style.display = 'none';
+  }} else {{
+    eField.style.display = '';
+    var currentEffort = (prefs && prefs[backend] && prefs[backend].effort) || null;
+    eSel.innerHTML = '';
+    for (var j = 0; j < efforts.length; j++) {{
+      var eopt = document.createElement('option');
+      eopt.value = efforts[j] === 'default' ? '' : efforts[j];
+      eopt.textContent = efforts[j];
+      if ((efforts[j] === 'default' && !currentEffort) || efforts[j] === currentEffort) eopt.selected = true;
+      eSel.appendChild(eopt);
+    }}
+  }}
+}}
+
+function onBackendChange() {{
+  var bSel = document.getElementById('cfg-backend');
+  var newBackend = bSel.value;
+  if (chatConfigData) {{
+    populateModelEffort(newBackend, chatConfigData.prefs);
+  }}
+  saveConfig();
+}}
+
+function onConfigChange() {{
+  if (configSaveTimer) clearTimeout(configSaveTimer);
+  configSaveTimer = setTimeout(saveConfig, 300);
+}}
+
+function saveConfig() {{
+  var backend = document.getElementById('cfg-backend').value;
+  var model = document.getElementById('cfg-model').value;
+  var effort = document.getElementById('cfg-effort').value;
+  var body = 'csrf_token=' + encodeURIComponent(csrfToken)
+    + '&backend=' + encodeURIComponent(backend)
+    + '&model=' + encodeURIComponent(model)
+    + '&effort=' + encodeURIComponent(effort);
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: body
+  }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+    if (d.ok && chatConfigData) {{
+      chatConfigData.backend = backend;
+      if (!chatConfigData.prefs[backend]) chatConfigData.prefs[backend] = {{}};
+      chatConfigData.prefs[backend].model = model || null;
+      chatConfigData.prefs[backend].effort = effort || null;
+    }}
+  }});
+}}
 
 if (currentAgent) {{
   renderMessages();
@@ -6230,20 +6386,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       gap: var(--s-1);
       flex-shrink: 0;
     }
-    .agent-ctrl-btn {
-      background: none;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      padding: 2px 4px;
-      cursor: pointer;
-      color: var(--fg-muted);
-      display: flex;
-      align-items: center;
-    }
-    .agent-ctrl-btn:hover {
-      background: var(--bg-hover);
-      color: var(--fg);
-    }
 
     .user-list {
       display: flex;
@@ -6324,8 +6466,10 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       overflow-y: auto;
     }
     .chat-sidebar-header {
-      padding: var(--s-4);
+      padding: var(--s-3) var(--s-4);
       border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
     }
     .chat-agent-list {
       flex: 1;
@@ -6435,14 +6579,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       object-fit: cover;
       flex-shrink: 0;
     }
-    .chat-avatar-msg {
-      width: 26px;
-      height: 26px;
-      border-radius: 4px;
-      object-fit: cover;
-      flex-shrink: 0;
-      margin-top: 2px;
-    }
     .chat-back-btn {
       display: none;
       align-items: center;
@@ -6452,6 +6588,36 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: var(--fg);
       cursor: pointer;
       padding: var(--s-2);
+    }
+    .chat-config-panel {
+      flex: 1;
+      overflow-y: auto;
+      padding: var(--s-5);
+    }
+    .chat-config-inner {
+      max-width: 400px;
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-4);
+    }
+    .chat-config-field {
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-1);
+    }
+    .chat-config-label {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--fg-muted);
+    }
+    .chat-config-select {
+      padding: var(--s-2) var(--s-3);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--input-bg);
+      color: var(--ink);
+      font-size: 0.95rem;
+      font-family: var(--font-sans);
     }
     .chat-messages {
       flex: 1;

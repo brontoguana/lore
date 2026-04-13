@@ -355,6 +355,7 @@ fn build_app_with_librarian(
         .route("/ui/chat/stream", get(chat_sse_stream))
         .route("/ui/chat/{agent}/send", post(chat_send_message))
         .route("/ui/chat/{agent}/command", post(chat_slash_command))
+        .route("/ui/chat/{agent}/config", post(chat_save_config).get(chat_get_config))
         .route("/ui/settings", get(settings_page))
         .route("/ui/settings/theme", post(update_theme_from_ui))
         .route("/ui/admin", get(admin_page))
@@ -8135,6 +8136,75 @@ async fn chat_agent_config(
 struct ChatCommandForm {
     csrf_token: String,
     command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatSaveConfigForm {
+    csrf_token: String,
+    backend: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+async fn chat_get_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent_name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_ui_session(&state, &headers)?;
+    let owner = session.user.username.as_str();
+
+    let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
+    let agent = agents.iter().find(|a| a.name == agent_name)
+        .ok_or(LoreError::PermissionDenied)?;
+    let backend_str = agent.backend.to_string();
+
+    let mut all_prefs = serde_json::Map::new();
+    for b in &["claude", "gemini", "codex", "openai"] {
+        let (model, effort) = state.chat.get_backend_prefs(owner, b).unwrap_or((None, None));
+        all_prefs.insert(b.to_string(), serde_json::json!({
+            "model": model,
+            "effort": effort,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "backend": backend_str,
+        "prefs": all_prefs,
+    })))
+}
+
+async fn chat_save_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent_name): Path<String>,
+    Form(form): Form<ChatSaveConfigForm>,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let owner = session.user.username.as_str();
+
+    let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
+    let agent = agents.iter().find(|a| a.name == agent_name)
+        .ok_or(LoreError::PermissionDenied)?;
+
+    let backend_str = if let Some(ref new_backend) = form.backend {
+        let parsed: crate::auth::AgentBackend = new_backend.parse()?;
+        if parsed != agent.backend {
+            state.auth.set_agent_backend(&agent_name, &session.user.username, parsed)?;
+        }
+        new_backend.clone()
+    } else {
+        agent.backend.to_string()
+    };
+
+    let model_val = form.model.as_deref().filter(|m| !m.is_empty() && *m != "default");
+    state.chat.set_backend_model(owner, &backend_str, model_val.map(|s| s.to_string()))?;
+
+    let effort_val = form.effort.as_deref().filter(|e| !e.is_empty() && *e != "default");
+    state.chat.set_backend_effort(owner, &backend_str, effort_val.map(|s| s.to_string()))?;
+
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 async fn chat_slash_command(
