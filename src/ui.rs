@@ -2,8 +2,9 @@ use crate::audit::{AuditActor, AuditActorKind};
 use crate::auth::{ProjectGrant, ProjectPermission, StoredMachine, StoredRole};
 use crate::config::{ColorMode, ExternalAuthConfig, ExternalScheme, OidcConfig, ServerConfig, UiTheme};
 use crate::librarian::{
-    LibrarianActor, LibrarianActorKind, LibrarianConfig, LibrarianRunKind, LibrarianRunStatus,
-    ProjectLibrarianOperationType, ProviderCheckResult, StoredLibrarianOperation,
+    Endpoint, LibrarianActor, LibrarianActorKind, LibrarianConfig, LibrarianRunKind,
+    LibrarianRunStatus, ProjectLibrarianOperationType, ProviderCheckResult,
+    StoredLibrarianOperation,
 };
 use crate::model::{Block, BlockId, BlockType, ProjectName};
 use crate::store::{FileBlockStore, ProjectInfo};
@@ -322,6 +323,7 @@ pub struct AgentTokenSummary {
     pub owner: Option<String>,
     pub grants: Vec<ProjectGrant>,
     pub backend: String,
+    pub endpoint_id: Option<String>,
     pub machine_name: Option<String>,
     pub process_status: Option<String>,
     pub created_at: time::OffsetDateTime,
@@ -1932,6 +1934,7 @@ pub fn render_agents_page(
     agents: &[AgentTokenSummary],
     machines: &[StoredMachine],
     user_projects: &[UserProjectAccess],
+    endpoints: &[Endpoint],
     selected_agent: Option<&str>,
     flash: Option<&str>,
 ) -> String {
@@ -2175,6 +2178,20 @@ pub fn render_agents_page(
                 )
             };
 
+            let endpoint_options = {
+                let none_sel = if agent.endpoint_id.is_none() { " selected" } else { "" };
+                let mut opts = format!(r#"<option value=""{none_sel}>None (CLI-managed)</option>"#);
+                for ep in endpoints {
+                    let sel = if agent.endpoint_id.as_deref() == Some(&ep.id) { " selected" } else { "" };
+                    opts.push_str(&format!(
+                        r#"<option value="{}"{}>{} ({})</option>"#,
+                        escape_attribute(&ep.id), sel,
+                        escape_text(&ep.name), escape_text(&ep.model),
+                    ));
+                }
+                opts
+            };
+
             format!(
                 r##"<section class="panel" style="margin-top: var(--s-5);">
                 <div class="panel-header"><h2>{display_name}</h2><p>{owner}-{slug} &middot; {backend}</p></div>
@@ -2202,6 +2219,11 @@ pub fn render_agents_page(
                   }});
                 }})();
                 </script>
+
+                <div class="panel-header"><h3>Endpoint</h3><p>Assign a configured endpoint for proxied LLM access.</p></div>
+                <div class="padded">
+                  <select id="agent-endpoint-select" style="width:100%;" onchange="saveAgentEndpoint('{name_attr}')">{endpoint_options}</select>
+                </div>
 
                 <div class="panel-header"><h3>Setup instructions</h3><p>Copy and give to your agent.</p></div>
                 <div class="padded">
@@ -2233,6 +2255,7 @@ pub fn render_agents_page(
                 name_attr = escape_attribute(&agent.name),
                 csrf_token = escape_attribute(csrf_token),
                 edit_grants_html = edit_grants_html,
+                endpoint_options = endpoint_options,
                 setup_instruction = escape_text(&setup_instruction),
                 mcp_config_text = escape_text(&mcp_config_text),
             )
@@ -2271,6 +2294,19 @@ pub fn render_agents_page(
       navigator.clipboard.writeText(el.value).then(function() {{
         var btn = event && event.target && event.target.closest('button');
         if (btn) {{ var orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(function(){{ btn.textContent = orig; }}, 1500); }}
+      }});
+    }}
+
+    function saveAgentEndpoint(agentName) {{
+      var sel = document.getElementById('agent-endpoint-select');
+      if (!sel) return;
+      var csrf = document.querySelector('input[name="csrf_token"]');
+      var body = 'csrf_token=' + encodeURIComponent(csrf ? csrf.value : '')
+        + '&endpoint_id=' + encodeURIComponent(sel.value);
+      fetch('/ui/chat/' + encodeURIComponent(agentName) + '/config', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+        body: body
       }});
     }}
 
@@ -3005,7 +3041,11 @@ pub fn render_chat_page(
 <div class="chat-messages" id="chat-messages"></div>
 <div class="chat-config-panel" id="chat-config-panel" style="display:none;">
   <div class="chat-config-inner">
-    <div class="chat-config-field">
+    <div class="chat-config-field" id="cfg-endpoint-field">
+      <label class="chat-config-label">Endpoint</label>
+      <select id="cfg-endpoint" class="chat-config-select" onchange="onEndpointChange()"></select>
+    </div>
+    <div class="chat-config-field" id="cfg-backend-field">
       <label class="chat-config-label">Backend</label>
       <select id="cfg-backend" class="chat-config-select" onchange="onBackendChange()"></select>
     </div>
@@ -3162,10 +3202,12 @@ function renderMessages() {{
   var html = '';
   for (var i = 0; i < chatMessages.length; i++) {{
     var msg = chatMessages[i];
-    var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : msg.role === 'config' ? 'chat-msg-config' : 'chat-msg-assistant';
+    var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : msg.role === 'config' ? 'chat-msg-config' : msg.role === 'tool' ? 'chat-msg-tool' : 'chat-msg-assistant';
     html += '<div class="chat-msg ' + cls + '">';
     if (msg.role === 'assistant') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
+    }} else if (msg.role === 'tool') {{
+      html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
     }} else {{
       html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
     }}
@@ -3374,7 +3416,10 @@ function sendMessage(e) {{
     xhr.onload = function() {{
       try {{
         var resp = JSON.parse(xhr.responseText);
-        if (resp.response) {{
+        if (resp.action === 'clear') {{
+          chatMessages = [];
+          renderMessages();
+        }} else if (resp.response) {{
           chatMessages.push({{ role: 'system', content: resp.response }});
           renderMessages();
         }}
@@ -3410,7 +3455,7 @@ function updateHeaderStatus() {{
   var parts = [];
   if (agentConfig.backend) parts.push(agentConfig.backend);
   if (agentConfig.model) parts.push(agentConfig.model);
-  if (agentConfig.effort) parts.push(agentConfig.effort);
+  if (agentConfig.effort && backendEfforts[agentConfig.backend] && backendEfforts[agentConfig.backend].length > 0) parts.push(agentConfig.effort);
   if (agentStatus) parts.push(agentStatus);
   el.textContent = parts.join(' \u00b7 ');
 }}
@@ -3422,7 +3467,25 @@ function connectSSE() {{
     try {{
       var evt = JSON.parse(e.data);
       if (evt.agent !== currentAgent) return;
-      if (evt.event_type === 'chunk') {{
+      if (evt.event_type === 'tool_use') {{
+        var detail = '\u{{1F527}} ' + evt.data.detail;
+        var lastMsg = chatMessages[chatMessages.length - 1];
+        if (lastMsg && lastMsg.role === 'tool') {{
+          var lines = lastMsg.content.split('\n');
+          var prevLine = lines[lines.length - 1];
+          var prevMatch = prevLine.match(/^(.+?)( \(x(\d+)\))?$/);
+          if (prevMatch && prevMatch[1] === detail) {{
+            var count = prevMatch[3] ? parseInt(prevMatch[3]) + 1 : 2;
+            lines[lines.length - 1] = detail + ' (x' + count + ')';
+            lastMsg.content = lines.join('\n');
+          }} else {{
+            lastMsg.content += '\n' + detail;
+          }}
+        }} else {{
+          chatMessages.push({{ role: 'tool', content: detail }});
+        }}
+        renderMessages();
+      }} else if (evt.event_type === 'chunk') {{
         streamingContent += evt.data.text;
         var lastMsg = chatMessages[chatMessages.length - 1];
         if (lastMsg && lastMsg.role === 'assistant' && lastMsg.streaming) {{
@@ -3536,7 +3599,7 @@ function toggleChatConfig() {{
 }}
 
 function loadChatConfig() {{
-  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config')
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{ cache: 'no-store' }})
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
       chatConfigData = data;
@@ -3588,6 +3651,69 @@ function populateConfigDropdowns(backend, prefs) {{
     bSel.appendChild(opt);
   }}
   populateModelEffort(backend, prefs);
+
+  var epSel = document.getElementById('cfg-endpoint');
+  var epField = document.getElementById('cfg-endpoint-field');
+  var bField = document.getElementById('cfg-backend-field');
+  if (chatConfigData && chatConfigData.endpoints && chatConfigData.endpoints.length > 0) {{
+    epField.style.display = '';
+    epSel.innerHTML = '';
+    var noneOpt = document.createElement('option');
+    noneOpt.value = '';
+    noneOpt.textContent = 'None (CLI-managed)';
+    if (!chatConfigData.endpoint_id) noneOpt.selected = true;
+    epSel.appendChild(noneOpt);
+    for (var j = 0; j < chatConfigData.endpoints.length; j++) {{
+      var ep = chatConfigData.endpoints[j];
+      var eopt = document.createElement('option');
+      eopt.value = ep.id;
+      eopt.textContent = ep.name + ' (' + ep.model + ')';
+      if (chatConfigData.endpoint_id === ep.id) eopt.selected = true;
+      epSel.appendChild(eopt);
+    }}
+    if (chatConfigData.endpoint_id) {{
+      bField.style.display = 'none';
+    }} else {{
+      bField.style.display = '';
+    }}
+  }} else {{
+    epField.style.display = 'none';
+    bField.style.display = '';
+  }}
+}}
+
+function onEndpointChange() {{
+  var epSel = document.getElementById('cfg-endpoint');
+  var eid = epSel.value;
+  var bField = document.getElementById('cfg-backend-field');
+  if (eid) {{
+    bField.style.display = 'none';
+    if (chatConfigData) chatConfigData.endpoint_id = eid;
+    var ep = chatConfigData && chatConfigData.endpoints && chatConfigData.endpoints.find(function(e) {{ return e.id === eid; }});
+    if (ep) {{
+      agentConfig.backend = ep.name;
+      agentConfig.model = ep.model;
+      agentConfig.effort = '';
+      updateHeaderStatus();
+    }}
+  }} else {{
+    bField.style.display = '';
+    if (chatConfigData) chatConfigData.endpoint_id = null;
+    var backend = document.getElementById('cfg-backend').value;
+    agentConfig.backend = backend;
+    updateHeaderStatus();
+  }}
+  saveEndpointConfig(eid);
+}}
+
+function saveEndpointConfig(endpointId) {{
+  var body = 'csrf_token=' + encodeURIComponent(csrfToken)
+    + '&endpoint_id=' + encodeURIComponent(endpointId || '');
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: body
+  }});
 }}
 
 function populateModelEffort(backend, prefs) {{
@@ -3647,7 +3773,8 @@ function onConfigChange() {{
 function saveConfig() {{
   var backend = document.getElementById('cfg-backend').value;
   var model = document.getElementById('cfg-model').value;
-  var effort = document.getElementById('cfg-effort').value;
+  var eField = document.getElementById('cfg-effort-field');
+  var effort = (eField && eField.style.display !== 'none') ? document.getElementById('cfg-effort').value : '';
   var body = 'csrf_token=' + encodeURIComponent(csrfToken)
     + '&backend=' + encodeURIComponent(backend)
     + '&model=' + encodeURIComponent(model)
@@ -3664,7 +3791,7 @@ function saveConfig() {{
       chatConfigData.prefs[backend].effort = effort || null;
       agentConfig.backend = backend;
       agentConfig.model = model || '';
-      agentConfig.effort = effort || '';
+      agentConfig.effort = (backendEfforts[backend] && backendEfforts[backend].length > 0) ? (effort || '') : '';
       updateHeaderStatus();
     }}
   }});
@@ -3673,15 +3800,28 @@ function saveConfig() {{
 if (currentAgent) {{
   renderMessages();
   connectSSE();
-  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config')
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{ cache: 'no-store' }})
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
+      if (data.endpoint_id && data.endpoints) {{
+        var ep = data.endpoints.find(function(e) {{ return e.id === data.endpoint_id; }});
+        if (ep) {{
+          agentConfig.backend = ep.name;
+          agentConfig.model = ep.model;
+          agentConfig.effort = '';
+          updateHeaderStatus();
+          return;
+        }}
+      }}
       agentConfig.backend = data.backend || '';
       var prefs = data.prefs && data.prefs[data.backend];
       agentConfig.model = (prefs && prefs.model) || '';
       agentConfig.effort = (prefs && prefs.effort) || '';
       updateHeaderStatus();
     }});
+  window.addEventListener('pageshow', function(e) {{
+    if (e.persisted && chatConfigOpen) loadChatConfig();
+  }});
 }}
 </script>"#,
         layout_class = layout_class,
@@ -6632,7 +6772,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       flex-direction: column;
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      margin: var(--s-3) var(--s-5) 0;
+      margin: var(--s-5);
       overflow: hidden;
     }
     .sel-item {
@@ -6671,8 +6811,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .sel-detail {
       border: 1px solid var(--line);
-      border-top: none;
-      border-radius: 0 0 var(--radius) var(--radius);
+      border-radius: var(--radius);
       margin: 0 var(--s-5) var(--s-5);
       padding: var(--s-4) 0;
     }
@@ -6935,6 +7074,15 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-size: 0.8rem;
       padding: var(--s-1) var(--s-3);
       opacity: 0.7;
+    }
+    .chat-msg-tool {
+      align-self: flex-start;
+      background: none;
+      color: var(--fg-muted);
+      font-size: 0.8rem;
+      padding: var(--s-1) var(--s-3);
+      font-family: var(--font-mono);
+      max-width: 100%;
     }
     .chat-msg-user .chat-msg-content,
     .chat-msg-system .chat-msg-content { white-space: pre-wrap; }

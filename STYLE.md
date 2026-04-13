@@ -173,13 +173,13 @@ A standard pattern for any list where items can be selected and a detail panel a
 
 | Class | Purpose |
 |---|---|
-| `.sel-list` | Container. Bordered, rounded, column flex. Margin `var(--s-3) var(--s-5) 0`. |
+| `.sel-list` | Container. Bordered, rounded, column flex. Margin `var(--s-5)` on all four sides. |
 | `.sel-item` | Row. Flex between, padded `var(--s-3) var(--s-4)`, bottom border, hover highlight. |
 | `.sel-item.active` | Selected state: `var(--bg-hover)` background + 4px `var(--accent)` left border. |
 | `.sel-item-name` | Primary label. `font-weight: 600`, mono font, `0.9rem`. |
 | `.sel-item-meta` | Secondary text/badges. `0.82rem`, `var(--fg-muted)`, flex with gap. |
 | `.sel-item-actions` | Right-side button group. Flex, `gap: var(--s-1)`, no shrink. Use `btn-sm` buttons with SVG glyphs and `title` tooltips. |
-| `.sel-detail` | Detail panel below list. Connected visually (no top border, inherits border-radius bottom). Hidden by default (`display:none`), shown when parent `.sel-item` is active. |
+| `.sel-detail` | Detail panel below list. Fully bordered with full border-radius. Hidden by default (`display:none`), shown when parent `.sel-item` is active. |
 
 ### Behaviour (JS)
 
@@ -219,6 +219,12 @@ Buttons inside `.sel-item-actions` should use `btn-sm` (28x28 icon buttons) with
 - **Admin users list** — username items with role badge, detail panel for password/session management
 - **Admin endpoints list** — provider endpoints with kind badge, detail panel for config/test/delete
 - **Agents page** — agent list with status badge and stop/restart buttons, detail panel for grants and setup
+
+---
+
+## Spacing Rule: Container Margins
+
+Content blocks inside panels (lists, detail panels, form groups) must have margin on all four sides -- never flush against the edge of their parent. Use `var(--s-5)` (24px) as the default margin for major containers like `.sel-list`. This ensures breathing room around content and prevents items from butting up against the bottom of their parent div.
 
 ---
 

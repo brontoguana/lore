@@ -720,6 +720,8 @@ struct CreateAgentTokenRequest {
     owner: String,
     #[serde(default)]
     backend: Option<String>,
+    #[serde(default)]
+    endpoint_id: Option<String>,
     grants: Vec<CreateProjectGrantRequest>,
 }
 
@@ -1794,6 +1796,7 @@ async fn create_agent_token(
             })
             .collect::<Result<Vec<_>, LoreError>>()?,
         backend,
+        endpoint_id: payload.endpoint_id.clone(),
     })?;
     append_audit_event(
         &state,
@@ -2891,6 +2894,7 @@ async fn agents_page(
     }
 
     let user_projects = build_user_project_access(&state, &session.user)?;
+    let endpoints = state.endpoint_store.list()?;
     Ok(Html(render_agents_page(
         &config,
         session.user.username.as_str(),
@@ -2901,6 +2905,7 @@ async fn agents_page(
         &agents,
         &machines,
         &user_projects,
+        &endpoints,
         query.selected.as_deref(),
         query.flash.as_deref(),
     )))
@@ -5231,6 +5236,7 @@ fn agent_token_summary(token: StoredAgentToken) -> AgentTokenSummary {
         owner: token.owner.map(|u| u.as_str().to_string()),
         grants: token.grants,
         backend: token.backend.to_string(),
+        endpoint_id: token.endpoint_id,
         machine_name: token.machine_name,
         process_status: None,
         created_at: token.created_at,
@@ -8199,6 +8205,7 @@ async fn chat_sse_stream(
 #[derive(Debug, Deserialize)]
 struct ChatRespondBody {
     text: Option<String>,
+    tool_use: Option<String>,
     complete: Option<bool>,
     content: Option<String>,
 }
@@ -8349,8 +8356,16 @@ async fn chat_agent_respond(
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
+    if let Some(detail) = &body.tool_use {
+        push_chat_event(&state, owner_str, ChatEvent {
+            event_type: "tool_use".into(),
+            agent: agent.name.clone(),
+            owner: owner_str.to_string(),
+            data: json!({ "detail": detail }),
+        });
+    }
+
     if let Some(text) = &body.text {
-        // Streaming chunk
         push_chat_event(&state, owner_str, ChatEvent {
             event_type: "chunk".into(),
             agent: agent.name.clone(),
@@ -8481,7 +8496,11 @@ async fn chat_agent_history(
     let (model, effort) = state.chat.get_backend_prefs(owner_str, &backend_str).unwrap_or((None, None));
     let project_context = collect_project_context(&state, &agent.grants);
 
-    Ok(Json(json!({
+    let endpoint_info = agent.endpoint_id.as_deref().and_then(|eid| {
+        state.endpoint_store.get(eid).ok().flatten()
+    });
+
+    let mut resp = json!({
         "messages": msgs,
         "summary": conv.summary,
         "window_size": conv.window_size,
@@ -8490,7 +8509,17 @@ async fn chat_agent_history(
         "project_context": project_context,
         "model": model,
         "effort": effort,
-    })))
+    });
+    if let Some(ep) = endpoint_info {
+        resp["endpoint"] = json!({
+            "id": ep.id,
+            "name": ep.name,
+            "kind": ep.kind.to_string(),
+            "url": ep.url,
+            "model": ep.model,
+        });
+    }
+    Ok(Json(resp))
 }
 
 // --- Agent compact endpoint ---
@@ -8528,9 +8557,20 @@ async fn chat_agent_config(
 ) -> Result<Json<Value>, ApiError> {
     let agent = authenticate_agent(&state, &headers)?
         .ok_or(LoreError::PermissionDenied)?;
-    Ok(Json(serde_json::json!({
+    let mut resp = serde_json::json!({
         "backend": agent.backend.to_string(),
-    })))
+    });
+    if let Some(ref eid) = agent.endpoint_id {
+        if let Ok(Some(ep)) = state.endpoint_store.get(eid) {
+            resp["endpoint"] = json!({
+                "id": ep.id,
+                "name": ep.name,
+                "kind": ep.kind.to_string(),
+                "model": ep.model,
+            });
+        }
+    }
+    Ok(Json(resp))
 }
 
 // --- Slash command handler ---
@@ -8548,6 +8588,7 @@ struct ChatSaveConfigForm {
     model: Option<String>,
     effort: Option<String>,
     pinned_context: Option<String>,
+    endpoint_id: Option<String>,
 }
 
 async fn chat_get_config(
@@ -8575,11 +8616,17 @@ async fn chat_get_config(
     let pinned_context = state.chat.get_pinned_context(owner, &agent_name)?;
     let project_context = collect_project_context(&state, &agent.grants);
 
+    let endpoints: Vec<Value> = state.endpoint_store.list()?.iter().map(|ep| {
+        json!({ "id": ep.id, "name": ep.name, "kind": ep.kind.to_string(), "model": ep.model })
+    }).collect();
+
     Ok(Json(serde_json::json!({
         "backend": backend_str,
         "prefs": all_prefs,
         "pinned_context": pinned_context,
         "project_context": project_context,
+        "endpoint_id": agent.endpoint_id,
+        "endpoints": endpoints,
     })))
 }
 
@@ -8615,6 +8662,11 @@ async fn chat_save_config(
 
     if let Some(ref pinned) = form.pinned_context {
         state.chat.set_pinned_context(owner, &agent_name, pinned)?;
+    }
+
+    if let Some(ref eid) = form.endpoint_id {
+        let eid_opt = if eid.is_empty() { None } else { Some(eid.as_str()) };
+        state.auth.set_agent_endpoint_id(&agent_name, &session.user.username, eid_opt)?;
     }
 
     Ok(Json(serde_json::json!({"ok": true})))
@@ -8852,7 +8904,7 @@ async fn chat_slash_command(
         }
         "/clear" => {
             state.chat.clear_messages(owner, &agent_name)?;
-            "Messages cleared.".to_string()
+            return Ok(Json(json!({"action": "clear"})).into_response());
         }
         "/compact" => {
             // Queue a compact command for the agent to pick up
@@ -9012,14 +9064,6 @@ async fn chat_slash_command(
     };
 
     state.chat_audit.log(&agent_name, owner, "command", trimmed);
-
-    // Push the command response as a system message via SSE
-    push_chat_event(&state, owner, ChatEvent {
-        event_type: "command_response".into(),
-        agent: agent_name.clone(),
-        owner: owner.to_string(),
-        data: json!({ "response": response_text }),
-    });
 
     Ok(Json(json!({"response": response_text})).into_response())
 }

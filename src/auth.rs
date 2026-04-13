@@ -69,6 +69,8 @@ pub struct StoredAgentToken {
     #[serde(default)]
     pub backend: AgentBackend,
     #[serde(default)]
+    pub endpoint_id: Option<String>,
+    #[serde(default)]
     pub machine_name: Option<String>,
     pub created_at: OffsetDateTime,
 }
@@ -79,6 +81,7 @@ pub struct NewAgentToken {
     pub owner: UserName,
     pub grants: Vec<ProjectGrant>,
     pub backend: AgentBackend,
+    pub endpoint_id: Option<String>,
 }
 
 impl NewAgentToken {
@@ -160,6 +163,7 @@ pub struct AuthenticatedAgent {
     pub owner: Option<UserName>,
     pub grants: Vec<ProjectGrant>,
     pub backend: AgentBackend,
+    pub endpoint_id: Option<String>,
     pub machine_name: Option<String>,
 }
 
@@ -444,6 +448,7 @@ impl LocalAuthStore {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .expect("failed to set pragmas");
         conn.execute_batch(AUTH_SCHEMA).expect("failed to create schema");
+        let _ = conn.execute("ALTER TABLE agent_tokens ADD COLUMN endpoint_id TEXT", []);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -686,15 +691,16 @@ impl LocalAuthStore {
             owner: Some(token.owner),
             grants: grants.clone(),
             backend: token.backend,
+            endpoint_id: token.endpoint_id,
             machine_name: None,
             created_at: now,
         };
         conn.execute(
-            "INSERT INTO agent_tokens (name, display_name, token_hash, owner, grants, backend, machine_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO agent_tokens (name, display_name, token_hash, owner, grants, backend, endpoint_id, machine_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![stored.name, stored.display_name, stored.token_hash,
                     stored.owner.as_ref().map(|u| u.as_str().to_string()),
                     serde_json::to_string(&grants)?,
-                    stored.backend.to_string(), stored.machine_name, fmt_dt(&now)],
+                    stored.backend.to_string(), stored.endpoint_id, stored.machine_name, fmt_dt(&now)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(CreatedAgentToken { token: raw_token, stored })
     }
@@ -798,6 +804,23 @@ impl LocalAuthStore {
         Ok(())
     }
 
+    pub fn set_agent_endpoint_id(
+        &self,
+        name: &str,
+        owner: &UserName,
+        endpoint_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let updated = conn.execute(
+            "UPDATE agent_tokens SET endpoint_id = ?1 WHERE name = ?2 AND owner = ?3",
+            params![endpoint_id, name, owner.as_str()],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        if updated == 0 {
+            return Err(LoreError::Validation("agent does not exist".into()));
+        }
+        Ok(())
+    }
+
     pub fn update_agent_token_grants(
         &self,
         name: &str,
@@ -839,7 +862,7 @@ impl LocalAuthStore {
         let token_hash = hash_agent_token(token);
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let row = conn.query_row(
-            "SELECT name, display_name, owner, grants, backend, machine_name FROM agent_tokens WHERE token_hash = ?1",
+            "SELECT name, display_name, owner, grants, backend, machine_name, endpoint_id FROM agent_tokens WHERE token_hash = ?1",
             params![token_hash],
             |row| {
                 Ok((
@@ -849,6 +872,7 @@ impl LocalAuthStore {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         ).map_err(|_| LoreError::PermissionDenied)?;
@@ -861,6 +885,7 @@ impl LocalAuthStore {
             owner,
             grants,
             backend,
+            endpoint_id: row.6,
             machine_name: row.5,
         })
     }
@@ -1254,9 +1279,9 @@ impl LocalAuthStore {
 
     fn load_agent_tokens_filtered(conn: &Connection, owner: Option<&UserName>) -> Result<Vec<StoredAgentToken>> {
         let sql = if owner.is_some() {
-            "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at FROM agent_tokens WHERE owner = ?1 ORDER BY name"
+            "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at, endpoint_id FROM agent_tokens WHERE owner = ?1 ORDER BY name"
         } else {
-            "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at FROM agent_tokens ORDER BY name"
+            "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at, endpoint_id FROM agent_tokens ORDER BY name"
         };
         let mut stmt = conn.prepare(sql).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let rows = if let Some(o) = owner {
@@ -1278,28 +1303,22 @@ impl LocalAuthStore {
             backend: row.get::<_, String>(5)?.parse().unwrap_or_default(),
             machine_name: row.get(6)?,
             created_at: parse_dt(&row.get::<_, String>(7)?),
+            endpoint_id: row.get(8)?,
         })
     }
 
     fn get_agent_token_from_conn(conn: &Connection, name: &str, owner: Option<&UserName>) -> Result<StoredAgentToken> {
-        let (sql, result) = if let Some(o) = owner {
-            (
-                "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at FROM agent_tokens WHERE name = ?1 AND owner = ?2",
-                conn.query_row(
-                    "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at FROM agent_tokens WHERE name = ?1 AND owner = ?2",
-                    params![name, o.as_str()], Self::row_to_agent_token,
-                ),
+        let result = if let Some(o) = owner {
+            conn.query_row(
+                "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at, endpoint_id FROM agent_tokens WHERE name = ?1 AND owner = ?2",
+                params![name, o.as_str()], Self::row_to_agent_token,
             )
         } else {
-            (
-                "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at FROM agent_tokens WHERE name = ?1",
-                conn.query_row(
-                    "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at FROM agent_tokens WHERE name = ?1",
-                    params![name], Self::row_to_agent_token,
-                ),
+            conn.query_row(
+                "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at, endpoint_id FROM agent_tokens WHERE name = ?1",
+                params![name], Self::row_to_agent_token,
             )
         };
-        let _ = sql;
         result.map_err(|_| LoreError::Validation("agent does not exist".into()))
     }
 
@@ -2183,6 +2202,7 @@ mod tests {
                     permission: ProjectPermission::ReadWrite,
                 }],
                 backend: AgentBackend::default(),
+                endpoint_id: None,
             })
             .unwrap();
 

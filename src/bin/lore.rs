@@ -2087,23 +2087,34 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
             Err(_) => continue,
         };
 
-        match parse_backend_line(backend, &parsed) {
-            BackendEvent::Text(text) => {
-                full_response.push_str(&text);
-                let _ = context
-                    .client
-                    .post(format!("{}/v1/chat/respond", context.url))
-                    .header("x-lore-key", token)
-                    .json(&serde_json::json!({ "text": text }))
-                    .send()
-                    .await;
-            }
-            BackendEvent::Result(text) => {
-                if full_response.is_empty() && !text.is_empty() {
-                    full_response = text;
+        for event in parse_backend_line(backend, &parsed) {
+            match event {
+                BackendEvent::Text(text) => {
+                    full_response.push_str(&text);
+                    let _ = context
+                        .client
+                        .post(format!("{}/v1/chat/respond", context.url))
+                        .header("x-lore-key", token)
+                        .json(&serde_json::json!({ "text": text }))
+                        .send()
+                        .await;
                 }
+                BackendEvent::ToolUse(detail) => {
+                    let _ = context
+                        .client
+                        .post(format!("{}/v1/chat/respond", context.url))
+                        .header("x-lore-key", token)
+                        .json(&serde_json::json!({ "tool_use": detail }))
+                        .send()
+                        .await;
+                }
+                BackendEvent::Result(text) => {
+                    if full_response.is_empty() && !text.is_empty() {
+                        full_response = text;
+                    }
+                }
+                BackendEvent::Skip => {}
             }
-            BackendEvent::Skip => {}
         }
     }
 
@@ -2247,8 +2258,96 @@ async fn do_compact(context: &CliContext, agent_name: &str, aggressive: bool, ba
 
 enum BackendEvent {
     Text(String),
+    ToolUse(String),
     Result(String),
     Skip,
+}
+
+fn short_path(p: &str) -> String {
+    let path = std::path::Path::new(p);
+    let file = path.file_name().map(|f| f.to_string_lossy()).unwrap_or_default();
+    let dir = path.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy());
+    match dir {
+        Some(d) if !d.is_empty() && d != "." => format!("{d}/{file}"),
+        _ => file.to_string(),
+    }
+}
+
+fn format_tool_use_claude(name: &str, input: &serde_json::Value) -> String {
+    match name {
+        "Read" => format!("Read {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
+        "Edit" => format!("Edit {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
+        "Write" => format!("Write {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
+        "MultiEdit" => format!("MultiEdit {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
+        "Bash" => {
+            let cmd = input["command"].as_str().unwrap_or("");
+            let truncated: String = cmd.chars().take(120).collect();
+            format!("Bash: {truncated}")
+        }
+        "Grep" => {
+            let pattern = input["pattern"].as_str().unwrap_or("");
+            let path = input["path"].as_str().map(|p| short_path(p)).unwrap_or_else(|| ".".to_string());
+            format!("Grep \"{pattern}\" in {path}")
+        }
+        "Glob" => format!("Glob {}", input["pattern"].as_str().unwrap_or("")),
+        "WebSearch" => {
+            let query = input["query"].as_str().unwrap_or("");
+            let truncated: String = query.chars().take(100).collect();
+            format!("WebSearch: {truncated}")
+        }
+        "WebFetch" => {
+            let url = input["url"].as_str().unwrap_or("");
+            let truncated: String = url.chars().take(100).collect();
+            format!("WebFetch: {truncated}")
+        }
+        "LSP" => {
+            let op = input["operation"].as_str().unwrap_or("");
+            let file = input["filePath"].as_str().map(short_path).unwrap_or_default();
+            format!("LSP {op} {file}")
+        }
+        _ => name.to_string(),
+    }
+}
+
+fn format_tool_use_gemini(name: &str, input: &serde_json::Value) -> String {
+    match name {
+        "read_file" => format!("Read {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
+        "replace" => format!("Edit {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
+        "write_file" => format!("Write {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
+        "run_shell_command" => {
+            let cmd = input["command"].as_str().unwrap_or("");
+            let truncated: String = cmd.chars().take(120).collect();
+            format!("Bash: {truncated}")
+        }
+        "grep_search" => {
+            let pattern = input["pattern"].as_str().unwrap_or("");
+            let path = input["dir_path"].as_str().map(|p| short_path(p)).unwrap_or_else(|| ".".to_string());
+            format!("Grep \"{pattern}\" in {path}")
+        }
+        "glob" => format!("Glob {}", input["pattern"].as_str().unwrap_or("")),
+        "google_web_search" => {
+            let query = input["query"].as_str().unwrap_or("");
+            let truncated: String = query.chars().take(100).collect();
+            format!("WebSearch: {truncated}")
+        }
+        "web_fetch" => {
+            let url = input["url"].as_str().unwrap_or("");
+            let truncated: String = url.chars().take(100).collect();
+            format!("WebFetch: {truncated}")
+        }
+        _ => name.to_string(),
+    }
+}
+
+fn format_tool_use_codex(item: &serde_json::Value) -> String {
+    if item["type"].as_str() == Some("command_execution") {
+        let cmd = item["command"].as_str().unwrap_or("")
+            .trim_start_matches("/bin/bash -lc ");
+        let truncated: String = cmd.chars().take(120).collect();
+        format!("Bash: {truncated}")
+    } else {
+        item["type"].as_str().unwrap_or("unknown").to_string()
+    }
 }
 
 async fn spawn_backend(
@@ -2332,18 +2431,19 @@ async fn spawn_backend(
     Ok(child)
 }
 
-fn parse_backend_line(backend: AgentBackend, parsed: &serde_json::Value) -> BackendEvent {
+fn parse_backend_line(backend: AgentBackend, parsed: &serde_json::Value) -> Vec<BackendEvent> {
     match backend {
         AgentBackend::Claude => parse_claude_line(parsed),
         AgentBackend::Gemini => parse_gemini_line(parsed),
         AgentBackend::Codex => parse_codex_line(parsed),
-        AgentBackend::OpenAi => BackendEvent::Skip,
+        AgentBackend::OpenAi => vec![BackendEvent::Skip],
     }
 }
 
-fn parse_claude_line(parsed: &serde_json::Value) -> BackendEvent {
+fn parse_claude_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
     match parsed["type"].as_str() {
         Some("assistant") => {
+            let mut events = Vec::new();
             if let Some(content) = parsed["message"]["content"].as_array() {
                 let mut text = String::new();
                 for block in content {
@@ -2351,55 +2451,67 @@ fn parse_claude_line(parsed: &serde_json::Value) -> BackendEvent {
                         if let Some(t) = block["text"].as_str() {
                             text.push_str(t);
                         }
+                    } else if block["type"].as_str() == Some("tool_use") {
+                        if let Some(name) = block["name"].as_str() {
+                            let input = &block["input"];
+                            events.push(BackendEvent::ToolUse(format_tool_use_claude(name, input)));
+                        }
                     }
                 }
                 if !text.is_empty() {
-                    return BackendEvent::Text(text);
+                    events.insert(0, BackendEvent::Text(text));
                 }
             }
-            BackendEvent::Skip
+            if events.is_empty() { vec![BackendEvent::Skip] } else { events }
         }
         Some("result") => {
             let text = parsed["result"].as_str().unwrap_or("").to_string();
-            BackendEvent::Result(text)
+            vec![BackendEvent::Result(text)]
         }
-        _ => BackendEvent::Skip,
+        _ => vec![BackendEvent::Skip],
     }
 }
 
-fn parse_gemini_line(parsed: &serde_json::Value) -> BackendEvent {
+fn parse_gemini_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
     match parsed["type"].as_str() {
         Some("message") => {
             if parsed["role"].as_str() == Some("assistant") {
                 if let Some(content) = parsed["content"].as_str() {
                     if !content.is_empty() {
-                        return BackendEvent::Text(content.to_string());
+                        return vec![BackendEvent::Text(content.to_string())];
                     }
                 }
             }
-            BackendEvent::Skip
+            vec![BackendEvent::Skip]
         }
-        Some("result") => BackendEvent::Result(String::new()),
-        _ => BackendEvent::Skip,
+        Some("tool_use") => {
+            let name = parsed["tool_name"].as_str().unwrap_or("");
+            let params = &parsed["parameters"];
+            vec![BackendEvent::ToolUse(format_tool_use_gemini(name, params))]
+        }
+        Some("result") => vec![BackendEvent::Result(String::new())],
+        _ => vec![BackendEvent::Skip],
     }
 }
 
-fn parse_codex_line(parsed: &serde_json::Value) -> BackendEvent {
+fn parse_codex_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
     match parsed["type"].as_str() {
         Some("item.completed") => {
             if let Some(item) = parsed.get("item") {
                 if item["type"].as_str() == Some("agent_message") {
                     if let Some(text) = item["text"].as_str() {
                         if !text.is_empty() {
-                            return BackendEvent::Text(text.to_string());
+                            return vec![BackendEvent::Text(text.to_string())];
                         }
                     }
+                } else if item["type"].as_str() == Some("command_execution") {
+                    return vec![BackendEvent::ToolUse(format_tool_use_codex(item))];
                 }
             }
-            BackendEvent::Skip
+            vec![BackendEvent::Skip]
         }
-        Some("turn.completed") => BackendEvent::Result(String::new()),
-        _ => BackendEvent::Skip,
+        Some("turn.completed") => vec![BackendEvent::Result(String::new())],
+        _ => vec![BackendEvent::Skip],
     }
 }
 
@@ -2441,14 +2553,16 @@ async fn run_compaction(backend: AgentBackend, prompt: &str) -> CliResult<String
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                match parse_backend_line(backend, &parsed) {
-                    BackendEvent::Text(text) => result.push_str(&text),
-                    BackendEvent::Result(text) => {
-                        if result.is_empty() && !text.is_empty() {
-                            result = text;
+                for event in parse_backend_line(backend, &parsed) {
+                    match event {
+                        BackendEvent::Text(text) => result.push_str(&text),
+                        BackendEvent::Result(text) => {
+                            if result.is_empty() && !text.is_empty() {
+                                result = text;
+                            }
                         }
+                        BackendEvent::ToolUse(_) | BackendEvent::Skip => {}
                     }
-                    BackendEvent::Skip => {}
                 }
             }
             let _ = child.wait().await;
