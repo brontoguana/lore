@@ -450,6 +450,51 @@ impl LocalAuthStore {
         Self { conn: Mutex::new(conn) }
     }
 
+    pub fn cleanup_orphans(&self) {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => { eprintln!("warning: could not acquire db lock for auth cleanup"); return; }
+        };
+
+        // Expired sessions
+        let now = fmt_dt(&OffsetDateTime::now_utc());
+        match conn.execute("DELETE FROM sessions WHERE expires_at < ?1", params![now]) {
+            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} expired session(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: session cleanup failed: {e}"),
+        }
+
+        // Sessions for non-existent users
+        match conn.execute(
+            "DELETE FROM sessions WHERE username NOT IN (SELECT username FROM users)",
+            [],
+        ) {
+            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} session(s) for deleted user(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: session cleanup failed: {e}"),
+        }
+
+        // Agent tokens for non-existent users
+        match conn.execute(
+            "DELETE FROM agent_tokens WHERE owner IS NOT NULL AND owner NOT IN (SELECT username FROM users)",
+            [],
+        ) {
+            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} agent token(s) for deleted user(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: agent token cleanup failed: {e}"),
+        }
+
+        // Machines for non-existent users
+        match conn.execute(
+            "DELETE FROM machines WHERE username NOT IN (SELECT username FROM users)",
+            [],
+        ) {
+            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} machine registration(s) for deleted user(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: machine cleanup failed: {e}"),
+        }
+    }
+
     pub fn has_users(&self) -> Result<bool> {
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
@@ -1429,10 +1474,6 @@ pub struct ChatConversation {
     pub agent_status: AgentChatStatus,
     pub last_seen: Option<OffsetDateTime>,
     #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub effort: Option<String>,
-    #[serde(default)]
     pub profile_url: Option<String>,
     #[serde(default)]
     pub auto_message: Option<String>,
@@ -1452,8 +1493,6 @@ impl Default for ChatConversation {
             next_id: 1,
             agent_status: AgentChatStatus::Offline,
             last_seen: None,
-            model: None,
-            effort: None,
             profile_url: None,
             auto_message: None,
             cwd: None,
@@ -1507,6 +1546,13 @@ CREATE TABLE IF NOT EXISTS pins (
     timestamp TEXT NOT NULL,
     PRIMARY KEY (owner, agent, id)
 );
+CREATE TABLE IF NOT EXISTS backend_preferences (
+    owner TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    model TEXT,
+    effort TEXT,
+    PRIMARY KEY (owner, backend)
+);
 ";
 
 impl ChatStore {
@@ -1521,6 +1567,63 @@ impl ChatStore {
         Self { conn: Mutex::new(conn) }
     }
 
+    pub fn cleanup_orphans(&self) {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => { eprintln!("warning: could not acquire db lock for chat cleanup"); return; }
+        };
+
+        // Conversations for non-existent users
+        match conn.execute(
+            "DELETE FROM conversations WHERE owner NOT IN (SELECT username FROM users)",
+            [],
+        ) {
+            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} conversation(s) for deleted user(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: conversation cleanup failed: {e}"),
+        }
+
+        // Conversations for agents with no token
+        match conn.execute(
+            "DELETE FROM conversations WHERE agent NOT IN (SELECT DISTINCT name FROM agent_tokens)",
+            [],
+        ) {
+            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} conversation(s) for deleted agent(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: conversation cleanup failed: {e}"),
+        }
+
+        // Orphaned messages (conversation was deleted above, or never existed)
+        match conn.execute(
+            "DELETE FROM messages WHERE NOT EXISTS (SELECT 1 FROM conversations c WHERE c.owner = messages.owner AND c.agent = messages.agent)",
+            [],
+        ) {
+            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} orphaned message(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: message cleanup failed: {e}"),
+        }
+
+        // Orphaned pins
+        match conn.execute(
+            "DELETE FROM pins WHERE NOT EXISTS (SELECT 1 FROM conversations c WHERE c.owner = pins.owner AND c.agent = pins.agent)",
+            [],
+        ) {
+            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} orphaned pin(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: pin cleanup failed: {e}"),
+        }
+
+        // Backend preferences for non-existent users
+        match conn.execute(
+            "DELETE FROM backend_preferences WHERE owner NOT IN (SELECT username FROM users)",
+            [],
+        ) {
+            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} backend preference(s) for deleted user(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: backend preference cleanup failed: {e}"),
+        }
+    }
+
     fn ensure_conversation(conn: &Connection, owner: &str, agent: &str) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO conversations (owner, agent) VALUES (?1, ?2)",
@@ -1532,7 +1635,7 @@ impl ChatStore {
     pub fn load_conversation(&self, owner: &str, agent: &str) -> Result<ChatConversation> {
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let conv = conn.query_row(
-            "SELECT agent_status, last_seen, summary, window_size, cwd, git_branch, model, effort, profile_url, auto_message, next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+            "SELECT agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
             |row| {
                 Ok(ChatConversation {
@@ -1540,17 +1643,15 @@ impl ChatStore {
                     pins: Vec::new(),
                     summary: row.get::<_, String>(2)?,
                     window_size: row.get::<_, i64>(3)? as usize,
-                    next_id: row.get::<_, i64>(10)? as u64,
+                    next_id: row.get::<_, i64>(8)? as u64,
                     agent_status: match row.get::<_, String>(0)?.as_str() {
                         "idle" => AgentChatStatus::Idle,
                         "thinking" => AgentChatStatus::Thinking,
                         _ => AgentChatStatus::Offline,
                     },
                     last_seen: row.get::<_, Option<String>>(1)?.map(|s| parse_dt(&s)),
-                    model: row.get(6)?,
-                    effort: row.get(7)?,
-                    profile_url: row.get(8)?,
-                    auto_message: row.get(9)?,
+                    profile_url: row.get(6)?,
+                    auto_message: row.get(7)?,
                     cwd: row.get(4)?,
                     git_branch: row.get(5)?,
                 })
@@ -1604,11 +1705,11 @@ impl ChatStore {
         };
         let last_seen_str = conv.last_seen.as_ref().map(|dt| fmt_dt(dt));
         conn.execute(
-            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, window_size, cwd, git_branch, model, effort, profile_url, auto_message, next_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
-             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, window_size=?6, cwd=?7, git_branch=?8, model=?9, effort=?10, profile_url=?11, auto_message=?12, next_id=?13",
+            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, window_size=?6, cwd=?7, git_branch=?8, profile_url=?9, auto_message=?10, next_id=?11",
             params![owner, agent, status_str, last_seen_str, conv.summary, conv.window_size as i64,
-                    conv.cwd, conv.git_branch, conv.model, conv.effort, conv.profile_url, conv.auto_message, conv.next_id as i64],
+                    conv.cwd, conv.git_branch, conv.profile_url, conv.auto_message, conv.next_id as i64],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         // Replace messages
         conn.execute("DELETE FROM messages WHERE owner = ?1 AND agent = ?2", params![owner, agent])
@@ -1745,24 +1846,36 @@ impl ChatStore {
         Ok(())
     }
 
-    pub fn update_model(&self, owner: &str, agent: &str, model: Option<String>) -> Result<()> {
+    pub fn get_backend_prefs(&self, owner: &str, backend: &str) -> Result<(Option<String>, Option<String>)> {
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        Self::ensure_conversation(&conn, owner, agent)
-            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let result = conn.query_row(
+            "SELECT model, effort FROM backend_preferences WHERE owner = ?1 AND backend = ?2",
+            params![owner, backend],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok(prefs) => Ok(prefs),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((None, None)),
+            Err(e) => Err(LoreError::Validation(format!("db error: {e}"))),
+        }
+    }
+
+    pub fn set_backend_model(&self, owner: &str, backend: &str, model: Option<String>) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         conn.execute(
-            "UPDATE conversations SET model = ?1 WHERE owner = ?2 AND agent = ?3",
-            params![model, owner, agent],
+            "INSERT INTO backend_preferences (owner, backend, model) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(owner, backend) DO UPDATE SET model = ?3",
+            params![owner, backend, model],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
-    pub fn update_effort(&self, owner: &str, agent: &str, effort: Option<String>) -> Result<()> {
+    pub fn set_backend_effort(&self, owner: &str, backend: &str, effort: Option<String>) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        Self::ensure_conversation(&conn, owner, agent)
-            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
-            "UPDATE conversations SET effort = ?1 WHERE owner = ?2 AND agent = ?3",
-            params![effort, owner, agent],
+            "INSERT INTO backend_preferences (owner, backend, effort) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(owner, backend) DO UPDATE SET effort = ?3",
+            params![owner, backend, effort],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }

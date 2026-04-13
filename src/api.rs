@@ -147,6 +147,9 @@ impl AppState {
         let auto_update_root = root.clone();
         let chat_root = root.clone();
         let auth = LocalAuthStore::new(root.clone());
+        let chat = ChatStore::new(chat_root);
+        auth.cleanup_orphans();
+        chat.cleanup_orphans();
         let config = ServerConfigStore::new(root.clone(), default_port);
         Self {
             store: Arc::new(store),
@@ -176,7 +179,7 @@ impl AppState {
             agent_auth_rate_limits: Arc::new(Mutex::new(Vec::new())),
             global_librarian_rate_limits: Arc::new(Mutex::new(Vec::new())),
             mcp_sessions: Arc::new(Mutex::new(HashMap::new())),
-            chat: Arc::new(ChatStore::new(chat_root)),
+            chat: Arc::new(chat),
             chat_senders: Arc::new(Mutex::new(HashMap::new())),
             chat_agent_notifiers: Arc::new(Mutex::new(HashMap::new())),
             machine_commands: Arc::new(Mutex::new(HashMap::new())),
@@ -8011,13 +8014,16 @@ async fn chat_agent_history(
         })
         .collect();
 
+    let backend_str = agent.backend.to_string();
+    let (model, effort) = state.chat.get_backend_prefs(owner_str, &backend_str).unwrap_or((None, None));
+
     Ok(Json(json!({
         "messages": msgs,
         "summary": conv.summary,
         "window_size": conv.window_size,
         "pins": conv.pins.iter().map(|p| json!({"id": p.id, "text": p.text})).collect::<Vec<_>>(),
-        "model": conv.model,
-        "effort": conv.effort,
+        "model": model,
+        "effort": effort,
     })))
 }
 
@@ -8102,11 +8108,14 @@ async fn chat_slash_command(
                 AgentChatStatus::Thinking => "thinking",
                 AgentChatStatus::Offline => "offline",
             };
+            let backend = agents.iter().find(|a| a.name == agent_name)
+                .map(|a| a.backend.to_string()).unwrap_or_default();
+            let (model, effort) = state.chat.get_backend_prefs(owner, &backend).unwrap_or((None, None));
             format!(
-                "Agent: {}\nStatus: {}\nModel: {}\nEffort: {}\nMessages: {}\nPins: {}\nWindow: {}",
-                agent_name, status_str,
-                conv.model.as_deref().unwrap_or("default"),
-                conv.effort.as_deref().unwrap_or("default"),
+                "Agent: {}\nStatus: {}\nBackend: {}\nModel: {}\nEffort: {}\nMessages: {}\nPins: {}\nWindow: {}",
+                agent_name, status_str, backend,
+                model.as_deref().unwrap_or("default"),
+                effort.as_deref().unwrap_or("default"),
                 conv.messages.len(), conv.pins.len(), conv.window_size
             )
         }
@@ -8211,13 +8220,11 @@ async fn chat_slash_command(
             }
         }
         "/model" => {
+            let backend = agents.iter().find(|a| a.name == agent_name)
+                .map(|a| a.backend.to_string()).unwrap_or_default();
+            let (current_model, _) = state.chat.get_backend_prefs(owner, &backend).unwrap_or((None, None));
             if args.is_empty() {
-                let conv = state.chat.load_conversation(owner, &agent_name)?;
-                let current = conv.model.as_deref().unwrap_or("default");
-                // Get backend for this agent
-                let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
-                let backend = agents.iter().find(|a| a.name == agent_name)
-                    .map(|a| a.backend.to_string()).unwrap_or_default();
+                let current = current_model.as_deref().unwrap_or("default");
                 let options = match backend.as_str() {
                     "gemini" => format!(
                         "Current model: {current}\n\nOptions:\n  /model gemini-2.5-pro\n  /model gemini-2.5-flash\n  /model gemini-3-pro-preview\n  /model default"
@@ -8237,47 +8244,46 @@ async fn chat_slash_command(
                 } else {
                     Some(args.clone())
                 };
-                let conv = state.chat.load_conversation(owner, &agent_name)?;
-                if conv.model == new_model {
+                if current_model == new_model {
                     format!("Already using {} model.", new_model.as_deref().unwrap_or("default"))
                 } else {
-                    state.chat.update_model(owner, &agent_name, new_model.clone())?;
+                    state.chat.set_backend_model(owner, &backend, new_model.clone())?;
                     let label = new_model.as_deref().unwrap_or("default");
-                    format!("Model set to {label}. Next message will use it.")
+                    format!("Model set to {label} for {backend}. Next message will use it.")
                 }
             }
         }
         "/effort" => {
-            let conv = state.chat.load_conversation(owner, &agent_name)?;
-            // Check backend supports effort
-            let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
             let backend = agents.iter().find(|a| a.name == agent_name)
                 .map(|a| a.backend.to_string()).unwrap_or_default();
             if backend != "claude" {
                 "Effort is only supported for Claude backend.".to_string()
-            } else if args.is_empty() {
-                let current = conv.effort.as_deref().unwrap_or("default");
-                format!(
-                    "Current effort: {current}\n\nOptions:\n  /effort low -- minimal thinking\n  /effort medium -- balanced\n  /effort high -- deeper reasoning\n  /effort max -- maximum thinking\n  /effort default -- reset to default"
-                )
             } else {
-                let lower = args.to_lowercase();
-                if lower == "default" || lower == "off" || lower == "none" {
-                    if conv.effort.is_none() {
-                        "Already using default effort.".to_string()
-                    } else {
-                        state.chat.update_effort(owner, &agent_name, None)?;
-                        "Effort reset to default. Next message will use it.".to_string()
-                    }
-                } else if ["low", "medium", "high", "max"].contains(&lower.as_str()) {
-                    if conv.effort.as_deref() == Some(&lower) {
-                        format!("Already using {lower} effort.")
-                    } else {
-                        state.chat.update_effort(owner, &agent_name, Some(lower.clone()))?;
-                        format!("Effort set to {lower}. Next message will use it.")
-                    }
+                let (_, current_effort) = state.chat.get_backend_prefs(owner, &backend).unwrap_or((None, None));
+                if args.is_empty() {
+                    let current = current_effort.as_deref().unwrap_or("default");
+                    format!(
+                        "Current effort: {current}\n\nOptions:\n  /effort low -- minimal thinking\n  /effort medium -- balanced\n  /effort high -- deeper reasoning\n  /effort max -- maximum thinking\n  /effort default -- reset to default"
+                    )
                 } else {
-                    "Invalid effort level. Options: low, medium, high, max, default".to_string()
+                    let lower = args.to_lowercase();
+                    if lower == "default" || lower == "off" || lower == "none" {
+                        if current_effort.is_none() {
+                            "Already using default effort.".to_string()
+                        } else {
+                            state.chat.set_backend_effort(owner, &backend, None)?;
+                            "Effort reset to default for claude. Next message will use it.".to_string()
+                        }
+                    } else if ["low", "medium", "high", "max"].contains(&lower.as_str()) {
+                        if current_effort.as_deref() == Some(&lower) {
+                            format!("Already using {lower} effort.")
+                        } else {
+                            state.chat.set_backend_effort(owner, &backend, Some(lower.clone()))?;
+                            format!("Effort set to {lower} for claude. Next message will use it.")
+                        }
+                    } else {
+                        "Invalid effort level. Options: low, medium, high, max, default".to_string()
+                    }
                 }
             }
         }
