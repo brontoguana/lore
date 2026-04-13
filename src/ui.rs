@@ -1448,6 +1448,28 @@ pub fn render_admin_page(
         }});
       }}
 
+      function pollMachineStatus(btn, name, csrf) {{
+        fetch('/ui/agents/machines/' + encodeURIComponent(name) + '/status-json', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+          body: 'csrf_token=' + encodeURIComponent(csrf)
+        }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+          if (d.up_to_date) {{
+            btn.textContent = 'Up to date';
+            btn.style.opacity = '0.6';
+            btn.onclick = null;
+          }} else if (d.pending_update) {{
+            setTimeout(function() {{ pollMachineStatus(btn, name, csrf); }}, 3000);
+          }} else {{
+            btn.textContent = 'Update';
+            btn.disabled = false;
+            btn.style.opacity = '';
+          }}
+        }}).catch(function() {{
+          setTimeout(function() {{ pollMachineStatus(btn, name, csrf); }}, 5000);
+        }});
+      }}
+
       function updateMachine(btn, name) {{
         var csrf = btn.getAttribute('data-csrf');
         btn.disabled = true;
@@ -1460,11 +1482,8 @@ pub fn render_admin_page(
           if (!r.ok) throw new Error('server returned ' + r.status);
           return r.json();
         }}).then(function() {{
-          var span = document.createElement('span');
-          span.className = 'hint';
-          span.style.fontSize = '0.8rem';
-          span.textContent = 'Update queued';
-          btn.parentNode.replaceChild(span, btn);
+          btn.textContent = 'Updating\u2026';
+          setTimeout(function() {{ pollMachineStatus(btn, name, csrf); }}, 3000);
         }}).catch(function() {{
           btn.textContent = 'Failed';
           btn.disabled = false;
@@ -1517,6 +1536,12 @@ pub fn render_admin_page(
         }});
       }});
     }})();
+
+    document.querySelectorAll('[data-machine-update]').forEach(function(btn) {{
+      var name = btn.getAttribute('data-machine-update');
+      var csrf = btn.getAttribute('data-csrf');
+      pollMachineStatus(btn, name, csrf);
+    }});
     </script>"#,
         nav_items = nav_items,
         csrf_token = escape_attribute(csrf_token),
@@ -1847,9 +1872,13 @@ pub fn render_agents_page(
                         escape_attribute(csrf_token),
                     )
                 } else if m.pending_update {
-                    r#"<span class="hint" style="font-size:0.8rem;">Update queued</span>"#.to_string()
+                    format!(
+                        r#"<button type="button" disabled data-machine-update="{}" data-csrf="{}" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Updating&hellip;</button>"#,
+                        escape_attribute(&m.name),
+                        escape_attribute(csrf_token),
+                    )
                 } else {
-                    String::new()
+                    r#"<button type="button" disabled style="font-size:0.8rem; padding:var(--s-1) var(--s-2); opacity:0.6;">Up to date</button>"#.to_string()
                 };
                 let version_class = if is_outdated { r#" style="color:var(--danger)""# } else { "" };
                 format!(
@@ -2223,6 +2252,33 @@ pub fn render_agents_page(
       }});
     }}
 
+    function pollMachineStatus(btn, name, csrf) {{
+      fetch('/ui/agents/machines/' + encodeURIComponent(name) + '/status-json', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+        body: 'csrf_token=' + encodeURIComponent(csrf)
+      }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+        if (d.up_to_date) {{
+          btn.textContent = 'Up to date';
+          btn.style.opacity = '0.6';
+          btn.onclick = null;
+          var verSpan = btn.closest('.agent-list-item').querySelector('.agent-list-meta');
+          if (verSpan) {{
+            verSpan.textContent = 'v' + d.version;
+            verSpan.style.color = '';
+          }}
+        }} else if (d.pending_update) {{
+          setTimeout(function() {{ pollMachineStatus(btn, name, csrf); }}, 3000);
+        }} else {{
+          btn.textContent = 'Update';
+          btn.disabled = false;
+          btn.style.opacity = '';
+        }}
+      }}).catch(function() {{
+        setTimeout(function() {{ pollMachineStatus(btn, name, csrf); }}, 5000);
+      }});
+    }}
+
     function updateMachine(btn, name) {{
       var csrf = btn.getAttribute('data-csrf');
       btn.disabled = true;
@@ -2235,11 +2291,8 @@ pub fn render_agents_page(
         if (!r.ok) throw new Error('server returned ' + r.status);
         return r.json();
       }}).then(function() {{
-        var span = document.createElement('span');
-        span.className = 'hint';
-        span.style.fontSize = '0.8rem';
-        span.textContent = 'Update queued';
-        btn.parentNode.replaceChild(span, btn);
+        btn.textContent = 'Updating\u2026';
+        setTimeout(function() {{ pollMachineStatus(btn, name, csrf); }}, 3000);
       }}).catch(function() {{
         btn.textContent = 'Failed';
         btn.disabled = false;
@@ -2300,6 +2353,12 @@ pub fn render_agents_page(
         if (statusEl) {{ statusEl.textContent = 'Failed to create agent'; statusEl.style.color = 'var(--danger)'; }}
       }});
     }}
+
+    document.querySelectorAll('[data-machine-update]').forEach(function(btn) {{
+      var name = btn.getAttribute('data-machine-update');
+      var csrf = btn.getAttribute('data-csrf');
+      pollMachineStatus(btn, name, csrf);
+    }});
 
     </script>"##,
         agent_list_html = agent_list_html,
@@ -6319,7 +6378,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .hero-actions a.primary:hover,
     .button-link:hover {
       opacity: 0.9;
-      transform: translateY(-1px);
     }
 
     .layout {

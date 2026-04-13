@@ -423,6 +423,10 @@ fn build_app_with_librarian(
             post(update_machine_json),
         )
         .route(
+            "/ui/agents/machines/{name}/status-json",
+            post(machine_status_json),
+        )
+        .route(
             "/ui/agents/machines/{name}/list-dir",
             post(machine_list_dir_json),
         )
@@ -8768,6 +8772,28 @@ async fn update_machine_json(
     state.auth.set_machine_pending_update(&name, &session.user.username, true)?;
     notify_machine_poll(&state, &format!("{}_{}", session.user.username, name));
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn machine_status_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let server_version = env!("CARGO_PKG_VERSION");
+    if let Some(m) = state.auth.get_machine(&name, &session.user.username)? {
+        let version = m.cli_version.as_deref().unwrap_or("unknown");
+        let up_to_date = version.trim_start_matches('v') == server_version;
+        Ok(Json(serde_json::json!({
+            "version": version,
+            "pending_update": m.pending_update,
+            "up_to_date": up_to_date
+        })))
+    } else {
+        Ok(Json(serde_json::json!({ "error": "machine not found" })))
+    }
 }
 
 // --- Machine service poll/command infrastructure ---
