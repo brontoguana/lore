@@ -1836,23 +1836,41 @@ pub fn render_agents_page(
                             <span style="font-size:0.8rem; color:var(--fg-2);">Agent name</span>
                             <input type="text" id="create-name-{name_attr}" placeholder="my-agent" style="width:100%; margin-top:var(--s-1);">
                           </label>
-                          <label style="flex:0 0 auto;">
+                          <div style="display:flex; flex-direction:column; gap:var(--s-1);">
                             <span style="font-size:0.8rem; color:var(--fg-2);">Backend</span>
-                            <select id="create-backend-{name_attr}" style="margin-top:var(--s-1);">
-                              <option value="claude">Claude</option>
-                              <option value="gemini">Gemini</option>
-                              <option value="codex">Codex</option>
-                            </select>
-                          </label>
+                            <div style="display:flex; align-items:center; gap:var(--s-2);">
+                              <select id="create-backend-{name_attr}">
+                                <option value="claude">Claude</option>
+                                <option value="gemini">Gemini</option>
+                                <option value="codex">Codex</option>
+                              </select>
+                              <button type="button" onclick="toggleMkdir('{name_attr}')" title="Create folder" aria-label="Create folder" style="display:inline-flex; align-items:center; justify-content:center; width:2rem; height:2rem; padding:0; flex:0 0 auto;">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                                  <path d="M12 11v6"/>
+                                  <path d="M9 14h6"/>
+                                </svg>
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                        <div id="create-mkdir-row-{name_attr}" style="display:none; margin-top:var(--s-3);">
+                          <div style="display:flex; gap:var(--s-2); align-items:center;">
+                            <input type="text" id="create-mkdir-name-{name_attr}" placeholder="new-folder" style="flex:1; min-width:0;">
+                            <button type="button" onclick="createFolder('{name_attr}')" style="font-size:0.8rem; padding:var(--s-1) var(--s-3);">Create</button>
+                          </div>
+                          <div id="create-mkdir-status-{name_attr}" class="hint" style="margin-top:var(--s-1); font-size:0.8rem;"></div>
                         </div>
                         <div style="margin-top:var(--s-3);">
-                          <span style="font-size:0.8rem; color:var(--fg-2);">Working directory</span>
+                          <span style="font-size:0.8rem; color:var(--fg-2);">Agent folder</span>
                           <div id="create-folder-{name_attr}" class="folder-browser" style="margin-top:var(--s-1); border:1px solid var(--line); border-radius:var(--radius); max-height:240px; overflow-y:auto;">
                             <div class="folder-loading hint" style="padding:var(--s-2);">Loading...</div>
                           </div>
-                          <div style="display:flex; align-items:center; gap:var(--s-2); margin-top:var(--s-2);">
-                            <input type="text" id="create-path-{name_attr}" style="flex:1; font-size:0.85rem; font-family:var(--font-mono);" readonly>
-                            <button type="button" id="create-mkdir-{name_attr}" onclick="promptMkdir('{name_attr}')" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">New folder</button>
+                          <div style="margin-top:var(--s-2); display:flex; flex-direction:column; gap:var(--s-1);">
+                            <span style="font-size:0.75rem; color:var(--fg-2);">The folder shown above is the folder this agent will use.</span>
+                            <div id="create-path-display-{name_attr}" style="font-size:0.85rem; font-family:var(--font-mono); word-break:break-all;"></div>
+                            <input type="hidden" id="create-path-{name_attr}">
+                            <input type="hidden" id="create-home-{name_attr}">
                           </div>
                         </div>
                         <div style="margin-top:var(--s-3); display:flex; gap:var(--s-2);">
@@ -2055,9 +2073,35 @@ pub fn render_agents_page(
       return btn ? btn.getAttribute('data-csrf') : '';
     }}
 
+    function setTextStatus(id, text, isError) {{
+      var el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = text || '';
+      el.style.color = isError ? 'var(--danger)' : '';
+    }}
+
+    function setCreateFolderPath(machine, path) {{
+      var pathInput = document.getElementById('create-path-' + machine);
+      var pathDisplay = document.getElementById('create-path-display-' + machine);
+      if (pathInput) pathInput.value = path || '';
+      if (pathDisplay) pathDisplay.textContent = path || '';
+    }}
+
+    function toggleMkdir(machine) {{
+      var row = document.getElementById('create-mkdir-row-' + machine);
+      var input = document.getElementById('create-mkdir-name-' + machine);
+      if (!row) return;
+      var show = row.style.display === 'none';
+      row.style.display = show ? 'block' : 'none';
+      if (!show) {{
+        setTextStatus('create-mkdir-status-' + machine, '', false);
+      }}
+      if (show && input) input.focus();
+    }}
+
     function loadFolder(machine, path) {{
       var browser = document.getElementById('create-folder-' + machine);
-      var pathInput = document.getElementById('create-path-' + machine);
+      var homeInput = document.getElementById('create-home-' + machine);
       if (!browser) return;
       browser.innerHTML = '<div class="hint" style="padding:var(--s-2);">Loading\u2026</div>';
       fetch('/ui/agents/machines/' + encodeURIComponent(machine) + '/list-dir', {{
@@ -2070,13 +2114,15 @@ pub fn render_agents_page(
           return;
         }}
         var currentPath = data.path || path;
-        if (pathInput) pathInput.value = currentPath;
+        var homePath = data.home || currentPath;
+        setCreateFolderPath(machine, currentPath);
+        if (homeInput) homeInput.value = homePath;
         var html = '';
         // Parent directory link
-        if (currentPath !== '/') {{
+        if (currentPath !== homePath) {{
           var parts = currentPath.replace(/\/+$/, '').split('/');
           parts.pop();
-          var parent = parts.join('/') || '/';
+          var parent = parts.join('/') || homePath;
           html += '<div class="folder-entry" onclick="loadFolder(\'' + machine + '\', \'' + escapeAttr(parent) + '\')" style="padding:var(--s-1) var(--s-2); cursor:pointer; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:var(--s-2);">';
           html += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>';
           html += '<span style="font-family:var(--font-mono); font-size:0.85rem;">..</span></div>';
@@ -2107,21 +2153,36 @@ pub fn render_agents_page(
       return s.replace(/\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
     }}
 
-    function promptMkdir(machine) {{
+    function createFolder(machine) {{
       var pathInput = document.getElementById('create-path-' + machine);
+      var nameInput = document.getElementById('create-mkdir-name-' + machine);
+      var statusId = 'create-mkdir-status-' + machine;
       var currentPath = pathInput ? pathInput.value : '';
-      var name = prompt('New folder name:');
-      if (!name || !name.trim()) return;
-      name = name.trim();
-      if (name.indexOf('/') !== -1 || name.indexOf('..') !== -1) {{
-        alert('Invalid folder name');
+      var name = nameInput ? nameInput.value.trim() : '';
+      if (!name) {{
+        setTextStatus(statusId, 'Enter a folder name', true);
         return;
       }}
-      var newPath = currentPath === '/' ? '/' + name : currentPath + '/' + name;
-      // We'll create it when the agent is created. For now just navigate to the typed path.
-      if (pathInput) pathInput.value = newPath;
-      // Also try to load it (will show empty or error, which is fine)
-      loadFolder(machine, newPath);
+      if (name.indexOf('/') !== -1 || name.indexOf('\\\\') !== -1 || name === '.' || name === '..') {{
+        setTextStatus(statusId, 'Invalid folder name', true);
+        return;
+      }}
+      setTextStatus(statusId, 'Creating\u2026', false);
+      fetch('/ui/agents/machines/' + encodeURIComponent(machine) + '/mkdir', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{ csrf_token: getCsrf(machine), path: currentPath, name: name }})
+      }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+        if (data.error) {{
+          setTextStatus(statusId, data.error, true);
+          return;
+        }}
+        if (nameInput) nameInput.value = '';
+        setTextStatus(statusId, '', false);
+        loadFolder(machine, data.path || currentPath);
+      }}).catch(function(err) {{
+        setTextStatus(statusId, 'Failed to create folder', true);
+      }});
     }}
 
     function agentCommand(action, agentName, machine) {{

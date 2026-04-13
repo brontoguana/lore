@@ -2904,6 +2904,7 @@ async fn service_poll_and_execute(
 
         let result = match cmd_type {
             "list_dir" => service_handle_list_dir(params).await,
+            "mkdir" => service_handle_mkdir(params).await,
             "create_agent" => {
                 let r = service_handle_create_agent(context, machine_token, params, svc_state).await;
                 svc_state.save();
@@ -2938,12 +2939,40 @@ async fn service_poll_and_execute(
     Ok(false)
 }
 
-async fn service_handle_list_dir(params: &serde_json::Value) -> CliResult<serde_json::Value> {
-    let path_str = params["path"].as_str().unwrap_or("~");
-    let path = if path_str == "~" || path_str.is_empty() {
-        env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+fn service_home_dir() -> CliResult<PathBuf> {
+    let raw_home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
+    Ok(fs::canonicalize(&raw_home)?)
+}
+
+fn ensure_path_within_home(path: &Path, home: &Path) -> CliResult<()> {
+    if path.starts_with(home) {
+        Ok(())
+    } else {
+        Err("path must stay within your home directory".into())
+    }
+}
+
+fn resolve_existing_service_path(path_str: &str) -> CliResult<(PathBuf, PathBuf)> {
+    let home = service_home_dir()?;
+    let requested = if path_str == "~" || path_str.is_empty() {
+        home.clone()
     } else {
         PathBuf::from(path_str)
+    };
+    let resolved = fs::canonicalize(&requested)?;
+    ensure_path_within_home(&resolved, &home)?;
+    Ok((home, resolved))
+}
+
+async fn service_handle_list_dir(params: &serde_json::Value) -> CliResult<serde_json::Value> {
+    let path_str = params["path"].as_str().unwrap_or("~");
+    let (home, path) = match resolve_existing_service_path(path_str) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(serde_json::json!({
+                "error": e.to_string(),
+            }));
+        }
     };
 
     if !path.exists() {
@@ -2994,7 +3023,34 @@ async fn service_handle_list_dir(params: &serde_json::Value) -> CliResult<serde_
 
     Ok(serde_json::json!({
         "path": path.to_string_lossy(),
+        "home": home.to_string_lossy(),
         "entries": entries,
+    }))
+}
+
+async fn service_handle_mkdir(params: &serde_json::Value) -> CliResult<serde_json::Value> {
+    let base_path = params["path"].as_str().unwrap_or("~");
+    let name = params["name"].as_str().unwrap_or("").trim();
+
+    if name.is_empty() {
+        return Ok(serde_json::json!({ "error": "missing folder name" }));
+    }
+    if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        return Ok(serde_json::json!({ "error": "invalid folder name" }));
+    }
+
+    let (home, parent) = match resolve_existing_service_path(base_path) {
+        Ok(v) => v,
+        Err(e) => return Ok(serde_json::json!({ "error": e.to_string() })),
+    };
+
+    let new_path = parent.join(name);
+    ensure_path_within_home(&new_path, &home)?;
+    fs::create_dir(&new_path)?;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": new_path.to_string_lossy(),
     }))
 }
 
@@ -3007,8 +3063,10 @@ async fn service_handle_create_agent(
     let agent_name = params["agent_name"].as_str().ok_or("missing agent_name")?;
     let folder = params["folder"].as_str().ok_or("missing folder")?;
     let backend = params["backend"].as_str().unwrap_or("claude");
-
-    fs::create_dir_all(folder)?;
+    let (_, folder_path) = match resolve_existing_service_path(folder) {
+        Ok(v) => v,
+        Err(e) => return Ok(serde_json::json!({ "error": e.to_string() })),
+    };
 
     // Provision the agent via the API
     let resp = context
@@ -3044,7 +3102,7 @@ async fn service_handle_create_agent(
     let mut managed = ManagedAgent {
         name: agent_slug.to_string(),
         pid: 0,
-        folder: folder.to_string(),
+        folder: folder_path.to_string_lossy().into_owned(),
         backend: backend.to_string(),
         token: agent_token.to_string(),
     };
@@ -3053,7 +3111,12 @@ async fn service_handle_create_agent(
     match spawn_agent_process(context, &managed) {
         Ok(pid) => {
             managed.pid = pid;
-            eprintln!("[service] Agent '{}' started in {} (pid {})", agent_slug, folder, pid);
+            eprintln!(
+                "[service] Agent '{}' started in {} (pid {})",
+                agent_slug,
+                managed.folder,
+                pid
+            );
         }
         Err(e) => {
             eprintln!("[service] Failed to start agent '{}': {e}", agent_slug);
@@ -3065,7 +3128,7 @@ async fn service_handle_create_agent(
     Ok(serde_json::json!({
         "ok": true,
         "agent_name": agent_slug,
-        "folder": folder,
+        "folder": managed.folder,
         "pid": managed.pid,
     }))
 }

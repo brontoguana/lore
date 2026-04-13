@@ -425,6 +425,7 @@ fn build_app_with_librarian(
             "/ui/agents/machines/{name}/list-dir",
             post(machine_list_dir_json),
         )
+        .route("/ui/agents/machines/{name}/mkdir", post(machine_mkdir_json))
         .route(
             "/ui/agents/machines/{name}/create-agent",
             post(machine_create_agent_json),
@@ -8850,6 +8851,13 @@ struct MachineCreateAgentRequest {
     backend: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MachineMkdirRequest {
+    csrf_token: String,
+    path: String,
+    name: String,
+}
+
 async fn machine_create_agent_json(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8867,6 +8875,26 @@ async fn machine_create_agent_json(
         "backend": backend,
     });
     match queue_machine_command_and_wait(&state, &machine_key, "create_agent", params).await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+async fn machine_mkdir_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(machine_name): Path<String>,
+    Json(req): Json<MachineMkdirRequest>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &req.csrf_token)?;
+    let machine_key = format!("{}_{}", session.user.username, machine_name);
+
+    let params = json!({
+        "path": req.path,
+        "name": req.name,
+    });
+    match queue_machine_command_and_wait(&state, &machine_key, "mkdir", params).await {
         Ok(data) => Ok(Json(data)),
         Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
     }
