@@ -7901,8 +7901,10 @@ async fn chat_agent_poll(
         None
     };
 
+    let poll_backend = agent.backend.to_string();
+
     let build_poll_response = |msgs: Vec<Value>| -> Json<Value> {
-        let mut resp = json!({ "messages": msgs });
+        let mut resp = json!({ "messages": msgs, "backend": poll_backend });
         if let Some(ref ver) = update_to {
             resp["update_to"] = json!(ver);
             if let Some(ref config) = update_config {
@@ -8054,6 +8056,21 @@ async fn chat_agent_update_status(
         owner: owner_str.to_string(),
         data: json!({ "status": body.status }),
     });
+
+    if matches!(status, AgentChatStatus::Thinking) {
+        let backend_str = agent.backend.to_string();
+        let (model, effort) = state.chat.get_backend_prefs(owner_str, &backend_str).unwrap_or((None, None));
+        push_chat_event(&state, owner_str, ChatEvent {
+            event_type: "config_info".into(),
+            agent: agent.name.clone(),
+            owner: owner_str.to_string(),
+            data: json!({
+                "backend": backend_str,
+                "model": model,
+                "effort": effort,
+            }),
+        });
+    }
 
     Ok(StatusCode::OK)
 }

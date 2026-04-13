@@ -1455,9 +1455,7 @@ pub fn render_admin_page(
           body: 'csrf_token=' + encodeURIComponent(csrf)
         }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
           if (d.up_to_date) {{
-            btn.textContent = 'Up to date';
-            btn.style.opacity = '0.6';
-            btn.onclick = null;
+            btn.style.display = 'none';
           }} else if (d.pending_update) {{
             setTimeout(function() {{ pollMachineStatus(btn, name, csrf); }}, 3000);
           }} else {{
@@ -1878,7 +1876,7 @@ pub fn render_agents_page(
                         escape_attribute(csrf_token),
                     )
                 } else {
-                    r#"<button type="button" disabled style="font-size:0.8rem; padding:var(--s-1) var(--s-2); opacity:0.6;">Up to date</button>"#.to_string()
+                    String::new()
                 };
                 let version_class = if is_outdated { r#" style="color:var(--danger)""# } else { "" };
                 format!(
@@ -2259,9 +2257,7 @@ pub fn render_agents_page(
         body: 'csrf_token=' + encodeURIComponent(csrf)
       }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
         if (d.up_to_date) {{
-          btn.textContent = 'Up to date';
-          btn.style.opacity = '0.6';
-          btn.onclick = null;
+          btn.style.display = 'none';
           var verSpan = btn.closest('.agent-list-item').querySelector('.agent-list-meta');
           if (verSpan) {{
             verSpan.textContent = 'v' + d.version;
@@ -2926,6 +2922,8 @@ var chatMessages = {messages_json};
 var agentProfileUrl = {profile_url_js};
 var eventSource = null;
 var streamingContent = '';
+var agentConfig = {{ backend: '', model: '', effort: '' }};
+var agentStatus = '';
 
 function selectAgent(name) {{
   window.location.href = '/ui/chat?agent=' + encodeURIComponent(name);
@@ -3002,7 +3000,7 @@ function renderMessages() {{
   var html = '';
   for (var i = 0; i < chatMessages.length; i++) {{
     var msg = chatMessages[i];
-    var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : 'chat-msg-assistant';
+    var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : msg.role === 'config' ? 'chat-msg-config' : 'chat-msg-assistant';
     html += '<div class="chat-msg ' + cls + '">';
     if (msg.role === 'assistant') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
@@ -3244,6 +3242,17 @@ function sendMessage(e) {{
   return false;
 }}
 
+function updateHeaderStatus() {{
+  var el = document.getElementById('chat-agent-status');
+  if (!el) return;
+  var parts = [];
+  if (agentConfig.backend) parts.push(agentConfig.backend);
+  if (agentConfig.model) parts.push(agentConfig.model);
+  if (agentConfig.effort) parts.push(agentConfig.effort);
+  if (agentStatus) parts.push(agentStatus);
+  el.textContent = parts.join(' \u00b7 ');
+}}
+
 function connectSSE() {{
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/ui/chat/stream');
@@ -3274,9 +3283,14 @@ function connectSSE() {{
       }} else if (evt.event_type === 'command_response') {{
         chatMessages.push({{ role: 'system', content: evt.data.response }});
         renderMessages();
+      }} else if (evt.event_type === 'config_info') {{
+        agentConfig.backend = evt.data.backend || '';
+        agentConfig.model = evt.data.model || '';
+        agentConfig.effort = evt.data.effort || '';
+        updateHeaderStatus();
       }} else if (evt.event_type === 'status') {{
-        var el = document.getElementById('chat-agent-status');
-        if (el) el.textContent = evt.data.status || '';
+        agentStatus = evt.data.status || '';
+        updateHeaderStatus();
         if (evt.data.cwd) {{
           var cwdEl = document.getElementById('chat-agent-cwd');
           if (cwdEl) {{
@@ -3454,6 +3468,10 @@ function saveConfig() {{
       if (!chatConfigData.prefs[backend]) chatConfigData.prefs[backend] = {{}};
       chatConfigData.prefs[backend].model = model || null;
       chatConfigData.prefs[backend].effort = effort || null;
+      agentConfig.backend = backend;
+      agentConfig.model = model || '';
+      agentConfig.effort = effort || '';
+      updateHeaderStatus();
     }}
   }});
 }}
@@ -3461,6 +3479,15 @@ function saveConfig() {{
 if (currentAgent) {{
   renderMessages();
   connectSSE();
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config')
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      agentConfig.backend = data.backend || '';
+      var prefs = data.prefs && data.prefs[data.backend];
+      agentConfig.model = (prefs && prefs.model) || '';
+      agentConfig.effort = (prefs && prefs.effort) || '';
+      updateHeaderStatus();
+    }});
 }}
 </script>"#,
         layout_class = layout_class,
@@ -6552,6 +6579,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border-bottom: 1px solid var(--line);
       display: flex;
       align-items: center;
+      line-height: 28px;
     }
     .chat-agent-list {
       flex: 1;
@@ -6738,6 +6766,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-size: 0.85rem;
       max-width: 90%;
       font-family: var(--font-mono);
+    }
+    .chat-msg-config {
+      align-self: center;
+      background: none;
+      color: var(--fg-muted);
+      font-size: 0.8rem;
+      padding: var(--s-1) var(--s-3);
+      opacity: 0.7;
     }
     .chat-msg-user .chat-msg-content,
     .chat-msg-system .chat-msg-content { white-space: pre-wrap; }

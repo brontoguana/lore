@@ -1769,37 +1769,14 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
         fs::write(lore_dir.join("lore.pid"), std::process::id().to_string())?;
     }
 
-    // Resolve backend: CLI flag > server config > default
-    let backend = if let Some(ref b) = args.backend {
-        b.parse().unwrap_or(AgentBackend::Claude)
-    } else {
-        let token = agent_context.token.as_deref().unwrap_or("");
-        match agent_context
-            .client
-            .get(format!("{}/v1/chat/config", agent_context.url))
-            .header("x-lore-key", token)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    json["backend"]
-                        .as_str()
-                        .and_then(|b| b.parse().ok())
-                        .unwrap_or(AgentBackend::Claude)
-                } else {
-                    AgentBackend::Claude
-                }
-            }
-            Err(_) => AgentBackend::Claude,
-        }
-    };
+    let cli_backend_override = args.backend.as_ref().and_then(|b| b.parse().ok());
 
-    eprintln!("[agent] Starting agent '{}' (backend: {backend})", args.name);
+    eprintln!("[agent] Starting agent '{}' (backend: {})", args.name,
+        cli_backend_override.map(|b: AgentBackend| b.to_string()).as_deref().unwrap_or("server config"));
 
     // Main agent loop: poll for messages, process them
     loop {
-        match agent_poll_and_process(&agent_context, &args.name, backend).await {
+        match agent_poll_and_process(&agent_context, &args.name, cli_backend_override).await {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[agent] Error: {e}");
@@ -1809,7 +1786,7 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
     }
 }
 
-async fn agent_poll_and_process(context: &CliContext, agent_name: &str, backend: AgentBackend) -> CliResult<()> {
+async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_backend_override: Option<AgentBackend>) -> CliResult<()> {
     let token = context.token.as_deref().ok_or("no token configured")?;
 
     // Long-poll for messages
@@ -1871,6 +1848,13 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, backend:
             Err(e) => eprintln!("[agent] Update failed: {e}"),
         }
     }
+
+    let backend = cli_backend_override.unwrap_or_else(|| {
+        body["backend"]
+            .as_str()
+            .and_then(|b| b.parse().ok())
+            .unwrap_or(AgentBackend::Claude)
+    });
 
     let messages = body["messages"].as_array();
 
