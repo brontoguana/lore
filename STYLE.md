@@ -33,6 +33,20 @@ All styles live in `src/ui.rs` inside the `render_styles()` function. There are 
 
 ---
 
+## Button Sizes
+
+Two canonical size classes that can be combined with any color/style class:
+
+### Small (`.btn-sm`)
+28x28px square icon buttons. `border-radius: 5px`, no padding, inline-flex centered, flex-shrink: 0.
+Use for: icon-only action buttons in headers, toolbars, chat panes.
+
+### Large (`.btn-lg`)
+48px min-height with `padding: var(--s-3) var(--s-4)`, 16px font.
+Use for: full form buttons, prominent actions. This matches the default `<button>` sizing but provides an explicit class when needed.
+
+---
+
 ## Button Categories
 
 ### 1. Prominent Buttons (`.button-link`)

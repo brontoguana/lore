@@ -1790,14 +1790,14 @@ pub fn render_agents_page(
                     let is_running = agent.process_status.as_deref() == Some("running");
                     let stop_btn = if is_running {
                         format!(
-                            r#"<button type="button" class="button-link" style="aspect-ratio:1; width:auto; padding:0; min-height:0; display:inline-flex; align-items:center; justify-content:center;" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('stop', '{}', '{}')" title="Stop">{}</button>"#,
+                            r#"<button type="button" class="btn-sm button-link" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('stop', '{}', '{}')" title="Stop">{}</button>"#,
                             escape_attribute(&agent.name),
                             escape_attribute(mname),
                             ICON_STOP,
                         )
                     } else { String::new() };
                     let restart_btn = format!(
-                        r#"<button type="button" class="button-link" style="aspect-ratio:1; width:auto; padding:0; min-height:0; display:inline-flex; align-items:center; justify-content:center;" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('restart', '{}', '{}')" title="Restart">{}</button>"#,
+                        r#"<button type="button" class="btn-sm button-link" onclick="event.preventDefault(); event.stopPropagation(); agentCommand('restart', '{}', '{}')" title="Restart">{}</button>"#,
                         escape_attribute(&agent.name),
                         escape_attribute(mname),
                         ICON_RESTART,
@@ -2220,6 +2220,30 @@ pub fn render_agents_page(
         loadFolder(machine, data.path || currentPath);
       }}).catch(function(err) {{
         setTextStatus(statusId, 'Failed to create folder', true);
+      }});
+    }}
+
+    function updateMachine(btn, name) {{
+      var csrf = btn.getAttribute('data-csrf');
+      btn.disabled = true;
+      btn.textContent = 'Queuing\u2026';
+      fetch('/ui/agents/machines/' + encodeURIComponent(name) + '/update-json', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+        body: 'csrf_token=' + encodeURIComponent(csrf)
+      }}).then(function(r) {{
+        if (!r.ok) throw new Error('server returned ' + r.status);
+        return r.json();
+      }}).then(function() {{
+        var span = document.createElement('span');
+        span.className = 'hint';
+        span.style.fontSize = '0.8rem';
+        span.textContent = 'Update queued';
+        btn.parentNode.replaceChild(span, btn);
+      }}).catch(function() {{
+        btn.textContent = 'Failed';
+        btn.disabled = false;
+        setTimeout(function() {{ btn.textContent = 'Update'; }}, 3000);
       }});
     }}
 
@@ -2767,7 +2791,7 @@ pub fn render_chat_page(
   {header_avatar}<span class="chat-header-name">{display_name}</span>
   <span class="chat-header-status" id="chat-agent-status"></span>
   {cwd_html}
-  <button type="button" class="button-link" id="chat-config-btn" style="aspect-ratio:1; width:auto; padding:0; min-height:0; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
+  <button type="button" class="btn-sm button-link" id="chat-config-btn" style="margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
 </div>
 <div class="chat-messages" id="chat-messages"></div>
 <div class="chat-config-panel" id="chat-config-panel" style="display:none;">
@@ -7324,6 +7348,24 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 
     button:disabled:hover {
       opacity: 0.4;
+    }
+
+    .btn-sm {
+      width: 28px;
+      height: 28px;
+      min-height: auto;
+      padding: 0;
+      border-radius: 5px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .btn-lg {
+      min-height: 48px;
+      padding: var(--s-3) var(--s-4);
+      font-size: 16px;
     }
 
     .callout {
