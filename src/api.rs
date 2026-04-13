@@ -1,5 +1,5 @@
 use crate::audit::{AuditActor, AuditActorKind, AuditStore, StoredAuditEvent};
-use crate::auth::{
+use crate::auth::{ChatAuditLog,
     AgentBackend, AgentChatStatus, AuthenticatedAgent, AuthenticatedUser, ChatMessage, ChatRole,
     ChatStore, PinnedChatItem, CreatedAgentToken, LocalAuthStore, NewAgentToken, NewRole,
     NewSession, NewUser, ProjectGrant, ProjectPermission, RoleName, StoredAgentToken, StoredMachine,
@@ -12,13 +12,14 @@ use crate::config::{
 };
 use crate::error::LoreError;
 use crate::librarian::{
-    AnswerLibrarianClient, ApiKeyUpdate, HttpLibrarianClient, LibrarianActor, LibrarianActorKind,
-    LibrarianAnswer, LibrarianConfigStore, LibrarianHistoryStore, LibrarianProviderStatusStore,
-    LibrarianRequest, LibrarianRunKind, LibrarianRunStatus, MAX_CONTEXT_BLOCKS,
-    MAX_PROJECT_ACTION_OPERATIONS, MAX_PROMPT_CHARS, PendingLibrarianAction,
-    PendingLibrarianActionStore, ProjectLibrarianOperation, ProjectLibrarianRequest,
-    ProviderCheckResult, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECS, StoredLibrarianOperation,
-    build_action_prompt, build_prompt,
+    AnswerLibrarianClient, ApiKeyUpdate, Endpoint, EndpointKind, EndpointStore,
+    HttpLibrarianClient, LibrarianActor, LibrarianActorKind, LibrarianAnswer,
+    LibrarianConfigStore, LibrarianHistoryStore, LibrarianProviderStatusStore, LibrarianRequest,
+    LibrarianRunKind, LibrarianRunStatus, MAX_CONTEXT_BLOCKS, MAX_PROJECT_ACTION_OPERATIONS,
+    MAX_PROMPT_CHARS, PendingLibrarianAction, PendingLibrarianActionStore,
+    ProjectLibrarianOperation, ProjectLibrarianRequest, ProviderCheckResult,
+    RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECS, StoredLibrarianOperation, build_action_prompt,
+    build_prompt,
 };
 use crate::model::{
     Block, BlockId, BlockType, ImageUpload, NewBlock, OrderKey, ProjectName, UpdateBlock,
@@ -46,7 +47,7 @@ use axum::body::Body;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Form, Json, Router};
 use base64::Engine;
 use openidconnect::core::{
@@ -60,6 +61,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -92,6 +94,7 @@ pub struct AppState {
     external_auth: Arc<ExternalAuthStore>,
     oidc: Arc<OidcConfigStore>,
     oidc_states: Arc<OidcLoginStateStore>,
+    endpoint_store: Arc<EndpointStore>,
     librarian_config: Arc<LibrarianConfigStore>,
     librarian_history: Arc<LibrarianHistoryStore>,
     project_history: Arc<ProjectHistoryStore>,
@@ -101,6 +104,7 @@ pub struct AppState {
     librarian_provider_status: Arc<LibrarianProviderStatusStore>,
     auto_update_config: Arc<AutoUpdateConfigStore>,
     auto_update_status: Arc<AutoUpdateStatusStore>,
+    update_check_cache: Arc<Mutex<Option<(Instant, AutoUpdateStatus)>>>,
     librarian_client: Arc<dyn AnswerLibrarianClient>,
     librarian_rate_limits: Arc<Mutex<HashMap<String, Vec<OffsetDateTime>>>>,
     librarian_inflight_runs: Arc<Mutex<usize>>,
@@ -109,6 +113,7 @@ pub struct AppState {
     global_librarian_rate_limits: Arc<Mutex<Vec<OffsetDateTime>>>,
     mcp_sessions: Arc<Mutex<HashMap<String, McpSessionEntry>>>,
     chat: Arc<ChatStore>,
+    chat_audit: Arc<ChatAuditLog>,
     chat_senders: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ChatEvent>>>>,
     chat_agent_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     machine_commands: Arc<Mutex<HashMap<String, Vec<MachineCommand>>>>,
@@ -148,9 +153,26 @@ impl AppState {
         let chat_root = root.clone();
         let auth = LocalAuthStore::new(root.clone());
         let chat = ChatStore::new(chat_root);
+        let chat_audit = ChatAuditLog::new(root.clone());
+        chat_audit.cleanup_old_logs(90);
         auth.cleanup_orphans();
         chat.cleanup_orphans();
         let config = ServerConfigStore::new(root.clone(), default_port);
+        let endpoint_store = EndpointStore::new(root.clone());
+        let librarian_config_store = LibrarianConfigStore::new(root.clone());
+        if let Ok(lc) = librarian_config_store.load() {
+            if lc.needs_migration() {
+                if let Ok(ep) = endpoint_store.create(
+                    "Migrated".into(),
+                    EndpointKind::OpenAi,
+                    lc.endpoint_url.clone(),
+                    lc.model.clone(),
+                    lc.api_key.clone(),
+                ) {
+                    let _ = librarian_config_store.set_endpoint_id(Some(ep.id));
+                }
+            }
+        }
         Self {
             store: Arc::new(store),
             auth: Arc::new(auth),
@@ -159,7 +181,8 @@ impl AppState {
             external_auth: Arc::new(ExternalAuthStore::new(root.clone())),
             oidc: Arc::new(OidcConfigStore::new(root.clone())),
             oidc_states: Arc::new(OidcLoginStateStore::new(root.clone())),
-            librarian_config: Arc::new(LibrarianConfigStore::new(root.clone())),
+            endpoint_store: Arc::new(endpoint_store),
+            librarian_config: Arc::new(librarian_config_store),
             librarian_history: Arc::new(LibrarianHistoryStore::new(root.clone())),
             project_history: Arc::new(ProjectHistoryStore::new(root.clone())),
             git_export_config: Arc::new(GitExportConfigStore::new(root.clone())),
@@ -172,6 +195,7 @@ impl AppState {
             )),
             auto_update_config: Arc::new(AutoUpdateConfigStore::new(auto_update_root.clone())),
             auto_update_status: Arc::new(AutoUpdateStatusStore::new(auto_update_root)),
+            update_check_cache: Arc::new(Mutex::new(None)),
             librarian_client,
             librarian_rate_limits: Arc::new(Mutex::new(HashMap::new())),
             librarian_inflight_runs: Arc::new(Mutex::new(0)),
@@ -180,6 +204,7 @@ impl AppState {
             global_librarian_rate_limits: Arc::new(Mutex::new(Vec::new())),
             mcp_sessions: Arc::new(Mutex::new(HashMap::new())),
             chat: Arc::new(chat),
+            chat_audit: Arc::new(chat_audit),
             chat_senders: Arc::new(Mutex::new(HashMap::new())),
             chat_agent_notifiers: Arc::new(Mutex::new(HashMap::new())),
             machine_commands: Arc::new(Mutex::new(HashMap::new())),
@@ -240,16 +265,24 @@ fn build_app_with_librarian(
             get(get_server_config).post(update_server_config),
         )
         .route(
+            "/v1/admin/endpoints",
+            get(list_endpoints).post(create_endpoint),
+        )
+        .route(
+            "/v1/admin/endpoints/{id}",
+            put(update_endpoint).delete(delete_endpoint),
+        )
+        .route(
+            "/v1/admin/endpoints/{id}/test",
+            post(test_endpoint),
+        )
+        .route(
             "/v1/admin/librarian-config",
             get(get_librarian_config).post(update_librarian_config),
         )
         .route(
             "/v1/admin/librarian-config/test",
             post(test_librarian_config),
-        )
-        .route(
-            "/v1/admin/librarian-config/rotate-key",
-            post(rotate_librarian_api_key),
         )
         .route(
             "/v1/admin/git-export-config",
@@ -380,12 +413,21 @@ fn build_app_with_librarian(
             post(revoke_user_sessions_from_ui),
         )
         .route("/ui/admin/setup", post(update_setup_from_ui))
+        .route("/ui/admin/endpoints", post(create_endpoint_from_ui))
+        .route(
+            "/ui/admin/endpoints/{id}",
+            post(update_endpoint_from_ui),
+        )
+        .route(
+            "/ui/admin/endpoints/{id}/delete",
+            post(delete_endpoint_from_ui),
+        )
+        .route(
+            "/ui/admin/endpoints/{id}/test",
+            post(test_endpoint_from_ui),
+        )
         .route("/ui/admin/librarian", post(update_librarian_from_ui))
         .route("/ui/admin/librarian/test", post(test_librarian_from_ui))
-        .route(
-            "/ui/admin/librarian/rotate-key",
-            post(rotate_librarian_key_from_ui),
-        )
         .route("/ui/admin/git-export", post(update_git_export_from_ui))
         .route("/ui/admin/git-export/sync", post(sync_git_export_from_ui))
         .route(
@@ -823,10 +865,7 @@ struct UpdateGitExportUiForm {
 
 #[derive(Debug, Deserialize)]
 struct UpdateLibrarianConfigRequest {
-    endpoint_url: String,
-    model: String,
-    api_key: Option<String>,
-    clear_api_key: Option<bool>,
+    endpoint_id: Option<String>,
     request_timeout_secs: Option<u64>,
     max_concurrent_runs: Option<usize>,
     action_requires_approval: Option<bool>,
@@ -835,13 +874,60 @@ struct UpdateLibrarianConfigRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateLibrarianUiForm {
     csrf_token: String,
-    endpoint_url: String,
-    model: String,
-    api_key: String,
-    clear_api_key: Option<String>,
+    endpoint_id: Option<String>,
     request_timeout_secs: Option<u64>,
     max_concurrent_runs: Option<usize>,
     action_requires_approval: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateEndpointRequest {
+    name: String,
+    kind: String,
+    url: String,
+    model: String,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateEndpointRequest {
+    name: String,
+    kind: String,
+    url: String,
+    model: String,
+    api_key: Option<String>,
+    clear_api_key: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateEndpointUiForm {
+    csrf_token: String,
+    name: String,
+    kind: String,
+    url: String,
+    model: String,
+    api_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateEndpointUiForm {
+    csrf_token: String,
+    name: String,
+    kind: String,
+    url: String,
+    model: String,
+    api_key: String,
+    clear_api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteEndpointUiForm {
+    csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestEndpointUiForm {
+    csrf_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -868,19 +954,8 @@ struct AskLibrarianForm {
 }
 
 #[derive(Debug, Deserialize)]
-struct RotateLibrarianApiKeyRequest {
-    api_key: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct LibrarianProviderTestUiForm {
     csrf_token: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RotateLibrarianKeyUiForm {
-    csrf_token: String,
-    api_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1082,13 +1157,24 @@ struct ServerConfigSummary {
 
 #[derive(Debug, Serialize)]
 struct LibrarianConfigSummary {
-    endpoint_url: String,
-    model: String,
-    has_api_key: bool,
+    endpoint_id: Option<String>,
     configured: bool,
     request_timeout_secs: u64,
     max_concurrent_runs: usize,
     action_requires_approval: bool,
+    updated_at: time::OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+struct EndpointSummary {
+    id: String,
+    name: String,
+    kind: String,
+    url: String,
+    model: String,
+    has_api_key: bool,
+    configured: bool,
+    created_at: time::OffsetDateTime,
     updated_at: time::OffsetDateTime,
 }
 
@@ -2038,9 +2124,7 @@ async fn update_librarian_config(
     let admin = require_admin(&state, &headers)?;
     let existing = state.librarian_config.load()?;
     let config = state.librarian_config.update(
-        payload.endpoint_url,
-        payload.model,
-        api_key_update_from_request(payload.api_key.as_deref(), payload.clear_api_key),
+        payload.endpoint_id,
         payload
             .request_timeout_secs
             .unwrap_or(existing.request_timeout_secs),
@@ -2069,30 +2153,116 @@ async fn test_librarian_config(
     headers: HeaderMap,
 ) -> ApiResult<Json<LibrarianProviderStatusSummary>> {
     require_admin(&state, &headers)?;
-    let config = state.librarian_config.load()?;
-    let status = state.librarian_client.healthcheck(&config).await?;
+    let (endpoint, config) = resolve_librarian_endpoint(&state)?;
+    let status = state
+        .librarian_client
+        .healthcheck(&endpoint, config.request_timeout_secs)
+        .await?;
     state.librarian_provider_status.save(&status)?;
     Ok(Json(provider_status_summary(status)))
 }
 
-async fn rotate_librarian_api_key(
+async fn list_endpoints(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<RotateLibrarianApiKeyRequest>,
-) -> ApiResult<Json<LibrarianConfigSummary>> {
+) -> ApiResult<Json<Vec<EndpointSummary>>> {
+    require_admin(&state, &headers)?;
+    let endpoints = state.endpoint_store.list()?;
+    Ok(Json(endpoints.iter().map(endpoint_summary).collect()))
+}
+
+async fn create_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateEndpointRequest>,
+) -> ApiResult<Json<EndpointSummary>> {
     let admin = require_admin(&state, &headers)?;
-    let config = state.librarian_config.rotate_api_key(&payload.api_key)?;
+    let kind: EndpointKind = payload.kind.parse()?;
+    let ep = state.endpoint_store.create(
+        payload.name,
+        kind,
+        payload.url,
+        payload.model,
+        payload.api_key,
+    )?;
     append_audit_event(
         &state,
         AuditActor {
             kind: AuditActorKind::User,
             name: admin.username.as_str().to_string(),
         },
-        "rotate librarian api key",
+        &format!("create endpoint: {}", ep.name),
         None,
         Some("api".into()),
     )?;
-    Ok(Json(librarian_config_summary(&config)))
+    Ok(Json(endpoint_summary(&ep)))
+}
+
+async fn update_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateEndpointRequest>,
+) -> ApiResult<Json<EndpointSummary>> {
+    let admin = require_admin(&state, &headers)?;
+    let kind: EndpointKind = payload.kind.parse()?;
+    let ep = state.endpoint_store.update(
+        &id,
+        payload.name,
+        kind,
+        payload.url,
+        payload.model,
+        api_key_update_from_request(payload.api_key.as_deref(), payload.clear_api_key),
+    )?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: admin.username.as_str().to_string(),
+        },
+        &format!("update endpoint: {}", ep.name),
+        None,
+        Some("api".into()),
+    )?;
+    Ok(Json(endpoint_summary(&ep)))
+}
+
+async fn delete_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let admin = require_admin(&state, &headers)?;
+    state.endpoint_store.delete(&id)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: admin.username.as_str().to_string(),
+        },
+        "delete endpoint",
+        None,
+        Some("api".into()),
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn test_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<LibrarianProviderStatusSummary>> {
+    require_admin(&state, &headers)?;
+    let endpoint = state
+        .endpoint_store
+        .get(&id)?
+        .ok_or_else(|| LoreError::Validation("endpoint not found".into()))?;
+    let config = state.librarian_config.load()?;
+    let status = state
+        .librarian_client
+        .healthcheck(&endpoint, config.request_timeout_secs)
+        .await?;
+    Ok(Json(provider_status_summary(status)))
 }
 
 async fn get_git_export_config(
@@ -2609,6 +2779,7 @@ async fn admin_page(
     let oidc_config = state.oidc.load()?;
     let auto_update_config = state.auto_update_config.load()?;
     let librarian_config = state.librarian_config.load()?;
+    let endpoints = state.endpoint_store.list()?;
     let git_export_config = state.git_export_config.load()?;
     let librarian_audit = state.librarian_history.list_recent_all(12)?;
     let pending_actions = state.pending_librarian_actions.list_all(12)?;
@@ -2656,6 +2827,7 @@ async fn admin_page(
         &oidc_config,
         &auto_update_config,
         &librarian_config,
+        &endpoints,
         &git_export_config,
         state.auto_update_status.load()?.as_ref(),
         state.librarian_provider_status.load()?,
@@ -3294,10 +3466,11 @@ async fn update_librarian_from_ui(
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     let existing = state.librarian_config.load()?;
+    let endpoint_id = form
+        .endpoint_id
+        .filter(|id| !id.is_empty());
     state.librarian_config.update(
-        form.endpoint_url,
-        form.model,
-        api_key_update_from_form(&form.api_key, form.clear_api_key.as_deref()),
+        endpoint_id,
         form.request_timeout_secs
             .unwrap_or(existing.request_timeout_secs),
         form.max_concurrent_runs
@@ -3314,7 +3487,9 @@ async fn update_librarian_from_ui(
         None,
         None,
     )?;
-    Ok(Redirect::to("/ui/admin?flash=Answer%20librarian%20saved"))
+    Ok(Redirect::to(
+        "/ui/admin?section=librarian&flash=Librarian%20config%20saved",
+    ))
 }
 
 async fn test_librarian_from_ui(
@@ -3324,8 +3499,11 @@ async fn test_librarian_from_ui(
 ) -> UiResult<Redirect> {
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    let config = state.librarian_config.load()?;
-    let status = state.librarian_client.healthcheck(&config).await?;
+    let (endpoint, config) = resolve_librarian_endpoint(&state)?;
+    let status = state
+        .librarian_client
+        .healthcheck(&endpoint, config.request_timeout_secs)
+        .await?;
     let ok = status.ok;
     state.librarian_provider_status.save(&status)?;
     let flash = if ok {
@@ -3333,20 +3511,123 @@ async fn test_librarian_from_ui(
     } else {
         "Librarian%20provider%20test%20failed"
     };
-    Ok(Redirect::to(&format!("/ui/admin?flash={flash}")))
+    Ok(Redirect::to(&format!(
+        "/ui/admin?section=librarian&flash={flash}"
+    )))
 }
 
-async fn rotate_librarian_key_from_ui(
+async fn create_endpoint_from_ui(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<RotateLibrarianKeyUiForm>,
+    Form(form): Form<CreateEndpointUiForm>,
 ) -> UiResult<Redirect> {
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    state.librarian_config.rotate_api_key(&form.api_key)?;
+    let kind: EndpointKind = form.kind.parse()?;
+    let api_key = if form.api_key.is_empty() {
+        None
+    } else {
+        Some(form.api_key)
+    };
+    let ep = state
+        .endpoint_store
+        .create(form.name, kind, form.url, form.model, api_key)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        &format!("create endpoint: {}", ep.name),
+        None,
+        None,
+    )?;
     Ok(Redirect::to(
-        "/ui/admin?flash=Librarian%20API%20key%20rotated",
+        "/ui/admin?section=endpoints&flash=Endpoint%20created",
     ))
+}
+
+async fn update_endpoint_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<UpdateEndpointUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let kind: EndpointKind = form.kind.parse()?;
+    let ep = state.endpoint_store.update(
+        &id,
+        form.name,
+        kind,
+        form.url,
+        form.model,
+        api_key_update_from_form(&form.api_key, form.clear_api_key.as_deref()),
+    )?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        &format!("update endpoint: {}", ep.name),
+        None,
+        None,
+    )?;
+    Ok(Redirect::to(
+        "/ui/admin?section=endpoints&flash=Endpoint%20saved",
+    ))
+}
+
+async fn delete_endpoint_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteEndpointUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    state.endpoint_store.delete(&id)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "delete endpoint",
+        None,
+        None,
+    )?;
+    Ok(Redirect::to(
+        "/ui/admin?section=endpoints&flash=Endpoint%20deleted",
+    ))
+}
+
+async fn test_endpoint_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<TestEndpointUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let endpoint = state
+        .endpoint_store
+        .get(&id)?
+        .ok_or_else(|| LoreError::Validation("endpoint not found".into()))?;
+    let config = state.librarian_config.load()?;
+    let status = state
+        .librarian_client
+        .healthcheck(&endpoint, config.request_timeout_secs)
+        .await?;
+    let flash = if status.ok {
+        "Endpoint%20test%20succeeded"
+    } else {
+        "Endpoint%20test%20failed"
+    };
+    Ok(Redirect::to(&format!(
+        "/ui/admin?section=endpoints&flash={flash}"
+    )))
 }
 
 async fn update_git_export_from_ui(
@@ -4422,6 +4703,20 @@ fn extract_agent_token_candidate(headers: &HeaderMap) -> Result<Option<String>, 
     Ok(None)
 }
 
+fn collect_project_context(state: &AppState, grants: &[crate::auth::ProjectGrant]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for grant in grants {
+        let meta = state.store.read_project_meta(&grant.project);
+        if let Some(ctx) = meta.agent_context {
+            let trimmed = ctx.trim();
+            if !trimmed.is_empty() {
+                parts.push(format!("# {}\n{}", meta.display_name, trimmed));
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
 fn authenticate_agent(
     state: &AppState,
     headers: &HeaderMap,
@@ -4910,15 +5205,38 @@ fn server_config_summary(config: &ServerConfig) -> ServerConfigSummary {
 
 fn librarian_config_summary(config: &crate::librarian::LibrarianConfig) -> LibrarianConfigSummary {
     LibrarianConfigSummary {
-        endpoint_url: config.endpoint_url.clone(),
-        model: config.model.clone(),
-        has_api_key: config.has_api_key(),
+        endpoint_id: config.endpoint_id.clone(),
         configured: config.is_configured(),
         request_timeout_secs: config.request_timeout_secs,
         max_concurrent_runs: config.max_concurrent_runs,
         action_requires_approval: config.action_requires_approval,
         updated_at: config.updated_at,
     }
+}
+
+fn endpoint_summary(ep: &Endpoint) -> EndpointSummary {
+    EndpointSummary {
+        id: ep.id.clone(),
+        name: ep.name.clone(),
+        kind: ep.kind.to_string(),
+        url: ep.url.clone(),
+        model: ep.model.clone(),
+        has_api_key: ep.has_api_key(),
+        configured: ep.is_configured(),
+        created_at: ep.created_at,
+        updated_at: ep.updated_at,
+    }
+}
+
+fn resolve_librarian_endpoint(state: &AppState) -> Result<(Endpoint, crate::librarian::LibrarianConfig), LoreError> {
+    let config = state.librarian_config.load()?;
+    let endpoint_id = config.endpoint_id.as_deref().ok_or_else(|| {
+        LoreError::Validation("librarian is not configured: no endpoint selected".into())
+    })?;
+    let endpoint = state.endpoint_store.get(endpoint_id)?.ok_or_else(|| {
+        LoreError::Validation("configured librarian endpoint no longer exists".into())
+    })?;
+    Ok((endpoint, config))
 }
 
 fn git_export_config_summary(config: &GitExportConfig) -> GitExportConfigSummary {
@@ -5004,6 +5322,12 @@ fn git_export_status_summary(status: GitExportStatus) -> GitExportStatusSummary 
 }
 
 async fn run_auto_update_check(state: &AppState) -> Result<AutoUpdateStatus, LoreError> {
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(40);
+    if let Some((cached_at, cached)) = state.update_check_cache.lock().unwrap().as_ref() {
+        if cached_at.elapsed() < CACHE_TTL {
+            return Ok(cached.clone());
+        }
+    }
     let config = state.auto_update_config.load()?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -5033,6 +5357,7 @@ async fn run_auto_update_check(state: &AppState) -> Result<AutoUpdateStatus, Lor
         ok: true,
     };
     state.auto_update_status.save(&status)?;
+    *state.update_check_cache.lock().unwrap() = Some((Instant::now(), status.clone()));
     Ok(status)
 }
 
@@ -5274,14 +5599,17 @@ async fn answer_librarian_for_project(
 ) -> Result<LibrarianAnswerBody, LoreError> {
     let created_at = OffsetDateTime::now_utc();
     let mut source_blocks = Vec::new();
-    let config = state.librarian_config.load()?;
+    let (endpoint, config) = resolve_librarian_endpoint(state)?;
     let _guard = acquire_librarian_slot(state, &config)?;
     let result = async {
         enforce_librarian_rate_limit(state, &actor, project)?;
         enforce_global_librarian_rate_limit(state)?;
         let request = build_librarian_request(&state.store, project, &question, &options)?;
         source_blocks = request.context_blocks.clone();
-        let LibrarianAnswer { answer } = state.librarian_client.answer(&config, &request).await?;
+        let LibrarianAnswer { answer } = state
+            .librarian_client
+            .answer(&endpoint, config.request_timeout_secs, &request)
+            .await?;
         Ok(LibrarianAnswerBody {
             project: project.clone(),
             created_at,
@@ -5299,8 +5627,8 @@ async fn answer_librarian_for_project(
         project,
         actor,
         created_at,
-        &config.endpoint_url,
-        &config.model,
+        &endpoint.url,
+        &endpoint.model,
         &question,
         &source_blocks,
         &result,
@@ -5368,7 +5696,7 @@ async fn execute_project_librarian_action(
     state.auth.authorize_write(user, project)?;
     let actor = librarian_actor_for_user(user);
     let created_at = OffsetDateTime::now_utc();
-    let config = state.librarian_config.load()?;
+    let (endpoint, config) = resolve_librarian_endpoint(state)?;
     let _guard = acquire_librarian_slot(state, &config)?;
     let request = build_project_librarian_request(&state.store, project, &instruction, &options)?;
     let parent_run_id = Uuid::new_v4().to_string();
@@ -5386,8 +5714,8 @@ async fn execute_project_librarian_action(
             .map(|block| block.id.clone())
             .collect(),
         operations: Vec::new(),
-        provider_endpoint_url: config.endpoint_url.clone(),
-        provider_model: config.model.clone(),
+        provider_endpoint_url: endpoint.url.clone(),
+        provider_model: endpoint.model.clone(),
         status: LibrarianRunStatus::Success,
         error: None,
         created_at,
@@ -5399,7 +5727,7 @@ async fn execute_project_librarian_action(
         enforce_global_librarian_rate_limit(state)?;
         let plan = state
             .librarian_client
-            .plan_action(&config, &request)
+            .plan_action(&endpoint, config.request_timeout_secs, &request)
             .await?;
         if plan.operations.len() > MAX_PROJECT_ACTION_OPERATIONS {
             return Err(LoreError::Validation(format!(
@@ -5428,8 +5756,8 @@ async fn execute_project_librarian_action(
                     .map(|block| block.id.clone())
                     .collect(),
                 operations: plan.operations.clone(),
-                provider_endpoint_url: config.endpoint_url.clone(),
-                provider_model: config.model.clone(),
+                provider_endpoint_url: endpoint.url.clone(),
+                provider_model: endpoint.model.clone(),
                 created_at,
             };
             state.pending_librarian_actions.append(pending_action)?;
@@ -5477,8 +5805,8 @@ async fn execute_project_librarian_action(
         project,
         actor,
         created_at,
-        &config.endpoint_url,
-        &config.model,
+        &endpoint.url,
+        &endpoint.model,
         &request,
         &parent_run_id,
         &result,
@@ -7755,6 +8083,7 @@ async fn chat_send_message(
         ChatRole::User,
         form.message.clone(),
     )?;
+    state.chat_audit.log(&agent_name, owner, "user", &form.message);
 
     // Notify the agent if it's polling
     let notifier_key = format!("{owner}_{agent_name}");
@@ -7991,6 +8320,7 @@ async fn chat_agent_respond(
             ChatRole::Assistant,
             content.clone(),
         )?;
+        state.chat_audit.log(&agent.name, owner_str, "agent", &content);
 
         push_chat_event(&state, owner_str, ChatEvent {
             event_type: "response_complete".into(),
@@ -8017,6 +8347,7 @@ async fn chat_agent_respond(
                 ChatRole::User,
                 auto_msg.clone(),
             )?;
+            state.chat_audit.log(&agent.name, owner_str, "auto", auto_msg);
             push_chat_event(&state, owner_str, ChatEvent {
                 event_type: "auto_message".into(),
                 agent: agent.name.clone(),
@@ -8100,12 +8431,15 @@ async fn chat_agent_history(
 
     let backend_str = agent.backend.to_string();
     let (model, effort) = state.chat.get_backend_prefs(owner_str, &backend_str).unwrap_or((None, None));
+    let project_context = collect_project_context(&state, &agent.grants);
 
     Ok(Json(json!({
         "messages": msgs,
         "summary": conv.summary,
         "window_size": conv.window_size,
         "pins": conv.pins.iter().map(|p| json!({"id": p.id, "text": p.text})).collect::<Vec<_>>(),
+        "pinned_context": conv.pinned_context,
+        "project_context": project_context,
         "model": model,
         "effort": effort,
     })))
@@ -8165,6 +8499,7 @@ struct ChatSaveConfigForm {
     backend: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    pinned_context: Option<String>,
 }
 
 async fn chat_get_config(
@@ -8189,9 +8524,14 @@ async fn chat_get_config(
         }));
     }
 
+    let pinned_context = state.chat.get_pinned_context(owner, &agent_name)?;
+    let project_context = collect_project_context(&state, &agent.grants);
+
     Ok(Json(serde_json::json!({
         "backend": backend_str,
         "prefs": all_prefs,
+        "pinned_context": pinned_context,
+        "project_context": project_context,
     })))
 }
 
@@ -8225,6 +8565,10 @@ async fn chat_save_config(
     let effort_val = form.effort.as_deref().filter(|e| !e.is_empty() && *e != "default");
     state.chat.set_backend_effort(owner, &backend_str, effort_val.map(|s| s.to_string()))?;
 
+    if let Some(ref pinned) = form.pinned_context {
+        state.chat.set_pinned_context(owner, &agent_name, pinned)?;
+    }
+
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -8252,7 +8596,7 @@ async fn chat_slash_command(
 
     let response_text = match cmd.as_str() {
         "/help" => {
-            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /context -- show summary, pins, window\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- pin context that survives compaction\n    /pins -- list all pins\n    /unpin <id> -- remove a pin\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /forget -- clear all context and restart\n\n  MODEL\n    /model <name> -- switch model\n    /effort <level> -- low/medium/high/max/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- inject a side message\n    /auto [message] -- repeat after each response (no args to clear)\n    /boop -- ping the agent\n    /hi -- say hello".to_string()
+            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /context -- show summary, pins, window\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- add to pinned context\n    /pins -- show pinned context\n    /unpin <id> -- remove a pin by id\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /clear -- clear messages, keep context\n\n  MODEL\n    /model <name> -- switch model\n    /effort <level> -- low/medium/high/max/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- inject a side message\n    /auto [message] -- repeat after each response (no args to clear)\n    /boop -- ping the agent\n    /hi -- say hello\n\nPinned context can also be edited in the config panel (gear icon).".to_string()
         }
         "/status" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
@@ -8276,13 +8620,11 @@ async fn chat_slash_command(
             let conv = state.chat.load_conversation(owner, &agent_name)?;
             let mut parts = Vec::new();
 
-            if conv.pins.is_empty() {
-                parts.push("No pinned items.".to_string());
+            if conv.pinned_context.is_empty() {
+                parts.push("No pinned context.".to_string());
             } else {
-                parts.push("Pinned items:".to_string());
-                for pin in &conv.pins {
-                    parts.push(format!("  #{}: {}", pin.id, pin.text));
-                }
+                parts.push("Pinned context:".to_string());
+                parts.push(conv.pinned_context.clone());
             }
 
             if conv.summary.is_empty() {
@@ -8306,32 +8648,34 @@ async fn chat_slash_command(
                 let mut conv = state.chat.load_conversation(owner, &agent_name)?;
                 let pin = PinnedChatItem {
                     id: conv.next_id,
-                    text: pin_text,
+                    text: pin_text.clone(),
                     timestamp: OffsetDateTime::now_utc(),
                 };
                 conv.next_id += 1;
                 conv.pins.push(pin);
-                state.chat.save_conversation(owner, &agent_name, &conv)?;
-                let mut lines = vec!["Pinned.".to_string(), String::new()];
-                for p in &conv.pins {
-                    lines.push(format!("  #{}: {}", p.id, p.text));
+                if !conv.pinned_context.is_empty() {
+                    conv.pinned_context.push('\n');
                 }
-                lines.push(String::new());
-                lines.push("Use /unpin <id> to remove.".to_string());
-                lines.join("\n")
+                conv.pinned_context.push_str(&pin_text);
+                state.chat.save_conversation(owner, &agent_name, &conv)?;
+                format!("Pinned: {pin_text}")
             }
         }
         "/pins" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
-            if conv.pins.is_empty() {
-                "No pins.".to_string()
+            if conv.pinned_context.is_empty() {
+                "No pinned context.".to_string()
             } else {
-                let mut lines = Vec::new();
-                for p in &conv.pins {
-                    lines.push(format!("  #{}: {}", p.id, p.text));
+                let mut lines = vec!["Pinned context:".to_string(), conv.pinned_context.clone()];
+                if !conv.pins.is_empty() {
+                    lines.push(String::new());
+                    lines.push("Tracked pins:".to_string());
+                    for p in &conv.pins {
+                        lines.push(format!("  #{}: {}", p.id, p.text));
+                    }
+                    lines.push(String::new());
+                    lines.push("Use /unpin <id> to remove.".to_string());
                 }
-                lines.push(String::new());
-                lines.push("Use /unpin <id> to remove.".to_string());
                 lines.join("\n")
             }
         }
@@ -8345,8 +8689,26 @@ async fn chat_slash_command(
             match idx {
                 Some(i) => {
                     let removed = conv.pins.remove(i);
-                    state.chat.save_conversation(owner, &agent_name, &conv)?;
                     let preview: String = removed.text.chars().take(80).collect();
+                    if let Some(pos) = conv.pinned_context.find(&removed.text) {
+                        let end = pos + removed.text.len();
+                        let end = if end < conv.pinned_context.len() && conv.pinned_context.as_bytes()[end] == b'\n' {
+                            end + 1
+                        } else {
+                            end
+                        };
+                        let start = if pos > 0 && conv.pinned_context.as_bytes()[pos - 1] == b'\n' {
+                            pos - 1
+                        } else {
+                            pos
+                        };
+                        conv.pinned_context = format!(
+                            "{}{}",
+                            &conv.pinned_context[..start],
+                            &conv.pinned_context[end..]
+                        ).trim().to_string();
+                    }
+                    state.chat.save_conversation(owner, &agent_name, &conv)?;
                     format!("Removed pin #{id}: {preview}")
                 }
                 None => format!("Pin #{id} not found. Use /pins to see current pins."),
@@ -8440,9 +8802,9 @@ async fn chat_slash_command(
                 }
             }
         }
-        "/forget" | "/clear" => {
+        "/clear" => {
             state.chat.clear_messages(owner, &agent_name)?;
-            "Context cleared. Starting fresh.".to_string()
+            "Messages cleared.".to_string()
         }
         "/compact" => {
             // Queue a compact command for the agent to pick up
@@ -8600,6 +8962,8 @@ async fn chat_slash_command(
         }
         _ => format!("Unknown command: {}. Type /help for available commands.", cmd),
     };
+
+    state.chat_audit.log(&agent_name, owner, "command", trimmed);
 
     // Push the command response as a system message via SSE
     push_chat_event(&state, owner, ChatEvent {
@@ -9169,7 +9533,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::librarian::{
-        AnswerLibrarianClient, LibrarianAnswer, LibrarianConfig, LibrarianRequest,
+        AnswerLibrarianClient, Endpoint, LibrarianAnswer, LibrarianConfig, LibrarianRequest,
         ProjectLibrarianOperation, ProjectLibrarianPlan, ProjectLibrarianRequest,
         ProviderCheckResult, RATE_LIMIT_REQUESTS,
     };
@@ -9205,10 +9569,11 @@ mod tests {
     impl AnswerLibrarianClient for RecordingLibrarianClient {
         async fn answer(
             &self,
-            config: &LibrarianConfig,
+            endpoint: &Endpoint,
+            _timeout_secs: u64,
             request: &LibrarianRequest,
         ) -> Result<LibrarianAnswer, crate::LoreError> {
-            assert!(config.is_configured());
+            assert!(endpoint.is_configured());
             self.requests.lock().unwrap().push(request.clone());
             Ok(LibrarianAnswer {
                 answer: self.answer.clone(),
@@ -9217,9 +9582,10 @@ mod tests {
 
         async fn healthcheck(
             &self,
-            config: &LibrarianConfig,
+            endpoint: &Endpoint,
+            _timeout_secs: u64,
         ) -> Result<ProviderCheckResult, crate::LoreError> {
-            assert!(config.is_configured());
+            assert!(endpoint.is_configured());
             Ok(ProviderCheckResult {
                 ok: true,
                 detail: "ok".into(),
@@ -9229,10 +9595,11 @@ mod tests {
 
         async fn plan_action(
             &self,
-            config: &LibrarianConfig,
+            endpoint: &Endpoint,
+            _timeout_secs: u64,
             request: &ProjectLibrarianRequest,
         ) -> Result<ProjectLibrarianPlan, crate::LoreError> {
-            assert!(config.is_configured());
+            assert!(endpoint.is_configured());
             self.requests.lock().unwrap().push(LibrarianRequest {
                 project: request.project.clone(),
                 question: request.instruction.clone(),
@@ -10223,14 +10590,36 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         ensure_test_admin(dir.path());
 
+        let create_ep = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/endpoints")
+            .header("content-type", "application/json")
+            .header("authorization", basic_auth("admin", "correct-horse-battery"))
+            .body(Body::from(
+                r#"{"name":"Test","kind":"openai","url":"https://api.example.com/v1/chat/completions","model":"gpt-5.4","api_key":"secret-key"}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(create_ep).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ep_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 64)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let endpoint_id = ep_body["id"].as_str().unwrap();
+        assert_eq!(ep_body["kind"], "openai");
+        assert_eq!(ep_body["has_api_key"], true);
+
         let update = Request::builder()
             .method("POST")
             .uri("/v1/admin/librarian-config")
             .header("content-type", "application/json")
             .header("authorization", basic_auth("admin", "correct-horse-battery"))
-            .body(Body::from(
-                r#"{"endpoint_url":"https://api.example.com/v1/chat/completions","model":"gpt-5.4","api_key":"secret-key"}"#,
-            ))
+            .body(Body::from(format!(
+                r#"{{"endpoint_id":"{}"}}"#,
+                endpoint_id
+            )))
             .unwrap();
         let response = app.clone().oneshot(update).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -10250,12 +10639,7 @@ mod tests {
             .await
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            json["endpoint_url"],
-            "https://api.example.com/v1/chat/completions"
-        );
-        assert_eq!(json["model"], "gpt-5.4");
-        assert_eq!(json["has_api_key"], true);
+        assert_eq!(json["endpoint_id"], endpoint_id);
         assert_eq!(json["configured"], true);
     }
 
@@ -11325,13 +11709,33 @@ mod tests {
     {
         ensure_test_admin(dir);
 
+        let create_ep = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/endpoints")
+            .header("content-type", "application/json")
+            .header("authorization", basic_auth("admin", "correct-horse-battery"))
+            .body(Body::from(
+                r#"{"name":"Test","kind":"openai","url":"https://api.example.com/v1/chat/completions","model":"gpt-5.4","api_key":"secret-key"}"#,
+            ))
+            .unwrap();
+        let ep_response = app.clone().oneshot(create_ep).await.unwrap();
+        assert_eq!(ep_response.status(), StatusCode::OK);
+        let ep_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(ep_response.into_body(), 1024 * 64)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let endpoint_id = ep_body["id"].as_str().unwrap();
+
         let update = Request::builder()
             .method("POST")
             .uri("/v1/admin/librarian-config")
             .header("content-type", "application/json")
             .header("authorization", basic_auth("admin", "correct-horse-battery"))
             .body(Body::from(format!(
-                r#"{{"endpoint_url":"https://api.example.com/v1/chat/completions","model":"gpt-5.4","api_key":"secret-key","action_requires_approval":{}}}"#,
+                r#"{{"endpoint_id":"{}","action_requires_approval":{}}}"#,
+                endpoint_id,
                 if action_requires_approval { "true" } else { "false" }
             )))
             .unwrap();

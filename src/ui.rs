@@ -802,6 +802,7 @@ pub fn render_admin_page(
     oidc_config: &OidcConfig,
     auto_update_config: &AutoUpdateConfig,
     librarian_config: &LibrarianConfig,
+    endpoints: &[crate::librarian::Endpoint],
     git_export_config: &GitExportConfig,
     auto_update_status: Option<&AutoUpdateStatus>,
     provider_status: Option<ProviderCheckResult>,
@@ -893,6 +894,107 @@ pub fn render_admin_page(
             .collect::<Vec<_>>()
             .join("")
     };
+    let endpoints_list_html = if endpoints.is_empty() {
+        "<p class=\"hint padded\">No endpoints configured yet.</p>".to_string()
+    } else {
+        let items: Vec<String> = endpoints
+            .iter()
+            .map(|ep| {
+                let status = if ep.is_configured() && ep.has_api_key() {
+                    "configured"
+                } else {
+                    "incomplete"
+                };
+                format!(
+                    r#"<div class="user-list-item" data-endpoint-id="{id}">
+                      <span class="user-list-name">{name}</span>
+                      <span class="user-list-meta"><span class="pill">{kind}</span> &middot; {status}</span>
+                    </div>"#,
+                    id = escape_attribute(&ep.id),
+                    name = escape_text(&ep.name),
+                    kind = ep.kind,
+                    status = status,
+                )
+            })
+            .collect();
+        format!(r#"<div class="user-list">{}</div>"#, items.join(""))
+    };
+    let endpoints_detail_html: String = endpoints
+        .iter()
+        .map(|ep| {
+            let anthropic_sel = if ep.kind == crate::librarian::EndpointKind::Anthropic { " selected" } else { "" };
+            let gemini_sel = if ep.kind == crate::librarian::EndpointKind::Gemini { " selected" } else { "" };
+            let openai_sel = if ep.kind == crate::librarian::EndpointKind::OpenAi { " selected" } else { "" };
+            let key_placeholder = if ep.has_api_key() {
+                "Stored. Leave blank to preserve."
+            } else {
+                "Paste a provider secret"
+            };
+            format!(
+                r#"<div class="user-detail" data-endpoint-detail="{id}" style="display:none">
+                  <form method="post" action="/ui/admin/endpoints/{id}">
+                    <input type="hidden" name="csrf_token" value="{csrf}">
+                    <label>Name<input type="text" name="name" value="{name}" required></label>
+                    <label>Provider
+                      <select name="kind" class="endpoint-kind-select" data-endpoint-id="{id}">
+                        <option value="anthropic"{anthropic_sel}>Anthropic</option>
+                        <option value="gemini"{gemini_sel}>Gemini</option>
+                        <option value="openai"{openai_sel}>OpenAI</option>
+                      </select>
+                    </label>
+                    <label>URL<input type="url" name="url" value="{url}" placeholder="https://api.example.com/..."></label>
+                    <label>Model<input type="text" name="model" value="{model}" required></label>
+                    <label>API key<input type="password" name="api_key" placeholder="{key_placeholder}"></label>
+                    <div style="display:flex;gap:var(--s-2);flex-wrap:wrap">
+                      <button type="submit">Save endpoint</button>
+                    </div>
+                  </form>
+                  <div style="display:flex;gap:var(--s-2);margin-top:var(--s-3);flex-wrap:wrap">
+                    <form method="post" action="/ui/admin/endpoints/{id}/test" style="margin:0">
+                      <input type="hidden" name="csrf_token" value="{csrf}">
+                      <button type="submit" style="width:auto">Test</button>
+                    </form>
+                    <form method="post" action="/ui/admin/endpoints/{id}/delete" style="margin:0"
+                          onsubmit="return confirm('Delete this endpoint?')">
+                      <input type="hidden" name="csrf_token" value="{csrf}">
+                      <button type="submit" style="width:auto;background:var(--danger);color:#fff">Delete</button>
+                    </form>
+                  </div>
+                </div>"#,
+                id = escape_attribute(&ep.id),
+                csrf = escape_attribute(csrf_token),
+                name = escape_attribute(&ep.name),
+                url = escape_attribute(&ep.url),
+                model = escape_attribute(&ep.model),
+                anthropic_sel = anthropic_sel,
+                gemini_sel = gemini_sel,
+                openai_sel = openai_sel,
+                key_placeholder = key_placeholder,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    let librarian_endpoint_options: String = {
+        let none_selected = if librarian_config.endpoint_id.is_none() { " selected" } else { "" };
+        let mut opts = format!(r#"<option value=""{none_selected}>-- none --</option>"#);
+        for ep in endpoints {
+            let sel = if librarian_config.endpoint_id.as_deref() == Some(&ep.id) {
+                " selected"
+            } else {
+                ""
+            };
+            opts.push_str(&format!(
+                r#"<option value="{id}"{sel}>{name} ({kind})</option>"#,
+                id = escape_attribute(&ep.id),
+                name = escape_text(&ep.name),
+                kind = ep.kind,
+                sel = sel,
+            ));
+        }
+        opts
+    };
+
     let provider_status_html = provider_status
         .map(|status| {
             let label = if status.ok { "Healthy" } else { "Failed" };
@@ -952,6 +1054,7 @@ pub fn render_admin_page(
         "users",
         "roles",
         "network",
+        "endpoints",
         "librarian",
         "git-export",
         "oidc",
@@ -963,6 +1066,7 @@ pub fn render_admin_page(
         "Users",
         "User Roles",
         "Network",
+        "Endpoints",
         "Librarian",
         "Git export",
         "OIDC",
@@ -1100,24 +1204,41 @@ pub fn render_admin_page(
         </div>
       </section>
 
+      <section class="panel" data-panel="endpoints"{endpoints_display}>
+        <div class="panel-header">
+          <h2>Add endpoint</h2>
+          <p>Configure Anthropic, Gemini, or OpenAI provider endpoints.</p>
+        </div>
+        <form method="post" action="/ui/admin/endpoints">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>Name<input type="text" name="name" placeholder="Production Anthropic" required></label>
+          <label>Provider
+            <select name="kind" id="new-endpoint-kind">
+              <option value="anthropic">Anthropic</option>
+              <option value="gemini">Gemini</option>
+              <option value="openai">OpenAI</option>
+            </select>
+          </label>
+          <label>URL<input type="url" name="url" id="new-endpoint-url" placeholder="https://api.anthropic.com/v1/messages"></label>
+          <label>Model<input type="text" name="model" id="new-endpoint-model" placeholder="claude-sonnet-4-20250514" required></label>
+          <label>API key<input type="password" name="api_key"></label>
+          <button type="submit">Add endpoint</button>
+        </form>
+        <div class="panel-header"><h2>Endpoints</h2></div>
+        {endpoints_list_html}
+        <div id="endpoint-detail-container">{endpoints_detail_html}</div>
+      </section>
+
       <section class="panel" data-panel="librarian"{librarian_display}>
         <div class="panel-header">
           <h2>Librarian</h2>
-          <p>Configure an OpenAI-compatible chat completions endpoint.</p>
+          <p>Select which endpoint the librarian uses for AI requests.</p>
         </div>
         <form method="post" action="/ui/admin/librarian">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
           <label>
-            Endpoint URL
-            <input type="url" name="endpoint_url" value="{librarian_endpoint_url}" placeholder="https://api.example.com/v1/chat/completions">
-          </label>
-          <label>
-            Model
-            <input type="text" name="model" value="{librarian_model}" placeholder="gpt-5.4">
-          </label>
-          <label>
-            API key
-            <input type="password" name="api_key" placeholder="{librarian_key_placeholder}">
+            Endpoint
+            <select name="endpoint_id">{librarian_endpoint_options}</select>
           </label>
           <label>
             Provider timeout seconds
@@ -1533,6 +1654,35 @@ pub fn render_admin_page(
           }}
         }});
       }});
+
+      var epItems = document.querySelectorAll('[data-endpoint-id]');
+      var epDetails = document.querySelectorAll('[data-endpoint-detail]');
+      epItems.forEach(function(item) {{
+        item.addEventListener('click', function() {{
+          var id = item.getAttribute('data-endpoint-id');
+          var wasActive = item.classList.contains('active');
+          epItems.forEach(function(i) {{ i.classList.remove('active'); }});
+          epDetails.forEach(function(d) {{ d.style.display = 'none'; }});
+          if (!wasActive) {{
+            item.classList.add('active');
+            var detail = document.querySelector('[data-endpoint-detail="' + id + '"]');
+            if (detail) detail.style.display = '';
+          }}
+        }});
+      }});
+
+      var defaultUrls = {{anthropic:'https://api.anthropic.com/v1/messages',gemini:'https://generativelanguage.googleapis.com',openai:'https://api.openai.com/v1/chat/completions'}};
+      var defaultModels = {{anthropic:'claude-sonnet-4-20250514',gemini:'gemini-2.0-flash',openai:'gpt-4o'}};
+      var newKind = document.getElementById('new-endpoint-kind');
+      var newUrl = document.getElementById('new-endpoint-url');
+      var newModel = document.getElementById('new-endpoint-model');
+      if (newKind) {{
+        newKind.addEventListener('change', function() {{
+          newUrl.placeholder = defaultUrls[newKind.value] || '';
+          newModel.placeholder = defaultModels[newKind.value] || '';
+          if (!newUrl.value) newUrl.value = defaultUrls[newKind.value] || '';
+        }});
+      }}
     }})();
 
     document.querySelectorAll('[data-machine-update]').forEach(function(btn) {{
@@ -1557,13 +1707,9 @@ pub fn render_admin_page(
         external_port = server_config.external_port,
         setup_url = escape_text(&server_config.setup_url()),
         setup_text_url = escape_text(&server_config.setup_text_url()),
-        librarian_endpoint_url = escape_attribute(&librarian_config.endpoint_url),
-        librarian_model = escape_attribute(&librarian_config.model),
-        librarian_key_placeholder = if librarian_config.has_api_key() {
-            "Stored. Leave blank to preserve."
-        } else {
-            "Paste a provider secret"
-        },
+        endpoints_list_html = endpoints_list_html,
+        endpoints_detail_html = endpoints_detail_html,
+        librarian_endpoint_options = librarian_endpoint_options,
         request_timeout_secs = librarian_config.request_timeout_secs,
         max_concurrent_runs = librarian_config.max_concurrent_runs,
         action_requires_approval_checked = if librarian_config.action_requires_approval {
@@ -1660,6 +1806,7 @@ pub fn render_admin_page(
         users_display = hidden("users"),
         roles_display = hidden("roles"),
         network_display = hidden("network"),
+        endpoints_display = hidden("endpoints"),
         librarian_display = hidden("librarian"),
         git_export_display = hidden("git-export"),
         oidc_display = hidden("oidc"),
@@ -1887,8 +2034,8 @@ pub fn render_agents_page(
                           <span class="agent-list-meta"{version_class}>v{version}</span>
                         </div>
                         <div style="display:flex; gap:var(--s-2); align-items:center; flex-shrink:0;">
-                          <button type="button" onclick="toggleCreateAgent(this, '{name_attr}')" data-csrf="{csrf}" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Create</button>
                           {update_btn}
+                          <button type="button" onclick="toggleCreateAgent(this, '{name_attr}')" data-csrf="{csrf}" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Create</button>
                           <form method="post" action="/ui/agents/machines/{name_attr}/revoke" class="inline-form" style="margin:0;">
                             <input type="hidden" name="csrf_token" value="{csrf}">
                             <button class="danger" type="submit" style="font-size:0.8rem; padding:var(--s-1) var(--s-2);">Revoke</button>
@@ -2863,6 +3010,14 @@ pub fn render_chat_page(
       <label class="chat-config-label">Effort</label>
       <select id="cfg-effort" class="chat-config-select" onchange="onConfigChange()"></select>
     </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Pinned Context</label>
+      <textarea id="cfg-pinned-context" class="chat-config-textarea" placeholder="Context sent with every message to this agent..." oninput="onPinnedContextChange()"></textarea>
+    </div>
+    <div class="chat-config-field" id="cfg-project-context-field" style="flex:1;display:flex;flex-direction:column;display:none;">
+      <label class="chat-config-label">Project Context</label>
+      <textarea id="cfg-project-context" class="chat-config-textarea" readonly placeholder="No project context set."></textarea>
+    </div>
   </div>
 </div>
 <form class="chat-input-form" id="chat-input-form" onsubmit="return sendMessage(event)">
@@ -3379,7 +3534,39 @@ function loadChatConfig() {{
     .then(function(data) {{
       chatConfigData = data;
       populateConfigDropdowns(data.backend, data.prefs);
+      var ta = document.getElementById('cfg-pinned-context');
+      if (ta) ta.value = data.pinned_context || '';
+      var pctx = data.project_context || '';
+      var pfield = document.getElementById('cfg-project-context-field');
+      var pta = document.getElementById('cfg-project-context');
+      if (pfield && pta) {{
+        if (pctx) {{
+          pfield.style.display = 'flex';
+          pta.value = pctx;
+        }} else {{
+          pfield.style.display = 'none';
+          pta.value = '';
+        }}
+      }}
     }});
+}}
+
+var pinnedSaveTimer = null;
+function onPinnedContextChange() {{
+  if (pinnedSaveTimer) clearTimeout(pinnedSaveTimer);
+  pinnedSaveTimer = setTimeout(savePinnedContext, 600);
+}}
+
+function savePinnedContext() {{
+  var ta = document.getElementById('cfg-pinned-context');
+  if (!ta) return;
+  var body = 'csrf_token=' + encodeURIComponent(csrfToken)
+    + '&pinned_context=' + encodeURIComponent(ta.value);
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: body
+  }});
 }}
 
 function populateConfigDropdowns(backend, prefs) {{
@@ -6709,6 +6896,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       flex-direction: column;
       gap: var(--s-4);
+      height: 100%;
     }
     .chat-config-field {
       display: flex;
@@ -6728,6 +6916,24 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: var(--ink);
       font-size: 0.95rem;
       font-family: var(--font-sans);
+    }
+    .chat-config-textarea {
+      flex: 1;
+      min-height: 120px;
+      padding: var(--s-3);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--input-bg);
+      color: var(--ink);
+      font-size: 0.85rem;
+      font-family: var(--font-mono);
+      resize: vertical;
+      line-height: 1.5;
+    }
+    .chat-config-textarea[readonly] {
+      background: var(--bg-secondary, var(--bg));
+      opacity: 0.75;
+      cursor: default;
     }
     .chat-messages {
       flex: 1;

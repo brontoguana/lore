@@ -8,7 +8,9 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -1485,6 +1487,7 @@ pub enum AgentChatStatus {
 pub struct ChatConversation {
     pub messages: Vec<ChatMessage>,
     pub pins: Vec<PinnedChatItem>,
+    pub pinned_context: String,
     pub summary: String,
     pub window_size: usize,
     pub next_id: u64,
@@ -1505,6 +1508,7 @@ impl Default for ChatConversation {
         Self {
             messages: Vec::new(),
             pins: Vec::new(),
+            pinned_context: String::new(),
             summary: String::new(),
             window_size: 22,
             next_id: 1,
@@ -1544,6 +1548,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     profile_url TEXT,
     auto_message TEXT,
     next_id INTEGER NOT NULL DEFAULT 1,
+    pinned_context TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (owner, agent)
 );
 CREATE TABLE IF NOT EXISTS messages (
@@ -1581,6 +1586,7 @@ impl ChatStore {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .expect("failed to set pragmas");
         conn.execute_batch(CHAT_SCHEMA).expect("failed to create chat schema");
+        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN pinned_context TEXT NOT NULL DEFAULT ''", []);
         Self { conn: Mutex::new(conn) }
     }
 
@@ -1652,12 +1658,13 @@ impl ChatStore {
     pub fn load_conversation(&self, owner: &str, agent: &str) -> Result<ChatConversation> {
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let conv = conn.query_row(
-            "SELECT agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+            "SELECT agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context FROM conversations WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
             |row| {
                 Ok(ChatConversation {
                     messages: Vec::new(),
                     pins: Vec::new(),
+                    pinned_context: row.get::<_, String>(9)?,
                     summary: row.get::<_, String>(2)?,
                     window_size: row.get::<_, i64>(3)? as usize,
                     next_id: row.get::<_, i64>(8)? as u64,
@@ -1710,6 +1717,14 @@ impl ChatStore {
         }).map_err(|e| LoreError::Validation(format!("db error: {e}")))?
         .filter_map(|r| r.ok())
         .collect();
+        if conv.pinned_context.is_empty() && !conv.pins.is_empty() {
+            let migrated: Vec<&str> = conv.pins.iter().map(|p| p.text.as_str()).collect();
+            conv.pinned_context = migrated.join("\n");
+            let _ = conn.execute(
+                "UPDATE conversations SET pinned_context = ?1 WHERE owner = ?2 AND agent = ?3",
+                params![conv.pinned_context, owner, agent],
+            );
+        }
         Ok(conv)
     }
 
@@ -1722,11 +1737,11 @@ impl ChatStore {
         };
         let last_seen_str = conv.last_seen.as_ref().map(|dt| fmt_dt(dt));
         conn.execute(
-            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, window_size=?6, cwd=?7, git_branch=?8, profile_url=?9, auto_message=?10, next_id=?11",
+            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, window_size=?6, cwd=?7, git_branch=?8, profile_url=?9, auto_message=?10, next_id=?11, pinned_context=?12",
             params![owner, agent, status_str, last_seen_str, conv.summary, conv.window_size as i64,
-                    conv.cwd, conv.git_branch, conv.profile_url, conv.auto_message, conv.next_id as i64],
+                    conv.cwd, conv.git_branch, conv.profile_url, conv.auto_message, conv.next_id as i64, conv.pinned_context],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         // Replace messages
         conn.execute("DELETE FROM messages WHERE owner = ?1 AND agent = ?2", params![owner, agent])
@@ -1834,7 +1849,7 @@ impl ChatStore {
         conn.execute("DELETE FROM messages WHERE owner = ?1 AND agent = ?2", params![owner, agent])
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
-            "UPDATE conversations SET summary = '', next_id = 1 WHERE owner = ?1 AND agent = ?2",
+            "UPDATE conversations SET next_id = 1 WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
@@ -1861,6 +1876,31 @@ impl ChatStore {
             params![summary, owner, agent],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
+    }
+
+    pub fn set_pinned_context(&self, owner: &str, agent: &str, text: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::ensure_conversation(&conn, owner, agent)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "UPDATE conversations SET pinned_context = ?1 WHERE owner = ?2 AND agent = ?3",
+            params![text, owner, agent],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(())
+    }
+
+    pub fn get_pinned_context(&self, owner: &str, agent: &str) -> Result<String> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let result = conn.query_row(
+            "SELECT pinned_context FROM conversations WHERE owner = ?1 AND agent = ?2",
+            params![owner, agent],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(s) => Ok(s),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
+            Err(e) => Err(LoreError::Validation(format!("db error: {e}"))),
+        }
     }
 
     pub fn get_backend_prefs(&self, owner: &str, backend: &str) -> Result<(Option<String>, Option<String>)> {
@@ -1918,6 +1958,98 @@ impl ChatStore {
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
+}
+
+pub struct ChatAuditLog {
+    root: PathBuf,
+}
+
+impl ChatAuditLog {
+    pub fn new(data_root: impl Into<PathBuf>) -> Self {
+        let root = data_root.into().join("auditlog");
+        Self { root }
+    }
+
+    pub fn log(&self, agent: &str, owner: &str, kind: &str, content: &str) {
+        if let Err(e) = self.write_entry(agent, owner, kind, content) {
+            eprintln!("audit log write failed: {e}");
+        }
+    }
+
+    fn write_entry(&self, agent: &str, owner: &str, kind: &str, content: &str) -> std::io::Result<()> {
+        let agent_dir = self.root.join(sanitize_path_component(agent));
+        fs::create_dir_all(&agent_dir)?;
+        let now = OffsetDateTime::now_utc();
+        let date_str = format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
+        let log_path = agent_dir.join(format!("{date_str}.log"));
+        let ts = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            now.year(), now.month() as u8, now.day(),
+            now.hour(), now.minute(), now.second()
+        );
+        let escaped = content.replace('\n', "\\n");
+        let line = format!("[{ts}] [{kind}:{owner}] {escaped}\n");
+        let mut f = OpenOptions::new().create(true).append(true).open(&log_path)?;
+        f.write_all(line.as_bytes())
+    }
+
+    pub fn cleanup_old_logs(&self, max_age_days: u64) {
+        if let Err(e) = self.do_cleanup(max_age_days) {
+            eprintln!("audit log cleanup failed: {e}");
+        }
+    }
+
+    fn do_cleanup(&self, max_age_days: u64) -> std::io::Result<()> {
+        if !self.root.exists() {
+            return Ok(());
+        }
+        let now = OffsetDateTime::now_utc();
+        for agent_entry in fs::read_dir(&self.root)? {
+            let agent_entry = agent_entry?;
+            if !agent_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let agent_dir = agent_entry.path();
+            for log_entry in fs::read_dir(&agent_dir)? {
+                let log_entry = log_entry?;
+                let name = log_entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.ends_with(".log") {
+                    continue;
+                }
+                let date_part = &name_str[..name_str.len() - 4];
+                if let Some(file_date) = parse_date(date_part) {
+                    let age = now - file_date;
+                    if age.whole_days() > max_age_days as i64 {
+                        let _ = fs::remove_file(log_entry.path());
+                    }
+                }
+            }
+            if dir_is_empty(&agent_dir) {
+                let _ = fs::remove_dir(&agent_dir);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn sanitize_path_component(s: &str) -> String {
+    s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+}
+
+fn parse_date(s: &str) -> Option<OffsetDateTime> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 { return None; }
+    let y: i32 = parts[0].parse().ok()?;
+    let m: u8 = parts[1].parse().ok()?;
+    let d: u8 = parts[2].parse().ok()?;
+    let month = time::Month::try_from(m).ok()?;
+    let date = time::Date::from_calendar_date(y, month, d).ok()?;
+    Some(OffsetDateTime::new_utc(date, time::Time::MIDNIGHT))
+}
+
+fn dir_is_empty(path: &Path) -> bool {
+    fs::read_dir(path).map(|mut d| d.next().is_none()).unwrap_or(true)
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -13,6 +14,188 @@ use uuid::Uuid;
 
 const MAX_ENDPOINT_URL_LEN: usize = 2048;
 const MAX_MODEL_LEN: usize = 256;
+const MAX_ENDPOINT_NAME_LEN: usize = 256;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointKind {
+    Anthropic,
+    Gemini,
+    #[serde(rename = "openai")]
+    OpenAi,
+}
+
+impl Display for EndpointKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anthropic => write!(f, "anthropic"),
+            Self::Gemini => write!(f, "gemini"),
+            Self::OpenAi => write!(f, "openai"),
+        }
+    }
+}
+
+impl std::str::FromStr for EndpointKind {
+    type Err = LoreError;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "anthropic" => Ok(Self::Anthropic),
+            "gemini" => Ok(Self::Gemini),
+            "openai" => Ok(Self::OpenAi),
+            _ => Err(LoreError::Validation(format!(
+                "unknown endpoint kind: {s}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Endpoint {
+    pub id: String,
+    pub name: String,
+    pub kind: EndpointKind,
+    pub url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+impl Endpoint {
+    pub fn validate(&self) -> Result<()> {
+        let name = self.name.trim();
+        if name.is_empty() || name.len() > MAX_ENDPOINT_NAME_LEN {
+            return Err(LoreError::Validation(format!(
+                "endpoint name must be 1..={MAX_ENDPOINT_NAME_LEN} characters"
+            )));
+        }
+        validate_endpoint_url(&self.url)?;
+        validate_model(&self.model)?;
+        Ok(())
+    }
+
+    pub fn has_api_key(&self) -> bool {
+        self.api_key.is_some()
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.url.is_empty() && !self.model.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EndpointStore {
+    root: PathBuf,
+}
+
+impl EndpointStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn list(&self) -> Result<Vec<Endpoint>> {
+        let path = self.endpoints_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let endpoints: Vec<Endpoint> = serde_json::from_slice(&fs::read(path)?)?;
+        Ok(endpoints)
+    }
+
+    pub fn get(&self, id: &str) -> Result<Option<Endpoint>> {
+        Ok(self.list()?.into_iter().find(|e| e.id == id))
+    }
+
+    pub fn create(
+        &self,
+        name: String,
+        kind: EndpointKind,
+        url: String,
+        model: String,
+        api_key: Option<String>,
+    ) -> Result<Endpoint> {
+        self.ensure_layout()?;
+        let endpoint = Endpoint {
+            id: Uuid::new_v4().to_string(),
+            name: name.trim().to_string(),
+            kind,
+            url: url.trim().to_string(),
+            model: model.trim().to_string(),
+            api_key: api_key
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty()),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        endpoint.validate()?;
+        let mut endpoints = self.list()?;
+        endpoints.push(endpoint.clone());
+        write_json_atomic(self.endpoints_path(), &endpoints)?;
+        Ok(endpoint)
+    }
+
+    pub fn update(
+        &self,
+        id: &str,
+        name: String,
+        kind: EndpointKind,
+        url: String,
+        model: String,
+        api_key: ApiKeyUpdate<'_>,
+    ) -> Result<Endpoint> {
+        self.ensure_layout()?;
+        let mut endpoints = self.list()?;
+        let Some(endpoint) = endpoints.iter_mut().find(|e| e.id == id) else {
+            return Err(LoreError::Validation("endpoint not found".into()));
+        };
+        endpoint.name = name.trim().to_string();
+        endpoint.kind = kind;
+        endpoint.url = url.trim().to_string();
+        endpoint.model = model.trim().to_string();
+        match api_key {
+            ApiKeyUpdate::Preserve => {}
+            ApiKeyUpdate::Replace(value) => {
+                endpoint.api_key = Some(value.trim().to_string());
+            }
+            ApiKeyUpdate::Clear => {
+                endpoint.api_key = None;
+            }
+        }
+        endpoint.updated_at = OffsetDateTime::now_utc();
+        endpoint.validate()?;
+        let updated = endpoint.clone();
+        write_json_atomic(self.endpoints_path(), &endpoints)?;
+        Ok(updated)
+    }
+
+    pub fn delete(&self, id: &str) -> Result<()> {
+        let mut endpoints = self.list()?;
+        let before = endpoints.len();
+        endpoints.retain(|e| e.id != id);
+        if endpoints.len() == before {
+            return Err(LoreError::Validation("endpoint not found".into()));
+        }
+        write_json_atomic(self.endpoints_path(), &endpoints)
+    }
+
+    fn endpoints_path(&self) -> PathBuf {
+        self.config_dir().join("endpoints.json")
+    }
+
+    fn config_dir(&self) -> PathBuf {
+        self.root.join("config")
+    }
+
+    fn ensure_layout(&self) -> Result<()> {
+        fs::create_dir_all(self.config_dir())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(self.config_dir(), fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+}
 const MAX_QUESTION_LEN: usize = 4000;
 const MAX_INSTRUCTION_LEN: usize = 6000;
 pub const MAX_CONTEXT_BLOCKS: usize = 10;
@@ -29,8 +212,13 @@ const MAX_PENDING_ACTIONS_PER_PROJECT: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LibrarianConfig {
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+    #[serde(default)]
     pub endpoint_url: String,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
@@ -44,6 +232,7 @@ pub struct LibrarianConfig {
 impl LibrarianConfig {
     pub fn default() -> Self {
         Self {
+            endpoint_id: None,
             endpoint_url: String::new(),
             model: String::new(),
             api_key: None,
@@ -55,22 +244,24 @@ impl LibrarianConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.endpoint_url.is_empty() && self.model.is_empty() && self.api_key.is_none() {
-            return Ok(());
-        }
-        validate_endpoint_url(&self.endpoint_url)?;
-        validate_model(&self.model)?;
         validate_request_timeout_secs(self.request_timeout_secs)?;
         validate_max_concurrent_runs(self.max_concurrent_runs)?;
         Ok(())
     }
 
     pub fn is_configured(&self) -> bool {
-        !self.endpoint_url.is_empty() && !self.model.is_empty() && self.api_key.is_some()
+        self.endpoint_id.is_some()
+    }
+
+    pub fn needs_migration(&self) -> bool {
+        self.endpoint_id.is_none()
+            && !self.endpoint_url.is_empty()
+            && !self.model.is_empty()
+            && self.api_key.is_some()
     }
 
     pub fn has_api_key(&self) -> bool {
-        self.api_key.is_some()
+        self.endpoint_id.is_some() || self.api_key.is_some()
     }
 }
 
@@ -103,23 +294,17 @@ impl LibrarianConfigStore {
 
     pub fn update(
         &self,
-        endpoint_url: String,
-        model: String,
-        api_key: ApiKeyUpdate<'_>,
+        endpoint_id: Option<String>,
         request_timeout_secs: u64,
         max_concurrent_runs: usize,
         action_requires_approval: bool,
     ) -> Result<LibrarianConfig> {
         self.ensure_layout()?;
-        let existing = self.load()?;
         let config = LibrarianConfig {
-            endpoint_url: endpoint_url.trim().to_string(),
-            model: model.trim().to_string(),
-            api_key: match api_key {
-                ApiKeyUpdate::Preserve => existing.api_key,
-                ApiKeyUpdate::Replace(value) => Some(value.trim().to_string()),
-                ApiKeyUpdate::Clear => None,
-            },
+            endpoint_id,
+            endpoint_url: String::new(),
+            model: String::new(),
+            api_key: None,
             request_timeout_secs,
             max_concurrent_runs,
             action_requires_approval,
@@ -130,12 +315,10 @@ impl LibrarianConfigStore {
         Ok(config)
     }
 
-    pub fn rotate_api_key(&self, api_key: &str) -> Result<LibrarianConfig> {
+    pub fn set_endpoint_id(&self, endpoint_id: Option<String>) -> Result<LibrarianConfig> {
         let existing = self.load()?;
         self.update(
-            existing.endpoint_url,
-            existing.model,
-            ApiKeyUpdate::Replace(api_key),
+            endpoint_id,
             existing.request_timeout_secs,
             existing.max_concurrent_runs,
             existing.action_requires_approval,
@@ -619,15 +802,21 @@ impl LibrarianProviderStatusStore {
 pub trait AnswerLibrarianClient: Send + Sync {
     async fn answer(
         &self,
-        config: &LibrarianConfig,
+        endpoint: &Endpoint,
+        timeout_secs: u64,
         request: &LibrarianRequest,
     ) -> Result<LibrarianAnswer>;
 
-    async fn healthcheck(&self, config: &LibrarianConfig) -> Result<ProviderCheckResult>;
+    async fn healthcheck(
+        &self,
+        endpoint: &Endpoint,
+        timeout_secs: u64,
+    ) -> Result<ProviderCheckResult>;
 
     async fn plan_action(
         &self,
-        config: &LibrarianConfig,
+        endpoint: &Endpoint,
+        timeout_secs: u64,
         request: &ProjectLibrarianRequest,
     ) -> Result<ProjectLibrarianPlan>;
 }
@@ -654,38 +843,25 @@ impl Default for HttpLibrarianClient {
 impl AnswerLibrarianClient for HttpLibrarianClient {
     async fn answer(
         &self,
-        config: &LibrarianConfig,
+        endpoint: &Endpoint,
+        timeout_secs: u64,
         request: &LibrarianRequest,
     ) -> Result<LibrarianAnswer> {
         request.validate()?;
-        if !config.is_configured() {
+        if !endpoint.is_configured() {
             return Err(LoreError::Validation(
-                "answer librarian is not configured".into(),
+                "answer librarian endpoint is not configured".into(),
             ));
         }
 
-        let body = json!({
-            "model": config.model,
-            "temperature": 0.1,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are Lore Answer Librarian. You are read-only. You have access to exactly one Lore project and only the project context provided in this request. Answer only from that context. If the context is insufficient, say so plainly. Do not claim to run commands, browse the web, inspect anything outside the provided Lore blocks, or take actions."
-                },
-                {
-                    "role": "user",
-                    "content": build_prompt(request)
-                }
-            ]
-        });
-
-        let mut http = self.client.post(&config.endpoint_url).json(&body);
-        if let Some(api_key) = &config.api_key {
-            http = http.bearer_auth(api_key);
-        }
+        let system = "You are Lore Answer Librarian. You are read-only. You have access to exactly one Lore project and only the project context provided in this request. Answer only from that context. If the context is insufficient, say so plainly. Do not claim to run commands, browse the web, inspect anything outside the provided Lore blocks, or take actions.";
+        let user_msg = build_prompt(request);
+        let body = build_provider_request_body(endpoint, system, &user_msg, 0.1);
+        let url = build_provider_url(endpoint);
+        let http = add_provider_auth(self.client.post(&url).json(&body), endpoint);
 
         let response = http
-            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .timeout(Duration::from_secs(timeout_secs))
             .send()
             .await
             .map_err(|err| LoreError::ExternalService(err.to_string()))?;
@@ -695,58 +871,46 @@ impl AnswerLibrarianClient for HttpLibrarianClient {
             .await
             .map_err(|err| LoreError::ExternalService(err.to_string()))?;
         if !status.is_success() {
-            let detail = value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("provider request failed");
-            return Err(LoreError::ExternalService(detail.to_string()));
+            let detail = extract_provider_error(&value);
+            return Err(LoreError::ExternalService(detail));
         }
 
-        let answer = value
-            .get("choices")
-            .and_then(|choices| choices.as_array())
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(extract_content_text)
-            .map(str::trim)
-            .filter(|content| !content.is_empty())
+        let answer = extract_provider_response_text(endpoint, &value)
             .ok_or_else(|| {
                 LoreError::ExternalService("provider response did not contain answer text".into())
             })?;
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Err(LoreError::ExternalService(
+                "provider response did not contain answer text".into(),
+            ));
+        }
 
         Ok(LibrarianAnswer {
             answer: clamp_answer(answer),
         })
     }
 
-    async fn healthcheck(&self, config: &LibrarianConfig) -> Result<ProviderCheckResult> {
-        if !config.is_configured() {
+    async fn healthcheck(
+        &self,
+        endpoint: &Endpoint,
+        timeout_secs: u64,
+    ) -> Result<ProviderCheckResult> {
+        if !endpoint.is_configured() {
             return Err(LoreError::Validation(
-                "answer librarian is not configured".into(),
+                "answer librarian endpoint is not configured".into(),
             ));
         }
-        let body = json!({
-            "model": config.model,
-            "temperature": 0.0,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Reply with the single word OK."
-                },
-                {
-                    "role": "user",
-                    "content": "Connectivity check"
-                }
-            ]
-        });
-        let mut http = self.client.post(&config.endpoint_url).json(&body);
-        if let Some(api_key) = &config.api_key {
-            http = http.bearer_auth(api_key);
-        }
+        let body = build_provider_request_body(
+            endpoint,
+            "Reply with the single word OK.",
+            "Connectivity check",
+            0.0,
+        );
+        let url = build_provider_url(endpoint);
+        let http = add_provider_auth(self.client.post(&url).json(&body), endpoint);
         let response = http
-            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .timeout(Duration::from_secs(timeout_secs))
             .send()
             .await
             .map_err(|err| LoreError::ExternalService(err.to_string()))?;
@@ -756,14 +920,10 @@ impl AnswerLibrarianClient for HttpLibrarianClient {
             .await
             .map_err(|err| LoreError::ExternalService(err.to_string()))?;
         if !status.is_success() {
-            let detail = value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("provider connectivity check failed");
+            let detail = extract_provider_error(&value);
             return Ok(ProviderCheckResult {
                 ok: false,
-                detail: detail.to_string(),
+                detail,
                 checked_at: OffsetDateTime::now_utc(),
             });
         }
@@ -776,38 +936,25 @@ impl AnswerLibrarianClient for HttpLibrarianClient {
 
     async fn plan_action(
         &self,
-        config: &LibrarianConfig,
+        endpoint: &Endpoint,
+        timeout_secs: u64,
         request: &ProjectLibrarianRequest,
     ) -> Result<ProjectLibrarianPlan> {
         request.validate()?;
-        if !config.is_configured() {
+        if !endpoint.is_configured() {
             return Err(LoreError::Validation(
-                "project librarian is not configured".into(),
+                "project librarian endpoint is not configured".into(),
             ));
         }
 
-        let body = json!({
-            "model": config.model,
-            "temperature": 0.1,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are Lore Project Librarian. You operate on exactly one Lore project. You have no shell, no web, no access outside the provided project blocks, and no admin powers. Return only valid JSON with a short summary and a list of up to 5 Lore block operations. Allowed operation types are create_block, update_block, move_block, and delete_block. Use only block ids from the provided context. If no safe project-local action should be taken, return an empty operations array."
-                },
-                {
-                    "role": "user",
-                    "content": build_action_prompt(request)
-                }
-            ]
-        });
-
-        let mut http = self.client.post(&config.endpoint_url).json(&body);
-        if let Some(api_key) = &config.api_key {
-            http = http.bearer_auth(api_key);
-        }
+        let system = "You are Lore Project Librarian. You operate on exactly one Lore project. You have no shell, no web, no access outside the provided project blocks, and no admin powers. Return only valid JSON with a short summary and a list of up to 5 Lore block operations. Allowed operation types are create_block, update_block, move_block, and delete_block. Use only block ids from the provided context. If no safe project-local action should be taken, return an empty operations array.";
+        let user_msg = build_action_prompt(request);
+        let body = build_provider_request_body(endpoint, system, &user_msg, 0.1);
+        let url = build_provider_url(endpoint);
+        let http = add_provider_auth(self.client.post(&url).json(&body), endpoint);
 
         let response = http
-            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .timeout(Duration::from_secs(timeout_secs))
             .send()
             .await
             .map_err(|err| LoreError::ExternalService(err.to_string()))?;
@@ -817,29 +964,140 @@ impl AnswerLibrarianClient for HttpLibrarianClient {
             .await
             .map_err(|err| LoreError::ExternalService(err.to_string()))?;
         if !status.is_success() {
-            let detail = value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("provider action planning request failed");
-            return Err(LoreError::ExternalService(detail.to_string()));
+            let detail = extract_provider_error(&value);
+            return Err(LoreError::ExternalService(detail));
         }
-        let content = value
-            .get("choices")
-            .and_then(|choices| choices.as_array())
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(extract_content_text)
-            .map(str::trim)
-            .filter(|content| !content.is_empty())
+        let content = extract_provider_response_text(endpoint, &value)
             .ok_or_else(|| {
                 LoreError::ExternalService(
                     "provider response did not contain project action plan text".into(),
                 )
             })?;
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(LoreError::ExternalService(
+                "provider response did not contain project action plan text".into(),
+            ));
+        }
         parse_action_plan(content)
     }
+}
+
+fn build_provider_request_body(
+    endpoint: &Endpoint,
+    system_prompt: &str,
+    user_message: &str,
+    temperature: f32,
+) -> serde_json::Value {
+    match endpoint.kind {
+        EndpointKind::OpenAi => json!({
+            "model": endpoint.model,
+            "temperature": temperature,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ]
+        }),
+        EndpointKind::Anthropic => json!({
+            "model": endpoint.model,
+            "max_tokens": 8192,
+            "temperature": temperature,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": user_message}
+            ]
+        }),
+        EndpointKind::Gemini => json!({
+            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": 8192
+            }
+        }),
+    }
+}
+
+fn build_provider_url(endpoint: &Endpoint) -> String {
+    match endpoint.kind {
+        EndpointKind::Gemini => {
+            let base = endpoint.url.trim_end_matches('/');
+            let url = format!(
+                "{base}/v1beta/models/{}:generateContent",
+                endpoint.model
+            );
+            if let Some(ref api_key) = endpoint.api_key {
+                format!("{url}?key={api_key}")
+            } else {
+                url
+            }
+        }
+        _ => endpoint.url.clone(),
+    }
+}
+
+fn add_provider_auth(
+    mut req: reqwest::RequestBuilder,
+    endpoint: &Endpoint,
+) -> reqwest::RequestBuilder {
+    match endpoint.kind {
+        EndpointKind::OpenAi => {
+            if let Some(ref api_key) = endpoint.api_key {
+                req = req.bearer_auth(api_key);
+            }
+        }
+        EndpointKind::Anthropic => {
+            if let Some(ref api_key) = endpoint.api_key {
+                req = req.header("x-api-key", api_key);
+            }
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+        EndpointKind::Gemini => {}
+    }
+    req
+}
+
+fn extract_provider_response_text(
+    endpoint: &Endpoint,
+    value: &serde_json::Value,
+) -> Option<String> {
+    match endpoint.kind {
+        EndpointKind::OpenAi => value
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|msg| msg.get("content"))
+            .and_then(extract_content_text)
+            .map(|s| s.to_string()),
+        EndpointKind::Anthropic => value
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .and_then(|part| part.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string()),
+        EndpointKind::Gemini => value
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts"))
+            .and_then(|parts| parts.as_array())
+            .and_then(|parts| parts.first())
+            .and_then(|part| part.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string()),
+    }
+}
+
+fn extract_provider_error(value: &serde_json::Value) -> String {
+    value
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("provider request failed")
+        .to_string()
 }
 
 fn extract_content_text(value: &serde_json::Value) -> Option<&str> {
@@ -1063,34 +1321,84 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiKeyUpdate, LibrarianConfigStore};
+    use super::*;
     use tempfile::tempdir;
 
     #[test]
-    fn preserves_existing_api_key_when_requested() {
+    fn endpoint_store_crud() {
+        let dir = tempdir().unwrap();
+        let store = EndpointStore::new(dir.path());
+        assert!(store.list().unwrap().is_empty());
+
+        let ep = store
+            .create(
+                "Test EP".into(),
+                EndpointKind::OpenAi,
+                "https://api.example.com/v1/chat/completions".into(),
+                "gpt-test".into(),
+                Some("secret".into()),
+            )
+            .unwrap();
+        assert_eq!(ep.name, "Test EP");
+        assert_eq!(ep.kind, EndpointKind::OpenAi);
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        let updated = store
+            .update(
+                &ep.id,
+                "Renamed".into(),
+                EndpointKind::Anthropic,
+                "https://api.anthropic.com/v1/messages".into(),
+                "claude-test".into(),
+                ApiKeyUpdate::Preserve,
+            )
+            .unwrap();
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(updated.kind, EndpointKind::Anthropic);
+        assert_eq!(updated.api_key.as_deref(), Some("secret"));
+
+        store.delete(&ep.id).unwrap();
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn librarian_config_with_endpoint_id() {
         let dir = tempdir().unwrap();
         let store = LibrarianConfigStore::new(dir.path());
-        store
-            .update(
-                "https://example.com/v1/chat/completions".into(),
-                "gpt-test".into(),
-                ApiKeyUpdate::Replace("secret"),
-                super::REQUEST_TIMEOUT_SECS,
-                super::DEFAULT_MAX_CONCURRENT_RUNS,
-                false,
-            )
-            .unwrap();
         let config = store
             .update(
-                "https://example.com/v1/chat/completions".into(),
-                "gpt-test-2".into(),
-                ApiKeyUpdate::Preserve,
-                super::REQUEST_TIMEOUT_SECS,
-                super::DEFAULT_MAX_CONCURRENT_RUNS,
+                Some("ep-123".into()),
+                REQUEST_TIMEOUT_SECS,
+                DEFAULT_MAX_CONCURRENT_RUNS,
                 false,
             )
             .unwrap();
-        assert_eq!(config.api_key.as_deref(), Some("secret"));
-        assert_eq!(config.model, "gpt-test-2");
+        assert_eq!(config.endpoint_id.as_deref(), Some("ep-123"));
+        assert!(config.is_configured());
+    }
+
+    #[test]
+    fn librarian_config_migration_detection() {
+        let dir = tempdir().unwrap();
+        let store = LibrarianConfigStore::new(dir.path());
+        let legacy_config = LibrarianConfig {
+            endpoint_id: None,
+            endpoint_url: "https://api.example.com/v1/chat/completions".into(),
+            model: "gpt-test".into(),
+            api_key: Some("secret".into()),
+            request_timeout_secs: REQUEST_TIMEOUT_SECS,
+            max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
+            action_requires_approval: false,
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/librarian.json"),
+            serde_json::to_vec_pretty(&legacy_config).unwrap(),
+        )
+        .unwrap();
+        let config = store.load().unwrap();
+        assert!(config.needs_migration());
+        assert!(!config.is_configured());
     }
 }

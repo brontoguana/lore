@@ -2637,7 +2637,6 @@ fn spawn_agent_process(context: &CliContext, agent: &ManagedAgent) -> CliResult<
             "--url", &context.url,
             "--token", &agent.token,
             "agent", &agent.name,
-            "--backend", &agent.backend,
         ])
         .env(LORE_DAEMON_ENV, "1")
         .stdout(log_file.try_clone()?)
