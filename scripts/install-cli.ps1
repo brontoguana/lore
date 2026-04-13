@@ -5,6 +5,8 @@ $Repo = if ($env:LORE_GITHUB_REPO) { $env:LORE_GITHUB_REPO } else { "brontoguana
 $Version = if ($env:LORE_VERSION) { $env:LORE_VERSION } else { "latest" }
 $InstallDir = if ($env:LORE_INSTALL_DIR) { $env:LORE_INSTALL_DIR } else { "$env:LOCALAPPDATA\lore\bin" }
 $BinaryName = "lore"
+$LoreServiceDir = if ($env:LORE_SERVICE_DIR) { $env:LORE_SERVICE_DIR } else { "$HOME\lore-service" }
+$ServicePidFile = Join-Path $LoreServiceDir "service.pid"
 
 function Resolve-LatestVersion {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ "User-Agent" = "lore-installer" }
@@ -22,6 +24,36 @@ function Get-CurrentVersion {
         }
     }
     return "not installed"
+}
+
+function Test-ServiceRunning {
+    if (-not (Test-Path $ServicePidFile)) {
+        return $false
+    }
+    try {
+        $pid = (Get-Content $ServicePidFile -ErrorAction Stop | Select-Object -First 1).Trim()
+        if (-not $pid) {
+            return $false
+        }
+        Get-Process -Id ([int]$pid) -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Restart-ServiceIfRunning {
+    if (Test-ServiceRunning) {
+        Write-Host "Restarting lore machine service..."
+        try {
+            & (Join-Path $InstallDir "$BinaryName.exe") service | Out-Null
+            Write-Host "Lore machine service restarted"
+        } catch {
+            Write-Warning "Failed to restart lore machine service; run 'lore service' manually"
+        }
+    } else {
+        Write-Host "Lore machine service is not running; start it with 'lore service' to reconnect this machine"
+    }
 }
 
 # Resolve version
@@ -77,6 +109,7 @@ try {
     $src = Join-Path $TmpDir "$BinaryName.exe"
     $dst = Join-Path $InstallDir "$BinaryName.exe"
     Copy-Item -Path $src -Destination $dst -Force
+    Restart-ServiceIfRunning
 
     if ($CurrentVersion -ne "not installed") {
         Write-Host "Updated $BinaryName to $RemoteVersion (was $CurrentVersion)"

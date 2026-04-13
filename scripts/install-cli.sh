@@ -5,6 +5,8 @@ REPO="${LORE_GITHUB_REPO:-brontoguana/lore}"
 VERSION="${LORE_VERSION:-latest}"
 INSTALL_DIR="${LORE_INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="lore"
+LORE_SERVICE_DIR="${LORE_SERVICE_DIR:-$HOME/lore-service}"
+SERVICE_PID_FILE="$LORE_SERVICE_DIR/service.pid"
 
 detect_target() {
   os="$(uname -s)"
@@ -72,9 +74,35 @@ resolve_latest_version() {
 
 get_current_version() {
   if [ -x "$INSTALL_DIR/$BINARY_NAME" ]; then
-    "$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null | sed "s/$BINARY_NAME //" || echo "unknown"
+    "$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null | sed "s/^$BINARY_NAME //" || echo "unknown"
   else
     echo "not installed"
+  fi
+}
+
+is_service_running() {
+  if [ ! -f "$SERVICE_PID_FILE" ]; then
+    return 1
+  fi
+
+  pid="$(cat "$SERVICE_PID_FILE" 2>/dev/null || true)"
+  if [ -z "$pid" ]; then
+    return 1
+  fi
+
+  kill -0 "$pid" 2>/dev/null
+}
+
+restart_service_if_running() {
+  if is_service_running; then
+    echo "restarting lore machine service..."
+    if "$INSTALL_DIR/$BINARY_NAME" service >/dev/null 2>&1; then
+      echo "lore machine service restarted"
+    else
+      echo "warning: failed to restart lore machine service; run 'lore service' manually" >&2
+    fi
+  else
+    echo "lore machine service is not running; start it with 'lore service' to reconnect this machine"
   fi
 }
 
@@ -118,6 +146,7 @@ verify_checksum "$ARCHIVE" "$CHECKSUM"
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
 install "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+restart_service_if_running
 
 if [ "$CURRENT_VERSION" != "not installed" ]; then
   echo "updated $BINARY_NAME to $REMOTE_VERSION (was $CURRENT_VERSION)"

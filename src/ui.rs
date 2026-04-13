@@ -1268,7 +1268,7 @@ pub fn render_admin_page(
           <span>Enable automatic server self-update on restart</span>
         </label>
         <div style="padding:0 var(--s-5) var(--s-5);display:grid;gap:0.45rem;">
-          <label for="auto-update-stream"><strong>Release stream</strong></label>
+          <label for="auto-update-stream"><strong>Release Stream</strong></label>
           <select id="auto-update-stream" data-csrf="{csrf_token}">
             <option value="stable"{stable_selected}>Stable</option>
             <option value="prerelease"{prerelease_selected}>Prerelease</option>
@@ -1453,7 +1453,10 @@ pub fn render_admin_page(
           method: 'POST',
           headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
           body: 'csrf_token=' + encodeURIComponent(csrf)
-        }}).then(function(r) {{ return r.json(); }}).then(function() {{
+        }}).then(function(r) {{
+          if (!r.ok) throw new Error('server returned ' + r.status);
+          return r.json();
+        }}).then(function() {{
           var span = document.createElement('span');
           span.className = 'hint';
           span.style.fontSize = '0.8rem';
@@ -1476,7 +1479,10 @@ pub fn render_admin_page(
             method: 'POST',
             headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
             body: 'csrf_token=' + encodeURIComponent(csrf)
-          }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+          }}).then(function(r) {{
+            if (!r.ok) throw new Error('server returned ' + r.status);
+            return r.json();
+          }}).then(function(d) {{
             uamBtn.textContent = d.count + ' machine' + (d.count === 1 ? '' : 's') + ' queued';
             setTimeout(function() {{
               uamBtn.textContent = 'Update all machines';

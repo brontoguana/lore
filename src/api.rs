@@ -3661,6 +3661,7 @@ async fn update_all_machines_json(
         None,
         Some(format!("{count} machines queued for update")),
     )?;
+    notify_all_machine_polls(&state);
     Ok(Json(serde_json::json!({ "count": count })))
 }
 
@@ -8682,6 +8683,7 @@ async fn update_machine_from_ui(
     let session = require_ui_session(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     state.auth.set_machine_pending_update(&name, &session.user.username, true)?;
+    notify_machine_poll(&state, &format!("{}_{}", session.user.username, name));
     Ok(Redirect::to("/ui/agents?flash=Update%20queued%20—%20machine%20will%20update%20on%20next%20poll").into_response())
 }
 
@@ -8694,6 +8696,7 @@ async fn update_machine_json(
     let session = require_ui_session(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     state.auth.set_machine_pending_update(&name, &session.user.username, true)?;
+    notify_machine_poll(&state, &format!("{}_{}", session.user.username, name));
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -8854,12 +8857,7 @@ async fn queue_machine_command_and_wait(
     }
 
     // Wake the machine's poll
-    {
-        let notifiers = state.machine_poll_notifiers.lock().unwrap();
-        if let Some(mn) = notifiers.get(machine_key) {
-            mn.notify_one();
-        }
-    }
+    notify_machine_poll(state, machine_key);
 
     // Wait for result
     let result = tokio::time::timeout(
@@ -8887,6 +8885,20 @@ async fn queue_machine_command_and_wait(
     };
 
     data.ok_or_else(|| LoreError::Validation("no result from machine".into()))
+}
+
+fn notify_machine_poll(state: &AppState, machine_key: &str) {
+    let notifiers = state.machine_poll_notifiers.lock().unwrap();
+    if let Some(notify) = notifiers.get(machine_key) {
+        notify.notify_one();
+    }
+}
+
+fn notify_all_machine_polls(state: &AppState) {
+    let notifiers = state.machine_poll_notifiers.lock().unwrap();
+    for notify in notifiers.values() {
+        notify.notify_one();
+    }
 }
 
 #[derive(Deserialize)]

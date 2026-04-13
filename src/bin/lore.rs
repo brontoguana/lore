@@ -21,6 +21,7 @@ const CLI_AUTO_UPDATE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 #[derive(Parser)]
 #[command(name = "lore")]
 #[command(about = "Lore CLI")]
+#[command(version)]
 struct Cli {
     /// Server URL (overrides config)
     #[arg(long, global = true)]
