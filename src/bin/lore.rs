@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use lore_core::{
-    AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, SelfUpdateOutcome,
-    check_for_update, maybe_apply_self_update,
+    AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, ReleaseStream,
+    SelfUpdateOutcome, check_for_update, maybe_apply_self_update,
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -250,6 +250,23 @@ enum UpdateCommand {
 struct UpdateEnableArgs {
     #[arg(long, default_value = DEFAULT_UPDATE_REPO)]
     repo: String,
+    #[arg(long, value_enum, default_value_t = CliReleaseStream::Stable)]
+    stream: CliReleaseStream,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliReleaseStream {
+    Stable,
+    Prerelease,
+}
+
+impl From<CliReleaseStream> for ReleaseStream {
+    fn from(value: CliReleaseStream) -> Self {
+        match value {
+            CliReleaseStream::Stable => ReleaseStream::Stable,
+            CliReleaseStream::Prerelease => ReleaseStream::Prerelease,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -329,6 +346,8 @@ struct CliConfig {
     auto_update_enabled: bool,
     #[serde(default = "default_update_repo_string")]
     update_repo: String,
+    #[serde(default)]
+    update_stream: ReleaseStream,
     #[serde(default)]
     last_update_check: Option<OffsetDateTime>,
 }
@@ -641,6 +660,7 @@ fn run_config(command: ConfigCommand, config: &mut CliConfig) -> CliResult<()> {
                 }
             );
             println!("update repo: {}", config.update_repo);
+            println!("update stream: {}", config.update_stream.as_str());
         }
         ConfigCommand::Set(args) => {
             if let Some(url) = args.url {
@@ -713,6 +733,7 @@ async fn run_update(command: UpdateCommand, config: &mut CliConfig) -> CliResult
                 }
             );
             println!("update repo: {}", config.update_repo);
+            println!("update stream: {}", config.update_stream.as_str());
             println!(
                 "last check: {}",
                 config
@@ -733,6 +754,7 @@ async fn run_update(command: UpdateCommand, config: &mut CliConfig) -> CliResult
         UpdateCommand::Enable(args) => {
             config.auto_update_enabled = true;
             config.update_repo = args.repo;
+            config.update_stream = args.stream.into();
             save_cli_config(config)?;
             println!("saved {}", cli_config_path()?.display());
         }
@@ -1315,19 +1337,29 @@ async fn check_cli_for_updates(config: &CliConfig) -> CliResult<lore_core::updat
         "lore",
         env!("CARGO_PKG_VERSION"),
         &config.update_repo,
+        config.update_stream,
     )
     .await
     .map_err(|err| io::Error::other(err.to_string()).into())
 }
 
 async fn apply_cli_update(config: &mut CliConfig) -> CliResult<()> {
+    apply_cli_update_with_source(config, config.update_repo.clone(), config.update_stream).await
+}
+
+async fn apply_cli_update_with_source(
+    config: &mut CliConfig,
+    repo: String,
+    stream: ReleaseStream,
+) -> CliResult<()> {
     let client = reqwest::Client::new();
     let executable_path = env::current_exe()?;
     match maybe_apply_self_update(
         &client,
         "lore",
         env!("CARGO_PKG_VERSION"),
-        &config.update_repo,
+        &repo,
+        stream,
         &executable_path,
     )
     .await
@@ -1335,11 +1367,15 @@ async fn apply_cli_update(config: &mut CliConfig) -> CliResult<()> {
     {
         SelfUpdateOutcome::UpToDate(status) => {
             println!("{}", status.detail);
+            config.update_repo = repo.clone();
+            config.update_stream = stream;
             config.last_update_check = Some(status.checked_at);
             save_cli_config(config)?;
         }
         SelfUpdateOutcome::Updated(status) => {
             println!("{}", status.detail);
+            config.update_repo = repo;
+            config.update_stream = stream;
             config.last_update_check = Some(status.checked_at);
             save_cli_config(config)?;
             relaunch_cli(&executable_path);
@@ -1415,6 +1451,14 @@ fn cli_config_path() -> CliResult<PathBuf> {
 
 fn default_update_repo_string() -> String {
     DEFAULT_UPDATE_REPO.to_string()
+}
+
+fn parse_release_stream(value: &str) -> Option<ReleaseStream> {
+    match value {
+        "stable" => Some(ReleaseStream::Stable),
+        "prerelease" => Some(ReleaseStream::Prerelease),
+        _ => None,
+    }
 }
 
 fn normalize_url(value: &str) -> String {
@@ -1810,7 +1854,15 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, backend:
     if let Some(update_version) = body["update_to"].as_str() {
         eprintln!("[agent] Server requested update to v{update_version}, updating...");
         let mut cfg = load_cli_config()?;
-        match apply_cli_update(&mut cfg).await {
+        let repo = body["update_repo"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| cfg.update_repo.clone());
+        let stream = body["update_stream"]
+            .as_str()
+            .and_then(parse_release_stream)
+            .unwrap_or(cfg.update_stream);
+        match apply_cli_update_with_source(&mut cfg, repo, stream).await {
             Ok(()) => {
                 eprintln!("[agent] Updated CLI, restarting...");
                 std::process::exit(0);
@@ -2519,6 +2571,31 @@ impl ServiceState {
         }
     }
 
+    fn remove_agent(&mut self, name: &str) -> serde_json::Value {
+        if let Some(index) = self.agents.iter().position(|a| a.name == name) {
+            let agent = self.agents[index].clone();
+            if agent.pid != 0 && is_process_running(agent.pid) {
+                eprintln!("[service] Removing agent '{}' (pid {})", name, agent.pid);
+                kill_process(agent.pid);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            } else {
+                eprintln!("[service] Removing agent '{}'", name);
+            }
+
+            self.agents.remove(index);
+            self.save();
+
+            if let Ok(mut config) = load_cli_config() {
+                config.agent_tokens.remove(name);
+                let _ = save_cli_config(&config);
+            }
+
+            serde_json::json!({ "ok": true, "agent_name": name })
+        } else {
+            serde_json::json!({ "error": format!("agent '{}' not managed by this service", name) })
+        }
+    }
+
     fn restart_agent(&mut self, context: &CliContext, name: &str) -> serde_json::Value {
         if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
             // Stop if running
@@ -2887,6 +2964,18 @@ async fn service_poll_and_execute(
 
     // Check for self-update request
     if body["update_to"].as_str().is_some() {
+        let repo = body["update_repo"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| load_cli_config().ok().map(|cfg| cfg.update_repo).unwrap_or_else(default_update_repo_string));
+        let stream = body["update_stream"]
+            .as_str()
+            .and_then(parse_release_stream)
+            .unwrap_or(ReleaseStream::Stable);
+        let mut cfg = load_cli_config()?;
+        cfg.update_repo = repo;
+        cfg.update_stream = stream;
+        save_cli_config(&cfg)?;
         return Ok(true);
     }
 
@@ -2913,6 +3002,10 @@ async fn service_poll_and_execute(
             "stop_agent" => {
                 let name = params["agent_name"].as_str().unwrap_or("");
                 Ok(svc_state.stop_agent(name))
+            }
+            "remove_agent" => {
+                let name = params["agent_name"].as_str().unwrap_or("");
+                Ok(svc_state.remove_agent(name))
             }
             "restart_agent" => {
                 let name = params["agent_name"].as_str().unwrap_or("");

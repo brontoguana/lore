@@ -34,7 +34,7 @@ use crate::ui::{
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
-    check_for_update, maybe_apply_self_update,
+    ReleaseStream, check_for_update, maybe_apply_self_update,
 };
 use crate::versioning::{
     GitExportConfig, GitExportConfigStore, GitExportStatus, GitExportStatusStore,
@@ -437,6 +437,10 @@ fn build_app_with_librarian(
         .route(
             "/ui/agents/machines/{name}/restart-agent",
             post(machine_restart_agent_json),
+        )
+        .route(
+            "/ui/agents/machines/{name}/remove-agent",
+            post(machine_remove_agent_json),
         )
         .route(
             "/ui/chat/{agent}/profile-pic",
@@ -943,6 +947,8 @@ struct UpdateOidcUiForm {
 struct UpdateAutoUpdateConfigRequest {
     enabled: bool,
     github_repo: String,
+    #[serde(default)]
+    release_stream: Option<ReleaseStream>,
     confirm_password: Option<String>,
 }
 
@@ -951,6 +957,7 @@ struct UpdateAutoUpdateUiForm {
     csrf_token: String,
     enabled: Option<String>,
     github_repo: String,
+    release_stream: Option<ReleaseStream>,
     confirm_password: Option<String>,
 }
 
@@ -1112,6 +1119,7 @@ struct GitExportStatusSummary {
 struct AutoUpdateConfigSummary {
     enabled: bool,
     github_repo: String,
+    release_stream: String,
     configured: bool,
     updated_at: time::OffsetDateTime,
 }
@@ -2236,6 +2244,9 @@ async fn update_auto_update_config(
 ) -> ApiResult<Json<AutoUpdateConfigSummary>> {
     let admin = require_admin(&state, &headers)?;
     let current_config = state.auto_update_config.load()?;
+    let release_stream = payload
+        .release_stream
+        .unwrap_or(current_config.release_stream);
     if payload.github_repo != current_config.github_repo {
         let password = payload.confirm_password.as_deref().unwrap_or("");
         state
@@ -2250,7 +2261,7 @@ async fn update_auto_update_config(
     }
     let config = state
         .auto_update_config
-        .update(payload.enabled, payload.github_repo)?;
+        .update(payload.enabled, payload.github_repo, release_stream)?;
     let repo_changed = config.github_repo != current_config.github_repo;
     append_audit_event(
         &state,
@@ -2265,8 +2276,10 @@ async fn update_auto_update_config(
         },
         None,
         Some(format!(
-            "enabled={} repo={}",
-            config.enabled, config.github_repo
+            "enabled={} repo={} stream={}",
+            config.enabled,
+            config.github_repo,
+            config.release_stream.as_str()
         )),
     )?;
     Ok(Json(auto_update_config_summary(&config)))
@@ -2784,6 +2797,20 @@ async fn delete_agent_from_ui(
 ) -> UiResult<Response> {
     let session = require_ui_session(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
+    let agent = state
+        .auth
+        .list_agent_tokens_for_user(&session.user.username)?
+        .into_iter()
+        .find(|agent| agent.name == name)
+        .ok_or_else(|| LoreError::Validation("agent does not exist".into()))?;
+    if let Some(machine_name) = agent.machine_name.as_deref() {
+        let machine_key = format!("{}_{}", session.user.username, machine_name);
+        let params = json!({ "agent_name": name });
+        let result = queue_machine_command_and_wait(&state, &machine_key, "remove_agent", params).await?;
+        if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+            return Err(LoreError::Validation(error.to_string()).into());
+        }
+    }
     state
         .auth
         .revoke_agent_token(&name, &session.user.username)?;
@@ -3436,9 +3463,13 @@ async fn toggle_auto_update_json(
     verify_csrf(&session, csrf)?;
     let enabled = form.get("enabled").map(|s| s == "true").unwrap_or(false);
     let current = state.auto_update_config.load()?;
+    let release_stream = form
+        .get("release_stream")
+        .and_then(|value| parse_release_stream(value))
+        .unwrap_or(current.release_stream);
     state
         .auto_update_config
-        .update(enabled, current.github_repo)?;
+        .update(enabled, current.github_repo, release_stream)?;
     Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3450,6 +3481,9 @@ async fn update_auto_update_from_ui(
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     let current_config = state.auto_update_config.load()?;
+    let release_stream = form
+        .release_stream
+        .unwrap_or(current_config.release_stream);
     if form.github_repo != current_config.github_repo {
         let password = form.confirm_password.as_deref().unwrap_or("");
         state
@@ -3464,7 +3498,11 @@ async fn update_auto_update_from_ui(
     }
     let config = state
         .auto_update_config
-        .update(form.enabled.as_deref() == Some("true"), form.github_repo)?;
+        .update(
+            form.enabled.as_deref() == Some("true"),
+            form.github_repo,
+            release_stream,
+        )?;
     let repo_changed = config.github_repo != current_config.github_repo;
     append_audit_event(
         &state,
@@ -3479,8 +3517,10 @@ async fn update_auto_update_from_ui(
         },
         None,
         Some(format!(
-            "enabled={} repo={}",
-            config.enabled, config.github_repo
+            "enabled={} repo={} stream={}",
+            config.enabled,
+            config.github_repo,
+            config.release_stream.as_str()
         )),
     )?;
     Ok(Redirect::to("/ui/admin?flash=Auto%20update%20saved"))
@@ -4915,8 +4955,17 @@ fn auto_update_config_summary(config: &AutoUpdateConfig) -> AutoUpdateConfigSumm
     AutoUpdateConfigSummary {
         enabled: config.enabled,
         github_repo: config.github_repo.clone(),
+        release_stream: config.release_stream.as_str().to_string(),
         configured: !config.github_repo.trim().is_empty(),
         updated_at: config.updated_at,
+    }
+}
+
+fn parse_release_stream(value: &str) -> Option<ReleaseStream> {
+    match value {
+        "stable" => Some(ReleaseStream::Stable),
+        "prerelease" => Some(ReleaseStream::Prerelease),
+        _ => None,
     }
 }
 
@@ -4959,6 +5008,7 @@ async fn run_auto_update_check(state: &AppState) -> Result<AutoUpdateStatus, Lor
         "lore-server",
         env!("CARGO_PKG_VERSION"),
         &config.github_repo,
+        config.release_stream,
     )
     .await?;
     let status = AutoUpdateStatus {
@@ -4992,6 +5042,7 @@ async fn run_auto_update_apply(state: &AppState) -> Result<AutoUpdateStatus, Lor
         "lore-server",
         env!("CARGO_PKG_VERSION"),
         &config.github_repo,
+        config.release_stream,
         &executable_path,
     )
     .await
@@ -7838,11 +7889,20 @@ async fn chat_agent_poll(
             None
         }
     });
+    let update_config = if update_to.is_some() {
+        state.auto_update_config.load().ok()
+    } else {
+        None
+    };
 
     let build_poll_response = |msgs: Vec<Value>| -> Json<Value> {
         let mut resp = json!({ "messages": msgs });
         if let Some(ref ver) = update_to {
             resp["update_to"] = json!(ver);
+            if let Some(ref config) = update_config {
+                resp["update_repo"] = json!(config.github_repo);
+                resp["update_stream"] = json!(config.release_stream.as_str());
+            }
         }
         Json(resp)
     };
@@ -8676,11 +8736,20 @@ async fn machine_service_poll(
         .ok()
         .flatten()
         .and_then(|m| if m.pending_update { Some(server_version.to_string()) } else { None });
+    let update_config = if update_to.is_some() {
+        state.auto_update_config.load().ok()
+    } else {
+        None
+    };
 
     let build_response = |commands: Vec<MachineCommand>| -> Json<Value> {
         let mut resp = json!({ "commands": commands });
         if let Some(ref ver) = update_to {
             resp["update_to"] = json!(ver);
+            if let Some(ref config) = update_config {
+                resp["update_repo"] = json!(config.github_repo);
+                resp["update_stream"] = json!(config.release_stream.as_str());
+            }
         }
         Json(resp)
     };
@@ -8935,6 +9004,23 @@ async fn machine_restart_agent_json(
 
     let params = json!({ "agent_name": req.agent_name });
     match queue_machine_command_and_wait(&state, &machine_key, "restart_agent", params).await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+async fn machine_remove_agent_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(machine_name): Path<String>,
+    Json(req): Json<MachineAgentCommandRequest>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &req.csrf_token)?;
+    let machine_key = format!("{}_{}", session.user.username, machine_name);
+
+    let params = json!({ "agent_name": req.agent_name });
+    match queue_machine_command_and_wait(&state, &machine_key, "remove_agent", params).await {
         Ok(data) => Ok(Json(data)),
         Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
     }

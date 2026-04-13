@@ -7,7 +7,7 @@ use crate::librarian::{
 };
 use crate::model::{Block, BlockId, BlockType, ProjectName};
 use crate::store::{FileBlockStore, ProjectInfo};
-use crate::updater::{AutoUpdateConfig, AutoUpdateStatus, DEFAULT_UPDATE_REPO};
+use crate::updater::{AutoUpdateConfig, AutoUpdateStatus, ReleaseStream};
 use crate::versioning::{
     GitExportConfig, GitExportStatus, ProjectVersionActor, ProjectVersionActorKind,
     ProjectVersionOperationType,
@@ -935,6 +935,16 @@ pub fn render_admin_page(
         r#"<button type="button" id="update-btn" data-csrf="{csrf_token}" data-state="check">Check for updates</button>"#,
         csrf_token = csrf_token,
     );
+    let stable_selected = if auto_update_config.release_stream == ReleaseStream::Stable {
+        " selected"
+    } else {
+        ""
+    };
+    let prerelease_selected = if auto_update_config.release_stream == ReleaseStream::Prerelease {
+        " selected"
+    } else {
+        ""
+    };
     let _ = auto_update_status; // no longer rendered
 
     let sections = [
@@ -1257,6 +1267,14 @@ pub fn render_admin_page(
           <input type="checkbox" id="auto-update-toggle" data-csrf="{csrf_token}"{auto_update_enabled_checked}>
           <span>Enable automatic server self-update on restart</span>
         </label>
+        <div style="padding:0 var(--s-5) var(--s-5);display:grid;gap:0.45rem;">
+          <label for="auto-update-stream"><strong>Release stream</strong></label>
+          <select id="auto-update-stream" data-csrf="{csrf_token}">
+            <option value="stable"{stable_selected}>Stable</option>
+            <option value="prerelease"{prerelease_selected}>Prerelease</option>
+          </select>
+          <p class="hint" style="margin:0;">Machine-triggered CLI updates follow the server's selected stream.</p>
+        </div>
       </section>
 
       <section class="panel" data-panel="audit"{audit_display}>
@@ -1405,14 +1423,25 @@ pub fn render_admin_page(
       }}
 
       var autoCb = document.getElementById('auto-update-toggle');
+      var autoStream = document.getElementById('auto-update-stream');
+      function saveAutoUpdateSettings() {{
+        if (!autoCb) return;
+        var csrf = autoCb.getAttribute('data-csrf');
+        var stream = autoStream ? autoStream.value : 'stable';
+        fetch('/ui/admin/auto-update/toggle-json', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+          body: 'csrf_token=' + encodeURIComponent(csrf) + '&enabled=' + autoCb.checked + '&release_stream=' + encodeURIComponent(stream)
+        }});
+      }}
       if (autoCb) {{
         autoCb.addEventListener('change', function() {{
-          var csrf = autoCb.getAttribute('data-csrf');
-          fetch('/ui/admin/auto-update/toggle-json', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-            body: 'csrf_token=' + encodeURIComponent(csrf) + '&enabled=' + autoCb.checked
-          }});
+          saveAutoUpdateSettings();
+        }});
+      }}
+      if (autoStream) {{
+        autoStream.addEventListener('change', function() {{
+          saveAutoUpdateSettings();
         }});
       }}
 
@@ -2238,6 +2267,7 @@ pub fn render_agents_page(
         if (statusEl) {{ statusEl.textContent = 'Failed to create agent'; statusEl.style.color = 'var(--danger)'; }}
       }});
     }}
+
     </script>"##,
         agent_list_html = agent_list_html,
         machines_html = machines_html,

@@ -12,12 +12,31 @@ use uuid::Uuid;
 
 pub const DEFAULT_UPDATE_REPO: &str = "brontoguana/lore";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseStream {
+    #[default]
+    Stable,
+    Prerelease,
+}
+
+impl ReleaseStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Prerelease => "prerelease",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoUpdateConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_update_repo")]
     pub github_repo: String,
+    #[serde(default)]
+    pub release_stream: ReleaseStream,
     pub updated_at: OffsetDateTime,
 }
 
@@ -26,15 +45,17 @@ impl AutoUpdateConfig {
         Self {
             enabled: false,
             github_repo: default_update_repo(),
+            release_stream: ReleaseStream::Stable,
             updated_at: OffsetDateTime::now_utc(),
         }
     }
 
-    pub fn new(enabled: bool, github_repo: String) -> Result<Self> {
+    pub fn new(enabled: bool, github_repo: String, release_stream: ReleaseStream) -> Result<Self> {
         validate_github_repo(&github_repo)?;
         Ok(Self {
             enabled,
             github_repo,
+            release_stream,
             updated_at: OffsetDateTime::now_utc(),
         })
     }
@@ -68,8 +89,13 @@ impl AutoUpdateConfigStore {
         Ok(AutoUpdateConfig::default())
     }
 
-    pub fn update(&self, enabled: bool, github_repo: String) -> Result<AutoUpdateConfig> {
-        let config = AutoUpdateConfig::new(enabled, github_repo)?;
+    pub fn update(
+        &self,
+        enabled: bool,
+        github_repo: String,
+        release_stream: ReleaseStream,
+    ) -> Result<AutoUpdateConfig> {
+        let config = AutoUpdateConfig::new(enabled, github_repo, release_stream)?;
         self.ensure_layout()?;
         write_json_atomic(self.config_path(), &config)?;
         Ok(config)
@@ -157,10 +183,11 @@ pub async fn check_for_update(
     binary_name: &str,
     current_version: &str,
     github_repo: &str,
+    release_stream: ReleaseStream,
 ) -> Result<UpdateCheck> {
     validate_github_repo(github_repo)?;
-    let release = fetch_latest_release(client, github_repo).await?;
     let target = detect_target()?;
+    let release = fetch_release(client, github_repo, release_stream, binary_name, &target).await?;
     let archive_name = format!("{binary_name}-{target}.tar.gz");
     let checksum_name = format!("{archive_name}.sha256");
     let archive_url = release
@@ -201,9 +228,11 @@ pub async fn maybe_apply_self_update(
     binary_name: &str,
     current_version: &str,
     github_repo: &str,
+    release_stream: ReleaseStream,
     executable_path: &Path,
 ) -> Result<SelfUpdateOutcome> {
-    let check = check_for_update(client, binary_name, current_version, github_repo).await?;
+    let check =
+        check_for_update(client, binary_name, current_version, github_repo, release_stream).await?;
     if !check.needs_update {
         return Ok(SelfUpdateOutcome::UpToDate(AutoUpdateStatus {
             checked_at: OffsetDateTime::now_utc(),
@@ -236,6 +265,10 @@ pub async fn maybe_apply_self_update(
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    draft: bool,
     assets: Vec<GithubReleaseAsset>,
 }
 
@@ -263,6 +296,56 @@ async fn fetch_latest_release(
         .json::<GithubRelease>()
         .await
         .map_err(|err| LoreError::ExternalService(err.to_string()))
+}
+
+async fn fetch_release(
+    client: &reqwest::Client,
+    github_repo: &str,
+    release_stream: ReleaseStream,
+    binary_name: &str,
+    target: &str,
+) -> Result<GithubRelease> {
+    match release_stream {
+        ReleaseStream::Stable => fetch_latest_release(client, github_repo).await,
+        ReleaseStream::Prerelease => {
+            fetch_latest_prerelease(client, github_repo, binary_name, target).await
+        }
+    }
+}
+
+async fn fetch_latest_prerelease(
+    client: &reqwest::Client,
+    github_repo: &str,
+    binary_name: &str,
+    target: &str,
+) -> Result<GithubRelease> {
+    let archive_name = format!("{binary_name}-{target}.tar.gz");
+    let checksum_name = format!("{archive_name}.sha256");
+    let releases = client
+        .get(format!("https://api.github.com/repos/{github_repo}/releases"))
+        .header(USER_AGENT, format!("lore/{}", env!("CARGO_PKG_VERSION")))
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|err| LoreError::ExternalService(err.to_string()))?
+        .error_for_status()
+        .map_err(|err| LoreError::ExternalService(err.to_string()))?
+        .json::<Vec<GithubRelease>>()
+        .await
+        .map_err(|err| LoreError::ExternalService(err.to_string()))?;
+    releases
+        .into_iter()
+        .find(|release| {
+            release.prerelease
+                && !release.draft
+                && release.assets.iter().any(|asset| asset.name == archive_name)
+                && release.assets.iter().any(|asset| asset.name == checksum_name)
+        })
+        .ok_or_else(|| {
+            LoreError::ExternalService(format!(
+                "no matching prerelease found for target {target}"
+            ))
+        })
 }
 
 async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
@@ -469,7 +552,8 @@ fn write_json_atomic(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, compare_versions, normalize_version_tag,
+        AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream, compare_versions,
+        normalize_version_tag,
     };
 
     #[test]
@@ -479,6 +563,7 @@ mod tests {
         let config = store.load().unwrap();
         assert!(!config.enabled);
         assert_eq!(config.github_repo, DEFAULT_UPDATE_REPO);
+        assert_eq!(config.release_stream, ReleaseStream::Stable);
     }
 
     #[test]

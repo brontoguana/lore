@@ -907,6 +907,7 @@ async fn maybe_update_server(data_root: &PathBuf) -> lore_core::Result<()> {
         "lore-server",
         env!("CARGO_PKG_VERSION"),
         &update_config.github_repo,
+        update_config.release_stream,
         &executable_path,
     )
     .await
@@ -928,12 +929,13 @@ async fn maybe_update_server(data_root: &PathBuf) -> lore_core::Result<()> {
                 current_version: env!("CARGO_PKG_VERSION").to_string(),
                 latest_version: None,
                 detail: format!(
-                    "auto-update failed against {}: {err}",
+                    "auto-update failed against {} ({}) : {err}",
                     if update_config.github_repo.is_empty() {
                         DEFAULT_UPDATE_REPO
                     } else {
                         &update_config.github_repo
-                    }
+                    },
+                    update_config.release_stream.as_str(),
                 ),
                 applied: false,
                 ok: false,
