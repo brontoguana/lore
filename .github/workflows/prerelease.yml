@@ -11,15 +11,9 @@ permissions:
 jobs:
   build:
     if: ${{ contains(github.ref_name, '-') }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +21,7 @@ jobs:
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
-          rustup target add ${{ matrix.target }}
+          rustup target add $TARGET
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
@@ -37,17 +31,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ env.TARGET }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ matrix.target }}-
-
-      - name: Install cross-compilation tools (Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+            cargo-${{ env.TARGET }}-
 
       - name: Inject tag version into Cargo.toml
         run: |
@@ -55,21 +41,20 @@ jobs:
           sed -i "s/^version = \".*\"/version = \"${TAG}\"/" Cargo.toml
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target $TARGET
 
       - name: Package binaries
-        shell: bash
         run: |
           for bin in lore lore-server; do
-            src="target/${{ matrix.target }}/release/${bin}"
-            tar -czf "${bin}-${{ matrix.target }}.tar.gz" -C "$(dirname "$src")" "$(basename "$src")"
-            sha256sum "${bin}-${{ matrix.target }}.tar.gz" > "${bin}-${{ matrix.target }}.tar.gz.sha256"
+            src="target/${TARGET}/release/${bin}"
+            tar -czf "${bin}-${TARGET}.tar.gz" -C "$(dirname "$src")" "$(basename "$src")"
+            sha256sum "${bin}-${TARGET}.tar.gz" > "${bin}-${TARGET}.tar.gz.sha256"
           done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ matrix.target }}
+          name: binaries-${{ env.TARGET }}
           path: |
             *.tar.gz
             *.tar.gz.sha256
