@@ -187,7 +187,9 @@ pub async fn check_for_update(
 ) -> Result<UpdateCheck> {
     validate_github_repo(github_repo)?;
     let target = detect_target()?;
+    eprintln!("updater: checking {github_repo} ({}) for {binary_name} on {target}, current version {current_version}", release_stream.as_str());
     let release = fetch_release(client, github_repo, release_stream, binary_name, &target).await?;
+    eprintln!("updater: found release {}", release.tag_name);
     let archive_name = format!("{binary_name}-{target}.tar.gz");
     let checksum_name = format!("{archive_name}.sha256");
     let archive_url = release
@@ -209,6 +211,11 @@ pub async fn check_for_update(
     let latest_version = normalize_version_tag(&release.tag_name);
     let current_version = normalize_version_tag(current_version);
     let needs_update = version_is_newer(&latest_version, &current_version);
+    if needs_update {
+        eprintln!("updater: update available {current_version} -> {latest_version}");
+    } else {
+        eprintln!("updater: up to date ({current_version})");
+    }
     Ok(UpdateCheck {
         detail: if needs_update {
             format!("update available: {current_version} -> {latest_version}")
@@ -234,6 +241,7 @@ pub async fn maybe_apply_self_update(
     let check =
         check_for_update(client, binary_name, current_version, github_repo, release_stream).await?;
     if !check.needs_update {
+        eprintln!("updater: no update needed");
         return Ok(SelfUpdateOutcome::UpToDate(AutoUpdateStatus {
             checked_at: OffsetDateTime::now_utc(),
             current_version: check.current_version,
@@ -243,10 +251,14 @@ pub async fn maybe_apply_self_update(
             ok: true,
         }));
     }
+    eprintln!("updater: downloading {} -> {}", check.current_version, check.latest_version);
     let archive = fetch_bytes(client, &check.archive_url).await?;
+    eprintln!("updater: downloaded {} bytes, verifying checksum", archive.len());
     let checksum = fetch_text(client, &check.checksum_url).await?;
     verify_checksum(&archive, &checksum)?;
+    eprintln!("updater: checksum verified, replacing binary at {}", executable_path.display());
     replace_executable(binary_name, executable_path, &archive)?;
+    eprintln!("updater: binary replaced successfully");
     let current_version = check.current_version.clone();
     let latest_version = check.latest_version.clone();
     Ok(SelfUpdateOutcome::Updated(AutoUpdateStatus {
@@ -333,19 +345,25 @@ async fn fetch_latest_prerelease(
         .json::<Vec<GithubRelease>>()
         .await
         .map_err(|err| LoreError::ExternalService(err.to_string()))?;
-    releases
+    let mut candidates: Vec<GithubRelease> = releases
         .into_iter()
-        .find(|release| {
+        .filter(|release| {
             release.prerelease
                 && !release.draft
                 && release.assets.iter().any(|asset| asset.name == archive_name)
                 && release.assets.iter().any(|asset| asset.name == checksum_name)
         })
-        .ok_or_else(|| {
-            LoreError::ExternalService(format!(
-                "no matching prerelease found for target {target}"
-            ))
-        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        let a_ver = normalize_version_tag(&a.tag_name);
+        let b_ver = normalize_version_tag(&b.tag_name);
+        compare_versions(&b_ver, &a_ver)
+    });
+    candidates.into_iter().next().ok_or_else(|| {
+        LoreError::ExternalService(format!(
+            "no matching prerelease found for target {target}"
+        ))
+    })
 }
 
 async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
@@ -487,14 +505,10 @@ fn version_is_newer(candidate: &str, current: &str) -> bool {
 }
 
 fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
-    let left_parts = left
-        .split(['.', '-'])
-        .map(version_part_value)
-        .collect::<Vec<_>>();
-    let right_parts = right
-        .split(['.', '-'])
-        .map(version_part_value)
-        .collect::<Vec<_>>();
+    let (left_base, left_pre) = split_version(left);
+    let (right_base, right_pre) = split_version(right);
+    let left_parts: Vec<u64> = left_base.split('.').map(version_part_value).collect();
+    let right_parts: Vec<u64> = right_base.split('.').map(version_part_value).collect();
     let len = left_parts.len().max(right_parts.len());
     for index in 0..len {
         let left_value = *left_parts.get(index).unwrap_or(&0);
@@ -504,7 +518,19 @@ fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
             non_equal => return non_equal,
         }
     }
-    left.cmp(right)
+    match (left_pre, right_pre) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(l), Some(r)) => version_part_value(l).cmp(&version_part_value(r)),
+    }
+}
+
+fn split_version(v: &str) -> (&str, Option<&str>) {
+    match v.find('-') {
+        Some(i) => (&v[..i], Some(&v[i + 1..])),
+        None => (v, None),
+    }
 }
 
 fn version_part_value(part: &str) -> u64 {
@@ -584,5 +610,13 @@ mod tests {
         assert!(compare_versions("0.1.65-rc2", "0.1.65-rc1").is_gt());
         assert!(compare_versions("0.1.65-rc1", "0.1.65-rc1").is_eq());
         assert!(compare_versions("0.1.65-rc1", "0.1.65-rc2").is_lt());
+        assert!(compare_versions("0.1.65-rc13", "0.1.65-rc9").is_gt());
+    }
+
+    #[test]
+    fn stable_version_is_newer_than_rc() {
+        assert!(compare_versions("0.1.65", "0.1.65-rc13").is_gt());
+        assert!(compare_versions("0.1.65-rc13", "0.1.65").is_lt());
+        assert!(compare_versions("0.1.66", "0.1.65-rc13").is_gt());
     }
 }

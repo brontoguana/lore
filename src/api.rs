@@ -5606,7 +5606,8 @@ async fn run_auto_update_apply(state: &AppState) -> Result<AutoUpdateStatus, Lor
 fn schedule_server_restart(executable_path: std::path::PathBuf) {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        eprintln!("updater: restarting server in 3 seconds");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         // If running as a systemd service, restart through systemd so the
         // service manager tracks the new process and dependent services
         // (like Caddy) are not disrupted.
