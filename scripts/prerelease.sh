@@ -23,7 +23,7 @@ cargo build --release 2>/dev/null
 cargo test 2>/dev/null
 echo "Build and tests passed."
 
-git add Cargo.toml Cargo.lock
+git add Cargo.toml
 git commit -m "${TAG}"
 git tag "$TAG"
 git push origin main
