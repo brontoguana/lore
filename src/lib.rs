@@ -31,8 +31,8 @@ pub use order::generate_order_key;
 pub use store::FileBlockStore;
 pub use updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
-    DEFAULT_UPDATE_REPO, ReleaseStream, SelfUpdateOutcome, check_for_update,
-    maybe_apply_self_update,
+    DEFAULT_UPDATE_REPO, ReleaseStream, SelfUpdateOutcome, apply_update_to_version,
+    check_for_update, maybe_apply_self_update,
 };
 pub use versioning::{
     GitExportConfig, GitExportConfigStore, GitExportStatus, GitExportStatusStore,

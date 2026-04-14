@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use lore_core::{
     AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, ReleaseStream,
-    SelfUpdateOutcome, check_for_update, maybe_apply_self_update,
+    SelfUpdateOutcome, apply_update_to_version, check_for_update, maybe_apply_self_update,
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1348,6 +1348,34 @@ async fn apply_cli_update(config: &mut CliConfig) -> CliResult<()> {
     apply_cli_update_with_source(config, config.update_repo.clone(), config.update_stream).await
 }
 
+async fn apply_cli_update_to_target(config: &mut CliConfig, target_version: &str, repo: &str) -> CliResult<()> {
+    let client = reqwest::Client::new();
+    let executable_path = env::current_exe()?;
+    match apply_update_to_version(
+        &client,
+        "lore",
+        env!("CARGO_PKG_VERSION"),
+        target_version,
+        repo,
+        &executable_path,
+    )
+    .await
+    .map_err(|err| io::Error::other(err.to_string()))?
+    {
+        SelfUpdateOutcome::UpToDate(status) => {
+            eprintln!("[update] {}", status.detail);
+            config.last_update_check = Some(status.checked_at);
+            save_cli_config(config)?;
+        }
+        SelfUpdateOutcome::Updated(status) => {
+            eprintln!("[update] {}", status.detail);
+            config.last_update_check = Some(status.checked_at);
+            save_cli_config(config)?;
+        }
+    }
+    Ok(())
+}
+
 async fn apply_cli_update_with_source(
     config: &mut CliConfig,
     repo: String,
@@ -1452,14 +1480,6 @@ fn cli_config_path() -> CliResult<PathBuf> {
 
 fn default_update_repo_string() -> String {
     DEFAULT_UPDATE_REPO.to_string()
-}
-
-fn parse_release_stream(value: &str) -> Option<ReleaseStream> {
-    match value {
-        "stable" => Some(ReleaseStream::Stable),
-        "prerelease" => Some(ReleaseStream::Prerelease),
-        _ => None,
-    }
 }
 
 fn normalize_url(value: &str) -> String {
@@ -1836,11 +1856,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| cfg.update_repo.clone());
-        let stream = body["update_stream"]
-            .as_str()
-            .and_then(parse_release_stream)
-            .unwrap_or(cfg.update_stream);
-        match apply_cli_update_with_source(&mut cfg, repo, stream).await {
+        match apply_cli_update_to_target(&mut cfg, update_version, &repo).await {
             Ok(()) => {
                 eprintln!("[agent] Updated CLI, restarting...");
                 std::process::exit(0);
@@ -1892,6 +1908,19 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     }
 
     eprintln!("[agent] Received message: {}...", &combined.chars().take(80).collect::<String>());
+
+    // Log user message to .lore chat log
+    {
+        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let _ = fs::create_dir_all(&lore_dir);
+        let ts = time::OffsetDateTime::now_utc();
+        let timestamp = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            ts.year(), ts.month() as u8, ts.day(), ts.hour(), ts.minute(), ts.second());
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(lore_dir.join("lore.log")) {
+            use std::io::Write;
+            let _ = write!(f, "[{timestamp}] USER:\n{combined}\n\n");
+        }
+    }
 
     // Update status to thinking
     let _ = context
@@ -2063,6 +2092,13 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
 
     let full_prompt = prompt_parts.join("\n\n");
 
+    // Save full prompt + context to .lore for debugging
+    {
+        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let _ = fs::create_dir_all(&lore_dir);
+        let _ = fs::write(lore_dir.join("context.txt"), &full_prompt);
+    }
+
     // Read model/effort overrides from conversation state
     let model_override = history["model"].as_str().map(|s| s.to_string());
     let effort_override = history["effort"].as_str().map(|s| s.to_string());
@@ -2134,6 +2170,18 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         .await;
 
     eprintln!("[agent] Response sent ({} chars)", full_response.len());
+
+    // Log agent response to .lore chat log
+    {
+        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let ts = time::OffsetDateTime::now_utc();
+        let timestamp = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            ts.year(), ts.month() as u8, ts.day(), ts.hour(), ts.minute(), ts.second());
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(lore_dir.join("lore.log")) {
+            use std::io::Write;
+            let _ = write!(f, "[{timestamp}] AGENT:\n{full_response}\n\n");
+        }
+    }
 
     // Check if compaction is needed
     if let Err(e) = maybe_auto_compact(context, agent_name, backend).await {
@@ -2977,13 +3025,12 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
 
         let poll_start = std::time::Instant::now();
         match service_poll_and_execute(context, machine_token, &mut svc_state).await {
-            Ok(should_update) => {
-                if should_update {
-                    eprintln!("[service] Self-update requested, stopping all agents...");
+            Ok(update_info) => {
+                if let Some((target_version, repo)) = update_info {
+                    eprintln!("[service] Self-update to v{target_version} requested, stopping all agents...");
                     svc_state.stop_all_agents();
-                    // Download and apply update
                     let mut cfg = load_cli_config()?;
-                    match apply_cli_update(&mut cfg).await {
+                    match apply_cli_update_to_target(&mut cfg, &target_version, &repo).await {
                         Ok(()) => {
                             eprintln!("[service] Updated CLI binary, re-launching service...");
                             // Re-exec self — the new binary will restart agents from agents.json
@@ -3034,12 +3081,12 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
     }
 }
 
-/// Returns true if the service should self-update.
+/// Returns Some((target_version, repo)) if the service should self-update.
 async fn service_poll_and_execute(
     context: &CliContext,
     machine_token: &str,
     svc_state: &mut ServiceState,
-) -> CliResult<bool> {
+) -> CliResult<Option<(String, String)>> {
     let agent_statuses = svc_state.agent_statuses();
 
     let resp = context
@@ -3054,32 +3101,24 @@ async fn service_poll_and_execute(
 
     let resp = match resp {
         Ok(r) => r,
-        Err(e) if e.is_timeout() => return Ok(false),
+        Err(e) if e.is_timeout() => return Ok(None),
         Err(e) => return Err(e.into()),
     };
 
     let body: serde_json::Value = resp.error_for_status()?.json().await?;
 
     // Check for self-update request
-    if body["update_to"].as_str().is_some() {
+    if let Some(target_version) = body["update_to"].as_str() {
         let repo = body["update_repo"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| load_cli_config().ok().map(|cfg| cfg.update_repo).unwrap_or_else(default_update_repo_string));
-        let stream = body["update_stream"]
-            .as_str()
-            .and_then(parse_release_stream)
-            .unwrap_or(ReleaseStream::Stable);
-        let mut cfg = load_cli_config()?;
-        cfg.update_repo = repo;
-        cfg.update_stream = stream;
-        save_cli_config(&cfg)?;
-        return Ok(true);
+        return Ok(Some((target_version.to_string(), repo)));
     }
 
     let commands = match body["commands"].as_array() {
         Some(c) if !c.is_empty() => c.clone(),
-        _ => return Ok(false),
+        _ => return Ok(None),
     };
 
     for cmd in &commands {
@@ -3127,7 +3166,7 @@ async fn service_poll_and_execute(
             .await;
     }
 
-    Ok(false)
+    Ok(None)
 }
 
 fn service_home_dir() -> CliResult<PathBuf> {

@@ -2178,23 +2178,40 @@ pub fn render_agents_page(
                 )
             };
 
-            let endpoint_options = {
-                let none_sel = if agent.endpoint_id.is_none() { " selected" } else { "" };
-                let mut opts = format!(r#"<option value=""{none_sel}>None (CLI-managed)</option>"#);
+            let backend_options = {
+                let cli_backends = ["claude", "gemini", "codex"];
+                let mut cli_opts = String::new();
+                for b in &cli_backends {
+                    let sel = if agent.endpoint_id.is_none() && agent.backend.to_string() == *b { " selected" } else { "" };
+                    let label = {
+                        let mut c = b.chars();
+                        match c.next() {
+                            Some(first) => first.to_uppercase().to_string() + c.as_str(),
+                            None => String::new(),
+                        }
+                    };
+                    cli_opts.push_str(&format!(r#"<option value="cli:{b}"{sel}>{label}</option>"#));
+                }
+                let mut ep_opts = String::new();
                 for ep in endpoints {
                     let sel = if agent.endpoint_id.as_deref() == Some(&ep.id) { " selected" } else { "" };
-                    opts.push_str(&format!(
-                        r#"<option value="{}"{}>{} ({})</option>"#,
+                    ep_opts.push_str(&format!(
+                        r#"<option value="ep:{}"{}>{} ({})</option>"#,
                         escape_attribute(&ep.id), sel,
                         escape_text(&ep.name), escape_text(&ep.model),
                     ));
                 }
-                opts
+                let ep_group = if !ep_opts.is_empty() {
+                    format!(r#"<optgroup label="Endpoints">{ep_opts}</optgroup>"#)
+                } else {
+                    String::new()
+                };
+                format!(r#"<optgroup label="CLI">{cli_opts}</optgroup>{ep_group}"#)
             };
 
             format!(
                 r##"<section class="panel" style="margin-top: var(--s-5);">
-                <div class="panel-header"><h2>{display_name}</h2><p>{owner}-{slug} &middot; {backend}</p></div>
+                <div class="panel-header"><h2>{display_name}</h2><p>{owner}-{slug}</p></div>
 
                 <div class="panel-header"><h3>Configuration</h3></div>
                 <form method="post" action="/ui/agents/{name_attr}/grants" id="edit-grants-form">
@@ -2220,9 +2237,9 @@ pub fn render_agents_page(
                 }})();
                 </script>
 
-                <div class="panel-header"><h3>Endpoint</h3><p>Assign a configured endpoint for proxied LLM access.</p></div>
+                <div class="panel-header"><h3>Backend</h3><p>Choose a CLI backend or a configured endpoint.</p></div>
                 <div class="padded">
-                  <select id="agent-endpoint-select" style="width:100%;" onchange="saveAgentEndpoint('{name_attr}')">{endpoint_options}</select>
+                  <select id="agent-backend-select" style="width:100%;" onchange="saveAgentBackend('{name_attr}')">{backend_options}</select>
                 </div>
 
                 <div class="panel-header"><h3>Setup instructions</h3><p>Copy and give to your agent.</p></div>
@@ -2251,11 +2268,10 @@ pub fn render_agents_page(
                 display_name = escape_text(&agent.display_name),
                 slug = escape_text(&agent.name),
                 owner = escape_text(username),
-                backend = escape_text(&agent.backend),
                 name_attr = escape_attribute(&agent.name),
                 csrf_token = escape_attribute(csrf_token),
                 edit_grants_html = edit_grants_html,
-                endpoint_options = endpoint_options,
+                backend_options = backend_options,
                 setup_instruction = escape_text(&setup_instruction),
                 mcp_config_text = escape_text(&mcp_config_text),
             )
@@ -2297,12 +2313,21 @@ pub fn render_agents_page(
       }});
     }}
 
-    function saveAgentEndpoint(agentName) {{
-      var sel = document.getElementById('agent-endpoint-select');
+    function saveAgentBackend(agentName) {{
+      var sel = document.getElementById('agent-backend-select');
       if (!sel) return;
+      var val = sel.value;
       var csrf = document.querySelector('input[name="csrf_token"]');
-      var body = 'csrf_token=' + encodeURIComponent(csrf ? csrf.value : '')
-        + '&endpoint_id=' + encodeURIComponent(sel.value);
+      var body;
+      if (val.indexOf('ep:') === 0) {{
+        body = 'csrf_token=' + encodeURIComponent(csrf ? csrf.value : '')
+          + '&endpoint_id=' + encodeURIComponent(val.substring(3));
+      }} else {{
+        var cli = val.indexOf('cli:') === 0 ? val.substring(4) : val;
+        body = 'csrf_token=' + encodeURIComponent(csrf ? csrf.value : '')
+          + '&backend=' + encodeURIComponent(cli)
+          + '&endpoint_id=';
+      }}
       fetch('/ui/chat/' + encodeURIComponent(agentName) + '/config', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
@@ -3042,11 +3067,7 @@ pub fn render_chat_page(
 <div class="chat-messages" id="chat-messages"></div>
 <div class="chat-config-panel" id="chat-config-panel" style="display:none;">
   <div class="chat-config-inner">
-    <div class="chat-config-field" id="cfg-endpoint-field">
-      <label class="chat-config-label">Endpoint</label>
-      <select id="cfg-endpoint" class="chat-config-select" onchange="onEndpointChange()"></select>
-    </div>
-    <div class="chat-config-field" id="cfg-backend-field">
+    <div class="chat-config-field">
       <label class="chat-config-label">Backend</label>
       <select id="cfg-backend" class="chat-config-select" onchange="onBackendChange()"></select>
     </div>
@@ -3091,7 +3112,7 @@ pub fn render_chat_page(
       <textarea id="mgr-redflags" class="chat-config-textarea" placeholder="What should cause the manager to halt the agent?" oninput="onManageFieldChange()"></textarea>
     </div>
     <div class="chat-config-field">
-      <button type="button" class="btn-sm" id="mgr-toggle" onclick="toggleManageMode()">Enable</button>
+      <button type="button" class="btn-lg" id="mgr-toggle" onclick="toggleManageMode()">Enable</button>
       <span id="mgr-status" style="margin-left:var(--s-2);font-size:0.85em;color:var(--fg-muted);"></span>
     </div>
   </div>
@@ -3156,7 +3177,15 @@ var streamingContent = '';
 var agentConfig = {{ backend: '', model: '', effort: '' }};
 var agentStatus = '';
 
+if (currentAgent) {{
+  localStorage.setItem('lastChatAgent', currentAgent);
+}} else {{
+  var last = localStorage.getItem('lastChatAgent');
+  if (last) window.location.replace('/ui/chat?agent=' + encodeURIComponent(last));
+}}
+
 function selectAgent(name) {{
+  localStorage.setItem('lastChatAgent', name);
   window.location.href = '/ui/chat?agent=' + encodeURIComponent(name);
 }}
 
@@ -3739,7 +3768,7 @@ function updateManageToggle(enabled) {{
   var headerBtn = document.getElementById('chat-manage-btn');
   if (btn) {{
     btn.textContent = enabled ? 'Disable' : 'Enable';
-    btn.className = enabled ? 'btn-sm button-danger' : 'btn-sm';
+    btn.className = enabled ? 'btn-lg button-danger' : 'btn-lg';
   }}
   if (headerBtn) {{
     headerBtn.style.color = enabled ? 'var(--accent)' : '';
@@ -3792,79 +3821,75 @@ function toggleManageMode() {{
 
 function populateConfigDropdowns(backend, prefs) {{
   var bSel = document.getElementById('cfg-backend');
-  var backends = ['claude', 'gemini', 'codex', 'openai'];
   bSel.innerHTML = '';
-  for (var i = 0; i < backends.length; i++) {{
-    var opt = document.createElement('option');
-    opt.value = backends[i];
-    opt.textContent = backends[i].charAt(0).toUpperCase() + backends[i].slice(1);
-    if (backends[i] === backend) opt.selected = true;
-    bSel.appendChild(opt);
-  }}
-  populateModelEffort(backend, prefs);
+  var cliBackends = ['claude', 'gemini', 'codex'];
+  var hasEndpoints = chatConfigData && chatConfigData.endpoints && chatConfigData.endpoints.length > 0;
+  var selectedEndpoint = chatConfigData && chatConfigData.endpoint_id;
 
-  var epSel = document.getElementById('cfg-endpoint');
-  var epField = document.getElementById('cfg-endpoint-field');
-  var bField = document.getElementById('cfg-backend-field');
-  if (chatConfigData && chatConfigData.endpoints && chatConfigData.endpoints.length > 0) {{
-    epField.style.display = '';
-    epSel.innerHTML = '';
-    var noneOpt = document.createElement('option');
-    noneOpt.value = '';
-    noneOpt.textContent = 'None (CLI-managed)';
-    if (!chatConfigData.endpoint_id) noneOpt.selected = true;
-    epSel.appendChild(noneOpt);
+  var cliGroup = document.createElement('optgroup');
+  cliGroup.label = 'CLI';
+  for (var i = 0; i < cliBackends.length; i++) {{
+    var opt = document.createElement('option');
+    opt.value = 'cli:' + cliBackends[i];
+    opt.textContent = cliBackends[i].charAt(0).toUpperCase() + cliBackends[i].slice(1);
+    if (!selectedEndpoint && cliBackends[i] === backend) opt.selected = true;
+    cliGroup.appendChild(opt);
+  }}
+  bSel.appendChild(cliGroup);
+
+  if (hasEndpoints) {{
+    var epGroup = document.createElement('optgroup');
+    epGroup.label = 'Endpoints';
     for (var j = 0; j < chatConfigData.endpoints.length; j++) {{
       var ep = chatConfigData.endpoints[j];
       var eopt = document.createElement('option');
-      eopt.value = ep.id;
+      eopt.value = 'ep:' + ep.id;
       eopt.textContent = ep.name + ' (' + ep.model + ')';
-      if (chatConfigData.endpoint_id === ep.id) eopt.selected = true;
-      epSel.appendChild(eopt);
+      if (selectedEndpoint === ep.id) eopt.selected = true;
+      epGroup.appendChild(eopt);
     }}
-    if (chatConfigData.endpoint_id) {{
-      bField.style.display = 'none';
-    }} else {{
-      bField.style.display = '';
-    }}
+    bSel.appendChild(epGroup);
+  }}
+
+  if (selectedEndpoint) {{
+    document.getElementById('cfg-model').parentNode.style.display = 'none';
+    var eField = document.getElementById('cfg-effort-field');
+    if (eField) eField.style.display = 'none';
   }} else {{
-    epField.style.display = 'none';
-    bField.style.display = '';
+    document.getElementById('cfg-model').parentNode.style.display = '';
+    populateModelEffort(backend, prefs);
   }}
 }}
 
-function onEndpointChange() {{
-  var epSel = document.getElementById('cfg-endpoint');
-  var eid = epSel.value;
-  var bField = document.getElementById('cfg-backend-field');
-  if (eid) {{
-    bField.style.display = 'none';
+function onBackendSelectChange(val) {{
+  if (val.indexOf('ep:') === 0) {{
+    var eid = val.substring(3);
     if (chatConfigData) chatConfigData.endpoint_id = eid;
     var ep = chatConfigData && chatConfigData.endpoints && chatConfigData.endpoints.find(function(e) {{ return e.id === eid; }});
     if (ep) {{
       agentConfig.backend = ep.name;
       agentConfig.model = ep.model;
       agentConfig.effort = '';
-      updateHeaderStatus();
     }}
+    document.getElementById('cfg-model').parentNode.style.display = 'none';
+    var eField = document.getElementById('cfg-effort-field');
+    if (eField) eField.style.display = 'none';
+    var body = 'csrf_token=' + encodeURIComponent(csrfToken)
+      + '&endpoint_id=' + encodeURIComponent(eid);
+    fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+      body: body
+    }});
   }} else {{
-    bField.style.display = '';
+    var cli = val.indexOf('cli:') === 0 ? val.substring(4) : val;
     if (chatConfigData) chatConfigData.endpoint_id = null;
-    var backend = document.getElementById('cfg-backend').value;
-    agentConfig.backend = backend;
-    updateHeaderStatus();
+    agentConfig.backend = cli;
+    document.getElementById('cfg-model').parentNode.style.display = '';
+    if (chatConfigData) populateModelEffort(cli, chatConfigData.prefs);
+    saveConfig();
   }}
-  saveEndpointConfig(eid);
-}}
-
-function saveEndpointConfig(endpointId) {{
-  var body = 'csrf_token=' + encodeURIComponent(csrfToken)
-    + '&endpoint_id=' + encodeURIComponent(endpointId || '');
-  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{
-    method: 'POST',
-    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-    body: body
-  }});
+  updateHeaderStatus();
 }}
 
 function populateModelEffort(backend, prefs) {{
@@ -3909,11 +3934,7 @@ function populateModelEffort(backend, prefs) {{
 
 function onBackendChange() {{
   var bSel = document.getElementById('cfg-backend');
-  var newBackend = bSel.value;
-  if (chatConfigData) {{
-    populateModelEffort(newBackend, chatConfigData.prefs);
-  }}
-  saveConfig();
+  onBackendSelectChange(bSel.value);
 }}
 
 function onConfigChange() {{
@@ -3922,14 +3943,16 @@ function onConfigChange() {{
 }}
 
 function saveConfig() {{
-  var backend = document.getElementById('cfg-backend').value;
+  var raw = document.getElementById('cfg-backend').value;
+  var backend = raw.indexOf('cli:') === 0 ? raw.substring(4) : raw;
   var model = document.getElementById('cfg-model').value;
   var eField = document.getElementById('cfg-effort-field');
   var effort = (eField && eField.style.display !== 'none') ? document.getElementById('cfg-effort').value : '';
   var body = 'csrf_token=' + encodeURIComponent(csrfToken)
     + '&backend=' + encodeURIComponent(backend)
     + '&model=' + encodeURIComponent(model)
-    + '&effort=' + encodeURIComponent(effort);
+    + '&effort=' + encodeURIComponent(effort)
+    + '&endpoint_id=';
   fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
@@ -7867,6 +7890,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: var(--input-bg);
       color: var(--ink);
       font-family: inherit;
+    }
+
+    select option {
+      background: var(--panel-strong);
+      color: var(--ink);
     }
 
     input:not([type="checkbox"]):focus, select:focus, textarea:focus {

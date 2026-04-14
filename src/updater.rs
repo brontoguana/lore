@@ -274,6 +274,68 @@ pub async fn maybe_apply_self_update(
     }))
 }
 
+pub async fn apply_update_to_version(
+    client: &reqwest::Client,
+    binary_name: &str,
+    current_version: &str,
+    target_version: &str,
+    github_repo: &str,
+    executable_path: &Path,
+) -> Result<SelfUpdateOutcome> {
+    validate_github_repo(github_repo)?;
+    let target = detect_target()?;
+    let current_version = normalize_version_tag(current_version);
+    let target_version = normalize_version_tag(target_version);
+    if current_version == target_version {
+        eprintln!("updater: already at target version {current_version}");
+        return Ok(SelfUpdateOutcome::UpToDate(AutoUpdateStatus {
+            checked_at: OffsetDateTime::now_utc(),
+            current_version,
+            latest_version: Some(target_version),
+            detail: "already at target version".to_string(),
+            applied: false,
+            ok: true,
+        }));
+    }
+    let tag = format!("v{target_version}");
+    eprintln!("updater: fetching exact release {tag} from {github_repo}");
+    let release = fetch_release_by_tag(client, github_repo, &tag).await?;
+    let archive_name = format!("{binary_name}-{target}.tar.gz");
+    let checksum_name = format!("{archive_name}.sha256");
+    let archive_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == archive_name)
+        .map(|asset| asset.browser_download_url.clone())
+        .ok_or_else(|| {
+            LoreError::ExternalService(format!("release {tag} missing asset: {archive_name}"))
+        })?;
+    let checksum_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == checksum_name)
+        .map(|asset| asset.browser_download_url.clone())
+        .ok_or_else(|| {
+            LoreError::ExternalService(format!("release {tag} missing asset: {checksum_name}"))
+        })?;
+    eprintln!("updater: downloading {current_version} -> {target_version}");
+    let archive = fetch_bytes(client, &archive_url).await?;
+    eprintln!("updater: downloaded {} bytes, verifying checksum", archive.len());
+    let checksum = fetch_text(client, &checksum_url).await?;
+    verify_checksum(&archive, &checksum)?;
+    eprintln!("updater: checksum verified, replacing binary at {}", executable_path.display());
+    replace_executable(binary_name, executable_path, &archive)?;
+    eprintln!("updater: binary replaced successfully");
+    Ok(SelfUpdateOutcome::Updated(AutoUpdateStatus {
+        checked_at: OffsetDateTime::now_utc(),
+        current_version: current_version.clone(),
+        latest_version: Some(target_version.clone()),
+        detail: format!("updated {binary_name} from {current_version} to {target_version}"),
+        applied: true,
+        ok: true,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -288,6 +350,27 @@ struct GithubRelease {
 struct GithubReleaseAsset {
     name: String,
     browser_download_url: String,
+}
+
+async fn fetch_release_by_tag(
+    client: &reqwest::Client,
+    github_repo: &str,
+    tag: &str,
+) -> Result<GithubRelease> {
+    client
+        .get(format!(
+            "https://api.github.com/repos/{github_repo}/releases/tags/{tag}"
+        ))
+        .header(USER_AGENT, format!("lore/{}", env!("CARGO_PKG_VERSION")))
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|err| LoreError::ExternalService(err.to_string()))?
+        .error_for_status()
+        .map_err(|err| LoreError::ExternalService(format!("release tag {tag} not found: {err}")))?
+        .json::<GithubRelease>()
+        .await
+        .map_err(|err| LoreError::ExternalService(err.to_string()))
 }
 
 async fn fetch_latest_release(
