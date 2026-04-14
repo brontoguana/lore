@@ -1,8 +1,11 @@
 #!/bin/sh
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh | sh -s -- v0.1.65-rc16
 set -eu
 
 REPO="${LORE_GITHUB_REPO:-brontoguana/lore}"
-VERSION="${LORE_VERSION:-latest}"
+VERSION="${1:-${LORE_VERSION:-latest}}"
 INSTALL_DIR="${LORE_INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="lore"
 LORE_SERVICE_DIR="${LORE_SERVICE_DIR:-$HOME/lore-service}"
@@ -135,17 +138,29 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
 BASE_URL="https://github.com/$REPO/releases/download/$REMOTE_VERSION"
-
 ARCHIVE="$TMP_DIR/${BINARY_NAME}-${TARGET}.tar.gz"
 CHECKSUM="$ARCHIVE.sha256"
 
-fetch "$BASE_URL/${BINARY_NAME}-${TARGET}.tar.gz" "$ARCHIVE"
+if ! fetch "$BASE_URL/${BINARY_NAME}-${TARGET}.tar.gz" "$ARCHIVE" 2>/dev/null; then
+  echo "error: release $REMOTE_VERSION not found or has no binary for $TARGET" >&2
+  echo "check https://github.com/$REPO/releases for available versions" >&2
+  exit 1
+fi
 fetch "$BASE_URL/${BINARY_NAME}-${TARGET}.tar.gz.sha256" "$CHECKSUM"
 verify_checksum "$ARCHIVE" "$CHECKSUM"
 
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
 install "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+
+INSTALLED_VERSION="$(get_current_version)"
+expected_cmp="$(echo "$REMOTE_VERSION" | sed 's/^v//')"
+installed_cmp="$(echo "$INSTALLED_VERSION" | sed 's/^v//')"
+if [ "$installed_cmp" != "$expected_cmp" ]; then
+  echo "error: installed binary reports $INSTALLED_VERSION but expected $REMOTE_VERSION" >&2
+  exit 1
+fi
+
 restart_service_if_running
 
 if [ "$CURRENT_VERSION" != "not installed" ]; then
