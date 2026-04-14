@@ -508,7 +508,11 @@ fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
 }
 
 fn version_part_value(part: &str) -> u64 {
-    part.parse::<u64>().unwrap_or(0)
+    if let Ok(n) = part.parse::<u64>() {
+        return n;
+    }
+    let digits: String = part.chars().skip_while(|c| !c.is_ascii_digit()).collect();
+    digits.parse::<u64>().unwrap_or(0)
 }
 
 fn validate_github_repo(value: &str) -> Result<()> {
@@ -572,5 +576,13 @@ mod tests {
         assert!(compare_versions("1.2.0", "1.2.0").is_eq());
         assert!(compare_versions("1.2.0", "1.2.1").is_lt());
         assert_eq!(normalize_version_tag("v0.1.0"), "0.1.0");
+    }
+
+    #[test]
+    fn compare_versions_handles_rc_tags() {
+        assert!(compare_versions("0.1.65-rc11", "0.1.65-rc8").is_gt());
+        assert!(compare_versions("0.1.65-rc2", "0.1.65-rc1").is_gt());
+        assert!(compare_versions("0.1.65-rc1", "0.1.65-rc1").is_eq());
+        assert!(compare_versions("0.1.65-rc1", "0.1.65-rc2").is_lt());
     }
 }
