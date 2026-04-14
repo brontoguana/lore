@@ -3036,6 +3036,7 @@ pub fn render_chat_page(
   {header_avatar}<span class="chat-header-name">{display_name}</span>
   <span class="chat-header-status" id="chat-agent-status"></span>
   {cwd_html}
+  <button type="button" class="btn-sm button-link" id="chat-manage-btn" style="margin-left:var(--s-2);" onclick="toggleManagePanel()" title="Manage"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>
   <button type="button" class="btn-sm button-link" id="chat-config-btn" style="margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
 </div>
 <div class="chat-messages" id="chat-messages"></div>
@@ -3064,6 +3065,34 @@ pub fn render_chat_page(
     <div class="chat-config-field" id="cfg-project-context-field" style="flex:1;display:flex;flex-direction:column;display:none;">
       <label class="chat-config-label">Project Context</label>
       <textarea id="cfg-project-context" class="chat-config-textarea" readonly placeholder="No project context set."></textarea>
+    </div>
+  </div>
+</div>
+<div class="chat-config-panel" id="chat-manage-panel" style="display:none;">
+  <div class="chat-config-inner">
+    <div class="chat-config-field">
+      <label class="chat-config-label">Manager Endpoint</label>
+      <select id="mgr-endpoint" class="chat-config-select" onchange="onManageChange()"></select>
+    </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Goals</label>
+      <textarea id="mgr-goals" class="chat-config-textarea" placeholder="What should the agent accomplish?" oninput="onManageFieldChange()"></textarea>
+    </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Stopping Point</label>
+      <textarea id="mgr-stopping" class="chat-config-textarea" placeholder="When should the manager stop the agent?" oninput="onManageFieldChange()"></textarea>
+    </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Periodic Checks</label>
+      <textarea id="mgr-checks" class="chat-config-textarea" placeholder="What should the agent verify every few turns?" oninput="onManageFieldChange()"></textarea>
+    </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Red Flags</label>
+      <textarea id="mgr-redflags" class="chat-config-textarea" placeholder="What should cause the manager to halt the agent?" oninput="onManageFieldChange()"></textarea>
+    </div>
+    <div class="chat-config-field">
+      <button type="button" class="btn-sm" id="mgr-toggle" onclick="toggleManageMode()">Enable</button>
+      <span id="mgr-status" style="margin-left:var(--s-2);font-size:0.85em;color:var(--fg-muted);"></span>
     </div>
   </div>
 </div>
@@ -3560,8 +3589,11 @@ function connectSSE() {{
 }})();
 
 var chatConfigOpen = false;
+var chatManageOpen = false;
 var chatConfigData = null;
+var manageConfigData = null;
 var configSaveTimer = null;
+var manageSaveTimer = null;
 
 var backendModels = {{
   claude: ['default', 'opus', 'sonnet', 'haiku'],
@@ -3577,25 +3609,53 @@ var backendEfforts = {{
   openai: []
 }};
 
+function closeAllPanels() {{
+  var msgs = document.getElementById('chat-messages');
+  var form = document.getElementById('chat-input-form');
+  var cfg = document.getElementById('chat-config-panel');
+  var mgr = document.getElementById('chat-manage-panel');
+  var cfgBtn = document.getElementById('chat-config-btn');
+  var mgrBtn = document.getElementById('chat-manage-btn');
+  if (msgs) msgs.style.display = '';
+  if (form) form.style.display = '';
+  if (cfg) cfg.style.display = 'none';
+  if (mgr) mgr.style.display = 'none';
+  if (cfgBtn) cfgBtn.classList.remove('active');
+  if (mgrBtn) mgrBtn.classList.remove('active');
+  chatConfigOpen = false;
+  chatManageOpen = false;
+}}
+
 function toggleChatConfig() {{
+  if (chatConfigOpen) {{ closeAllPanels(); return; }}
+  closeAllPanels();
   var msgs = document.getElementById('chat-messages');
   var cfg = document.getElementById('chat-config-panel');
   var btn = document.getElementById('chat-config-btn');
   var form = document.getElementById('chat-input-form');
   if (!msgs || !cfg) return;
-  chatConfigOpen = !chatConfigOpen;
-  if (chatConfigOpen) {{
-    msgs.style.display = 'none';
-    cfg.style.display = '';
-    if (form) form.style.display = 'none';
-    if (btn) btn.classList.add('active');
-    loadChatConfig();
-  }} else {{
-    msgs.style.display = '';
-    cfg.style.display = 'none';
-    if (form) form.style.display = '';
-    if (btn) btn.classList.remove('active');
-  }}
+  chatConfigOpen = true;
+  msgs.style.display = 'none';
+  cfg.style.display = '';
+  if (form) form.style.display = 'none';
+  if (btn) btn.classList.add('active');
+  loadChatConfig();
+}}
+
+function toggleManagePanel() {{
+  if (chatManageOpen) {{ closeAllPanels(); return; }}
+  closeAllPanels();
+  var msgs = document.getElementById('chat-messages');
+  var mgr = document.getElementById('chat-manage-panel');
+  var btn = document.getElementById('chat-manage-btn');
+  var form = document.getElementById('chat-input-form');
+  if (!msgs || !mgr) return;
+  chatManageOpen = true;
+  msgs.style.display = 'none';
+  mgr.style.display = '';
+  if (form) form.style.display = 'none';
+  if (btn) btn.classList.add('active');
+  loadManageConfig();
 }}
 
 function loadChatConfig() {{
@@ -3636,6 +3696,97 @@ function savePinnedContext() {{
     method: 'POST',
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
     body: body
+  }});
+}}
+
+function loadManageConfig() {{
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/manage', {{ cache: 'no-store' }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      manageConfigData = data;
+      var epSel = document.getElementById('mgr-endpoint');
+      if (epSel) {{
+        epSel.innerHTML = '<option value="">Select endpoint...</option>';
+        var eps = data.endpoints || [];
+        for (var i = 0; i < eps.length; i++) {{
+          var opt = document.createElement('option');
+          opt.value = eps[i].id;
+          opt.textContent = eps[i].name + ' (' + eps[i].model + ')';
+          if (eps[i].id === data.endpoint_id) opt.selected = true;
+          epSel.appendChild(opt);
+        }}
+      }}
+      var goals = document.getElementById('mgr-goals');
+      var stopping = document.getElementById('mgr-stopping');
+      var checks = document.getElementById('mgr-checks');
+      var redflags = document.getElementById('mgr-redflags');
+      if (goals) goals.value = data.goals || '';
+      if (stopping) stopping.value = data.stopping_point || '';
+      if (checks) checks.value = data.periodic_checks || '';
+      if (redflags) redflags.value = data.red_flags || '';
+      updateManageToggle(data.enabled);
+      var status = document.getElementById('mgr-status');
+      if (status && data.enabled) {{
+        status.textContent = 'Turn ' + data.turn_counter;
+      }} else if (status) {{
+        status.textContent = '';
+      }}
+    }});
+}}
+
+function updateManageToggle(enabled) {{
+  var btn = document.getElementById('mgr-toggle');
+  var headerBtn = document.getElementById('chat-manage-btn');
+  if (btn) {{
+    btn.textContent = enabled ? 'Disable' : 'Enable';
+    btn.className = enabled ? 'btn-sm button-danger' : 'btn-sm';
+  }}
+  if (headerBtn) {{
+    headerBtn.style.color = enabled ? 'var(--accent)' : '';
+  }}
+}}
+
+function onManageChange() {{
+  saveManageConfig();
+}}
+
+function onManageFieldChange() {{
+  if (manageSaveTimer) clearTimeout(manageSaveTimer);
+  manageSaveTimer = setTimeout(saveManageConfig, 600);
+}}
+
+function saveManageConfig() {{
+  var epSel = document.getElementById('mgr-endpoint');
+  var goals = document.getElementById('mgr-goals');
+  var stopping = document.getElementById('mgr-stopping');
+  var checks = document.getElementById('mgr-checks');
+  var redflags = document.getElementById('mgr-redflags');
+  var body = 'csrf_token=' + encodeURIComponent(csrfToken)
+    + '&endpoint_id=' + encodeURIComponent(epSel ? epSel.value : '')
+    + '&goals=' + encodeURIComponent(goals ? goals.value : '')
+    + '&stopping_point=' + encodeURIComponent(stopping ? stopping.value : '')
+    + '&periodic_checks=' + encodeURIComponent(checks ? checks.value : '')
+    + '&red_flags=' + encodeURIComponent(redflags ? redflags.value : '');
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/manage', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: body
+  }});
+}}
+
+function toggleManageMode() {{
+  var isEnabled = manageConfigData && manageConfigData.enabled;
+  var body = 'csrf_token=' + encodeURIComponent(csrfToken)
+    + '&enabled=' + (!isEnabled);
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/manage', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: body
+  }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    if (manageConfigData) manageConfigData.enabled = data.enabled;
+    updateManageToggle(data.enabled);
+    var status = document.getElementById('mgr-status');
+    if (status) status.textContent = data.enabled ? 'Turn 0' : '';
   }});
 }}
 

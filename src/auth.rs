@@ -1502,6 +1502,24 @@ pub enum AgentChatStatus {
     Thinking,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManageConfig {
+    #[serde(default)]
+    pub endpoint_id: String,
+    #[serde(default)]
+    pub goals: String,
+    #[serde(default)]
+    pub stopping_point: String,
+    #[serde(default)]
+    pub periodic_checks: String,
+    #[serde(default)]
+    pub red_flags: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub turn_counter: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatConversation {
     pub messages: Vec<ChatMessage>,
@@ -1520,6 +1538,8 @@ pub struct ChatConversation {
     pub cwd: Option<String>,
     #[serde(default)]
     pub git_branch: Option<String>,
+    #[serde(default)]
+    pub manage_config: Option<ManageConfig>,
 }
 
 impl Default for ChatConversation {
@@ -1537,6 +1557,7 @@ impl Default for ChatConversation {
             auto_message: None,
             cwd: None,
             git_branch: None,
+            manage_config: None,
         }
     }
 }
@@ -1606,6 +1627,7 @@ impl ChatStore {
             .expect("failed to set pragmas");
         conn.execute_batch(CHAT_SCHEMA).expect("failed to create chat schema");
         let _ = conn.execute("ALTER TABLE conversations ADD COLUMN pinned_context TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN manage_config TEXT", []);
         Self { conn: Mutex::new(conn) }
     }
 
@@ -1677,9 +1699,11 @@ impl ChatStore {
     pub fn load_conversation(&self, owner: &str, agent: &str) -> Result<ChatConversation> {
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let conv = conn.query_row(
-            "SELECT agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context FROM conversations WHERE owner = ?1 AND agent = ?2",
+            "SELECT agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config FROM conversations WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
             |row| {
+                let mc_json: Option<String> = row.get(10)?;
+                let manage_config = mc_json.and_then(|s| serde_json::from_str::<ManageConfig>(&s).ok());
                 Ok(ChatConversation {
                     messages: Vec::new(),
                     pins: Vec::new(),
@@ -1697,6 +1721,7 @@ impl ChatStore {
                     auto_message: row.get(7)?,
                     cwd: row.get(4)?,
                     git_branch: row.get(5)?,
+                    manage_config,
                 })
             },
         );
@@ -1755,12 +1780,13 @@ impl ChatStore {
             AgentChatStatus::Offline => "offline",
         };
         let last_seen_str = conv.last_seen.as_ref().map(|dt| fmt_dt(dt));
+        let manage_json = conv.manage_config.as_ref().map(|mc| serde_json::to_string(mc).unwrap_or_default());
         conn.execute(
-            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
-             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, window_size=?6, cwd=?7, git_branch=?8, profile_url=?9, auto_message=?10, next_id=?11, pinned_context=?12",
+            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, window_size=?6, cwd=?7, git_branch=?8, profile_url=?9, auto_message=?10, next_id=?11, pinned_context=?12, manage_config=?13",
             params![owner, agent, status_str, last_seen_str, conv.summary, conv.window_size as i64,
-                    conv.cwd, conv.git_branch, conv.profile_url, conv.auto_message, conv.next_id as i64, conv.pinned_context],
+                    conv.cwd, conv.git_branch, conv.profile_url, conv.auto_message, conv.next_id as i64, conv.pinned_context, manage_json],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         // Replace messages
         conn.execute("DELETE FROM messages WHERE owner = ?1 AND agent = ?2", params![owner, agent])
@@ -1920,6 +1946,33 @@ impl ChatStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
             Err(e) => Err(LoreError::Validation(format!("db error: {e}"))),
         }
+    }
+
+    pub fn get_manage_config(&self, owner: &str, agent: &str) -> Result<Option<ManageConfig>> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let result = conn.query_row(
+            "SELECT manage_config FROM conversations WHERE owner = ?1 AND agent = ?2",
+            params![owner, agent],
+            |row| row.get::<_, Option<String>>(0),
+        );
+        match result {
+            Ok(Some(s)) => Ok(serde_json::from_str(&s).ok()),
+            Ok(None) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(LoreError::Validation(format!("db error: {e}"))),
+        }
+    }
+
+    pub fn save_manage_config(&self, owner: &str, agent: &str, config: &ManageConfig) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::ensure_conversation(&conn, owner, agent)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let json = serde_json::to_string(config).unwrap_or_default();
+        conn.execute(
+            "UPDATE conversations SET manage_config = ?1 WHERE owner = ?2 AND agent = ?3",
+            params![json, owner, agent],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(())
     }
 
     pub fn get_backend_prefs(&self, owner: &str, backend: &str) -> Result<(Option<String>, Option<String>)> {

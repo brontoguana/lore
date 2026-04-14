@@ -1,5 +1,5 @@
 use crate::audit::{AuditActor, AuditActorKind, AuditStore, StoredAuditEvent};
-use crate::auth::{ChatAuditLog,
+use crate::auth::{ChatAuditLog, ManageConfig,
     AgentBackend, AgentChatStatus, AuthenticatedAgent, AuthenticatedUser, ChatMessage, ChatRole,
     ChatStore, PinnedChatItem, CreatedAgentToken, LocalAuthStore, NewAgentToken, NewRole,
     NewSession, NewUser, ProjectGrant, ProjectPermission, RoleName, StoredAgentToken, StoredMachine,
@@ -536,6 +536,7 @@ fn build_app_with_librarian(
         .route("/ui/chat/{agent}/send", post(chat_send_message))
         .route("/ui/chat/{agent}/command", post(chat_slash_command))
         .route("/ui/chat/{agent}/config", post(chat_save_config).get(chat_get_config))
+        .route("/ui/chat/{agent}/manage", post(chat_save_manage).get(chat_get_manage))
         .route("/ui/settings", get(settings_page))
         .route("/ui/settings/theme", post(update_theme_from_ui))
         .route("/ui/admin", get(admin_page))
@@ -8572,27 +8573,66 @@ async fn chat_agent_respond(
             data: json!({ "status": "idle" }),
         });
 
-        // Auto-repeat: if set, queue the auto_message as a user message
-        let conv = state.chat.load_conversation(owner_str, &agent.name)?;
-        if let Some(auto_msg) = &conv.auto_message {
-            let auto_stored = state.chat.append_message(
-                owner_str,
-                &agent.name,
-                ChatRole::User,
-                auto_msg.clone(),
-            )?;
-            state.chat_audit.log(&agent.name, owner_str, "auto", auto_msg);
-            push_chat_event(&state, owner_str, ChatEvent {
-                event_type: "auto_message".into(),
-                agent: agent.name.clone(),
-                owner: owner_str.to_string(),
-                data: json!({ "id": auto_stored.id, "content": auto_stored.content }),
-            });
-            let notifier_key = format!("{owner_str}_{}", agent.name);
-            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
-                notify.notify_one();
+        // Manager turn for process agents
+        let state2 = state.clone();
+        let owner2 = owner_str.to_string();
+        let agent_name2 = agent.name.clone();
+        tokio::spawn(async move {
+            match run_manager_turn(&state2, &owner2, &agent_name2).await {
+                Some(ManagerAction::Continue(guidance)) => {
+                    if let Ok(mgr_msg) = state2.chat.append_message(
+                        &owner2, &agent_name2, ChatRole::User, format!("[manager] {guidance}"),
+                    ) {
+                        push_chat_event(&state2, &owner2, ChatEvent {
+                            event_type: "message".into(),
+                            agent: agent_name2.clone(),
+                            owner: owner2.clone(),
+                            data: json!({ "id": mgr_msg.id, "role": "user", "content": mgr_msg.content }),
+                        });
+                        let notifier_key = format!("{}_{}", owner2, agent_name2);
+                        if let Some(notify) = state2.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                            notify.notify_one();
+                        }
+                    }
+                    return;
+                }
+                Some(ManagerAction::Stop(display)) => {
+                    if let Ok(stop_msg) = state2.chat.append_message(
+                        &owner2, &agent_name2, ChatRole::User, format!("[manager] {display}"),
+                    ) {
+                        push_chat_event(&state2, &owner2, ChatEvent {
+                            event_type: "message".into(),
+                            agent: agent_name2.clone(),
+                            owner: owner2.clone(),
+                            data: json!({ "id": stop_msg.id, "role": "user", "content": stop_msg.content }),
+                        });
+                    }
+                    return;
+                }
+                None => {}
             }
-        }
+
+            // Auto-repeat: if set, queue the auto_message as a user message
+            if let Ok(conv) = state2.chat.load_conversation(&owner2, &agent_name2) {
+                if let Some(auto_msg) = &conv.auto_message {
+                    if let Ok(auto_stored) = state2.chat.append_message(
+                        &owner2, &agent_name2, ChatRole::User, auto_msg.clone(),
+                    ) {
+                        state2.chat_audit.log(&agent_name2, &owner2, "auto", auto_msg);
+                        push_chat_event(&state2, &owner2, ChatEvent {
+                            event_type: "auto_message".into(),
+                            agent: agent_name2.clone(),
+                            owner: owner2.clone(),
+                            data: json!({ "id": auto_stored.id, "content": auto_stored.content }),
+                        });
+                        let notifier_key = format!("{}_{}", owner2, agent_name2);
+                        if let Some(notify) = state2.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                            notify.notify_one();
+                        }
+                    }
+                }
+            }
+        });
     }
 
     Ok(StatusCode::OK)
@@ -8908,6 +8948,174 @@ async fn do_exchange_compact(
         .map_err(|e| format!("Compact save failed: {e}"))?;
 
     Ok(format!("Context compacted. {summarized_exchanges} exchanges summarized, {kept_exchanges} kept."))
+}
+
+// --- Manager loop ---
+
+enum ManagerAction {
+    Continue(String),
+    Stop(String),
+}
+
+fn build_manager_prompt(mc: &ManageConfig, turn_in_cycle: u32) -> String {
+    let base = format!(
+        "You are a manager overseeing an AI agent working on a task. \
+         Your role is to provide guidance, catch problems early, and know when to stop.\n\n\
+         GOALS:\n{}\n\nSTOPPING POINT:\n{}\n\nRED FLAGS:\n{}",
+        mc.goals, mc.stopping_point, mc.red_flags
+    );
+
+    let sentinel = "\n\nIMPORTANT: If the stopping point criteria are met, respond with STOPPING_POINT in your message. \
+                     If any red flags are triggered, respond with RED_FLAG_POINT in your message. \
+                     Otherwise, do NOT include these tokens.";
+
+    match turn_in_cycle {
+        0 | 1 | 2 => format!(
+            "{base}{sentinel}\n\n\
+             Review the agent's latest output. Provide brief guidance on next steps. \
+             If the agent is on track, a short confirmation is enough."
+        ),
+        3 => format!(
+            "{base}{sentinel}\n\n\
+             PERIODIC CHECKS:\n{}\n\n\
+             It's time for periodic checks. Ask the agent to verify the items listed above. \
+             Frame your message as direct instructions to the agent.",
+            mc.periodic_checks
+        ),
+        4 => format!(
+            "{base}{sentinel}\n\n\
+             PERIODIC CHECKS:\n{}\n\n\
+             The agent just ran periodic checks. Validate the results. \
+             If anything looks wrong, flag it. Then provide guidance on next steps.",
+            mc.periodic_checks
+        ),
+        _ => unreachable!(),
+    }
+}
+
+async fn run_manager_turn(
+    state: &AppState,
+    owner: &str,
+    agent_name: &str,
+) -> Option<ManagerAction> {
+    let mc = match state.chat.get_manage_config(owner, agent_name) {
+        Ok(Some(mc)) if mc.enabled && !mc.endpoint_id.is_empty() => mc,
+        _ => return None,
+    };
+
+    let endpoint = match state.endpoint_store.get(&mc.endpoint_id) {
+        Ok(Some(ep)) => ep,
+        _ => {
+            eprintln!("[manager] Endpoint {} not found, disabling manage", mc.endpoint_id);
+            let mut mc2 = mc.clone();
+            mc2.enabled = false;
+            let _ = state.chat.save_manage_config(owner, agent_name, &mc2);
+            return None;
+        }
+    };
+
+    let turn_in_cycle = mc.turn_counter % 5;
+    let system_prompt = build_manager_prompt(&mc, turn_in_cycle);
+
+    let conv = match state.chat.load_conversation(owner, agent_name) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+
+    let boundaries = exchange_boundaries(&conv.messages);
+    let last_10_start = if boundaries.len() > 10 {
+        boundaries[boundaries.len() - 10]
+    } else {
+        0
+    };
+    let recent = &conv.messages[last_10_start..];
+
+    let mut api_messages = vec![
+        crate::librarian::ProxyChatMessage {
+            role: "system".into(),
+            content: Some(json!(system_prompt)),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+    ];
+    for msg in recent {
+        let role = match msg.role {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        };
+        api_messages.push(crate::librarian::ProxyChatMessage {
+            role: role.into(),
+            content: Some(json!(msg.content)),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+    }
+
+    let req = crate::librarian::ProxyChatRequest {
+        messages: api_messages,
+        model: None,
+        stream: Some(false),
+        tools: None,
+        temperature: Some(0.3),
+        max_tokens: Some(2048),
+        top_p: None,
+        stop: None,
+    };
+    let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
+    let result = crate::librarian::proxy_non_streaming_raw(
+        &state.librarian_client_http, &endpoint, &url, &body, 60,
+    ).await;
+
+    let response_text = match result {
+        Ok((status, ref resp)) if status.is_success() => {
+            resp.get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string()
+        }
+        Ok((_, ref resp)) => {
+            let err = crate::librarian::extract_provider_error(resp);
+            eprintln!("[manager] API error: {err}");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[manager] Request failed: {e}");
+            return None;
+        }
+    };
+
+    if response_text.is_empty() {
+        return None;
+    }
+
+    state.chat_audit.log(agent_name, owner, "manager", &response_text);
+
+    let mut updated = mc.clone();
+    updated.turn_counter += 1;
+
+    let has_stop = response_text.contains("STOPPING_POINT");
+    let has_red = response_text.contains("RED_FLAG_POINT");
+
+    if has_stop || has_red {
+        updated.enabled = false;
+        let _ = state.chat.save_manage_config(owner, agent_name, &updated);
+
+        let display = if has_stop {
+            response_text.replace("STOPPING_POINT", "\u{2705}")
+        } else {
+            response_text.replace("RED_FLAG_POINT", "\u{1f6a9}")
+        };
+        Some(ManagerAction::Stop(display))
+    } else {
+        let _ = state.chat.save_manage_config(owner, agent_name, &updated);
+        Some(ManagerAction::Continue(response_text))
+    }
 }
 
 // --- API agent loop ---
@@ -9358,7 +9566,41 @@ async fn run_api_agent_loop(
                     eprintln!("[agent] Auto-compacting {agent_name}: {exchanges} exchanges >= window {}", conv.window_size);
                     let _ = do_exchange_compact(&state, agent.endpoint_id.as_deref(), &owner, &agent_name, false).await;
                 }
+            }
 
+            // Manager turn: if manage mode is on, run the manager
+            match run_manager_turn(&state, &owner, &agent_name).await {
+                Some(ManagerAction::Continue(guidance)) => {
+                    if let Ok(mgr_msg) = state.chat.append_message(
+                        &owner, &agent_name, ChatRole::User, format!("[manager] {guidance}"),
+                    ) {
+                        push_chat_event(&state, &owner, ChatEvent {
+                            event_type: "message".into(),
+                            agent: agent_name.clone(),
+                            owner: owner.clone(),
+                            data: json!({ "id": mgr_msg.id, "role": "user", "content": mgr_msg.content }),
+                        });
+                        continue 'outer;
+                    }
+                }
+                Some(ManagerAction::Stop(display)) => {
+                    if let Ok(stop_msg) = state.chat.append_message(
+                        &owner, &agent_name, ChatRole::User, format!("[manager] {display}"),
+                    ) {
+                        push_chat_event(&state, &owner, ChatEvent {
+                            event_type: "message".into(),
+                            agent: agent_name.clone(),
+                            owner: owner.clone(),
+                            data: json!({ "id": stop_msg.id, "role": "user", "content": stop_msg.content }),
+                        });
+                    }
+                    return;
+                }
+                None => {}
+            }
+
+            // Auto-repeat: if set, queue the auto_message as a user message
+            if let Ok(conv) = state.chat.load_conversation(&owner, &agent_name) {
                 if let Some(auto_msg) = &conv.auto_message {
                     if let Ok(auto_stored) = state.chat.append_message(
                         &owner, &agent_name, ChatRole::User, auto_msg.clone(),
@@ -9949,6 +10191,85 @@ async fn chat_save_config(
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
+async fn chat_get_manage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent_name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_ui_session(&state, &headers)?;
+    let owner = session.user.username.as_str();
+    let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
+    let _agent = agents.iter().find(|a| a.name == agent_name)
+        .ok_or(LoreError::PermissionDenied)?;
+
+    let mc = state.chat.get_manage_config(owner, &agent_name)?
+        .unwrap_or_default();
+
+    let endpoints: Vec<Value> = state.endpoint_store.list()?.iter().map(|ep| {
+        json!({ "id": ep.id, "name": ep.name, "kind": ep.kind.to_string(), "model": ep.model })
+    }).collect();
+
+    Ok(Json(json!({
+        "endpoint_id": mc.endpoint_id,
+        "goals": mc.goals,
+        "stopping_point": mc.stopping_point,
+        "periodic_checks": mc.periodic_checks,
+        "red_flags": mc.red_flags,
+        "enabled": mc.enabled,
+        "turn_counter": mc.turn_counter,
+        "endpoints": endpoints,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ManageSaveForm {
+    csrf_token: String,
+    #[serde(default)]
+    endpoint_id: Option<String>,
+    #[serde(default)]
+    goals: Option<String>,
+    #[serde(default)]
+    stopping_point: Option<String>,
+    #[serde(default)]
+    periodic_checks: Option<String>,
+    #[serde(default)]
+    red_flags: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+async fn chat_save_manage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent_name): Path<String>,
+    Form(form): Form<ManageSaveForm>,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let owner = session.user.username.as_str();
+    let agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
+    let _agent = agents.iter().find(|a| a.name == agent_name)
+        .ok_or(LoreError::PermissionDenied)?;
+
+    let mut mc = state.chat.get_manage_config(owner, &agent_name)?
+        .unwrap_or_default();
+
+    if let Some(eid) = &form.endpoint_id { mc.endpoint_id = eid.clone(); }
+    if let Some(g) = &form.goals { mc.goals = g.clone(); }
+    if let Some(sp) = &form.stopping_point { mc.stopping_point = sp.clone(); }
+    if let Some(pc) = &form.periodic_checks { mc.periodic_checks = pc.clone(); }
+    if let Some(rf) = &form.red_flags { mc.red_flags = rf.clone(); }
+    if let Some(en) = form.enabled {
+        if en && !mc.enabled {
+            mc.turn_counter = 0;
+        }
+        mc.enabled = en;
+    }
+
+    state.chat.save_manage_config(owner, &agent_name, &mc)?;
+    Ok(Json(json!({"ok": true, "enabled": mc.enabled})))
+}
+
 async fn chat_slash_command(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9973,7 +10294,7 @@ async fn chat_slash_command(
 
     let response_text = match cmd.as_str() {
         "/help" => {
-            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /prompt -- show full agent prompt and context\n    /context -- show message count and summary\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- add to pinned context\n    /pins -- show pinned context\n    /unpin <id> -- remove a pin by id\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /clear -- clear messages, keep context\n\n  MODEL\n    /model <name> -- switch model (process agents)\n    /effort <level> -- low/medium/high/max/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- side question (separate process)\n    /hi -- check if agent is working\n\nPinned context can also be edited in the config panel (gear icon).".to_string()
+            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /prompt -- show full agent prompt and context\n    /context -- show message count and summary\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- add to pinned context\n    /pins -- show pinned context\n    /unpin <id> -- remove a pin by id\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /clear -- clear messages, keep context\n\n  MODEL\n    /model <name> -- switch model (process agents)\n    /effort <level> -- low/medium/high/max/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- side question (separate process)\n    /hi -- check if agent is working\n\nManage mode can be configured in the manage panel (people icon).".to_string()
         }
         "/status" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
@@ -9997,19 +10318,30 @@ async fn chat_slash_command(
                 } else {
                     String::new()
                 };
+                let manage_line = match &conv.manage_config {
+                    Some(mc) if mc.enabled => format!("\nManage: ON (turn {})", mc.turn_counter),
+                    Some(_) => "\nManage: off".to_string(),
+                    None => String::new(),
+                };
                 format!(
-                    "Agent: {}\nStatus: {}\nMode: API\nEndpoint: {}\nProvider: {}\nModel: {}{}\nExchanges: {}\nPins: {}\nWindow: {} exchanges",
-                    agent_name, status_str, ep_name, ep_kind, ep_model, effort_line,
+                    "Agent: {}\nStatus: {}\nMode: API\nEndpoint: {}\nProvider: {}\nModel: {}{}{}\nExchanges: {}\nPins: {}\nWindow: {} exchanges",
+                    agent_name, status_str, ep_name, ep_kind, ep_model, effort_line, manage_line,
                     count_exchanges(&conv.messages), conv.pins.len(), conv.window_size
                 )
             } else {
                 let backend = agent_token.map(|a| a.backend.clone()).unwrap_or_default();
                 let (model, effort) = state.chat.get_backend_prefs(owner, &backend.to_string()).unwrap_or((None, None));
+                let manage_line = match &conv.manage_config {
+                    Some(mc) if mc.enabled => format!("\nManage: ON (turn {})", mc.turn_counter),
+                    Some(_) => "\nManage: off".to_string(),
+                    None => String::new(),
+                };
                 format!(
-                    "Agent: {}\nStatus: {}\nMode: process ({})\nModel: {}\nEffort: {}\nExchanges: {}\nPins: {}\nWindow: {} exchanges",
+                    "Agent: {}\nStatus: {}\nMode: process ({})\nModel: {}\nEffort: {}{}\nExchanges: {}\nPins: {}\nWindow: {} exchanges",
                     agent_name, status_str, backend,
                     model.as_deref().unwrap_or("default"),
                     effort.as_deref().unwrap_or("default"),
+                    manage_line,
                     count_exchanges(&conv.messages), conv.pins.len(), conv.window_size
                 )
             }
