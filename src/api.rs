@@ -59,7 +59,7 @@ use openidconnect::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use time::OffsetDateTime;
@@ -116,11 +116,151 @@ pub struct AppState {
     chat_audit: Arc<ChatAuditLog>,
     chat_senders: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ChatEvent>>>>,
     chat_agent_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    chat_agent_stops: Arc<Mutex<HashSet<String>>>,
     machine_commands: Arc<Mutex<HashMap<String, Vec<MachineCommand>>>>,
     machine_command_results: Arc<Mutex<HashMap<String, Value>>>,
     machine_poll_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     machine_result_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     machine_agent_statuses: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    librarian_client_http: reqwest::Client,
+    agent_recent_activity: Arc<Mutex<HashMap<String, AgentRecentActivity>>>,
+}
+
+#[derive(Debug, Clone)]
+struct RecentFileEntry {
+    path: String,
+    operation: String,
+    timestamp: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RecentCommandEntry {
+    command: String,
+    timestamp: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentRecentActivity {
+    files: Vec<RecentFileEntry>,
+    commands: Vec<RecentCommandEntry>,
+}
+
+const RECENT_FILES_MAX: usize = 5;
+const RECENT_COMMANDS_MAX: usize = 6;
+
+impl AgentRecentActivity {
+    fn record_file(&mut self, path: String, operation: String) {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        self.files.retain(|f| f.path != path);
+        self.files.insert(0, RecentFileEntry { path, operation, timestamp: now });
+        self.files.truncate(RECENT_FILES_MAX);
+    }
+
+    fn record_command(&mut self, command: String) {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        self.commands.insert(0, RecentCommandEntry { command, timestamp: now });
+        self.commands.truncate(RECENT_COMMANDS_MAX);
+    }
+
+    fn format_section(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.files.is_empty() {
+            let mut lines = vec!["Recently accessed files (most recent first):".to_string()];
+            for f in &self.files {
+                let ago = format_ago(f.timestamp);
+                lines.push(format!("  {} ({}) ({})", f.path, f.operation, ago));
+            }
+            parts.push(lines.join("\n"));
+        }
+        if !self.commands.is_empty() {
+            let mut lines = vec!["Recently run commands:".to_string()];
+            for c in &self.commands {
+                let ago = format_ago(c.timestamp);
+                lines.push(format!("  {} ({})", c.command, ago));
+            }
+            parts.push(lines.join("\n"));
+        }
+        parts.join("\n\n")
+    }
+}
+
+fn format_ago(unix_ts: i64) -> String {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let diff = now - unix_ts;
+    if diff < 60 { format!("{diff}s ago") }
+    else if diff < 3600 { format!("{}m ago", diff / 60) }
+    else if diff < 86400 { format!("{}h ago", diff / 3600) }
+    else { format!("{}d ago", diff / 86400) }
+}
+
+fn parse_tool_use_for_tracking(detail: &str) -> Option<(&str, &str, &str)> {
+    let d = detail.trim();
+    if let Some(rest) = d.strip_prefix("Read ") {
+        Some(("file", rest.trim(), "read"))
+    } else if let Some(rest) = d.strip_prefix("Edit ") {
+        Some(("file", rest.trim(), "edit"))
+    } else if let Some(rest) = d.strip_prefix("Write ") {
+        Some(("file", rest.trim(), "write"))
+    } else if let Some(rest) = d.strip_prefix("MultiEdit ") {
+        Some(("file", rest.trim(), "edit"))
+    } else if let Some(rest) = d.strip_prefix("Bash: ") {
+        Some(("command", rest.trim(), "bash"))
+    } else {
+        None
+    }
+}
+
+fn record_tool_activity(state: &AppState, owner: &str, agent: &str, detail: &str) {
+    if let Some((kind, value, op)) = parse_tool_use_for_tracking(detail) {
+        let key = format!("{owner}_{agent}");
+        let mut map = state.agent_recent_activity.lock().unwrap();
+        let activity = map.entry(key).or_default();
+        match kind {
+            "file" => activity.record_file(value.to_string(), op.to_string()),
+            "command" => activity.record_command(value.to_string()),
+            _ => {}
+        }
+    }
+}
+
+fn record_api_tool_activity(state: &AppState, owner: &str, agent: &str, tool_name: &str, args: &Value) {
+    let get_str = |key: &str| -> &str {
+        args.as_object().and_then(|m| m.get(key)).and_then(|v| v.as_str()).unwrap_or("")
+    };
+    match tool_name {
+        "read_block" | "read_blocks_around" => {
+            let project = get_str("project");
+            let block = get_str("block_id");
+            let short = if block.len() > 8 { &block[..8] } else { block };
+            let path = if project.is_empty() { short.to_string() } else { format!("{project}/{short}") };
+            let key = format!("{owner}_{agent}");
+            let mut map = state.agent_recent_activity.lock().unwrap();
+            map.entry(key).or_default().record_file(path, "read".into());
+        }
+        "create_block" => {
+            let project = get_str("project");
+            let key = format!("{owner}_{agent}");
+            let mut map = state.agent_recent_activity.lock().unwrap();
+            map.entry(key).or_default().record_file(project.to_string(), "create".into());
+        }
+        "update_block" => {
+            let project = get_str("project");
+            let block = get_str("block_id");
+            let short = if block.len() > 8 { &block[..8] } else { block };
+            let path = if project.is_empty() { short.to_string() } else { format!("{project}/{short}") };
+            let key = format!("{owner}_{agent}");
+            let mut map = state.agent_recent_activity.lock().unwrap();
+            map.entry(key).or_default().record_file(path, "edit".into());
+        }
+        "move_block" | "delete_block" => {
+            let block = get_str("block_id");
+            let short = if block.len() > 8 { &block[..8] } else { block };
+            let key = format!("{owner}_{agent}");
+            let mut map = state.agent_recent_activity.lock().unwrap();
+            map.entry(key).or_default().record_file(short.to_string(), tool_name.strip_prefix("move_").or(tool_name.strip_prefix("delete_")).unwrap_or(tool_name).into());
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -207,11 +347,17 @@ impl AppState {
             chat_audit: Arc::new(chat_audit),
             chat_senders: Arc::new(Mutex::new(HashMap::new())),
             chat_agent_notifiers: Arc::new(Mutex::new(HashMap::new())),
+            chat_agent_stops: Arc::new(Mutex::new(HashSet::new())),
             machine_commands: Arc::new(Mutex::new(HashMap::new())),
             machine_command_results: Arc::new(Mutex::new(HashMap::new())),
             machine_poll_notifiers: Arc::new(Mutex::new(HashMap::new())),
             machine_result_notifiers: Arc::new(Mutex::new(HashMap::new())),
             machine_agent_statuses: Arc::new(Mutex::new(HashMap::new())),
+            librarian_client_http: reqwest::Client::builder()
+                .pool_max_idle_per_host(32)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            agent_recent_activity: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -319,6 +465,7 @@ fn build_app_with_librarian(
         .route("/v1/chat/history", get(chat_agent_history))
         .route("/v1/chat/compact", post(chat_agent_compact))
         .route("/v1/chat/config", get(chat_agent_config))
+        .route("/v1/chat/completions", post(chat_proxy_completions))
         .route(
             "/v1/projects/{project}/blocks",
             get(list_project_blocks).post(create_project_block),
@@ -8139,12 +8286,6 @@ async fn chat_send_message(
     )?;
     state.chat_audit.log(&agent_name, owner, "user", &form.message);
 
-    // Notify the agent if it's polling
-    let notifier_key = format!("{owner}_{agent_name}");
-    if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
-        notify.notify_one();
-    }
-
     // Push SSE event to the user
     push_chat_event(&state, owner, ChatEvent {
         event_type: "message_sent".into(),
@@ -8152,6 +8293,35 @@ async fn chat_send_message(
         owner: owner.to_string(),
         data: json!({ "id": msg.id, "content": msg.content }),
     });
+
+    // Check if this is an API agent (has endpoint_id)
+    let agent_token = agents.iter().find(|a| a.name == agent_name);
+    if let Some(token) = agent_token {
+        if token.endpoint_id.is_some() {
+            let agent_auth = AuthenticatedAgent {
+                token: format!("api-agent-{}", agent_name),
+                name: agent_name.clone(),
+                owner: Some(session.user.username.clone()),
+                grants: token.grants.clone(),
+                backend: token.backend,
+                endpoint_id: token.endpoint_id.clone(),
+                machine_name: None,
+            };
+            let state_clone = state.clone();
+            let owner_str = owner.to_string();
+            state.chat_agent_stops.lock().unwrap().remove(&format!("{owner}_{agent_name}"));
+            tokio::spawn(async move {
+                run_api_agent_loop(state_clone, agent_auth, owner_str, agent_name).await;
+            });
+            return Ok(StatusCode::OK.into_response());
+        }
+    }
+
+    // Process-based agent: notify if it's polling
+    let notifier_key = format!("{owner}_{agent_name}");
+    if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+        notify.notify_one();
+    }
 
     Ok(StatusCode::OK.into_response())
 }
@@ -8363,6 +8533,7 @@ async fn chat_agent_respond(
             owner: owner_str.to_string(),
             data: json!({ "detail": detail }),
         });
+        record_tool_activity(&state, owner_str, &agent.name, detail);
     }
 
     if let Some(text) = &body.text {
@@ -8500,6 +8671,9 @@ async fn chat_agent_history(
         state.endpoint_store.get(eid).ok().flatten()
     });
 
+    let git_ctx = collect_git_context(conv.cwd.as_deref());
+    let activity = get_agent_recent_activity(&state, owner_str, &agent.name);
+
     let mut resp = json!({
         "messages": msgs,
         "summary": conv.summary,
@@ -8510,6 +8684,12 @@ async fn chat_agent_history(
         "model": model,
         "effort": effort,
     });
+    if !git_ctx.is_empty() {
+        resp["git_context"] = json!(git_ctx);
+    }
+    if !activity.is_empty() {
+        resp["recent_activity"] = json!(activity);
+    }
     if let Some(ep) = endpoint_info {
         resp["endpoint"] = json!({
             "id": ep.id,
@@ -8571,6 +8751,1049 @@ async fn chat_agent_config(
         }
     }
     Ok(Json(resp))
+}
+
+// --- API agent loop ---
+
+const API_AGENT_MAX_TURNS: usize = 500;
+const API_AGENT_TURN_WARNINGS: &[usize] = &[300, 400, 475];
+const API_AGENT_TOOL_RESULT_CAP: usize = 30_000;
+const API_AGENT_MAX_CONTEXT_CHARS: usize = 400_000;
+const API_AGENT_MAX_RETRIES: usize = 2;
+const API_AGENT_RATE_LIMIT_WAIT_SECS: u64 = 30;
+const API_AGENT_TRIMMED_STUB: &str = "[Content trimmed to save context \u{2014} re-read if needed]";
+const API_AGENT_TRIMMED_ASSISTANT: &str = "[Earlier analysis trimmed to save context]";
+
+fn estimate_context_size(messages: &[crate::librarian::ProxyChatMessage], tool_count: usize) -> usize {
+    let mut total = 0usize;
+    for m in messages {
+        if let Some(c) = &m.content {
+            total += match c {
+                Value::String(s) => s.len(),
+                other => other.to_string().len(),
+            };
+        }
+        if let Some(tcs) = &m.tool_calls {
+            for tc in tcs {
+                total += tc.get("function").and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str()).map(|s| s.len()).unwrap_or(0);
+                total += tc.get("function").and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str()).map(|s| s.len()).unwrap_or(0);
+            }
+        }
+    }
+    total += tool_count * 500;
+    total
+}
+
+fn trim_old_context(messages: &mut Vec<crate::librarian::ProxyChatMessage>, tool_count: usize) {
+    let size = estimate_context_size(messages, tool_count);
+    if size <= API_AGENT_MAX_CONTEXT_CHARS { return; }
+
+    let last_assistant = messages.iter().rposition(|m| m.role == "assistant").unwrap_or(0);
+
+    for i in 0..messages.len().min(last_assistant) {
+        let m = &mut messages[i];
+        if m.role == "tool" {
+            if let Some(Value::String(s)) = &m.content {
+                if s.len() > 200 {
+                    m.content = Some(json!(API_AGENT_TRIMMED_STUB));
+                }
+            }
+        }
+        if m.role == "assistant" {
+            if let Some(Value::String(s)) = &m.content {
+                if s.len() > 1000 {
+                    let preview = s.chars().take(200).collect::<String>();
+                    m.content = Some(json!(format!("{preview}\n{API_AGENT_TRIMMED_ASSISTANT}")));
+                }
+            }
+        }
+    }
+}
+
+fn aggressive_trim_all_tool_results(messages: &mut [crate::librarian::ProxyChatMessage]) {
+    for m in messages.iter_mut() {
+        if m.role == "tool" {
+            if let Some(Value::String(s)) = &m.content {
+                if s != API_AGENT_TRIMMED_STUB {
+                    m.content = Some(json!(API_AGENT_TRIMMED_STUB));
+                }
+            }
+        }
+    }
+}
+
+fn truncate_tool_result(tool_name: &str, text: &str) -> String {
+    if text.len() <= API_AGENT_TOOL_RESULT_CAP { return text.to_string(); }
+
+    let mut cut_at = text[..API_AGENT_TOOL_RESULT_CAP].rfind('\n')
+        .unwrap_or(API_AGENT_TOOL_RESULT_CAP);
+    if cut_at < API_AGENT_TOOL_RESULT_CAP / 2 { cut_at = API_AGENT_TOOL_RESULT_CAP; }
+
+    let total_lines = text.matches('\n').count() + 1;
+    let shown_lines = text[..cut_at].matches('\n').count() + 1;
+    let hint = match tool_name {
+        "read_block" | "read_blocks_around" => "Use smaller reads or targeted grep.",
+        "grep_blocks" => "Narrow your search query.",
+        "list_blocks" | "list_projects" => "Results are large; consider targeted queries.",
+        _ => "Consider a more targeted query to reduce output size.",
+    };
+    format!("{}\n\n[Output truncated \u{2014} showing ~{shown_lines} of {total_lines} lines. {hint}]",
+        &text[..cut_at])
+}
+
+async fn run_api_agent_loop(
+    state: AppState,
+    agent: AuthenticatedAgent,
+    owner: String,
+    agent_name: String,
+) {
+    'outer: loop {
+        let _ = state.chat.update_agent_status(&owner, &agent_name, AgentChatStatus::Thinking);
+        push_chat_event(&state, &owner, ChatEvent {
+            event_type: "status".into(),
+            agent: agent_name.clone(),
+            owner: owner.clone(),
+            data: json!({ "status": "thinking" }),
+        });
+
+        let endpoint_id = match agent.endpoint_id.as_deref() {
+            Some(id) => id,
+            None => {
+                finish_api_agent(&state, &owner, &agent_name, "No endpoint configured for this agent.");
+                return;
+            }
+        };
+        let endpoint = match state.endpoint_store.get(endpoint_id) {
+            Ok(Some(ep)) => ep,
+            Ok(None) => {
+                finish_api_agent(&state, &owner, &agent_name, "Configured endpoint not found.");
+                return;
+            }
+            Err(e) => {
+                finish_api_agent(&state, &owner, &agent_name, &format!("Endpoint error: {e}"));
+                return;
+            }
+        };
+
+        let conv = match state.chat.load_conversation(&owner, &agent_name) {
+            Ok(c) => c,
+            Err(e) => {
+                finish_api_agent(&state, &owner, &agent_name, &format!("Failed to load conversation: {e}"));
+                return;
+            }
+        };
+
+        let system_prompt = build_api_agent_system_prompt(&state, &agent, &conv);
+        let tools = build_api_agent_tools();
+        let tool_count = tools.len();
+
+        let mut messages: Vec<crate::librarian::ProxyChatMessage> = Vec::new();
+        messages.push(crate::librarian::ProxyChatMessage {
+            role: "system".into(),
+            content: Some(json!(system_prompt)),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+
+        if !conv.summary.is_empty() {
+            messages.push(crate::librarian::ProxyChatMessage {
+                role: "user".into(),
+                content: Some(json!(format!("[Conversation summary from earlier messages]\n{}", conv.summary))),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+            messages.push(crate::librarian::ProxyChatMessage {
+                role: "assistant".into(),
+                content: Some(json!("Understood, I have the conversation context.")),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+
+        for msg in &conv.messages {
+            messages.push(crate::librarian::ProxyChatMessage {
+                role: match msg.role {
+                    ChatRole::User => "user".into(),
+                    ChatRole::Assistant => "assistant".into(),
+                },
+                content: Some(json!(msg.content)),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+
+        let mut accumulated_text = String::new();
+        let mut rate_limit_retried = false;
+        let mut timeout_retries = 0usize;
+
+        for turn in 0..API_AGENT_MAX_TURNS {
+            if state.chat_agent_stops.lock().unwrap().remove(&format!("{owner}_{agent_name}")) {
+                let final_text = if accumulated_text.is_empty() {
+                    "Stopped.".to_string()
+                } else {
+                    format!("{accumulated_text}\n\n[Stopped by user]")
+                };
+                finish_api_agent(&state, &owner, &agent_name, &final_text);
+                return;
+            }
+
+            trim_old_context(&mut messages, tool_count);
+
+            let req = crate::librarian::ProxyChatRequest {
+                messages: messages.clone(),
+                model: None,
+                stream: Some(false),
+                tools: Some(tools.clone()),
+                temperature: None,
+                max_tokens: Some(16384),
+                top_p: None,
+                stop: None,
+            };
+
+            let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
+            let raw_result = crate::librarian::proxy_non_streaming_raw(
+                &state.librarian_client_http, &endpoint, &url, &body, 120,
+            ).await;
+
+            let (http_status, response) = match raw_result {
+                Ok(pair) => {
+                    timeout_retries = 0;
+                    pair
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("timed out") || err_msg.contains("timeout") {
+                        if timeout_retries < API_AGENT_MAX_RETRIES {
+                            timeout_retries += 1;
+                            push_chat_event(&state, &owner, ChatEvent {
+                                event_type: "tool_use".into(),
+                                agent: agent_name.clone(),
+                                owner: owner.clone(),
+                                data: json!({ "detail": format!("\u{23f3} Request timed out, retrying ({timeout_retries}/{API_AGENT_MAX_RETRIES})...") }),
+                            });
+                            continue;
+                        }
+                    }
+                    let final_text = if accumulated_text.is_empty() {
+                        format!("Provider error: {e}")
+                    } else {
+                        format!("{accumulated_text}\n\n[Provider error: {e}]")
+                    };
+                    finish_api_agent(&state, &owner, &agent_name, &final_text);
+                    return;
+                }
+            };
+
+            if !http_status.is_success() {
+                let status_code = http_status.as_u16();
+                let err_detail = crate::librarian::extract_provider_error(&response);
+
+                if status_code == 429 && !rate_limit_retried {
+                    rate_limit_retried = true;
+                    push_chat_event(&state, &owner, ChatEvent {
+                        event_type: "tool_use".into(),
+                        agent: agent_name.clone(),
+                        owner: owner.clone(),
+                        data: json!({ "detail": format!("\u{23f3} Rate limited, retrying in {API_AGENT_RATE_LIMIT_WAIT_SECS}s...") }),
+                    });
+                    tokio::time::sleep(std::time::Duration::from_secs(API_AGENT_RATE_LIMIT_WAIT_SECS)).await;
+                    continue;
+                }
+
+                if status_code == 400 {
+                    let has_untrimmed = messages.iter().any(|m|
+                        m.role == "tool" && m.content.as_ref()
+                            .and_then(|c| c.as_str())
+                            .map(|s| s != API_AGENT_TRIMMED_STUB)
+                            .unwrap_or(false)
+                    );
+                    if has_untrimmed {
+                        aggressive_trim_all_tool_results(&mut messages);
+                        push_chat_event(&state, &owner, ChatEvent {
+                            event_type: "tool_use".into(),
+                            agent: agent_name.clone(),
+                            owner: owner.clone(),
+                            data: json!({ "detail": "\u{2702}\u{fe0f} Context too large, trimming and retrying..." }),
+                        });
+                        continue;
+                    }
+                    let final_text = if accumulated_text.is_empty() {
+                        format!("Context/token limit exceeded even after trimming: {err_detail}")
+                    } else {
+                        format!("{accumulated_text}\n\n[Context limit: {err_detail}]")
+                    };
+                    finish_api_agent(&state, &owner, &agent_name, &final_text);
+                    return;
+                }
+
+                if status_code >= 500 {
+                    let final_text = if accumulated_text.is_empty() {
+                        format!("API error ({status_code}): {err_detail}")
+                    } else {
+                        format!("{accumulated_text}\n\n[API error ({status_code}): {err_detail}]")
+                    };
+                    finish_api_agent(&state, &owner, &agent_name, &final_text);
+                    return;
+                }
+
+                let final_text = if accumulated_text.is_empty() {
+                    format!("Provider error ({status_code}): {err_detail}")
+                } else {
+                    format!("{accumulated_text}\n\n[Provider error ({status_code}): {err_detail}]")
+                };
+                finish_api_agent(&state, &owner, &agent_name, &final_text);
+                return;
+            }
+
+            rate_limit_retried = false;
+
+            let choice = response.get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.first());
+            let message = choice.and_then(|c| c.get("message"));
+            let content = message.and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let finish_reason = choice.and_then(|c| c.get("finish_reason"))
+                .and_then(|f| f.as_str()).unwrap_or("");
+            let tool_calls = message.and_then(|m| m.get("tool_calls"))
+                .and_then(|t| t.as_array()).cloned();
+
+            accumulated_text.push_str(&content);
+
+            if let Some(ref tcs) = tool_calls {
+                if !tcs.is_empty() {
+                    if finish_reason == "length" {
+                        push_chat_event(&state, &owner, ChatEvent {
+                            event_type: "tool_use".into(),
+                            agent: agent_name.clone(),
+                            owner: owner.clone(),
+                            data: json!({ "detail": "\u{26a0}\u{fe0f} Tool call may be truncated (hit token limit)" }),
+                        });
+                    }
+
+                    messages.push(crate::librarian::ProxyChatMessage {
+                        role: "assistant".into(),
+                        content: if content.is_empty() { None } else { Some(json!(content)) },
+                        tool_calls: Some(tcs.clone()),
+                        tool_call_id: None,
+                        name: None,
+                    });
+
+                    for tc in tcs {
+                        let tool_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                        let func = tc.get("function");
+                        let tool_name = func.and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str()).unwrap_or("");
+                        let raw_args = func.and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str()).unwrap_or("{}");
+
+                        let (tool_args, parse_error) = match serde_json::from_str::<Value>(raw_args) {
+                            Ok(v) => (v, false),
+                            Err(_) => (json!({}), true),
+                        };
+
+                        let detail = format_api_tool_display(tool_name, &tool_args);
+                        push_chat_event(&state, &owner, ChatEvent {
+                            event_type: "tool_use".into(),
+                            agent: agent_name.clone(),
+                            owner: owner.clone(),
+                            data: json!({ "detail": detail }),
+                        });
+                        record_api_tool_activity(&state, &owner, &agent_name, tool_name, &tool_args);
+
+                        let result_text = if parse_error {
+                            format!("Error: Failed to parse tool arguments (malformed JSON). \
+                                Your tool call for {tool_name} had invalid/truncated arguments. \
+                                Please retry with valid JSON.")
+                        } else {
+                            match call_mcp_tool(&state, &agent, Some(&json!({
+                                "name": tool_name,
+                                "arguments": tool_args,
+                            }))) {
+                                Ok(val) => {
+                                    let text = val.get("content")
+                                        .and_then(|c| c.as_array())
+                                        .and_then(|a| a.first())
+                                        .and_then(|t| t.get("text"))
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("");
+                                    truncate_tool_result(tool_name, text)
+                                }
+                                Err(e) => format!("Error: {e}"),
+                            }
+                        };
+
+                        messages.push(crate::librarian::ProxyChatMessage {
+                            role: "tool".into(),
+                            content: Some(json!(result_text)),
+                            tool_calls: None,
+                            tool_call_id: Some(tool_id),
+                            name: Some(tool_name.to_string()),
+                        });
+                    }
+
+                    if API_AGENT_TURN_WARNINGS.contains(&turn) {
+                        messages.push(crate::librarian::ProxyChatMessage {
+                            role: "user".into(),
+                            content: Some(json!(format!(
+                                "You have used {turn} of {API_AGENT_MAX_TURNS} tool-calling turns. \
+                                You have {} turns remaining. Please wrap up your work and provide a final response soon.",
+                                API_AGENT_MAX_TURNS - turn
+                            ))),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                        });
+                    }
+
+                    continue;
+                }
+            }
+
+            // Empty response with finish_reason=length: likely truncated tool call
+            if finish_reason == "length" && content.trim().is_empty() {
+                messages.push(crate::librarian::ProxyChatMessage {
+                    role: "assistant".into(),
+                    content: Some(json!(content)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+                messages.push(crate::librarian::ProxyChatMessage {
+                    role: "user".into(),
+                    content: Some(json!("Your previous response was truncated. Please continue \u{2014} try to use fewer tool calls per turn if needed.")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+                continue;
+            }
+
+            // Final response with length truncation warning
+            if finish_reason == "length" && !content.is_empty() {
+                accumulated_text.push_str(
+                    "\n\n\u{26a0}\u{fe0f} Response was truncated (hit output token limit). You may want to ask me to continue."
+                );
+            }
+
+            if !accumulated_text.is_empty() {
+                push_chat_event(&state, &owner, ChatEvent {
+                    event_type: "chunk".into(),
+                    agent: agent_name.clone(),
+                    owner: owner.clone(),
+                    data: json!({ "text": &accumulated_text }),
+                });
+            }
+
+            let final_content = if accumulated_text.is_empty() { "(no response)".to_string() } else { accumulated_text };
+            finish_api_agent(&state, &owner, &agent_name, &final_content);
+
+            if let Ok(conv) = state.chat.load_conversation(&owner, &agent_name) {
+                if let Some(auto_msg) = &conv.auto_message {
+                    if let Ok(auto_stored) = state.chat.append_message(
+                        &owner, &agent_name, ChatRole::User, auto_msg.clone(),
+                    ) {
+                        state.chat_audit.log(&agent_name, &owner, "auto", auto_msg);
+                        push_chat_event(&state, &owner, ChatEvent {
+                            event_type: "auto_message".into(),
+                            agent: agent_name.clone(),
+                            owner: owner.clone(),
+                            data: json!({ "id": auto_stored.id, "content": auto_stored.content }),
+                        });
+                        continue 'outer;
+                    }
+                }
+            }
+            return;
+        }
+
+        let cutoff = format!("{accumulated_text}\n\n\u{26a0}\u{fe0f} Hard cutoff: reached maximum of {API_AGENT_MAX_TURNS} tool-calling turns. Work may be incomplete. Send another message to continue where I left off.");
+        finish_api_agent(&state, &owner, &agent_name, cutoff.trim());
+        return;
+    }
+}
+
+fn finish_api_agent(state: &AppState, owner: &str, agent_name: &str, content: &str) {
+    let msg = state.chat.append_message(owner, agent_name, ChatRole::Assistant, content.to_string());
+    state.chat_audit.log(agent_name, owner, "agent", content);
+
+    if let Ok(msg) = msg {
+        push_chat_event(state, owner, ChatEvent {
+            event_type: "response_complete".into(),
+            agent: agent_name.to_string(),
+            owner: owner.to_string(),
+            data: json!({ "id": msg.id, "content": content }),
+        });
+    }
+
+    let _ = state.chat.update_agent_status(owner, agent_name, AgentChatStatus::Idle);
+    push_chat_event(state, owner, ChatEvent {
+        event_type: "status".into(),
+        agent: agent_name.to_string(),
+        owner: owner.to_string(),
+        data: json!({ "status": "idle" }),
+    });
+}
+
+fn collect_git_context(cwd: Option<&str>) -> String {
+    let dir = match cwd {
+        Some(d) if !d.is_empty() => d,
+        _ => return String::new(),
+    };
+    let git_dir = std::path::Path::new(dir).join(".git");
+    if !git_dir.exists() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(dir)
+        .output()
+    {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !branch.is_empty() {
+            parts.push(format!("Branch: {branch}"));
+        }
+    }
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["log", "--oneline", "-3"])
+        .current_dir(dir)
+        .output()
+    {
+        let log = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !log.is_empty() {
+            parts.push(format!("Recent commits:\n{log}"));
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("\n")
+    }
+}
+
+fn get_agent_recent_activity(state: &AppState, owner: &str, agent: &str) -> String {
+    let key = format!("{owner}_{agent}");
+    let map = state.agent_recent_activity.lock().unwrap();
+    match map.get(&key) {
+        Some(activity) => activity.format_section(),
+        None => String::new(),
+    }
+}
+
+fn build_api_agent_system_prompt(
+    state: &AppState,
+    agent: &AuthenticatedAgent,
+    conv: &crate::auth::ChatConversation,
+) -> String {
+    let mut parts = Vec::new();
+    parts.push("You are a Lore knowledge base agent with tools to read and write content in Lore projects.\n\n\
+        Guidelines:\n\
+        - Be concise and direct. Provide clear answers.\n\
+        - Use tools to fulfill user requests. Read before writing. Grep to find content.\n\
+        - When a tool result is truncated, use more targeted queries rather than re-reading the same large result.\n\
+        - If you encounter an error, explain it clearly and suggest alternatives.\n\
+        - Do not make up content. If you can't find something, say so.\n\
+        - For multi-step tasks, plan before acting. Use fewer tool calls per turn when possible.".to_string());
+
+    let project_context = collect_project_context(state, &agent.grants);
+    if !project_context.is_empty() {
+        parts.push(format!("\n## Project Context\n{project_context}"));
+    }
+
+    if !conv.pinned_context.is_empty() {
+        parts.push(format!("\n## Pinned Context\n{}", conv.pinned_context));
+    }
+
+    let readable: Vec<String> = agent.grants.iter()
+        .map(|g| {
+            let perm = if g.permission.allows_write() { "read-write" } else { "read" };
+            format!("- {} ({})", g.project.as_str(), perm)
+        })
+        .collect();
+    if !readable.is_empty() {
+        parts.push(format!("\n## Accessible Projects\n{}", readable.join("\n")));
+    }
+
+    let git_ctx = collect_git_context(conv.cwd.as_deref());
+    if !git_ctx.is_empty() {
+        parts.push(format!("\n## Git Repository\n{git_ctx}"));
+    }
+
+    let owner_str = agent.owner.as_ref().map(|u| u.as_str()).unwrap_or("");
+    let activity = get_agent_recent_activity(state, owner_str, &agent.name);
+    if !activity.is_empty() {
+        parts.push(format!("\n## Recent Activity\n{activity}"));
+    }
+
+    parts.join("\n")
+}
+
+fn build_api_agent_tools() -> Vec<Value> {
+    mcp_tools().into_iter().map(|t| {
+        json!({
+            "type": "function",
+            "function": {
+                "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                "description": t.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                "parameters": t.get("inputSchema").cloned().unwrap_or(json!({"type": "object"})),
+            }
+        })
+    }).collect()
+}
+
+fn format_api_tool_display(name: &str, args: &Value) -> String {
+    let args_map = args.as_object();
+    let get_str = |key: &str| -> &str {
+        args_map.and_then(|m| m.get(key)).and_then(|v| v.as_str()).unwrap_or("")
+    };
+    match name {
+        "list_projects" => "\u{1f4cb} list_projects".into(),
+        "list_blocks" => format!("\u{1f4cb} list_blocks {}", get_str("project")),
+        "read_block" => {
+            let bid = get_str("block_id");
+            let short = if bid.len() > 8 { &bid[..8] } else { bid };
+            format!("\u{1f4d6} read_block {short}")
+        }
+        "read_blocks_around" => {
+            let bid = get_str("block_id");
+            let short = if bid.len() > 8 { &bid[..8] } else { bid };
+            format!("\u{1f4d6} read_blocks_around {short}")
+        }
+        "grep_blocks" => format!("\u{1f50d} grep_blocks \"{}\"", get_str("query")),
+        "create_block" => format!("\u{270f}\u{fe0f} create_block {}", get_str("project")),
+        "update_block" => {
+            let bid = get_str("block_id");
+            let short = if bid.len() > 8 { &bid[..8] } else { bid };
+            format!("\u{270f}\u{fe0f} update_block {short}")
+        }
+        "move_block" => {
+            let bid = get_str("block_id");
+            let short = if bid.len() > 8 { &bid[..8] } else { bid };
+            format!("\u{1f4e6} move_block {short}")
+        }
+        "delete_block" => {
+            let bid = get_str("block_id");
+            let short = if bid.len() > 8 { &bid[..8] } else { bid };
+            format!("\u{1f5d1}\u{fe0f} delete_block {short}")
+        }
+        "get_context" => "\u{1f4d6} get_context".into(),
+        _ => format!("\u{1f527} {name}"),
+    }
+}
+
+// --- API agent compact ---
+
+async fn run_api_compact(
+    state: &AppState,
+    endpoint_id: Option<&str>,
+    owner: &str,
+    agent_name: &str,
+) {
+    let endpoint_id = match endpoint_id {
+        Some(id) => id,
+        None => {
+            finish_api_agent(state, owner, agent_name, "Compact failed: no endpoint configured.");
+            return;
+        }
+    };
+    let endpoint = match state.endpoint_store.get(endpoint_id) {
+        Ok(Some(ep)) => ep,
+        _ => {
+            finish_api_agent(state, owner, agent_name, "Compact failed: endpoint not found.");
+            return;
+        }
+    };
+    let conv = match state.chat.load_conversation(owner, agent_name) {
+        Ok(c) => c,
+        Err(e) => {
+            finish_api_agent(state, owner, agent_name, &format!("Compact failed: {e}"));
+            return;
+        }
+    };
+
+    if conv.messages.len() <= 4 {
+        finish_api_agent(state, owner, agent_name, "Nothing to compact (4 or fewer messages).");
+        return;
+    }
+
+    let to_summarize = conv.messages.len().saturating_sub(4);
+    let mut conversation_text = String::new();
+    if !conv.summary.is_empty() {
+        conversation_text.push_str(&format!("Previous summary:\n{}\n\n", conv.summary));
+    }
+    conversation_text.push_str("Messages to summarize:\n");
+    for msg in &conv.messages[..to_summarize] {
+        let role = match msg.role {
+            ChatRole::User => "User",
+            ChatRole::Assistant => "Assistant",
+        };
+        let content: String = msg.content.chars().take(2000).collect();
+        let content = if content.len() < msg.content.len() {
+            format!("{content}...")
+        } else {
+            content
+        };
+        conversation_text.push_str(&format!("{role}: {content}\n"));
+    }
+
+    let summary_messages = vec![
+        crate::librarian::ProxyChatMessage {
+            role: "system".into(),
+            content: Some(json!("Summarize this conversation. Capture key facts, decisions, requests, and outcomes. Be comprehensive but concise. Output only the summary.")),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+        crate::librarian::ProxyChatMessage {
+            role: "user".into(),
+            content: Some(json!(conversation_text)),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+    ];
+
+    let req = crate::librarian::ProxyChatRequest {
+        messages: summary_messages,
+        model: None,
+        stream: Some(false),
+        tools: None,
+        temperature: None,
+        max_tokens: Some(4096),
+        top_p: None,
+        stop: None,
+    };
+
+    let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
+    let result = crate::librarian::proxy_non_streaming_raw(
+        &state.librarian_client_http, &endpoint, &url, &body, 60,
+    ).await;
+
+    let summary = match result {
+        Ok((status, ref response)) if status.is_success() => {
+            response.get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("(summary generation failed)")
+                .to_string()
+        }
+        Ok((_, ref response)) => {
+            let err = crate::librarian::extract_provider_error(response);
+            finish_api_agent(state, owner, agent_name, &format!("Compact failed: {err}"));
+            return;
+        }
+        Err(e) => {
+            finish_api_agent(state, owner, agent_name, &format!("Compact failed: {e}"));
+            return;
+        }
+    };
+
+    let kept: Vec<ChatMessage> = conv.messages.into_iter().skip(to_summarize).collect();
+    let kept_count = kept.len();
+    let summarized_count = to_summarize;
+
+    if let Err(e) = state.chat.set_messages(owner, agent_name, kept, summary) {
+        finish_api_agent(state, owner, agent_name, &format!("Compact save failed: {e}"));
+        return;
+    }
+
+    finish_api_agent(state, owner, agent_name,
+        &format!("Context compacted. {summarized_count} messages summarized, {kept_count} kept."));
+}
+
+// --- API agent btw ---
+
+async fn run_api_btw(
+    state: AppState,
+    agent: AuthenticatedAgent,
+    owner: String,
+    agent_name: String,
+    btw_message: String,
+) {
+    let endpoint_id = match agent.endpoint_id.as_deref() {
+        Some(id) => id,
+        None => return,
+    };
+    let endpoint = match state.endpoint_store.get(endpoint_id) {
+        Ok(Some(ep)) => ep,
+        _ => return,
+    };
+    let conv = match state.chat.load_conversation(&owner, &agent_name) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let mut system_parts = vec![
+        "You are handling a side question (btw) for a Lore knowledge base agent. \
+         You have full tool access but DO NOT create, update, move, or delete any content \
+         unless the user's message explicitly asks you to make a change. \
+         Read and search freely. Be concise.".to_string()
+    ];
+
+    let project_context = collect_project_context(&state, &agent.grants);
+    if !project_context.is_empty() {
+        system_parts.push(format!("\n## Project Context\n{project_context}"));
+    }
+    if !conv.pinned_context.is_empty() {
+        system_parts.push(format!("\n## Pinned Context\n{}", conv.pinned_context));
+    }
+    if !conv.summary.is_empty() {
+        system_parts.push(format!("\n## Conversation Summary\n{}", conv.summary));
+    }
+
+    let accessible: Vec<String> = agent.grants.iter()
+        .map(|g| {
+            let perm = if g.permission.allows_write() { "read-write" } else { "read" };
+            format!("- {} ({})", g.project.as_str(), perm)
+        })
+        .collect();
+    if !accessible.is_empty() {
+        system_parts.push(format!("\n## Accessible Projects\n{}", accessible.join("\n")));
+    }
+
+    let tools = build_api_agent_tools();
+    let tool_count = tools.len();
+
+    let mut messages = vec![
+        crate::librarian::ProxyChatMessage {
+            role: "system".into(),
+            content: Some(json!(system_parts.join("\n"))),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+        crate::librarian::ProxyChatMessage {
+            role: "user".into(),
+            content: Some(json!(btw_message)),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+    ];
+
+    let mut accumulated_text = String::new();
+    const BTW_MAX_TURNS: usize = 250;
+    const BTW_TURN_WARNINGS: &[usize] = &[150, 200, 237];
+
+    for turn in 0..BTW_MAX_TURNS {
+        trim_old_context(&mut messages, tool_count);
+
+        let req = crate::librarian::ProxyChatRequest {
+            messages: messages.clone(),
+            model: None,
+            stream: Some(false),
+            tools: Some(tools.clone()),
+            temperature: None,
+            max_tokens: Some(16384),
+            top_p: None,
+            stop: None,
+        };
+
+        let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
+        let raw_result = crate::librarian::proxy_non_streaming_raw(
+            &state.librarian_client_http, &endpoint, &url, &body, 120,
+        ).await;
+
+        let response = match raw_result {
+            Ok((status, resp)) => {
+                if !status.is_success() {
+                    let err = crate::librarian::extract_provider_error(&resp);
+                    accumulated_text.push_str(&format!("\n\n[btw error: {err}]"));
+                    break;
+                }
+                resp
+            }
+            Err(e) => {
+                accumulated_text.push_str(&format!("\n\n[btw error: {e}]"));
+                break;
+            }
+        };
+
+        let choice = response.get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first());
+        let message = choice.and_then(|c| c.get("message"));
+        let content = message.and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str()).unwrap_or("").to_string();
+        let tool_calls = message.and_then(|m| m.get("tool_calls"))
+            .and_then(|t| t.as_array()).cloned();
+
+        accumulated_text.push_str(&content);
+
+        if let Some(ref tcs) = tool_calls {
+            if !tcs.is_empty() {
+                messages.push(crate::librarian::ProxyChatMessage {
+                    role: "assistant".into(),
+                    content: if content.is_empty() { None } else { Some(json!(content)) },
+                    tool_calls: Some(tcs.clone()),
+                    tool_call_id: None,
+                    name: None,
+                });
+
+                for tc in tcs {
+                    let tool_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    let func = tc.get("function");
+                    let tool_name = func.and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str()).unwrap_or("");
+                    let raw_args = func.and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str()).unwrap_or("{}");
+                    let tool_args: Value = serde_json::from_str(raw_args).unwrap_or(json!({}));
+
+                    let detail = format_api_tool_display(tool_name, &tool_args);
+                    push_chat_event(&state, &owner, ChatEvent {
+                        event_type: "tool_use".into(),
+                        agent: agent_name.clone(),
+                        owner: owner.clone(),
+                        data: json!({"detail": format!("[btw] {detail}")}),
+                    });
+                    record_api_tool_activity(&state, &owner, &agent_name, tool_name, &tool_args);
+
+                    let result_text = match call_mcp_tool(&state, &agent, Some(&json!({
+                        "name": tool_name,
+                        "arguments": tool_args,
+                    }))) {
+                        Ok(val) => {
+                            let text = val.get("content")
+                                .and_then(|c| c.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|t| t.get("text"))
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
+                            truncate_tool_result(tool_name, text)
+                        }
+                        Err(e) => format!("Error: {e}"),
+                    };
+
+                    messages.push(crate::librarian::ProxyChatMessage {
+                        role: "tool".into(),
+                        content: Some(json!(result_text)),
+                        tool_calls: None,
+                        tool_call_id: Some(tool_id),
+                        name: Some(tool_name.to_string()),
+                    });
+                }
+                if BTW_TURN_WARNINGS.contains(&turn) {
+                    messages.push(crate::librarian::ProxyChatMessage {
+                        role: "user".into(),
+                        content: Some(json!(format!(
+                            "You have used {turn} of {BTW_MAX_TURNS} tool-calling turns. \
+                            You have {} turns remaining. Please wrap up your work and provide a final response soon.",
+                            BTW_MAX_TURNS - turn
+                        ))),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
+                continue;
+            }
+        }
+        break;
+    }
+
+    let final_content = if accumulated_text.trim().is_empty() {
+        "[btw] (no response)".to_string()
+    } else {
+        format!("[btw] {}", accumulated_text.trim())
+    };
+
+    if let Ok(msg) = state.chat.append_message(&owner, &agent_name, ChatRole::Assistant, final_content.clone()) {
+        state.chat_audit.log(&agent_name, &owner, "btw", &final_content);
+        push_chat_event(&state, &owner, ChatEvent {
+            event_type: "response_complete".into(),
+            agent: agent_name.clone(),
+            owner: owner.clone(),
+            data: json!({"id": msg.id, "content": final_content}),
+        });
+    }
+}
+
+// --- Chat completions proxy ---
+
+async fn chat_proxy_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<crate::librarian::ProxyChatRequest>,
+) -> Result<Response, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let endpoint_id = agent.endpoint_id.as_deref()
+        .ok_or_else(|| LoreError::Validation("agent has no endpoint configured".into()))?;
+    let endpoint = state.endpoint_store.get(endpoint_id)?
+        .ok_or_else(|| LoreError::Validation("configured endpoint not found".into()))?;
+
+    let streaming = req.stream.unwrap_or(false);
+    let model = req.model.as_deref().unwrap_or(&endpoint.model).to_string();
+    let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, streaming);
+    let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+
+    // Push tool_use events to the chat UI for visibility
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str().to_string();
+    let agent_name = agent.name.clone();
+
+    if streaming {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::librarian::ProxyStreamChunk>(256);
+        let client = state.librarian_client_http.clone();
+        let ep = endpoint.clone();
+        let url_owned = url.clone();
+        let body_owned = body.clone();
+        tokio::spawn(async move {
+            crate::librarian::proxy_streaming(&client, &ep, &url_owned, &body_owned, 300, tx).await;
+        });
+
+        let model_clone = model.clone();
+        let cid = completion_id.clone();
+        let state_clone = state.clone();
+        let stream = async_stream::stream! {
+            while let Some(chunk) = rx.recv().await {
+                // Forward tool_calls to chat UI
+                if let crate::librarian::ProxyStreamChunk::Delta { tool_calls: ref tc_opt, .. } = chunk {
+                    if let Some(tcs) = tc_opt {
+                        for tc in tcs {
+                            if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+                                if !name.is_empty() {
+                                    push_chat_event(&state_clone, &owner_str, ChatEvent {
+                                        event_type: "tool_use".into(),
+                                        agent: agent_name.clone(),
+                                        owner: owner_str.clone(),
+                                        data: json!({"detail": name}),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(formatted) = crate::librarian::format_openai_stream_chunk(&chunk, &model_clone, &cid) {
+                    yield Ok::<_, std::convert::Infallible>(formatted);
+                }
+                if matches!(chunk, crate::librarian::ProxyStreamChunk::Done) {
+                    break;
+                }
+            }
+        };
+
+        let body = Body::from_stream(stream);
+        Ok(Response::builder()
+            .header("Content-Type", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .body(body)
+            .unwrap())
+    } else {
+        let client = state.librarian_client_http.clone();
+        let result = crate::librarian::proxy_non_streaming(&client, &endpoint, &url, &body, 300).await?;
+        Ok(Json(result).into_response())
+    }
 }
 
 // --- Slash command handler ---
@@ -8696,7 +9919,7 @@ async fn chat_slash_command(
 
     let response_text = match cmd.as_str() {
         "/help" => {
-            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /context -- show summary, pins, window\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- add to pinned context\n    /pins -- show pinned context\n    /unpin <id> -- remove a pin by id\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /clear -- clear messages, keep context\n\n  MODEL\n    /model <name> -- switch model\n    /effort <level> -- low/medium/high/max/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- inject a side message\n    /auto [message] -- repeat after each response (no args to clear)\n    /boop -- ping the agent\n    /hi -- say hello\n\nPinned context can also be edited in the config panel (gear icon).".to_string()
+            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /prompt -- show full agent prompt and context\n    /context -- show message count and summary\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- add to pinned context\n    /pins -- show pinned context\n    /unpin <id> -- remove a pin by id\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /clear -- clear messages, keep context\n\n  MODEL\n    /model <name> -- switch model (process agents)\n    /effort <level> -- low/medium/high/max/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- side question (separate process)\n    /hi -- check if agent is working\n\nPinned context can also be edited in the config panel (gear icon).".to_string()
         }
         "/status" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
@@ -8705,39 +9928,109 @@ async fn chat_slash_command(
                 AgentChatStatus::Thinking => "thinking",
                 AgentChatStatus::Offline => "offline",
             };
-            let backend = agents.iter().find(|a| a.name == agent_name)
-                .map(|a| a.backend.to_string()).unwrap_or_default();
-            let (model, effort) = state.chat.get_backend_prefs(owner, &backend).unwrap_or((None, None));
-            format!(
-                "Agent: {}\nStatus: {}\nBackend: {}\nModel: {}\nEffort: {}\nMessages: {}\nPins: {}\nWindow: {}",
-                agent_name, status_str, backend,
-                model.as_deref().unwrap_or("default"),
-                effort.as_deref().unwrap_or("default"),
-                conv.messages.len(), conv.pins.len(), conv.window_size
-            )
+            let agent_token = agents.iter().find(|a| a.name == agent_name);
+            let is_api = agent_token.map(|a| a.endpoint_id.is_some()).unwrap_or(false);
+            if is_api {
+                let ep_id = agent_token.and_then(|a| a.endpoint_id.as_deref()).unwrap_or("unknown");
+                let (ep_name, ep_kind, ep_model) = state.endpoint_store.get(ep_id)
+                    .ok().flatten()
+                    .map(|ep| (ep.name.clone(), format!("{:?}", ep.kind), ep.model.clone()))
+                    .unwrap_or_else(|| (ep_id.to_string(), "unknown".into(), "unknown".into()));
+                let effort_key = format!("endpoint:{ep_id}");
+                let (_, effort) = state.chat.get_backend_prefs(owner, &effort_key).unwrap_or((None, None));
+                let effort_line = if ep_kind.contains("Anthropic") {
+                    format!("\nEffort: {}", effort.as_deref().unwrap_or("default"))
+                } else {
+                    String::new()
+                };
+                format!(
+                    "Agent: {}\nStatus: {}\nMode: API\nEndpoint: {}\nProvider: {}\nModel: {}{}\nMessages: {}\nPins: {}\nWindow: {}",
+                    agent_name, status_str, ep_name, ep_kind, ep_model, effort_line,
+                    conv.messages.len(), conv.pins.len(), conv.window_size
+                )
+            } else {
+                let backend = agent_token.map(|a| a.backend.clone()).unwrap_or_default();
+                let (model, effort) = state.chat.get_backend_prefs(owner, &backend.to_string()).unwrap_or((None, None));
+                format!(
+                    "Agent: {}\nStatus: {}\nMode: process ({})\nModel: {}\nEffort: {}\nMessages: {}\nPins: {}\nWindow: {}",
+                    agent_name, status_str, backend,
+                    model.as_deref().unwrap_or("default"),
+                    effort.as_deref().unwrap_or("default"),
+                    conv.messages.len(), conv.pins.len(), conv.window_size
+                )
+            }
         }
         "/context" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
             let mut parts = Vec::new();
-
-            if conv.pinned_context.is_empty() {
-                parts.push("No pinned context.".to_string());
-            } else {
-                parts.push("Pinned context:".to_string());
-                parts.push(conv.pinned_context.clone());
+            parts.push(format!("{} messages in window (max {}).", conv.messages.len(), conv.window_size));
+            let git_ctx = collect_git_context(conv.cwd.as_deref());
+            if !git_ctx.is_empty() {
+                parts.push(format!("\nGit:\n{git_ctx}"));
             }
-
+            let activity = get_agent_recent_activity(&state, owner, &agent_name);
+            if !activity.is_empty() {
+                parts.push(format!("\n{activity}"));
+            }
             if conv.summary.is_empty() {
-                parts.push("\nNo summary yet.".to_string());
+                parts.push("No conversation summary yet.".to_string());
             } else {
                 parts.push(format!("\nSummary:\n{}", conv.summary));
             }
+            parts.join("\n")
+        }
+        "/prompt" => {
+            let conv = state.chat.load_conversation(owner, &agent_name)?;
+            let agent_token = agents.iter().find(|a| a.name == agent_name);
+            let is_api = agent_token.map(|a| a.endpoint_id.is_some()).unwrap_or(false);
+            let mut parts = Vec::new();
 
-            parts.push(format!(
-                "\n{} messages in window (max {}).",
-                conv.messages.len(),
-                conv.window_size
-            ));
+            if is_api {
+                let dummy_agent = AuthenticatedAgent {
+                    token: String::new(),
+                    name: agent_name.clone(),
+                    owner: Some(session.user.username.clone()),
+                    grants: agent_token.map(|a| a.grants.clone()).unwrap_or_default(),
+                    backend: AgentBackend::default(),
+                    endpoint_id: agent_token.and_then(|a| a.endpoint_id.clone()),
+                    machine_name: None,
+                };
+                let prompt = build_api_agent_system_prompt(&state, &dummy_agent, &conv);
+                parts.push("== System Prompt ==".to_string());
+                parts.push(prompt);
+            } else {
+                parts.push("== Agent Context (process mode) ==".to_string());
+                let project_context = collect_project_context(&state, &agent_token.map(|a| a.grants.clone()).unwrap_or_default());
+                if !project_context.is_empty() {
+                    parts.push(format!("\n-- Project Context --\n{project_context}"));
+                }
+                if !conv.pinned_context.is_empty() {
+                    parts.push(format!("\n-- Pinned Context --\n{}", conv.pinned_context));
+                }
+                let readable: Vec<String> = agent_token.map(|a| &a.grants).unwrap_or(&vec![]).iter()
+                    .map(|g| {
+                        let perm = if g.permission.allows_write() { "read-write" } else { "read" };
+                        format!("- {} ({})", g.project.as_str(), perm)
+                    })
+                    .collect();
+                if !readable.is_empty() {
+                    parts.push(format!("\n-- Accessible Projects --\n{}", readable.join("\n")));
+                }
+            }
+
+            let git_ctx = collect_git_context(conv.cwd.as_deref());
+            if !git_ctx.is_empty() {
+                parts.push(format!("\n== Git Repository ==\n{git_ctx}"));
+            }
+            let activity = get_agent_recent_activity(&state, owner, &agent_name);
+            if !activity.is_empty() {
+                parts.push(format!("\n== Recent Activity ==\n{activity}"));
+            }
+
+            parts.push(format!("\n== Conversation ==\n{} messages in window (max {}).", conv.messages.len(), conv.window_size));
+            if !conv.summary.is_empty() {
+                parts.push(format!("\n-- Tail Summary --\n{}", conv.summary));
+            }
             parts.join("\n")
         }
         "/pin" => {
@@ -8835,46 +10128,67 @@ async fn chat_slash_command(
             }
         }
         "/model" => {
-            let backend = agents.iter().find(|a| a.name == agent_name)
-                .map(|a| a.backend.to_string()).unwrap_or_default();
-            let (current_model, _) = state.chat.get_backend_prefs(owner, &backend).unwrap_or((None, None));
-            if args.is_empty() {
-                let current = current_model.as_deref().unwrap_or("default");
-                let options = match backend.as_str() {
-                    "gemini" => format!(
-                        "Current model: {current}\n\nOptions:\n  /model gemini-2.5-pro\n  /model gemini-2.5-flash\n  /model gemini-3-pro-preview\n  /model default"
-                    ),
-                    "claude" => format!(
-                        "Current model: {current}\n\nOptions:\n  /model opus (claude-opus-4-6)\n  /model sonnet (claude-sonnet-4-6)\n  /model haiku (claude-haiku-4-5)\n  /model <full-model-id>\n  /model default"
-                    ),
-                    _ => format!(
-                        "Current model: {current}\n\nUsage: /model <model-name>\n  /model default"
-                    ),
-                };
-                options
+            let agent_token = agents.iter().find(|a| a.name == agent_name);
+            let is_api = agent_token.map(|a| a.endpoint_id.is_some()).unwrap_or(false);
+            if is_api {
+                let ep_id = agent_token.and_then(|a| a.endpoint_id.as_deref()).unwrap_or("");
+                let ep_model = state.endpoint_store.get(ep_id).ok().flatten()
+                    .map(|ep| ep.model.clone()).unwrap_or_else(|| "unknown".into());
+                format!("Model is set by endpoint config: {ep_model}\nChange it in the admin panel under Endpoints.")
             } else {
-                let lower = args.to_lowercase();
-                let new_model = if lower == "default" || lower == "off" || lower == "none" {
-                    None
+                let backend = agent_token.map(|a| a.backend.to_string()).unwrap_or_default();
+                let (current_model, _) = state.chat.get_backend_prefs(owner, &backend).unwrap_or((None, None));
+                if args.is_empty() {
+                    let current = current_model.as_deref().unwrap_or("default");
+                    let options = match backend.as_str() {
+                        "gemini" => format!(
+                            "Current model: {current}\n\nOptions:\n  /model gemini-2.5-pro\n  /model gemini-2.5-flash\n  /model gemini-3-pro-preview\n  /model default"
+                        ),
+                        "claude" => format!(
+                            "Current model: {current}\n\nOptions:\n  /model opus (claude-opus-4-6)\n  /model sonnet (claude-sonnet-4-6)\n  /model haiku (claude-haiku-4-5)\n  /model <full-model-id>\n  /model default"
+                        ),
+                        _ => format!(
+                            "Current model: {current}\n\nUsage: /model <model-name>\n  /model default"
+                        ),
+                    };
+                    options
                 } else {
-                    Some(args.clone())
-                };
-                if current_model == new_model {
-                    format!("Already using {} model.", new_model.as_deref().unwrap_or("default"))
-                } else {
-                    state.chat.set_backend_model(owner, &backend, new_model.clone())?;
-                    let label = new_model.as_deref().unwrap_or("default");
-                    format!("Model set to {label} for {backend}. Next message will use it.")
+                    let lower = args.to_lowercase();
+                    let new_model = if lower == "default" || lower == "off" || lower == "none" {
+                        None
+                    } else {
+                        Some(args.clone())
+                    };
+                    if current_model == new_model {
+                        format!("Already using {} model.", new_model.as_deref().unwrap_or("default"))
+                    } else {
+                        state.chat.set_backend_model(owner, &backend, new_model.clone())?;
+                        let label = new_model.as_deref().unwrap_or("default");
+                        format!("Model set to {label} for {backend}. Next message will use it.")
+                    }
                 }
             }
         }
         "/effort" => {
-            let backend = agents.iter().find(|a| a.name == agent_name)
-                .map(|a| a.backend.to_string()).unwrap_or_default();
-            if backend != "claude" {
-                "Effort is only supported for Claude backend.".to_string()
+            let agent_token = agents.iter().find(|a| a.name == agent_name);
+            let is_api = agent_token.map(|a| a.endpoint_id.is_some()).unwrap_or(false);
+            let is_anthropic = if is_api {
+                let ep_id = agent_token.and_then(|a| a.endpoint_id.as_deref()).unwrap_or("");
+                state.endpoint_store.get(ep_id).ok().flatten()
+                    .map(|ep| matches!(ep.kind, EndpointKind::Anthropic))
+                    .unwrap_or(false)
             } else {
-                let (_, current_effort) = state.chat.get_backend_prefs(owner, &backend).unwrap_or((None, None));
+                agent_token.map(|a| a.backend.to_string() == "claude").unwrap_or(false)
+            };
+            if !is_anthropic {
+                "Effort is only supported for Anthropic/Claude.".to_string()
+            } else {
+                let pref_key = if is_api {
+                    format!("endpoint:{}", agent_token.and_then(|a| a.endpoint_id.as_deref()).unwrap_or(""))
+                } else {
+                    agent_token.map(|a| a.backend.to_string()).unwrap_or_default()
+                };
+                let (_, current_effort) = state.chat.get_backend_prefs(owner, &pref_key).unwrap_or((None, None));
                 if args.is_empty() {
                     let current = current_effort.as_deref().unwrap_or("default");
                     format!(
@@ -8886,15 +10200,15 @@ async fn chat_slash_command(
                         if current_effort.is_none() {
                             "Already using default effort.".to_string()
                         } else {
-                            state.chat.set_backend_effort(owner, &backend, None)?;
-                            "Effort reset to default for claude. Next message will use it.".to_string()
+                            state.chat.set_backend_effort(owner, &pref_key, None)?;
+                            "Effort reset to default. Next message will use it.".to_string()
                         }
                     } else if ["low", "medium", "high", "max"].contains(&lower.as_str()) {
                         if current_effort.as_deref() == Some(&lower) {
                             format!("Already using {lower} effort.")
                         } else {
-                            state.chat.set_backend_effort(owner, &backend, Some(lower.clone()))?;
-                            format!("Effort set to {lower} for claude. Next message will use it.")
+                            state.chat.set_backend_effort(owner, &pref_key, Some(lower.clone()))?;
+                            format!("Effort set to {lower}. Next message will use it.")
                         }
                     } else {
                         "Invalid effort level. Options: low, medium, high, max, default".to_string()
@@ -8907,32 +10221,46 @@ async fn chat_slash_command(
             return Ok(Json(json!({"action": "clear"})).into_response());
         }
         "/compact" => {
-            // Queue a compact command for the agent to pick up
-            let msg = state.chat.append_message(
-                owner,
-                &agent_name,
-                ChatRole::User,
-                "/compact".to_string(),
-            )?;
-            let notifier_key = format!("{owner}_{agent_name}");
-            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
-                notify.notify_one();
+            let is_api = agents.iter().find(|a| a.name == agent_name)
+                .map(|a| a.endpoint_id.is_some()).unwrap_or(false);
+            if is_api {
+                let endpoint_id = agents.iter().find(|a| a.name == agent_name)
+                    .and_then(|a| a.endpoint_id.clone());
+                let state_clone = state.clone();
+                let owner_str = owner.to_string();
+                let agent_name_clone = agent_name.clone();
+                tokio::spawn(async move {
+                    run_api_compact(&state_clone, endpoint_id.as_deref(), &owner_str, &agent_name_clone).await;
+                });
+                "Compacting context...".to_string()
+            } else {
+                let _ = state.chat.append_message(
+                    owner, &agent_name, ChatRole::User, "/compact".to_string(),
+                )?;
+                let notifier_key = format!("{owner}_{agent_name}");
+                if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                    notify.notify_one();
+                }
+                "Compacting context...".to_string()
             }
-            "Compacting context...".to_string()
         }
         "/stop" => {
-            // Queue a stop command for the agent
-            let _ = state.chat.append_message(
-                owner,
-                &agent_name,
-                ChatRole::User,
-                "/stop".to_string(),
-            )?;
-            let notifier_key = format!("{owner}_{agent_name}");
-            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
-                notify.notify_one();
+            let is_api = agents.iter().find(|a| a.name == agent_name)
+                .map(|a| a.endpoint_id.is_some()).unwrap_or(false);
+            if is_api {
+                state.chat_agent_stops.lock().unwrap().insert(format!("{owner}_{agent_name}"));
+                let _ = state.chat.update_auto_message(owner, &agent_name, None);
+                "Stop requested. Auto-repeat cleared.".to_string()
+            } else {
+                let _ = state.chat.append_message(
+                    owner, &agent_name, ChatRole::User, "/stop".to_string(),
+                )?;
+                let notifier_key = format!("{owner}_{agent_name}");
+                if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                    notify.notify_one();
+                }
+                "Stop requested.".to_string()
             }
-            "Stop requested.".to_string()
         }
         "/restart" => {
             let _ = state.chat.append_message(
@@ -8978,62 +10306,69 @@ async fn chat_slash_command(
         }
         "/btw" => {
             if args.is_empty() {
-                "Usage: /btw <message> -- inject a side message to the agent".to_string()
+                "Usage: /btw <message> -- side question (runs separately, won't interrupt agent)".to_string()
             } else {
                 let content = format!("[btw] {args}");
                 let _ = state.chat.append_message(
-                    owner,
-                    &agent_name,
-                    ChatRole::User,
-                    content,
+                    owner, &agent_name, ChatRole::User, content,
                 )?;
-                let notifier_key = format!("{owner}_{agent_name}");
-                if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
-                    notify.notify_one();
+                let is_api = agents.iter().find(|a| a.name == agent_name)
+                    .map(|a| a.endpoint_id.is_some()).unwrap_or(false);
+                if is_api {
+                    let token = agents.iter().find(|a| a.name == agent_name).unwrap();
+                    let agent_auth = AuthenticatedAgent {
+                        token: format!("btw-{}", agent_name),
+                        name: agent_name.clone(),
+                        owner: Some(session.user.username.clone()),
+                        grants: token.grants.clone(),
+                        backend: token.backend,
+                        endpoint_id: token.endpoint_id.clone(),
+                        machine_name: None,
+                    };
+                    let state_clone = state.clone();
+                    let owner_str = owner.to_string();
+                    let agent_name_clone = agent_name.clone();
+                    let btw_msg = args.clone();
+                    tokio::spawn(async move {
+                        run_api_btw(state_clone, agent_auth, owner_str, agent_name_clone, btw_msg).await;
+                    });
+                    format!("[btw] {args}")
+                } else {
+                    let notifier_key = format!("{owner}_{agent_name}");
+                    if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                        notify.notify_one();
+                    }
+                    format!("Sent: [btw] {args}")
                 }
-                format!("Sent: [btw] {args}")
             }
         }
         "/auto" => {
-            if args.is_empty() {
-                let conv = state.chat.load_conversation(owner, &agent_name)?;
-                match &conv.auto_message {
-                    Some(msg) => {
-                        state.chat.update_auto_message(owner, &agent_name, None)?;
-                        format!("Auto-repeat cleared (was: \"{msg}\").")
-                    }
-                    None => "No auto-repeat set.\n\nUsage: /auto <message> -- repeat after each response\n  /auto -- clear auto-repeat".to_string(),
-                }
-            } else {
-                state.chat.update_auto_message(owner, &agent_name, Some(args.clone()))?;
-                format!("Auto-repeat set: \"{args}\"\nAgent will receive this after each response. Use /auto to clear.")
-            }
-        }
-        "/boop" => {
-            let _ = state.chat.append_message(
-                owner,
-                &agent_name,
-                ChatRole::User,
-                "*boop*".to_string(),
-            )?;
-            let notifier_key = format!("{owner}_{agent_name}");
-            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
-                notify.notify_one();
-            }
-            "*boop* sent.".to_string()
+            "Unknown command. Type /help for available commands.".to_string()
         }
         "/hi" => {
-            let _ = state.chat.append_message(
-                owner,
-                &agent_name,
-                ChatRole::User,
-                "hi".to_string(),
-            )?;
-            let notifier_key = format!("{owner}_{agent_name}");
-            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
-                notify.notify_one();
+            let conv = state.chat.load_conversation(owner, &agent_name)?;
+            let display = agents.iter().find(|a| a.name == agent_name)
+                .and_then(|a| a.display_name.as_deref())
+                .unwrap_or(&agent_name);
+            match conv.agent_status {
+                AgentChatStatus::Thinking => {
+                    let mut parts = vec![format!("{display} is processing a request.")];
+                    if let Some(ref last) = conv.last_seen {
+                        let elapsed = (time::OffsetDateTime::now_utc() - *last).whole_seconds();
+                        let ago = if elapsed < 60 {
+                            format!("{elapsed}s ago")
+                        } else if elapsed < 3600 {
+                            format!("{}m {}s ago", elapsed / 60, elapsed % 60)
+                        } else {
+                            format!("{}h {}m ago", elapsed / 3600, (elapsed % 3600) / 60)
+                        };
+                        parts.push(format!("Last activity: {ago}"));
+                    }
+                    parts.join("\n")
+                }
+                AgentChatStatus::Idle => format!("{display} is idle."),
+                AgentChatStatus::Offline => format!("{display} is offline."),
             }
-            "Said hi.".to_string()
         }
         "/report" => {
             let all_agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;

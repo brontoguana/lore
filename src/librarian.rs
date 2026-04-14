@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const MAX_ENDPOINT_URL_LEN: usize = 2048;
@@ -1209,7 +1210,7 @@ fn extract_provider_response_text(
     }
 }
 
-fn extract_provider_error(value: &serde_json::Value) -> String {
+pub fn extract_provider_error(value: &serde_json::Value) -> String {
     value
         .get("error")
         .and_then(|e| e.get("message"))
@@ -1435,6 +1436,712 @@ where
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+// --- Chat completions proxy ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyChatMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProxyChatRequest {
+    pub messages: Vec<ProxyChatMessage>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub stop: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyStreamChunk {
+    Delta { content: Option<String>, tool_calls: Option<Vec<serde_json::Value>>, finish_reason: Option<String> },
+    Done,
+    Error(String),
+}
+
+fn translate_messages_to_anthropic(
+    messages: &[ProxyChatMessage],
+    tools: &Option<Vec<serde_json::Value>>,
+) -> (Option<String>, Vec<serde_json::Value>, Option<Vec<serde_json::Value>>) {
+    let mut system_prompt = None;
+    let mut out = Vec::new();
+    for msg in messages {
+        if msg.role == "system" {
+            if let Some(ref c) = msg.content {
+                let text = content_to_text(c);
+                system_prompt = Some(match system_prompt {
+                    Some(existing) => format!("{existing}\n{text}"),
+                    None => text,
+                });
+            }
+            continue;
+        }
+        if msg.role == "tool" {
+            out.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                    "content": content_to_text(&msg.content.clone().unwrap_or(json!(""))),
+                }]
+            }));
+            continue;
+        }
+        if msg.role == "assistant" {
+            let mut content_blocks = Vec::new();
+            if let Some(ref c) = msg.content {
+                let text = content_to_text(c);
+                if !text.is_empty() {
+                    content_blocks.push(json!({"type": "text", "text": text}));
+                }
+            }
+            if let Some(ref tcs) = msg.tool_calls {
+                for tc in tcs {
+                    let input: serde_json::Value = tc.get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str())
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or(json!({}));
+                    content_blocks.push(json!({
+                        "type": "tool_use",
+                        "id": tc.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                        "name": tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or(""),
+                        "input": input,
+                    }));
+                }
+            }
+            if content_blocks.is_empty() {
+                content_blocks.push(json!({"type": "text", "text": ""}));
+            }
+            out.push(json!({"role": "assistant", "content": content_blocks}));
+            continue;
+        }
+        // user
+        out.push(json!({"role": "user", "content": content_to_text(&msg.content.clone().unwrap_or(json!("")))}));
+    }
+
+    let translated_tools = tools.as_ref().map(|tl| {
+        tl.iter().map(|t| {
+            let func = t.get("function").cloned().unwrap_or(json!({}));
+            json!({
+                "name": func.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                "description": func.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                "input_schema": func.get("parameters").cloned().unwrap_or(json!({"type": "object"})),
+            })
+        }).collect()
+    });
+    (system_prompt, out, translated_tools)
+}
+
+fn translate_messages_to_gemini(
+    messages: &[ProxyChatMessage],
+    tools: &Option<Vec<serde_json::Value>>,
+) -> (Option<serde_json::Value>, Vec<serde_json::Value>, Option<serde_json::Value>) {
+    let mut system_instruction = None;
+    let mut contents = Vec::new();
+    for msg in messages {
+        if msg.role == "system" {
+            if let Some(ref c) = msg.content {
+                system_instruction = Some(json!({"parts": [{"text": content_to_text(c)}]}));
+            }
+            continue;
+        }
+        if msg.role == "tool" {
+            contents.push(json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": msg.name.as_deref().unwrap_or("tool"),
+                        "response": {"result": content_to_text(&msg.content.clone().unwrap_or(json!("")))}
+                    }
+                }]
+            }));
+            continue;
+        }
+        if msg.role == "assistant" {
+            let mut parts = Vec::new();
+            if let Some(ref c) = msg.content {
+                let text = content_to_text(c);
+                if !text.is_empty() {
+                    parts.push(json!({"text": text}));
+                }
+            }
+            if let Some(ref tcs) = msg.tool_calls {
+                for tc in tcs {
+                    let args: serde_json::Value = tc.get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str())
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or(json!({}));
+                    parts.push(json!({
+                        "functionCall": {
+                            "name": tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or(""),
+                            "args": args,
+                        }
+                    }));
+                }
+            }
+            if parts.is_empty() {
+                parts.push(json!({"text": ""}));
+            }
+            contents.push(json!({"role": "model", "parts": parts}));
+            continue;
+        }
+        // user
+        contents.push(json!({
+            "role": "user",
+            "parts": [{"text": content_to_text(&msg.content.clone().unwrap_or(json!("")))}]
+        }));
+    }
+
+    let translated_tools = tools.as_ref().map(|tl| {
+        let decls: Vec<serde_json::Value> = tl.iter().map(|t| {
+            let func = t.get("function").cloned().unwrap_or(json!({}));
+            json!({
+                "name": func.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                "description": func.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                "parameters": func.get("parameters").cloned().unwrap_or(json!({"type": "object"})),
+            })
+        }).collect();
+        json!([{"functionDeclarations": decls}])
+    });
+    (system_instruction, contents, translated_tools)
+}
+
+fn content_to_text(value: &serde_json::Value) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = value.as_array() {
+        let mut out = String::new();
+        for part in arr {
+            if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(t);
+                }
+            }
+        }
+        return out;
+    }
+    value.to_string()
+}
+
+pub fn build_proxy_request(
+    endpoint: &Endpoint,
+    req: &ProxyChatRequest,
+    streaming: bool,
+) -> (String, serde_json::Value) {
+    let model = req.model.as_deref().unwrap_or(&endpoint.model);
+    let max_tokens = req.max_tokens.unwrap_or(8192);
+
+    match endpoint.kind {
+        EndpointKind::OpenAi => {
+            let mut body = json!({
+                "model": model,
+                "messages": req.messages,
+                "stream": streaming,
+            });
+            if let Some(t) = req.temperature { body["temperature"] = json!(t); }
+            if let Some(p) = req.top_p { body["top_p"] = json!(p); }
+            if let Some(ref s) = req.stop { body["stop"] = s.clone(); }
+            body["max_tokens"] = json!(max_tokens);
+            if let Some(ref tools) = req.tools {
+                if !tools.is_empty() {
+                    body["tools"] = json!(tools);
+                }
+            }
+            (endpoint.url.clone(), body)
+        }
+        EndpointKind::Anthropic => {
+            let (system, messages, tools) = translate_messages_to_anthropic(&req.messages, &req.tools);
+            let mut body = json!({
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "stream": streaming,
+            });
+            if let Some(sys) = system { body["system"] = json!(sys); }
+            if let Some(t) = req.temperature { body["temperature"] = json!(t); }
+            if let Some(p) = req.top_p { body["top_p"] = json!(p); }
+            if let Some(ref s) = req.stop { body["stop_sequences"] = s.clone(); }
+            if let Some(tl) = tools {
+                if !tl.is_empty() {
+                    body["tools"] = json!(tl);
+                }
+            }
+            let base = endpoint.url.trim_end_matches('/');
+            let url = if base.ends_with("/messages") {
+                base.to_string()
+            } else if base.contains("/v1") {
+                format!("{}/messages", base.split("/v1").next().unwrap_or(base).to_string() + "/v1")
+            } else {
+                format!("{base}/v1/messages")
+            };
+            (url, body)
+        }
+        EndpointKind::Gemini => {
+            let (system_instruction, contents, tools) = translate_messages_to_gemini(&req.messages, &req.tools);
+            let mut body = json!({
+                "contents": contents,
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                },
+            });
+            if let Some(si) = system_instruction {
+                body["system_instruction"] = si;
+            }
+            if let Some(t) = req.temperature { body["generationConfig"]["temperature"] = json!(t); }
+            if let Some(p) = req.top_p { body["generationConfig"]["topP"] = json!(p); }
+            if let Some(ref s) = req.stop { body["generationConfig"]["stopSequences"] = s.clone(); }
+            if let Some(tl) = tools {
+                body["tools"] = tl;
+            }
+            let base = endpoint.url.trim_end_matches('/');
+            let base_clean = base.split("/v1beta").next().unwrap_or(base).split("/v1").next().unwrap_or(base);
+            let action = if streaming { "streamGenerateContent?alt=sse" } else { "generateContent" };
+            let url = if let Some(ref key) = endpoint.api_key {
+                format!("{base_clean}/v1beta/models/{model}:{action}&key={key}")
+            } else {
+                format!("{base_clean}/v1beta/models/{model}:{action}")
+            };
+            (url, body)
+        }
+    }
+}
+
+pub fn add_proxy_auth(
+    req: reqwest::RequestBuilder,
+    endpoint: &Endpoint,
+) -> reqwest::RequestBuilder {
+    add_provider_auth(req, endpoint)
+}
+
+pub async fn proxy_streaming(
+    client: &Client,
+    endpoint: &Endpoint,
+    url: &str,
+    body: &serde_json::Value,
+    timeout_secs: u64,
+    tx: mpsc::Sender<ProxyStreamChunk>,
+) {
+    let http = add_provider_auth(client.post(url).json(body), endpoint);
+    let response = match http.timeout(Duration::from_secs(timeout_secs)).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await;
+            return;
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .map(|v| extract_provider_error(&v))
+            .unwrap_or_else(|| format!("provider returned {status}"));
+        let _ = tx.send(ProxyStreamChunk::Error(detail)).await;
+        return;
+    }
+
+    match endpoint.kind {
+        EndpointKind::OpenAi => stream_openai(response, tx).await,
+        EndpointKind::Anthropic => stream_anthropic(response, tx).await,
+        EndpointKind::Gemini => stream_gemini(response, tx).await,
+    }
+}
+
+pub async fn proxy_non_streaming(
+    client: &Client,
+    endpoint: &Endpoint,
+    url: &str,
+    body: &serde_json::Value,
+    timeout_secs: u64,
+) -> Result<serde_json::Value> {
+    let (status, value) = proxy_non_streaming_raw(client, endpoint, url, body, timeout_secs).await?;
+    if !status.is_success() {
+        return Err(LoreError::ExternalService(extract_provider_error(&value)));
+    }
+    Ok(value)
+}
+
+pub async fn proxy_non_streaming_raw(
+    client: &Client,
+    endpoint: &Endpoint,
+    url: &str,
+    body: &serde_json::Value,
+    timeout_secs: u64,
+) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+    let http = add_provider_auth(client.post(url).json(body), endpoint);
+    let response = http.timeout(Duration::from_secs(timeout_secs)).send().await
+        .map_err(|e| LoreError::ExternalService(e.to_string()))?;
+    let status = response.status();
+    let value: serde_json::Value = response.json().await
+        .map_err(|e| LoreError::ExternalService(e.to_string()))?;
+    let translated = if status.is_success() {
+        match endpoint.kind {
+            EndpointKind::OpenAi => value,
+            EndpointKind::Anthropic => anthropic_response_to_openai(&value),
+            EndpointKind::Gemini => gemini_response_to_openai(&value, &endpoint.model),
+        }
+    } else {
+        value
+    };
+    Ok((status, translated))
+}
+
+fn anthropic_response_to_openai(value: &serde_json::Value) -> serde_json::Value {
+    let mut content_text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut tc_idx = 0;
+    if let Some(blocks) = value.get("content").and_then(|c| c.as_array()) {
+        for block in blocks {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                        content_text.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    tool_calls.push(json!({
+                        "index": tc_idx,
+                        "id": block.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                            "arguments": block.get("input").map(|i| i.to_string()).unwrap_or_else(|| "{}".into()),
+                        }
+                    }));
+                    tc_idx += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let finish = value.get("stop_reason").and_then(|s| s.as_str()).map(|s| match s {
+        "end_turn" => "stop",
+        "tool_use" => "tool_calls",
+        "max_tokens" => "length",
+        other => other,
+    }).unwrap_or("stop");
+
+    let mut msg = json!({"role": "assistant"});
+    if !content_text.is_empty() { msg["content"] = json!(content_text); }
+    if !tool_calls.is_empty() { msg["tool_calls"] = json!(tool_calls); }
+    json!({
+        "id": value.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+        "object": "chat.completion",
+        "model": value.get("model").and_then(|m| m.as_str()).unwrap_or(""),
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+        "usage": value.get("usage").cloned().unwrap_or(json!({})),
+    })
+}
+
+fn gemini_response_to_openai(value: &serde_json::Value, model: &str) -> serde_json::Value {
+    let candidate = value.get("candidates").and_then(|c| c.as_array()).and_then(|c| c.first());
+    let mut content_text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut tc_idx = 0;
+    if let Some(parts) = candidate.and_then(|c| c.get("content")).and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+        for part in parts {
+            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                content_text.push_str(t);
+            }
+            if let Some(fc) = part.get("functionCall") {
+                tool_calls.push(json!({
+                    "index": tc_idx,
+                    "id": format!("call_{}", Uuid::new_v4()),
+                    "type": "function",
+                    "function": {
+                        "name": fc.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                        "arguments": fc.get("args").map(|a| a.to_string()).unwrap_or_else(|| "{}".into()),
+                    }
+                }));
+                tc_idx += 1;
+            }
+        }
+    }
+    let finish = if !tool_calls.is_empty() { "tool_calls" }
+        else if candidate.and_then(|c| c.get("finishReason")).and_then(|f| f.as_str()) == Some("MAX_TOKENS") { "length" }
+        else { "stop" };
+
+    let mut msg = json!({"role": "assistant"});
+    if !content_text.is_empty() { msg["content"] = json!(content_text); }
+    if !tool_calls.is_empty() { msg["tool_calls"] = json!(tool_calls); }
+    json!({
+        "id": format!("chatcmpl-{}", Uuid::new_v4()),
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+    })
+}
+
+// --- SSE stream parsers ---
+
+async fn stream_openai(response: reqwest::Response, tx: mpsc::Sender<ProxyStreamChunk>) {
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => { let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await; return; }
+        };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = buf.find("\n\n") {
+            let event_block = buf[..pos].to_string();
+            buf = buf[pos + 2..].to_string();
+            for line in event_block.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data.trim() == "[DONE]" {
+                        let _ = tx.send(ProxyStreamChunk::Done).await;
+                        return;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()) {
+                            let delta = choice.get("delta").cloned().unwrap_or(json!({}));
+                            let _ = tx.send(ProxyStreamChunk::Delta {
+                                content: delta.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                                tool_calls: delta.get("tool_calls").and_then(|t| t.as_array()).cloned(),
+                                finish_reason: choice.get("finish_reason").and_then(|f| f.as_str()).map(|s| s.to_string()),
+                            }).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = tx.send(ProxyStreamChunk::Done).await;
+}
+
+async fn stream_anthropic(response: reqwest::Response, tx: mpsc::Sender<ProxyStreamChunk>) {
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    let mut current_tool_args = String::new();
+    let mut tool_index: i64 = -1;
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => { let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await; return; }
+        };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = buf.find("\n\n") {
+            let event_block = buf[..pos].to_string();
+            buf = buf[pos + 2..].to_string();
+
+            let mut event_type = "";
+            let mut data_str = "";
+            for line in event_block.lines() {
+                if let Some(et) = line.strip_prefix("event: ") {
+                    event_type = et.trim();
+                } else if let Some(d) = line.strip_prefix("data: ") {
+                    data_str = d;
+                }
+            }
+            if data_str.is_empty() { continue; }
+            let data: serde_json::Value = match serde_json::from_str(data_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            match event_type {
+                "content_block_delta" => {
+                    if let Some(delta) = data.get("delta") {
+                        match delta.get("type").and_then(|t| t.as_str()) {
+                            Some("text_delta") => {
+                                let _ = tx.send(ProxyStreamChunk::Delta {
+                                    content: delta.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()),
+                                    tool_calls: None,
+                                    finish_reason: None,
+                                }).await;
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(partial) = delta.get("partial_json").and_then(|p| p.as_str()) {
+                                    current_tool_args.push_str(partial);
+                                    let _ = tx.send(ProxyStreamChunk::Delta {
+                                        content: None,
+                                        tool_calls: Some(vec![json!({
+                                            "index": tool_index,
+                                            "function": {"arguments": partial}
+                                        })]),
+                                        finish_reason: None,
+                                    }).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "content_block_start" => {
+                    if let Some(cb) = data.get("content_block") {
+                        if cb.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            tool_index += 1;
+                            current_tool_id = cb.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                            current_tool_name = cb.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                            current_tool_args.clear();
+                            let _ = tx.send(ProxyStreamChunk::Delta {
+                                content: None,
+                                tool_calls: Some(vec![json!({
+                                    "index": tool_index,
+                                    "id": current_tool_id,
+                                    "type": "function",
+                                    "function": {"name": current_tool_name, "arguments": ""}
+                                })]),
+                                finish_reason: None,
+                            }).await;
+                        }
+                    }
+                }
+                "message_delta" => {
+                    let reason = data.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str());
+                    let finish = reason.map(|r| match r {
+                        "end_turn" => "stop".to_string(),
+                        "tool_use" => "tool_calls".to_string(),
+                        "max_tokens" => "length".to_string(),
+                        other => other.to_string(),
+                    });
+                    if finish.is_some() {
+                        let _ = tx.send(ProxyStreamChunk::Delta {
+                            content: None,
+                            tool_calls: None,
+                            finish_reason: finish,
+                        }).await;
+                    }
+                }
+                "message_stop" => {
+                    let _ = tx.send(ProxyStreamChunk::Done).await;
+                    return;
+                }
+                "error" => {
+                    let msg = data.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("stream error");
+                    let _ = tx.send(ProxyStreamChunk::Error(msg.to_string())).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+    let _ = tx.send(ProxyStreamChunk::Done).await;
+}
+
+async fn stream_gemini(response: reqwest::Response, tx: mpsc::Sender<ProxyStreamChunk>) {
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+    let mut tool_idx_offset: usize = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => { let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await; return; }
+        };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = buf.find("\n\n") {
+            let event_block = buf[..pos].to_string();
+            buf = buf[pos + 2..].to_string();
+            for line in event_block.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    let v: serde_json::Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let candidate = v.get("candidates").and_then(|c| c.as_array()).and_then(|c| c.first());
+                    if let Some(parts) = candidate.and_then(|c| c.get("content")).and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                        for part in parts {
+                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                let _ = tx.send(ProxyStreamChunk::Delta {
+                                    content: Some(t.to_string()),
+                                    tool_calls: None,
+                                    finish_reason: None,
+                                }).await;
+                            }
+                            if let Some(fc) = part.get("functionCall") {
+                                let _ = tx.send(ProxyStreamChunk::Delta {
+                                    content: None,
+                                    tool_calls: Some(vec![json!({
+                                        "index": tool_idx_offset,
+                                        "id": format!("call_{}", Uuid::new_v4()),
+                                        "type": "function",
+                                        "function": {
+                                            "name": fc.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                                            "arguments": fc.get("args").map(|a| a.to_string()).unwrap_or_else(|| "{}".into()),
+                                        }
+                                    })]),
+                                    finish_reason: None,
+                                }).await;
+                                tool_idx_offset += 1;
+                            }
+                        }
+                    }
+                    let finish = candidate.and_then(|c| c.get("finishReason")).and_then(|f| f.as_str());
+                    if let Some(reason) = finish {
+                        let fr = match reason {
+                            "STOP" => "stop",
+                            "MAX_TOKENS" => "length",
+                            _ => if tool_idx_offset > 0 { "tool_calls" } else { "stop" },
+                        };
+                        let _ = tx.send(ProxyStreamChunk::Delta {
+                            content: None,
+                            tool_calls: None,
+                            finish_reason: Some(fr.to_string()),
+                        }).await;
+                    }
+                }
+            }
+        }
+    }
+    let _ = tx.send(ProxyStreamChunk::Done).await;
+}
+
+pub fn format_openai_stream_chunk(
+    chunk: &ProxyStreamChunk,
+    model: &str,
+    completion_id: &str,
+) -> Option<String> {
+    match chunk {
+        ProxyStreamChunk::Delta { content, tool_calls, finish_reason } => {
+            let mut delta = json!({});
+            if let Some(c) = content { delta["content"] = json!(c); }
+            if let Some(tc) = tool_calls { delta["tool_calls"] = json!(tc); }
+            let mut choice = json!({"index": 0, "delta": delta});
+            if let Some(fr) = finish_reason { choice["finish_reason"] = json!(fr); }
+            let obj = json!({
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [choice],
+            });
+            Some(format!("data: {}\n\n", obj))
+        }
+        ProxyStreamChunk::Done => Some("data: [DONE]\n\n".to_string()),
+        ProxyStreamChunk::Error(msg) => {
+            let obj = json!({"error": {"message": msg, "type": "proxy_error"}});
+            Some(format!("data: {}\n\n", obj))
+        }
+    }
 }
 
 #[cfg(test)]
