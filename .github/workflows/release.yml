@@ -55,6 +55,11 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
+      - name: Inject tag version into Cargo.toml
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"${TAG}\"/" Cargo.toml
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
