@@ -7771,6 +7771,12 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-size: 16px;
     }
 
+    .create-agent-panel select,
+    .create-agent-panel button {
+      width: auto;
+      min-height: auto;
+    }
+
     .callout {
       display: grid;
       gap: var(--s-3);

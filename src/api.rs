@@ -8753,6 +8753,163 @@ async fn chat_agent_config(
     Ok(Json(resp))
 }
 
+// --- Exchange helpers ---
+// An "exchange" = one user message + all following assistant messages until the next user message.
+// This matches Snoot's MessagePair concept. Window size, compaction, and context
+// management all count exchanges, not individual messages.
+
+fn count_exchanges(messages: &[ChatMessage]) -> usize {
+    messages.iter().filter(|m| m.role == ChatRole::User).count()
+}
+
+/// Returns the message index where each exchange starts (i.e. each User message index).
+fn exchange_boundaries(messages: &[ChatMessage]) -> Vec<usize> {
+    messages.iter().enumerate()
+        .filter(|(_, m)| m.role == ChatRole::User)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting conversation history for an LLM that \
+will continue this work in a future session. The LLM cannot see these messages \u{2014} only your \
+summary. Write high-signal notes that help it pick up where things left off.\n\n\
+Write ONLY what a new session needs to know:\n\
+- Decisions made and WHY (the reasoning matters more than the action)\n\
+- What changed: \"refactored X from Y to Z\" not \"edited file.rs lines 200-350\"\n\
+- Bugs found, root causes identified, fixes applied\n\
+- Requirements or constraints the user stated\n\
+- Work in progress or explicitly planned next steps\n\
+- Anything surprising or non-obvious that was discovered\n\n\
+Do NOT include:\n\
+- Small talk, greetings, acknowledgments\n\
+- Step-by-step narration of tool use (\"read file X, then edited Y\")\n\
+- File contents or code snippets (the LLM can re-read files)\n\
+- Things that are obvious from reading the current code\n\
+- Alternatives that were discussed then rejected (unless the rejection reason is important)\n\n\
+Keep it concise. A few dense paragraphs are better than an exhaustive log. If there is a current \
+summary, integrate the new messages into it \u{2014} update or replace outdated information rather \
+than appending.";
+
+/// Exchange-based compaction. Returns Ok(message) on success, Err(message) on failure.
+async fn do_exchange_compact(
+    state: &AppState,
+    endpoint_id: Option<&str>,
+    owner: &str,
+    agent_name: &str,
+    aggressive: bool,
+) -> Result<String, String> {
+    let endpoint_id = endpoint_id
+        .ok_or_else(|| "Compact failed: no endpoint configured.".to_string())?;
+    let endpoint = state.endpoint_store.get(endpoint_id)
+        .map_err(|e| format!("Compact failed: {e}"))?
+        .ok_or_else(|| "Compact failed: endpoint not found.".to_string())?;
+    let conv = state.chat.load_conversation(owner, agent_name)
+        .map_err(|e| format!("Compact failed: {e}"))?;
+
+    let exchanges = count_exchanges(&conv.messages);
+    if exchanges <= 2 {
+        return Err("Nothing to compact (2 or fewer exchanges).".to_string());
+    }
+
+    let target = if aggressive {
+        conv.window_size / 2
+    } else {
+        conv.window_size.saturating_sub(7).max(1)
+    };
+
+    let boundaries = exchange_boundaries(&conv.messages);
+    let keep_count = target.min(exchanges - 1);
+    let keep_from_exchange = boundaries.len().saturating_sub(keep_count);
+    let split_idx = boundaries[keep_from_exchange];
+
+    let to_summarize = &conv.messages[..split_idx];
+    if to_summarize.is_empty() {
+        return Err("Nothing to compact.".to_string());
+    }
+    let kept: Vec<ChatMessage> = conv.messages[split_idx..].to_vec();
+
+    let mut conversation_text = String::new();
+    if !conv.summary.is_empty() {
+        conversation_text.push_str(&format!("<current_summary>\n{}\n</current_summary>\n\n", conv.summary));
+    }
+    conversation_text.push_str("<messages_to_compact>\n");
+    for msg in to_summarize {
+        let role = match msg.role {
+            ChatRole::User => "User",
+            ChatRole::Assistant => "Assistant",
+        };
+        let content: String = msg.content.chars().take(2000).collect();
+        let content = if content.len() < msg.content.len() {
+            format!("{content}...")
+        } else {
+            content
+        };
+        conversation_text.push_str(&format!("{role}: {content}\n"));
+    }
+    conversation_text.push_str("</messages_to_compact>");
+
+    let summary_messages = vec![
+        crate::librarian::ProxyChatMessage {
+            role: "system".into(),
+            content: Some(json!(COMPACTION_SYSTEM_PROMPT)),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+        crate::librarian::ProxyChatMessage {
+            role: "user".into(),
+            content: Some(json!(conversation_text)),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+    ];
+
+    let req = crate::librarian::ProxyChatRequest {
+        messages: summary_messages,
+        model: None,
+        stream: Some(false),
+        tools: None,
+        temperature: None,
+        max_tokens: Some(4096),
+        top_p: None,
+        stop: None,
+    };
+
+    let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
+    let result = crate::librarian::proxy_non_streaming_raw(
+        &state.librarian_client_http, &endpoint, &url, &body, 60,
+    ).await;
+
+    let summary = match result {
+        Ok((status, ref response)) if status.is_success() => {
+            response.get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("(summary generation failed)")
+                .to_string()
+        }
+        Ok((_, ref response)) => {
+            let err = crate::librarian::extract_provider_error(response);
+            return Err(format!("Compact failed: {err}"));
+        }
+        Err(e) => {
+            return Err(format!("Compact failed: {e}"));
+        }
+    };
+
+    let summarized_exchanges = keep_from_exchange;
+    let kept_exchanges = count_exchanges(&kept);
+
+    state.chat.set_messages(owner, agent_name, kept, summary)
+        .map_err(|e| format!("Compact save failed: {e}"))?;
+
+    Ok(format!("Context compacted. {summarized_exchanges} exchanges summarized, {kept_exchanges} kept."))
+}
+
 // --- API agent loop ---
 
 const API_AGENT_MAX_TURNS: usize = 500;
@@ -9194,7 +9351,14 @@ async fn run_api_agent_loop(
             let final_content = if accumulated_text.is_empty() { "(no response)".to_string() } else { accumulated_text };
             finish_api_agent(&state, &owner, &agent_name, &final_content);
 
+            // Auto-compaction: check if exchanges exceed window_size
             if let Ok(conv) = state.chat.load_conversation(&owner, &agent_name) {
+                let exchanges = count_exchanges(&conv.messages);
+                if exchanges >= conv.window_size {
+                    eprintln!("[agent] Auto-compacting {agent_name}: {exchanges} exchanges >= window {}", conv.window_size);
+                    let _ = do_exchange_compact(&state, agent.endpoint_id.as_deref(), &owner, &agent_name, false).await;
+                }
+
                 if let Some(auto_msg) = &conv.auto_message {
                     if let Ok(auto_stored) = state.chat.append_message(
                         &owner, &agent_name, ChatRole::User, auto_msg.clone(),
@@ -9388,7 +9552,7 @@ fn format_api_tool_display(name: &str, args: &Value) -> String {
     }
 }
 
-// --- API agent compact ---
+// --- API agent compact (delegates to do_exchange_compact) ---
 
 async fn run_api_compact(
     state: &AppState,
@@ -9396,119 +9560,9 @@ async fn run_api_compact(
     owner: &str,
     agent_name: &str,
 ) {
-    let endpoint_id = match endpoint_id {
-        Some(id) => id,
-        None => {
-            finish_api_agent(state, owner, agent_name, "Compact failed: no endpoint configured.");
-            return;
-        }
-    };
-    let endpoint = match state.endpoint_store.get(endpoint_id) {
-        Ok(Some(ep)) => ep,
-        _ => {
-            finish_api_agent(state, owner, agent_name, "Compact failed: endpoint not found.");
-            return;
-        }
-    };
-    let conv = match state.chat.load_conversation(owner, agent_name) {
-        Ok(c) => c,
-        Err(e) => {
-            finish_api_agent(state, owner, agent_name, &format!("Compact failed: {e}"));
-            return;
-        }
-    };
-
-    if conv.messages.len() <= 4 {
-        finish_api_agent(state, owner, agent_name, "Nothing to compact (4 or fewer messages).");
-        return;
+    match do_exchange_compact(state, endpoint_id, owner, agent_name, true).await {
+        Ok(msg) | Err(msg) => finish_api_agent(state, owner, agent_name, &msg),
     }
-
-    let to_summarize = conv.messages.len().saturating_sub(4);
-    let mut conversation_text = String::new();
-    if !conv.summary.is_empty() {
-        conversation_text.push_str(&format!("Previous summary:\n{}\n\n", conv.summary));
-    }
-    conversation_text.push_str("Messages to summarize:\n");
-    for msg in &conv.messages[..to_summarize] {
-        let role = match msg.role {
-            ChatRole::User => "User",
-            ChatRole::Assistant => "Assistant",
-        };
-        let content: String = msg.content.chars().take(2000).collect();
-        let content = if content.len() < msg.content.len() {
-            format!("{content}...")
-        } else {
-            content
-        };
-        conversation_text.push_str(&format!("{role}: {content}\n"));
-    }
-
-    let summary_messages = vec![
-        crate::librarian::ProxyChatMessage {
-            role: "system".into(),
-            content: Some(json!("Summarize this conversation. Capture key facts, decisions, requests, and outcomes. Be comprehensive but concise. Output only the summary.")),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        },
-        crate::librarian::ProxyChatMessage {
-            role: "user".into(),
-            content: Some(json!(conversation_text)),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        },
-    ];
-
-    let req = crate::librarian::ProxyChatRequest {
-        messages: summary_messages,
-        model: None,
-        stream: Some(false),
-        tools: None,
-        temperature: None,
-        max_tokens: Some(4096),
-        top_p: None,
-        stop: None,
-    };
-
-    let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
-    let result = crate::librarian::proxy_non_streaming_raw(
-        &state.librarian_client_http, &endpoint, &url, &body, 60,
-    ).await;
-
-    let summary = match result {
-        Ok((status, ref response)) if status.is_success() => {
-            response.get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|c| c.first())
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("(summary generation failed)")
-                .to_string()
-        }
-        Ok((_, ref response)) => {
-            let err = crate::librarian::extract_provider_error(response);
-            finish_api_agent(state, owner, agent_name, &format!("Compact failed: {err}"));
-            return;
-        }
-        Err(e) => {
-            finish_api_agent(state, owner, agent_name, &format!("Compact failed: {e}"));
-            return;
-        }
-    };
-
-    let kept: Vec<ChatMessage> = conv.messages.into_iter().skip(to_summarize).collect();
-    let kept_count = kept.len();
-    let summarized_count = to_summarize;
-
-    if let Err(e) = state.chat.set_messages(owner, agent_name, kept, summary) {
-        finish_api_agent(state, owner, agent_name, &format!("Compact save failed: {e}"));
-        return;
-    }
-
-    finish_api_agent(state, owner, agent_name,
-        &format!("Context compacted. {summarized_count} messages summarized, {kept_count} kept."));
 }
 
 // --- API agent btw ---
@@ -9944,26 +9998,26 @@ async fn chat_slash_command(
                     String::new()
                 };
                 format!(
-                    "Agent: {}\nStatus: {}\nMode: API\nEndpoint: {}\nProvider: {}\nModel: {}{}\nMessages: {}\nPins: {}\nWindow: {}",
+                    "Agent: {}\nStatus: {}\nMode: API\nEndpoint: {}\nProvider: {}\nModel: {}{}\nExchanges: {}\nPins: {}\nWindow: {} exchanges",
                     agent_name, status_str, ep_name, ep_kind, ep_model, effort_line,
-                    conv.messages.len(), conv.pins.len(), conv.window_size
+                    count_exchanges(&conv.messages), conv.pins.len(), conv.window_size
                 )
             } else {
                 let backend = agent_token.map(|a| a.backend.clone()).unwrap_or_default();
                 let (model, effort) = state.chat.get_backend_prefs(owner, &backend.to_string()).unwrap_or((None, None));
                 format!(
-                    "Agent: {}\nStatus: {}\nMode: process ({})\nModel: {}\nEffort: {}\nMessages: {}\nPins: {}\nWindow: {}",
+                    "Agent: {}\nStatus: {}\nMode: process ({})\nModel: {}\nEffort: {}\nExchanges: {}\nPins: {}\nWindow: {} exchanges",
                     agent_name, status_str, backend,
                     model.as_deref().unwrap_or("default"),
                     effort.as_deref().unwrap_or("default"),
-                    conv.messages.len(), conv.pins.len(), conv.window_size
+                    count_exchanges(&conv.messages), conv.pins.len(), conv.window_size
                 )
             }
         }
         "/context" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
             let mut parts = Vec::new();
-            parts.push(format!("{} messages in window (max {}).", conv.messages.len(), conv.window_size));
+            parts.push(format!("{} exchanges in window (max {}).", count_exchanges(&conv.messages), conv.window_size));
             let git_ctx = collect_git_context(conv.cwd.as_deref());
             if !git_ctx.is_empty() {
                 parts.push(format!("\nGit:\n{git_ctx}"));
@@ -10027,7 +10081,7 @@ async fn chat_slash_command(
                 parts.push(format!("\n== Recent Activity ==\n{activity}"));
             }
 
-            parts.push(format!("\n== Conversation ==\n{} messages in window (max {}).", conv.messages.len(), conv.window_size));
+            parts.push(format!("\n== Conversation ==\n{} exchanges in window (max {}).", count_exchanges(&conv.messages), conv.window_size));
             if !conv.summary.is_empty() {
                 parts.push(format!("\n-- Tail Summary --\n{}", conv.summary));
             }
@@ -10111,17 +10165,17 @@ async fn chat_slash_command(
             if args.is_empty() {
                 let conv = state.chat.load_conversation(owner, &agent_name)?;
                 format!(
-                    "Window: {} messages\nCompaction at: {} messages (down to {})\nCurrent: {} messages in window\n\nUsage: /window <n> (e.g. /window 22)",
+                    "Window: {} exchanges\nAuto-compact at: {} exchanges (down to {})\nCurrent: {} exchanges in window\n\nUsage: /window <n> (e.g. /window 22)",
                     conv.window_size,
                     conv.window_size,
                     conv.window_size.saturating_sub(7).max(1),
-                    conv.messages.len()
+                    count_exchanges(&conv.messages)
                 )
             } else {
                 match args.parse::<usize>() {
                     Ok(n) if n >= 3 => {
                         state.chat.update_window_size(owner, &agent_name, n)?;
-                        format!("Window set to {n} messages. Auto-compact at {n}.")
+                        format!("Window set to {n} exchanges. Auto-compact at {n} exchanges.")
                     }
                     _ => "Window size must be a number >= 3.".to_string(),
                 }
@@ -10381,13 +10435,13 @@ async fn chat_slash_command(
                     AgentChatStatus::Offline => "offline",
                 };
                 let display = a.display_name.as_deref().unwrap_or(&a.name);
-                let msg_count = conv.messages.len();
+                let exchange_count = count_exchanges(&conv.messages);
                 let auto_str = match &conv.auto_message {
                     Some(m) => format!(" auto=\"{}\"", m.chars().take(30).collect::<String>()),
                     None => String::new(),
                 };
                 let last = conv.last_seen.map(|t| format_chat_time(t)).unwrap_or_else(|| "never".to_string());
-                lines.push(format!("{display}: {status_str}, {msg_count} msgs, seen {last}{auto_str}"));
+                lines.push(format!("{display}: {status_str}, {exchange_count} exchanges, seen {last}{auto_str}"));
             }
             if lines.is_empty() {
                 "No agents found.".to_string()
