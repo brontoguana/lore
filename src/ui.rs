@@ -1482,6 +1482,7 @@ pub fn render_admin_page(
               return r.json();
             }}).then(function(d) {{
               if (d.applied) {{
+                var oldVer = d.current_version;
                 ubtn.textContent = 'Restarting\u2026';
                 (function pollRestart() {{
                   var dots = 0;
@@ -1491,9 +1492,13 @@ pub fn render_admin_page(
                   }}, 400);
                   function tryReach() {{
                     fetch('/v1/health', {{method: 'GET', cache: 'no-store'}}).then(function(r) {{
-                      if (r.ok) {{
+                      if (!r.ok) {{ setTimeout(tryReach, 1500); return; }}
+                      return r.json();
+                    }}).then(function(h) {{
+                      if (!h) return;
+                      if (h.version && h.version !== oldVer) {{
                         clearInterval(iv);
-                        ubtn.textContent = 'Updated! Reloading\u2026';
+                        ubtn.textContent = 'Updated to v' + h.version + '! Reloading\u2026';
                         setTimeout(function() {{ location.reload(); }}, 500);
                       }} else {{
                         setTimeout(tryReach, 1500);
@@ -1512,6 +1517,7 @@ pub fn render_admin_page(
             }}).catch(function() {{
               ubtn.textContent = 'Restarting\u2026';
               ubtn.disabled = true;
+              var oldVer2 = '{current_version}';
               (function pollAfterCrash() {{
                 var dots = 0;
                 var iv = setInterval(function() {{
@@ -1520,9 +1526,13 @@ pub fn render_admin_page(
                 }}, 400);
                 function tryReach() {{
                   fetch('/v1/health', {{method: 'GET', cache: 'no-store'}}).then(function(r) {{
-                    if (r.ok) {{
+                    if (!r.ok) {{ setTimeout(tryReach, 1500); return; }}
+                    return r.json();
+                  }}).then(function(h) {{
+                    if (!h) return;
+                    if (h.version && h.version !== oldVer2) {{
                       clearInterval(iv);
-                      ubtn.textContent = 'Updated! Reloading\u2026';
+                      ubtn.textContent = 'Updated to v' + h.version + '! Reloading\u2026';
                       setTimeout(function() {{ location.reload(); }}, 500);
                     }} else {{
                       setTimeout(tryReach, 1500);
@@ -3294,6 +3304,7 @@ function renderMarkdown(text) {{
     svgs.push(m);
     return '__SVG_' + (svgs.length - 1) + '__';
   }});
+  text = text.replace(/```\w*\n\s*(__SVG_\d+__)\s*\n?```/g, '$1');
   var codeBlocks = [];
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, function(m, lang, code) {{
     codeBlocks.push('<pre><code>' + escapeHtmlRaw(code.replace(/\n$/, '')) + '</code></pre>');

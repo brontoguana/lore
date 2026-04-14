@@ -1707,7 +1707,7 @@ async fn setup_page(State(state): State<AppState>) -> UiResult<Html<String>> {
 }
 
 async fn health_check() -> axum::response::Json<serde_json::Value> {
-    axum::response::Json(serde_json::json!({"status": "ok"}))
+    axum::response::Json(serde_json::json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}))
 }
 
 async fn setup_text(State(state): State<AppState>) -> UiResult<Response> {
