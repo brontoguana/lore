@@ -6544,6 +6544,28 @@ fn render_theme_selector_cards(
         .join("")
 }
 
+fn accent_foreground(hex: &str) -> &'static str {
+    let h = hex.trim_start_matches('#').as_bytes();
+    let parse2 = |i: usize| {
+        let hi = match h[i] {
+            b'0'..=b'9' => h[i] - b'0',
+            b'a'..=b'f' => h[i] - b'a' + 10,
+            b'A'..=b'F' => h[i] - b'A' + 10,
+            _ => 0,
+        } as f64;
+        let lo = match h[i + 1] {
+            b'0'..=b'9' => h[i + 1] - b'0',
+            b'a'..=b'f' => h[i + 1] - b'a' + 10,
+            b'A'..=b'F' => h[i + 1] - b'A' + 10,
+            _ => 0,
+        } as f64;
+        let v = (hi * 16.0 + lo) / 255.0;
+        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    let lum = 0.2126 * parse2(0) + 0.7152 * parse2(2) + 0.0722 * parse2(4);
+    if lum > 0.36 { "#111" } else { "#fff" }
+}
+
 fn palette_css_vars(p: &ThemePalette) -> String {
     format!(
         r#"color-scheme: {color_scheme};
@@ -6554,6 +6576,7 @@ fn palette_css_vars(p: &ThemePalette) -> String {
       --muted: {muted};
       --line: {line};
       --accent: {accent};
+      --accent-fg: {accent_fg};
       --accent-soft: {accent_soft};
       --shadow: {shadow};
       --radius: {radius};
@@ -6589,6 +6612,7 @@ fn palette_css_vars(p: &ThemePalette) -> String {
         muted = p.muted,
         line = p.line,
         accent = p.accent,
+        accent_fg = accent_foreground(p.accent),
         accent_soft = p.accent_soft,
         shadow = p.shadow,
         radius = p.radius,
@@ -7233,7 +7257,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-msg-user {
       align-self: flex-end;
       background: var(--accent);
-      color: #fff;
+      color: var(--accent-fg);
     }
     .chat-msg-assistant {
       align-self: flex-start;
