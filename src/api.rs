@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -126,6 +126,7 @@ pub struct AppState {
     machine_agent_statuses: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     librarian_client_http: reqwest::Client,
     agent_recent_activity: Arc<Mutex<HashMap<String, AgentRecentActivity>>>,
+    machine_update_timestamps: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +361,7 @@ impl AppState {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             agent_recent_activity: Arc::new(Mutex::new(HashMap::new())),
+            machine_update_timestamps: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -3586,9 +3588,13 @@ async fn agents_page(
         .into_iter()
         .map(agent_token_summary)
         .collect();
-    let machines = state
+    let mut machines = state
         .auth
         .list_machines_for_user(&session.user.username)?;
+    for m in &mut machines {
+        let key = format!("{}_{}", session.user.username, m.name);
+        m.pending_update = is_machine_pending_update(&state, &key);
+    }
 
     // Enrich agents with process status from machine service reports
     {
@@ -5004,7 +5010,19 @@ async fn update_all_machines_json(
 ) -> ApiResult<Json<serde_json::Value>> {
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    let count = state.auth.set_all_machines_pending_update()?;
+    let server_version = env!("CARGO_PKG_VERSION");
+    let all_machines = state.auth.list_all_machines()?;
+    let mut count = 0usize;
+    for m in &all_machines {
+        let outdated = m.cli_version.as_deref()
+            .map(|v| v.trim_start_matches('v') != server_version)
+            .unwrap_or(true);
+        if outdated {
+            let key = format!("{}_{}", m.username, m.name);
+            set_machine_pending_update(&state, &key);
+            count += 1;
+        }
+    }
     append_audit_event(
         &state,
         AuditActor {
@@ -9516,17 +9534,43 @@ async fn librarian_chat_history(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<LibrarianChatHistoryQuery>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
-    let project_slug = match query.project {
-        Some(ref p) if !p.is_empty() => p.clone(),
-        _ => return Ok(Json(json!({ "messages": [], "pending_actions": [] }))),
-    };
-    let project = ProjectName::new(project_slug)?;
-    state.auth.authorize_read(&session.user, &project)?;
+) -> Response {
+    match librarian_chat_history_inner(&state, &headers, &query).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => Json(json!({ "messages": [], "pending_actions": [], "error": e.to_string() })).into_response(),
+    }
+}
 
-    let runs = state.librarian_history.list_recent_project(&project, 50)?;
-    let pending = state.pending_librarian_actions.list_project(&project, 20)?;
+async fn librarian_chat_history_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &LibrarianChatHistoryQuery,
+) -> Result<Value, LoreError> {
+    let session = require_ui_session(state, headers)?;
+    let specific_project = match query.project {
+        Some(ref p) if !p.is_empty() => Some(ProjectName::new(p.clone())?),
+        _ => None,
+    };
+
+    let (runs, pending) = if let Some(ref project) = specific_project {
+        state.auth.authorize_read(&session.user, project)?;
+        (
+            state.librarian_history.list_recent_project(project, 50)?,
+            state.pending_librarian_actions.list_project(project, 20)?,
+        )
+    } else {
+        let all_runs = state.librarian_history.list_recent_all(50)?;
+        let accessible_runs = all_runs
+            .into_iter()
+            .filter(|r| session.user.can_read(&r.project))
+            .collect();
+        let all_pending = state.pending_librarian_actions.list_all(20)?;
+        let accessible_pending = all_pending
+            .into_iter()
+            .filter(|a| session.user.can_read(&a.project))
+            .collect();
+        (accessible_runs, accessible_pending)
+    };
 
     let mut messages: Vec<Value> = Vec::new();
     for run in &runs {
@@ -9563,7 +9607,7 @@ async fn librarian_chat_history(
         })
         .collect();
 
-    Ok(Json(json!({ "messages": messages, "pending_actions": pending_json })))
+    Ok(json!({ "messages": messages, "pending_actions": pending_json }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -9579,11 +9623,20 @@ async fn librarian_chat_ask(
     State(state): State<AppState>,
     headers: HeaderMap,
     Form(form): Form<LibrarianChatAskForm>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
+) -> Response {
+    match librarian_chat_ask_inner(&state, &headers, form).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })).into_response(),
+    }
+}
+
+async fn librarian_chat_ask_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: LibrarianChatAskForm,
+) -> Result<Value, LoreError> {
+    let session = require_ui_session(state, headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    let project = ProjectName::new(form.project)?;
-    state.auth.authorize_read(&session.user, &project)?;
 
     let options = librarian_options_from_parts(
         None,
@@ -9595,9 +9648,76 @@ async fn librarian_chat_ask(
 
     let allow_edits = form.allow_edits.as_deref() == Some("1");
 
+    if form.project.is_empty() {
+        let projects: Vec<ProjectName> = state
+            .store
+            .list_projects()?
+            .into_iter()
+            .filter(|p| session.user.can_read(p))
+            .collect();
+        if projects.is_empty() {
+            return Ok(json!({ "ok": true, "answer": "No accessible projects." }));
+        }
+        let mut combined_answers = Vec::new();
+        let mut errors = Vec::new();
+        let mut any_pending = false;
+        for project in &projects {
+            if allow_edits && session.user.can_write(project) {
+                match execute_project_librarian_action(
+                    state,
+                    project,
+                    form.question.clone(),
+                    options.clone(),
+                    &session.user,
+                )
+                .await
+                {
+                    Ok(action_result) => {
+                        if !action_result.summary.is_empty() {
+                            combined_answers.push(format!("[{}] {}", project, action_result.summary));
+                        }
+                        if action_result.requires_approval {
+                            any_pending = true;
+                        }
+                    }
+                    Err(e) => errors.push(format!("[{}] {}", project, e)),
+                }
+            } else {
+                match answer_librarian_for_project(
+                    state,
+                    project,
+                    form.question.clone(),
+                    options.clone(),
+                    librarian_actor_for_user(&session.user),
+                )
+                .await
+                {
+                    Ok(body) => {
+                        if let Some(ref a) = body.answer {
+                            combined_answers.push(format!("[{}] {}", project, a));
+                        }
+                    }
+                    Err(e) => errors.push(format!("[{}] {}", project, e)),
+                }
+            }
+        }
+        if combined_answers.is_empty() && !errors.is_empty() {
+            return Ok(json!({ "ok": false, "error": errors.join("\n") }));
+        }
+        let answer = if combined_answers.is_empty() {
+            "No results found across projects.".to_string()
+        } else {
+            combined_answers.join("\n\n")
+        };
+        return Ok(json!({ "ok": true, "answer": answer, "pending": any_pending }));
+    }
+
+    let project = ProjectName::new(form.project)?;
+    state.auth.authorize_read(&session.user, &project)?;
+
     let result = if allow_edits && session.user.can_write(&project) {
         let action_result = execute_project_librarian_action(
-            &state,
+            state,
             &project,
             form.question.clone(),
             options,
@@ -9611,7 +9731,7 @@ async fn librarian_chat_ask(
         })
     } else {
         let answer = answer_librarian_for_project(
-            &state,
+            state,
             &project,
             form.question.clone(),
             options,
@@ -9626,14 +9746,24 @@ async fn librarian_chat_ask(
         })
     };
 
-    Ok(Json(result))
+    Ok(result)
 }
 
 async fn librarian_chat_get_config(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
+) -> Response {
+    match librarian_chat_get_config_inner(&state, &headers) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
+    }
+}
+
+fn librarian_chat_get_config_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Value, LoreError> {
+    let session = require_ui_session(state, headers)?;
     let config = state.librarian_config.load()?;
     let endpoints = state.endpoint_store.list()?;
     let status = state.librarian_provider_status.load().ok().flatten();
@@ -9643,7 +9773,7 @@ async fn librarian_chat_get_config(
         .map(|ep| json!({ "id": ep.id, "name": ep.name, "model": ep.model }))
         .collect();
 
-    Ok(Json(json!({
+    Ok(json!({
         "endpoint_id": config.endpoint_id,
         "request_timeout_secs": config.request_timeout_secs,
         "max_concurrent_runs": config.max_concurrent_runs,
@@ -9652,7 +9782,7 @@ async fn librarian_chat_get_config(
         "endpoints": endpoint_options,
         "status": status.map(|s| s.detail),
         "is_admin": session.user.is_admin,
-    })))
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -9668,11 +9798,22 @@ async fn librarian_chat_save_config(
     State(state): State<AppState>,
     headers: HeaderMap,
     Form(form): Form<LibrarianChatConfigForm>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
+) -> Response {
+    match librarian_chat_save_config_inner(&state, &headers, form) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })).into_response(),
+    }
+}
+
+fn librarian_chat_save_config_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: LibrarianChatConfigForm,
+) -> Result<Value, LoreError> {
+    let session = require_ui_session(state, headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     if !session.user.is_admin {
-        return Err(LoreError::PermissionDenied.into());
+        return Err(LoreError::PermissionDenied);
     }
     let existing = state.librarian_config.load()?;
     state.librarian_config.update(
@@ -9682,7 +9823,7 @@ async fn librarian_chat_save_config(
         form.action_requires_approval.as_deref() == Some("true")
             || form.action_requires_approval.as_deref() == Some("1"),
     )?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(json!({ "ok": true }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -9695,8 +9836,20 @@ async fn librarian_chat_approve_action(
     headers: HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<LibrarianActionForm>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
+) -> Response {
+    match librarian_chat_approve_inner(&state, &headers, &id, &form).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })).into_response(),
+    }
+}
+
+async fn librarian_chat_approve_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    form: &LibrarianActionForm,
+) -> Result<Value, LoreError> {
+    let session = require_ui_session(state, headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     let all_pending = state.pending_librarian_actions.list_all(200)?;
     let pending = all_pending
@@ -9705,8 +9858,8 @@ async fn librarian_chat_approve_action(
         .ok_or_else(|| LoreError::Validation("pending action does not exist".into()))?;
     let project = pending.project.clone();
     state.auth.authorize_write(&session.user, &project)?;
-    approve_pending_project_librarian_action(&state, &project, &id, &session.user).await?;
-    Ok(Json(json!({ "ok": true })))
+    approve_pending_project_librarian_action(state, &project, id, &session.user).await?;
+    Ok(json!({ "ok": true }))
 }
 
 async fn librarian_chat_reject_action(
@@ -9714,8 +9867,20 @@ async fn librarian_chat_reject_action(
     headers: HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<LibrarianActionForm>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
+) -> Response {
+    match librarian_chat_reject_inner(&state, &headers, &id, &form) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })).into_response(),
+    }
+}
+
+fn librarian_chat_reject_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    form: &LibrarianActionForm,
+) -> Result<Value, LoreError> {
+    let session = require_ui_session(state, headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     let all_pending = state.pending_librarian_actions.list_all(200)?;
     let pending = all_pending
@@ -9724,8 +9889,8 @@ async fn librarian_chat_reject_action(
         .ok_or_else(|| LoreError::Validation("pending action does not exist".into()))?;
     let project = pending.project.clone();
     state.auth.authorize_write(&session.user, &project)?;
-    reject_pending_project_librarian_action(&state, &project, &id, &session.user)?;
-    Ok(Json(json!({ "ok": true })))
+    reject_pending_project_librarian_action(state, &project, id, &session.user)?;
+    Ok(json!({ "ok": true }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -9887,12 +10052,17 @@ async fn chat_agent_poll(
         None => conv.messages.iter().filter(|m| m.role == ChatRole::User).collect(),
     };
 
-    // Check if machine has a pending update
+    // Check if machine has a pending update (transient, auto-expires after 3 min)
     let server_version = env!("CARGO_PKG_VERSION");
     let update_to = machine_name.as_ref().and_then(|mname| {
-        state.auth.get_machine(mname, owner).ok().flatten()
-    }).and_then(|m| {
-        if m.pending_update {
+        let machine_key = format!("{}_{}", owner, mname);
+        if let Some(ver) = &cli_version {
+            if ver.trim_start_matches('v') == server_version {
+                clear_machine_pending_update(&state, &machine_key);
+                return None;
+            }
+        }
+        if is_machine_pending_update(&state, &machine_key) {
             Some(server_version.to_string())
         } else {
             None
@@ -11976,8 +12146,9 @@ async fn update_machine_from_ui(
 ) -> UiResult<Response> {
     let session = require_ui_session(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    state.auth.set_machine_pending_update(&name, &session.user.username, true)?;
-    notify_machine_poll(&state, &format!("{}_{}", session.user.username, name));
+    let machine_key = format!("{}_{}", session.user.username, name);
+    set_machine_pending_update(&state, &machine_key);
+    notify_machine_poll(&state, &machine_key);
     Ok(Redirect::to("/ui/agents?flash=Update%20queued%20—%20machine%20will%20update%20on%20next%20poll").into_response())
 }
 
@@ -11989,8 +12160,9 @@ async fn update_machine_json(
 ) -> UiResult<Json<Value>> {
     let session = require_ui_session(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    state.auth.set_machine_pending_update(&name, &session.user.username, true)?;
-    notify_machine_poll(&state, &format!("{}_{}", session.user.username, name));
+    let machine_key = format!("{}_{}", session.user.username, name);
+    set_machine_pending_update(&state, &machine_key);
+    notify_machine_poll(&state, &machine_key);
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -12006,9 +12178,11 @@ async fn machine_status_json(
     if let Some(m) = state.auth.get_machine(&name, &session.user.username)? {
         let version = m.cli_version.as_deref().unwrap_or("unknown");
         let up_to_date = version.trim_start_matches('v') == server_version;
+        let machine_key = format!("{}_{}", session.user.username, name);
+        let pending = is_machine_pending_update(&state, &machine_key);
         Ok(Json(serde_json::json!({
             "version": version,
-            "pending_update": m.pending_update,
+            "pending_update": pending,
             "up_to_date": up_to_date
         })))
     } else {
@@ -12049,12 +12223,19 @@ async fn machine_service_poll(
         }
     }
 
-    // Check if machine should self-update
+    // Check if machine should self-update (transient, auto-expires after 3 min)
     let server_version = env!("CARGO_PKG_VERSION");
-    let update_to = state.auth.get_machine(&machine.machine_name, &machine.user.username)
-        .ok()
-        .flatten()
-        .and_then(|m| if m.pending_update { Some(server_version.to_string()) } else { None });
+    let reported_version = headers.get("x-lore-version").and_then(|v| v.to_str().ok());
+    let update_to = {
+        if reported_version.map(|v| v.trim_start_matches('v') == server_version).unwrap_or(false) {
+            clear_machine_pending_update(&state, &machine_key);
+            None
+        } else if is_machine_pending_update(&state, &machine_key) {
+            Some(server_version.to_string())
+        } else {
+            None
+        }
+    };
     let update_config = if update_to.is_some() {
         state.auto_update_config.load().ok()
     } else {
@@ -12201,6 +12382,29 @@ async fn queue_machine_command_and_wait(
     };
 
     data.ok_or_else(|| LoreError::Validation("no result from machine".into()))
+}
+
+const MACHINE_UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn is_machine_pending_update(state: &AppState, machine_key: &str) -> bool {
+    let mut map = state.machine_update_timestamps.lock().unwrap();
+    if let Some(started) = map.get(machine_key) {
+        if started.elapsed() < MACHINE_UPDATE_TIMEOUT {
+            return true;
+        }
+        map.remove(machine_key);
+    }
+    false
+}
+
+fn set_machine_pending_update(state: &AppState, machine_key: &str) {
+    state.machine_update_timestamps.lock().unwrap()
+        .insert(machine_key.to_string(), Instant::now());
+}
+
+fn clear_machine_pending_update(state: &AppState, machine_key: &str) {
+    state.machine_update_timestamps.lock().unwrap()
+        .remove(machine_key);
 }
 
 fn notify_machine_poll(state: &AppState, machine_key: &str) {

@@ -973,39 +973,11 @@ impl LocalAuthStore {
 
     pub fn update_machine_version(&self, name: &str, username: &UserName, version: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let server_version = env!("CARGO_PKG_VERSION");
-        let clear_pending = version.trim_start_matches('v') == server_version;
-        if clear_pending {
-            conn.execute(
-                "UPDATE machines SET cli_version = ?1, pending_update = 0 WHERE name = ?2 AND username = ?3",
-                params![version, name, username.as_str()],
-            ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        } else {
-            conn.execute(
-                "UPDATE machines SET cli_version = ?1 WHERE name = ?2 AND username = ?3",
-                params![version, name, username.as_str()],
-            ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        }
-        Ok(())
-    }
-
-    pub fn set_machine_pending_update(&self, name: &str, username: &UserName, pending: bool) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         conn.execute(
-            "UPDATE machines SET pending_update = ?1 WHERE name = ?2 AND username = ?3",
-            params![pending as i32, name, username.as_str()],
+            "UPDATE machines SET cli_version = ?1 WHERE name = ?2 AND username = ?3",
+            params![version, name, username.as_str()],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
-    }
-
-    pub fn set_all_machines_pending_update(&self) -> Result<usize> {
-        let server_version = env!("CARGO_PKG_VERSION");
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let count = conn.execute(
-            "UPDATE machines SET pending_update = 1 WHERE cli_version IS NULL OR REPLACE(cli_version, 'v', '') != ?1",
-            params![server_version],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        Ok(count)
     }
 
     pub fn get_machine(&self, name: &str, username: &UserName) -> Result<Option<StoredMachine>> {
@@ -1345,7 +1317,7 @@ impl LocalAuthStore {
             token_hash: row.get(2)?,
             created_at: parse_dt(&row.get::<_, String>(3)?),
             cli_version: row.get(4)?,
-            pending_update: row.get::<_, i32>(5)? != 0,
+            pending_update: false,
         })
     }
 

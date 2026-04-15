@@ -1532,7 +1532,7 @@ impl FileBlockStore {
                 children,
             });
         }
-        docs.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+        docs.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
         Ok(docs)
     }
 

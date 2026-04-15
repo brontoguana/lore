@@ -576,7 +576,7 @@ async fn run() -> CliResult<()> {
 
             // Auto-start the machine service daemon
             println!("Starting machine service...");
-            let exe = env::current_exe()?;
+            let exe = resolved_current_exe()?;
             let lore_dir = env::var("HOME").map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join("lore-service");
@@ -1348,9 +1348,19 @@ async fn apply_cli_update(config: &mut CliConfig) -> CliResult<()> {
     apply_cli_update_with_source(config, config.update_repo.clone(), config.update_stream).await
 }
 
+fn resolved_current_exe() -> io::Result<PathBuf> {
+    let p = env::current_exe()?;
+    let s = p.to_string_lossy();
+    if s.ends_with(" (deleted)") {
+        Ok(PathBuf::from(&s[..s.len() - " (deleted)".len()]))
+    } else {
+        Ok(p)
+    }
+}
+
 async fn apply_cli_update_to_target(config: &mut CliConfig, target_version: &str, repo: &str) -> CliResult<()> {
     let client = reqwest::Client::new();
-    let executable_path = env::current_exe()?;
+    let executable_path = resolved_current_exe()?;
     match apply_update_to_version(
         &client,
         "lore",
@@ -1382,7 +1392,7 @@ async fn apply_cli_update_with_source(
     stream: ReleaseStream,
 ) -> CliResult<()> {
     let client = reqwest::Client::new();
-    let executable_path = env::current_exe()?;
+    let executable_path = resolved_current_exe()?;
     match maybe_apply_self_update(
         &client,
         "lore",
@@ -1750,7 +1760,7 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
             .append(true)
             .open(&log_path)?;
 
-        let exe = env::current_exe()?;
+        let exe = resolved_current_exe()?;
         let mut cmd_args = vec![
             "--url".to_string(),
             context.url.clone(),
@@ -3705,7 +3715,7 @@ impl ServiceState {
 }
 
 fn spawn_agent_process(context: &CliContext, agent: &ManagedAgent) -> CliResult<u32> {
-    let exe = env::current_exe()?;
+    let exe = resolved_current_exe()?;
     let lore_dir = PathBuf::from(&agent.folder).join(format!(".lore/{}", agent.name));
     fs::create_dir_all(&lore_dir)?;
 
@@ -3900,7 +3910,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             .create(true)
             .append(true)
             .open(&log_path)?;
-        let exe = env::current_exe()?;
+        let exe = resolved_current_exe()?;
         let child = std::process::Command::new(&exe)
             .args(["--url", &context.url, "--token", machine_token, "service", "--fg"])
             .env(LORE_SERVICE_DAEMON_ENV, "1")
@@ -3955,8 +3965,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                     match apply_cli_update_to_target(&mut cfg, &target_version, &repo).await {
                         Ok(()) => {
                             eprintln!("[service] Updated CLI binary, re-launching service...");
-                            // Re-exec self — the new binary will restart agents from agents.json
-                            let exe = env::current_exe()?;
+                            let exe = resolved_current_exe()?;
                             let args_vec: Vec<String> = env::args().skip(1).collect();
                             let mut cmd = std::process::Command::new(&exe);
                             cmd.args(&args_vec);

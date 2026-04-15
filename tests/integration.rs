@@ -1229,6 +1229,320 @@ async fn chat_proxy_completions_with_mock_llm() {
 }
 
 #[tokio::test]
+async fn librarian_ask_via_ui_with_mock_llm() {
+    let dir = tempdir().unwrap();
+    let (llm_addr, _shutdown) = spawn_mock_llm().await;
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    // Create endpoint pointing to mock LLM
+    let endpoint_id = create_endpoint(
+        &client,
+        &addr,
+        "lib-endpoint",
+        &format!("http://{llm_addr}/v1/chat/completions"),
+        "mock-model",
+    )
+    .await;
+
+    // Configure librarian to use this endpoint
+    let resp = client
+        .post(url(&addr, "/v1/admin/librarian-config"))
+        .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
+        .json(&json!({
+            "endpoint_id": endpoint_id,
+            "request_timeout_secs": 30,
+            "max_concurrent_runs": 2,
+            "action_requires_approval": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "configure librarian failed: {}", resp.text().await.unwrap_or_default());
+
+    // Seed a project with content via API
+    let token = api_create_agent_token(&client, &addr, "lib-agent", &[("lib.proj", "read_write")]).await;
+    let resp = client
+        .post(url(&addr, "/v1/blocks"))
+        .header("x-lore-key", &token)
+        .json(&json!({"project": "lib.proj", "block_type": "markdown", "content": "The capital of France is Paris."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "seed block failed");
+
+    // Login as admin to get session cookie + CSRF
+    let (cookie, csrf) = admin_login(&client, &addr).await;
+
+    // Ask the librarian via the UI endpoint (specific project)
+    let resp = client
+        .post(url(&addr, "/ui/chat/librarian/ask"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "csrf_token={}&project=lib.proj&question=What+is+the+capital+of+France&include_history=0&allow_edits=0",
+            csrf
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap();
+    eprintln!("librarian ask response status={status} body={body_text}");
+
+    // The response MUST be JSON with `ok: true`
+    let body: Value = serde_json::from_str(&body_text)
+        .unwrap_or_else(|_| panic!("librarian response was not JSON: status={status} body={body_text}"));
+    assert!(body["ok"].as_bool().unwrap_or(false), "librarian ask failed: {body}");
+    let answer = body["answer"].as_str().unwrap_or("");
+    assert!(!answer.is_empty(), "librarian answer should not be empty: {body}");
+
+    // Also test "All Projects" mode (empty project)
+    let resp = client
+        .post(url(&addr, "/ui/chat/librarian/ask"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "csrf_token={}&project=&question=What+projects+exist&include_history=0&allow_edits=0",
+            csrf
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap();
+    eprintln!("librarian all-projects response status={status} body={body_text}");
+
+    let body: Value = serde_json::from_str(&body_text)
+        .unwrap_or_else(|_| panic!("all-projects response was not JSON: status={status} body={body_text}"));
+    assert!(body["ok"].as_bool().unwrap_or(false), "all-projects ask failed: {body}");
+}
+
+#[tokio::test]
+async fn librarian_ask_without_endpoint_returns_json_error() {
+    let dir = tempdir().unwrap();
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    // Seed a project so the librarian has something to work with
+    let token = api_create_agent_token(&client, &addr, "seed-agent", &[("no.ep.proj", "read_write")]).await;
+    let resp = client
+        .post(url(&addr, "/v1/blocks"))
+        .header("x-lore-key", &token)
+        .json(&json!({"project": "no.ep.proj", "block_type": "markdown", "content": "test content"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "seed block failed");
+
+    let (cookie, csrf) = admin_login(&client, &addr).await;
+
+    // Ask about a specific project WITHOUT configuring a librarian endpoint
+    let resp = client
+        .post(url(&addr, "/ui/chat/librarian/ask"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "csrf_token={}&project=no.ep.proj&question=hello&include_history=0&allow_edits=0",
+            csrf
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body_text = resp.text().await.unwrap();
+    eprintln!("no-endpoint response status={status} ct={content_type} body={body_text}");
+
+    // This endpoint is called via fetch() from JS -- it MUST return JSON, not HTML
+    assert!(
+        content_type.contains("application/json"),
+        "librarian ask should return JSON even on error, but got content-type={content_type} body={body_text}"
+    );
+
+    // Also test "All Projects" mode without endpoint
+    let resp = client
+        .post(url(&addr, "/ui/chat/librarian/ask"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "csrf_token={}&project=&question=hello&include_history=0&allow_edits=0",
+            csrf
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body_text = resp.text().await.unwrap();
+    eprintln!("no-endpoint all-projects response status={status} ct={content_type} body={body_text}");
+
+    assert!(
+        content_type.contains("application/json"),
+        "all-projects ask should return JSON even on error, but got content-type={content_type} body={body_text}"
+    );
+}
+
+#[tokio::test]
+async fn agent_chat_send_poll_respond() {
+    let dir = tempdir().unwrap();
+    let (llm_addr, _shutdown) = spawn_mock_llm().await;
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    // Create endpoint pointing to mock LLM
+    let endpoint_id = create_endpoint(
+        &client,
+        &addr,
+        "chat-ep",
+        &format!("http://{llm_addr}/v1/chat/completions"),
+        "mock-model",
+    )
+    .await;
+
+    // Create agent token with a project grant
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "chat-bot",
+        &[("chat.proj", "read_write")],
+    )
+    .await;
+
+    // Seed a project so it exists
+    let resp = client
+        .post(url(&addr, "/v1/blocks"))
+        .header("x-lore-key", &token)
+        .json(&json!({"project": "chat.proj", "block_type": "markdown", "content": "seed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Login as admin to get session
+    let (cookie, csrf) = admin_login(&client, &addr).await;
+
+    // Assign the endpoint to the agent via the config endpoint
+    let resp = client
+        .post(url(&addr, &format!("/ui/chat/chat-bot/config")))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "csrf_token={}&endpoint_id={}",
+            csrf, endpoint_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    let config_status = resp.status();
+    let config_body = resp.text().await.unwrap();
+    eprintln!("assign endpoint status={config_status} body={config_body}");
+    assert_eq!(config_status, 200, "assign endpoint failed: {config_body}");
+
+    // Step 1: Send a message via the UI endpoint
+    let resp = client
+        .post(url(&addr, &format!("/ui/chat/chat-bot/send")))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "csrf_token={}&message=Hello+agent",
+            csrf
+        ))
+        .send()
+        .await
+        .unwrap();
+    let send_status = resp.status();
+    let send_body = resp.text().await.unwrap();
+    eprintln!("send status={send_status} body={send_body}");
+    assert_eq!(send_status, 200, "send message failed: {send_body}");
+
+    // Step 2: Poll as the agent -- should see the pending message
+    let resp = client
+        .get(url(&addr, "/v1/chat/poll"))
+        .header("x-lore-key", &token)
+        .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    let poll_status = resp.status();
+    let poll_body: Value = resp.json().await.unwrap();
+    eprintln!("poll status={poll_status} body={poll_body}");
+    assert_eq!(poll_status, 200);
+
+    let messages = poll_body["messages"].as_array().expect("messages should be array");
+    assert!(!messages.is_empty(), "poll should return the pending message");
+    let msg_content = messages[0]["content"].as_str().unwrap_or("");
+    assert!(msg_content.contains("Hello agent"), "message content mismatch: {msg_content}");
+
+    // Step 3: Agent responds (simulating what the machine does)
+    let resp = client
+        .post(url(&addr, "/v1/chat/respond"))
+        .header("x-lore-key", &token)
+        .json(&json!({
+            "complete": true,
+            "content": "Hi! I'm the agent responding."
+        }))
+        .send()
+        .await
+        .unwrap();
+    let respond_status = resp.status();
+    eprintln!("respond status={respond_status}");
+    assert_eq!(respond_status, 200);
+
+    // Step 4: Verify the conversation has both messages
+    let resp = client
+        .get(url(&addr, "/v1/chat/history"))
+        .header("x-lore-key", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let history: Value = resp.json().await.unwrap();
+    let hist_msgs = history["messages"].as_array().expect("history messages");
+    eprintln!("history messages count={}", hist_msgs.len());
+    let has_user_msg = hist_msgs.iter().any(|m| m["role"] == "user" && m["content"].as_str().unwrap_or("").contains("Hello agent"));
+    let has_agent_msg = hist_msgs.iter().any(|m| m["role"] == "assistant" && m["content"].as_str().unwrap_or("").contains("agent responding"));
+    assert!(has_user_msg, "history should contain user message");
+    assert!(has_agent_msg, "history should contain agent response");
+
+    // Step 5: Now test the REAL issue -- proxy a completion through the server
+    // (this is what the machine does in API mode with an endpoint)
+    let resp = client
+        .post(url(&addr, "/v1/chat/completions"))
+        .header("x-lore-key", &token)
+        .json(&json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "Test message through proxy"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    let proxy_status = resp.status();
+    let proxy_body = resp.text().await.unwrap();
+    eprintln!("proxy completions status={proxy_status} body={proxy_body}");
+    assert_eq!(proxy_status, 200, "proxy completions failed: {proxy_body}");
+    let proxy_json: Value = serde_json::from_str(&proxy_body)
+        .unwrap_or_else(|_| panic!("proxy response not JSON: {proxy_body}"));
+    assert!(
+        proxy_json["choices"][0]["message"]["content"].as_str().is_some(),
+        "proxy should return LLM response: {proxy_json}"
+    );
+}
+
+#[tokio::test]
 async fn full_mcp_protocol_flow() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;

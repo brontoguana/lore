@@ -612,7 +612,13 @@ pub fn render_projects_page(
       document.querySelectorAll('.tree-doc-inline-create').forEach(function(el) {{ el.remove(); }});
       var li = document.createElement('li');
       li.className = 'tree-doc-node tree-doc-inline-create';
-      li.innerHTML = '<form class="tree-doc-row" method="post" action="/ui/' + projectSlug + '/documents">'
+      var indent = 20;
+      var node = btn.closest('.tree-doc-node');
+      if (parentDocId && node) {{
+        var parentRow = node.querySelector(':scope > .tree-doc-row');
+        if (parentRow) indent = (parseInt(parentRow.style.paddingLeft) || 0) + 20;
+      }}
+      li.innerHTML = '<form class="tree-doc-row" style="padding-left:' + indent + 'px" method="post" action="/ui/' + projectSlug + '/documents">'
         + '<input type="hidden" name="csrf_token" value="' + csrfToken + '">'
         + (parentDocId ? '<input type="hidden" name="parent_document_id" value="' + parentDocId + '">' : '')
         + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>'
@@ -3122,10 +3128,11 @@ pub fn render_chat_page(
     let librarian_entry = format!(
         r#"<div class="chat-agent-item{active_class}" data-agent="librarian" onclick="selectAgent('librarian')">
   <div class="chat-agent-header">
-    <div class="chat-avatar-sm-wrap"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></div>
+    <div class="chat-avatar-sm-wrap chat-avatar-empty"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></div>
     <span class="chat-agent-name">Librarian</span>
   </div>
   <div class="chat-agent-snippet">Ask questions about your projects</div>
+  <div class="chat-agent-time"></div>
 </div>"#,
         active_class = librarian_active_class,
     );
@@ -3208,39 +3215,13 @@ pub fn render_chat_page(
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin-right:var(--s-2);flex-shrink:0;"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>
   <span class="chat-header-name">Librarian</span>
   <select id="lib-project" class="chat-config-select" style="margin-left:var(--s-3);max-width:200px;" onchange="onLibProjectChange()">
-    <option value="">Select project...</option>
+    <option value="">All Projects</option>
     {project_options}
   </select>
-  <button type="button" class="btn-sm button-link" id="chat-config-btn" style="margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
+  <button type="button" class="btn-sm button-link lib-toggle" id="lib-toggle-history" style="margin-left:auto;" onclick="toggleLibOption('history')" title="Include history"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></button>
+  <button type="button" class="btn-sm button-link lib-toggle" id="lib-toggle-edits" style="margin-left:var(--s-1);" onclick="toggleLibOption('edits')" title="Allow edits"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
 </div>
 <div class="chat-messages" id="chat-messages"></div>
-<div class="chat-config-panel" id="chat-config-panel" style="display:none;">
-  <div class="chat-config-inner">
-    <div class="chat-config-field">
-      <label class="chat-config-label">Endpoint</label>
-      <select id="lib-endpoint" class="chat-config-select" onchange="onLibConfigChange()"></select>
-    </div>
-    <div class="chat-config-field">
-      <label class="chat-config-label">Timeout (seconds)</label>
-      <input type="number" id="lib-timeout" class="chat-config-select" min="1" max="120" onchange="onLibConfigChange()">
-    </div>
-    <div class="chat-config-field">
-      <label class="chat-config-label">Max concurrent runs</label>
-      <input type="number" id="lib-concurrent" class="chat-config-select" min="1" max="32" onchange="onLibConfigChange()">
-    </div>
-    <div class="chat-config-field">
-      <label class="toggle"><input type="checkbox" id="lib-approval" onchange="onLibConfigChange()"> <span>Require approval for edits</span></label>
-    </div>
-    <div class="chat-config-field">
-      <label class="toggle"><input type="checkbox" id="lib-include-history" value="1"> <span>Search document history</span></label>
-    </div>
-    <div class="chat-config-field">
-      <label class="toggle"><input type="checkbox" id="lib-allow-edits" value="1"> <span>Allow edits</span></label>
-    </div>
-    <div id="lib-status" class="chat-config-field" style="font-size:0.85em;color:var(--fg-muted);"></div>
-    <div id="lib-pending-actions"></div>
-  </div>
-</div>
 <form class="chat-input-form" id="chat-input-form" onsubmit="return sendLibrarianMessage(event)">
   <input type="hidden" name="csrf_token" value="{csrf_token}">
   <textarea class="chat-input" id="chat-input" placeholder="Ask the librarian..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
@@ -3248,7 +3229,6 @@ pub fn render_chat_page(
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
   </button>
 </form>"#,
-            settings_icon = ICON_SETTINGS,
             csrf_token = escape_attribute(csrf_token),
             project_options = project_options,
         )
@@ -3911,7 +3891,7 @@ function toggleChatConfig() {{
   cfg.style.display = '';
   if (form) form.style.display = 'none';
   if (btn) btn.classList.add('active');
-  if (isLibrarian) {{ loadLibrarianConfig(); }} else {{ loadChatConfig(); }}
+  if (!isLibrarian) {{ loadChatConfig(); }}
 }}
 
 function toggleManagePanel() {{
@@ -4247,17 +4227,17 @@ function sendLibrarianMessage(e) {{
   e.preventDefault();
   var input = document.getElementById('chat-input');
   var text = input.value.trim();
-  if (!text || !libProject) return false;
+  if (!text) return false;
   input.value = '';
   chatMessages.push({{ role: 'user', content: text }});
   renderMessages();
-  var inclHistory = document.getElementById('lib-include-history');
-  var allowEdits = document.getElementById('lib-allow-edits');
+  var histBtn = document.getElementById('lib-toggle-history');
+  var editsBtn = document.getElementById('lib-toggle-edits');
   var body = 'csrf_token=' + encodeURIComponent(csrfToken)
     + '&project=' + encodeURIComponent(libProject)
     + '&question=' + encodeURIComponent(text)
-    + '&include_history=' + (inclHistory && inclHistory.checked ? '1' : '0')
-    + '&allow_edits=' + (allowEdits && allowEdits.checked ? '1' : '0');
+    + '&include_history=' + (histBtn && histBtn.classList.contains('active') ? '1' : '0')
+    + '&allow_edits=' + (editsBtn && editsBtn.classList.contains('active') ? '1' : '0');
   fetch('/ui/chat/librarian/ask', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
@@ -4271,7 +4251,6 @@ function sendLibrarianMessage(e) {{
       chatMessages.push({{ role: 'system', content: 'Error: ' + (data.error || 'request failed') }});
     }}
     renderMessages();
-    if (chatConfigOpen) loadLibrarianConfig();
   }}).catch(function() {{
     chatMessages.push({{ role: 'system', content: 'Failed to send (network error)' }});
     renderMessages();
@@ -4287,11 +4266,6 @@ function onLibProjectChange() {{
 }}
 
 function loadLibrarianHistory() {{
-  if (!libProject) {{
-    chatMessages = [];
-    renderMessages();
-    return;
-  }}
   fetch('/ui/chat/librarian/history?project=' + encodeURIComponent(libProject), {{ cache: 'no-store' }})
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
@@ -4322,7 +4296,7 @@ function libApproveAction(id) {{
     method: 'POST',
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
     body: 'csrf_token=' + encodeURIComponent(csrfToken)
-  }}).then(function() {{ loadLibrarianHistory(); if (chatConfigOpen) loadLibrarianConfig(); }});
+  }}).then(function() {{ loadLibrarianHistory(); }});
 }}
 
 function libRejectAction(id) {{
@@ -4330,55 +4304,13 @@ function libRejectAction(id) {{
     method: 'POST',
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
     body: 'csrf_token=' + encodeURIComponent(csrfToken)
-  }}).then(function() {{ loadLibrarianHistory(); if (chatConfigOpen) loadLibrarianConfig(); }});
+  }}).then(function() {{ loadLibrarianHistory(); }});
 }}
 
-function loadLibrarianConfig() {{
-  fetch('/ui/chat/librarian/config', {{ cache: 'no-store' }})
-    .then(function(r) {{ return r.json(); }})
-    .then(function(data) {{
-      var epSel = document.getElementById('lib-endpoint');
-      if (epSel) {{
-        epSel.innerHTML = '<option value="">Not configured</option>';
-        var eps = data.endpoints || [];
-        for (var i = 0; i < eps.length; i++) {{
-          var opt = document.createElement('option');
-          opt.value = eps[i].id;
-          opt.textContent = eps[i].name + ' (' + eps[i].model + ')';
-          if (data.endpoint_id === eps[i].id) opt.selected = true;
-          epSel.appendChild(opt);
-        }}
-        epSel.disabled = !data.is_admin;
-      }}
-      var timeout = document.getElementById('lib-timeout');
-      if (timeout) {{ timeout.value = data.request_timeout_secs || 30; timeout.disabled = !data.is_admin; }}
-      var concurrent = document.getElementById('lib-concurrent');
-      if (concurrent) {{ concurrent.value = data.max_concurrent_runs || 4; concurrent.disabled = !data.is_admin; }}
-      var approval = document.getElementById('lib-approval');
-      if (approval) {{ approval.checked = !!data.action_requires_approval; approval.disabled = !data.is_admin; }}
-      var statusEl = document.getElementById('lib-status');
-      if (statusEl) {{
-        statusEl.textContent = data.is_configured ? 'Status: configured' : 'Status: not configured (select an endpoint)';
-        if (data.status) statusEl.textContent += ' — ' + data.status;
-      }}
-    }});
-}}
-
-function onLibConfigChange() {{
-  var epSel = document.getElementById('lib-endpoint');
-  var timeout = document.getElementById('lib-timeout');
-  var concurrent = document.getElementById('lib-concurrent');
-  var approval = document.getElementById('lib-approval');
-  var body = 'csrf_token=' + encodeURIComponent(csrfToken)
-    + '&endpoint_id=' + encodeURIComponent(epSel ? epSel.value : '')
-    + '&request_timeout_secs=' + encodeURIComponent(timeout ? timeout.value : '')
-    + '&max_concurrent_runs=' + encodeURIComponent(concurrent ? concurrent.value : '')
-    + '&action_requires_approval=' + (approval && approval.checked ? '1' : '0');
-  fetch('/ui/chat/librarian/config', {{
-    method: 'POST',
-    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-    body: body
-  }});
+function toggleLibOption(opt) {{
+  var btn = document.getElementById('lib-toggle-' + opt);
+  if (!btn) return;
+  btn.classList.toggle('active');
 }}
 
 if (isLibrarian) {{
@@ -4394,7 +4326,7 @@ if (isLibrarian) {{
     libProject = saved;
     if (!projSel.value) {{ libProject = ''; }}
   }}
-  if (libProject) loadLibrarianHistory();
+  loadLibrarianHistory();
 }} else if (currentAgent) {{
   renderMessages();
   connectSSE();
@@ -7394,6 +7326,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       box-shadow: var(--shadow);
       backdrop-filter: blur(8px);
       padding: var(--s-5);
+      margin-bottom: var(--s-4);
     }
 
     .hero {
@@ -8156,6 +8089,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       flex-shrink: 0;
     }
 
+    .tree-inline-create .tree-row-right {
+      flex-shrink: 1;
+    }
+
+    .tree-inline-create .tree-perm {
+      display: none;
+    }
+
     .tree-perm {
       font-size: 0.8rem;
       color: var(--muted);
@@ -8207,8 +8148,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
 
     .tree-inline-input {
-      flex: 1;
-      min-width: 0;
+      flex: 1 1 0;
+      min-width: 60px;
       font-size: 1rem;
       font-weight: 600;
       padding: var(--s-1) var(--s-2);
@@ -8217,6 +8158,13 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: var(--input-bg);
       color: var(--ink);
       outline: none;
+    }
+
+    .tree-doc-inline-create .tree-add-child {
+      flex-shrink: 0;
+      white-space: nowrap;
+      padding: 2px 8px;
+      font-size: 0.85rem;
     }
 
     .tree-create-form button {
@@ -8732,6 +8680,12 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       align-items: center;
       justify-content: center;
       flex-shrink: 0;
+    }
+
+    .lib-toggle.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
     }
 
     .btn-lg {
