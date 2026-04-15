@@ -819,6 +819,14 @@ pub trait AnswerLibrarianClient: Send + Sync {
         request: &LibrarianRequest,
     ) -> Result<LibrarianAnswer>;
 
+    async fn answer_raw(
+        &self,
+        endpoint: &Endpoint,
+        timeout_secs: u64,
+        system: &str,
+        user_msg: &str,
+    ) -> Result<LibrarianAnswer>;
+
     async fn healthcheck(
         &self,
         endpoint: &Endpoint,
@@ -851,6 +859,50 @@ impl Default for HttpLibrarianClient {
     }
 }
 
+async fn send_librarian_llm_request(
+    client: &Client,
+    endpoint: &Endpoint,
+    timeout_secs: u64,
+    system: &str,
+    user_msg: &str,
+) -> Result<LibrarianAnswer> {
+    if !endpoint.is_configured() {
+        return Err(LoreError::Validation(
+            "answer librarian endpoint is not configured".into(),
+        ));
+    }
+    let body = build_provider_request_body(endpoint, system, user_msg, 0.1);
+    let url = build_provider_url(endpoint);
+    let http = add_provider_auth(client.post(&url).json(&body), endpoint);
+    let response = http
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .map_err(|err| LoreError::ExternalService(err.to_string()))?;
+    let status = response.status();
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|err| LoreError::ExternalService(err.to_string()))?;
+    if !status.is_success() {
+        let detail = extract_provider_error(&value);
+        return Err(LoreError::ExternalService(detail));
+    }
+    let answer = extract_provider_response_text(endpoint, &value)
+        .ok_or_else(|| {
+            LoreError::ExternalService("provider response did not contain answer text".into())
+        })?;
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Err(LoreError::ExternalService(
+            "provider response did not contain answer text".into(),
+        ));
+    }
+    Ok(LibrarianAnswer {
+        answer: clamp_answer(answer),
+    })
+}
+
 #[async_trait]
 impl AnswerLibrarianClient for HttpLibrarianClient {
     async fn answer(
@@ -860,47 +912,19 @@ impl AnswerLibrarianClient for HttpLibrarianClient {
         request: &LibrarianRequest,
     ) -> Result<LibrarianAnswer> {
         request.validate()?;
-        if !endpoint.is_configured() {
-            return Err(LoreError::Validation(
-                "answer librarian endpoint is not configured".into(),
-            ));
-        }
-
         let system = "You are Lore Answer Librarian. You are read-only. You have access to exactly one Lore project and only the project context provided in this request. Answer only from that context. If the context is insufficient, say so plainly. Do not claim to run commands, browse the web, inspect anything outside the provided Lore blocks, or take actions.";
         let user_msg = build_prompt(request);
-        let body = build_provider_request_body(endpoint, system, &user_msg, 0.1);
-        let url = build_provider_url(endpoint);
-        let http = add_provider_auth(self.client.post(&url).json(&body), endpoint);
+        send_librarian_llm_request(&self.client, endpoint, timeout_secs, system, &user_msg).await
+    }
 
-        let response = http
-            .timeout(Duration::from_secs(timeout_secs))
-            .send()
-            .await
-            .map_err(|err| LoreError::ExternalService(err.to_string()))?;
-        let status = response.status();
-        let value: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|err| LoreError::ExternalService(err.to_string()))?;
-        if !status.is_success() {
-            let detail = extract_provider_error(&value);
-            return Err(LoreError::ExternalService(detail));
-        }
-
-        let answer = extract_provider_response_text(endpoint, &value)
-            .ok_or_else(|| {
-                LoreError::ExternalService("provider response did not contain answer text".into())
-            })?;
-        let answer = answer.trim();
-        if answer.is_empty() {
-            return Err(LoreError::ExternalService(
-                "provider response did not contain answer text".into(),
-            ));
-        }
-
-        Ok(LibrarianAnswer {
-            answer: clamp_answer(answer),
-        })
+    async fn answer_raw(
+        &self,
+        endpoint: &Endpoint,
+        timeout_secs: u64,
+        system: &str,
+        user_msg: &str,
+    ) -> Result<LibrarianAnswer> {
+        send_librarian_llm_request(&self.client, endpoint, timeout_secs, system, user_msg).await
     }
 
     async fn healthcheck(
@@ -1259,6 +1283,48 @@ pub fn build_prompt(request: &LibrarianRequest) -> String {
             block.author.as_str(),
             truncate_content(&block.content),
         ));
+    }
+    if prompt.chars().count() > MAX_PROMPT_CHARS {
+        truncate_chars(&prompt, MAX_PROMPT_CHARS)
+    } else {
+        prompt
+    }
+}
+
+pub fn build_prompt_multi_project(
+    projects_context: &[(ProjectName, Vec<Block>)],
+    question: &str,
+) -> String {
+    let project_names: Vec<&str> = projects_context.iter().map(|(p, _)| p.as_str()).collect();
+    let mut prompt = format!(
+        "Projects: {}\nQuestion: {}\n\nUse only the Lore blocks below. Reference project names where relevant.\n",
+        project_names.join(", "),
+        question.trim(),
+    );
+    let total_blocks: usize = projects_context.iter().map(|(_, blocks)| blocks.len()).sum();
+    if total_blocks == 0 {
+        prompt.push_str("\nNo blocks were available.\n");
+        return prompt;
+    }
+    prompt.push_str("\nContext blocks:\n");
+    for (project, blocks) in projects_context {
+        for block in blocks {
+            let block_type = match block.block_type {
+                BlockType::Markdown => "markdown",
+                BlockType::Html => "html",
+                BlockType::Svg => "svg",
+                BlockType::Image => "image",
+            };
+            prompt.push_str(&format!(
+                "\nProject: {}\nBlock {}\nType: {}\nOrder: {}\nAuthor: {}\nContent:\n{}\n",
+                project.as_str(),
+                block.id.as_str(),
+                block_type,
+                block.order.as_str(),
+                block.author.as_str(),
+                truncate_content(&block.content),
+            ));
+        }
     }
     if prompt.chars().count() > MAX_PROMPT_CHARS {
         truncate_chars(&prompt, MAX_PROMPT_CHARS)

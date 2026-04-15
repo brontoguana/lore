@@ -19,7 +19,7 @@ use crate::librarian::{
     MAX_PROMPT_CHARS, PendingLibrarianAction, PendingLibrarianActionStore,
     ProjectLibrarianOperation, ProjectLibrarianRequest, ProviderCheckResult,
     RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECS, StoredLibrarianOperation, build_action_prompt,
-    build_prompt,
+    build_prompt, build_prompt_multi_project,
 };
 use crate::model::{
     Block, BlockId, BlockType, DocumentId, ImageUpload, NewBlock, OrderKey, ProjectName,
@@ -9658,58 +9658,101 @@ async fn librarian_chat_ask_inner(
         if projects.is_empty() {
             return Ok(json!({ "ok": true, "answer": "No accessible projects." }));
         }
-        let mut combined_answers = Vec::new();
-        let mut errors = Vec::new();
-        let mut any_pending = false;
-        for project in &projects {
-            if allow_edits && session.user.can_write(project) {
-                match execute_project_librarian_action(
-                    state,
-                    project,
-                    form.question.clone(),
-                    options.clone(),
-                    &session.user,
-                )
-                .await
-                {
-                    Ok(action_result) => {
-                        if !action_result.summary.is_empty() {
-                            combined_answers.push(format!("[{}] {}", project, action_result.summary));
+        if allow_edits {
+            let mut combined_answers = Vec::new();
+            let mut errors = Vec::new();
+            let mut any_pending = false;
+            for project in &projects {
+                if session.user.can_write(project) {
+                    match execute_project_librarian_action(
+                        state,
+                        project,
+                        form.question.clone(),
+                        options.clone(),
+                        &session.user,
+                    )
+                    .await
+                    {
+                        Ok(action_result) => {
+                            if !action_result.summary.is_empty() {
+                                combined_answers
+                                    .push(format!("[{}] {}", project, action_result.summary));
+                            }
+                            if action_result.requires_approval {
+                                any_pending = true;
+                            }
                         }
-                        if action_result.requires_approval {
-                            any_pending = true;
-                        }
+                        Err(e) => errors.push(format!("[{}] {}", project, e)),
                     }
-                    Err(e) => errors.push(format!("[{}] {}", project, e)),
                 }
+            }
+            if combined_answers.is_empty() && !errors.is_empty() {
+                return Ok(json!({ "ok": false, "error": errors.join("\n") }));
+            }
+            let answer = if combined_answers.is_empty() {
+                "No results found across projects.".to_string()
             } else {
-                match answer_librarian_for_project(
-                    state,
-                    project,
-                    form.question.clone(),
-                    options.clone(),
-                    librarian_actor_for_user(&session.user),
-                )
-                .await
-                {
-                    Ok(body) => {
-                        if let Some(ref a) = body.answer {
-                            combined_answers.push(format!("[{}] {}", project, a));
-                        }
-                    }
-                    Err(e) => errors.push(format!("[{}] {}", project, e)),
+                combined_answers.join("\n\n")
+            };
+            return Ok(json!({ "ok": true, "answer": answer, "pending": any_pending }));
+        }
+
+        let (endpoint, config) = resolve_librarian_endpoint(state)?;
+        let _guard = acquire_librarian_slot(state, &config)?;
+        let created_at = OffsetDateTime::now_utc();
+        let actor = librarian_actor_for_user(&session.user);
+        let blocks_per_project = (options.max_sources / projects.len()).max(2);
+        let mut projects_context: Vec<(ProjectName, Vec<Block>)> = Vec::new();
+        for project in &projects {
+            let mut opts = options.clone();
+            opts.max_sources = blocks_per_project;
+            if let Ok(blocks) = build_librarian_context(&state.store, project, &form.question, &opts) {
+                if !blocks.is_empty() {
+                    projects_context.push((project.clone(), blocks));
                 }
             }
         }
-        if combined_answers.is_empty() && !errors.is_empty() {
-            return Ok(json!({ "ok": false, "error": errors.join("\n") }));
+        if projects_context.is_empty() {
+            return Ok(json!({ "ok": true, "answer": "No relevant content found across projects." }));
         }
-        let answer = if combined_answers.is_empty() {
-            "No results found across projects.".to_string()
-        } else {
-            combined_answers.join("\n\n")
+        let system = "You are Lore Answer Librarian. You are read-only. You have access to multiple Lore projects and only the project context provided in this request. Answer from that context, referencing project names where relevant. If the context is insufficient, say so plainly. Do not claim to run commands, browse the web, inspect anything outside the provided Lore blocks, or take actions.";
+        let user_msg = build_prompt_multi_project(&projects_context, &form.question);
+        if user_msg.chars().count() > MAX_PROMPT_CHARS {
+            return Ok(json!({ "ok": false, "error": "Combined context exceeds maximum prompt size." }));
+        }
+        let all_source_blocks: Vec<Block> = projects_context
+            .iter()
+            .flat_map(|(_, blocks)| blocks.clone())
+            .collect();
+        let result = state
+            .librarian_client
+            .answer_raw(&endpoint, config.request_timeout_secs, system, &user_msg)
+            .await;
+        let first_project = projects_context[0].0.clone();
+        let audit = librarian_audit_entry(
+            &first_project,
+            actor,
+            created_at,
+            &endpoint.url,
+            &endpoint.model,
+            &form.question,
+            &all_source_blocks,
+            &result.as_ref().map(|a| LibrarianAnswerBody {
+                project: first_project.clone(),
+                created_at,
+                actor: librarian_actor_for_user(&session.user),
+                question: form.question.clone(),
+                answer: Some(a.answer.clone()),
+                status: LibrarianRunStatus::Success,
+                error: None,
+                context_blocks: all_source_blocks.clone(),
+            }).map_err(|e| LoreError::Validation(e.to_string())),
+        );
+        state.librarian_history.append(audit)?;
+        return match result {
+            Ok(answer) => Ok(json!({ "ok": true, "answer": answer.answer })),
+            Err(e) => Ok(json!({ "ok": false, "error": e.to_string() })),
         };
-        return Ok(json!({ "ok": true, "answer": answer, "pending": any_pending }));
     }
 
     let project = ProjectName::new(form.project)?;
@@ -11936,9 +11979,6 @@ async fn chat_slash_command(
                 }
             }
         }
-        "/auto" => {
-            "Unknown command. Type /help for available commands.".to_string()
-        }
         "/hi" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
             let display = agents.iter().find(|a| a.name == agent_name)
@@ -12630,6 +12670,19 @@ mod tests {
         ) -> Result<LibrarianAnswer, crate::LoreError> {
             assert!(endpoint.is_configured());
             self.requests.lock().unwrap().push(request.clone());
+            Ok(LibrarianAnswer {
+                answer: self.answer.clone(),
+            })
+        }
+
+        async fn answer_raw(
+            &self,
+            endpoint: &Endpoint,
+            _timeout_secs: u64,
+            _system: &str,
+            _user_msg: &str,
+        ) -> Result<LibrarianAnswer, crate::LoreError> {
+            assert!(endpoint.is_configured());
             Ok(LibrarianAnswer {
                 answer: self.answer.clone(),
             })
