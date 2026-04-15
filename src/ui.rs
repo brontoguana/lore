@@ -3128,8 +3128,9 @@ pub fn render_chat_page(
     let librarian_entry = format!(
         r#"<div class="chat-agent-item{active_class}" data-agent="librarian" onclick="selectAgent('librarian')">
   <div class="chat-agent-header">
-    <div class="chat-avatar-sm-wrap chat-avatar-empty"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></div>
+    <div class="chat-avatar-sm-wrap chat-avatar-empty"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.4"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></div>
     <span class="chat-agent-name">Librarian</span>
+    <span class="chat-status-dot chat-status-online"></span>
   </div>
   <div class="chat-agent-snippet">Ask questions about your projects</div>
   <div class="chat-agent-time"></div>
@@ -4750,9 +4751,9 @@ fn render_reserved_block_panel(
         false
     };
     let panel_class = if over_soft {
-        "panel reserved-block-section reserved-over-soft"
+        "panel reserved-over-soft"
     } else {
-        "panel reserved-block-section"
+        "panel"
     };
 
     let edit_form = if can_write {
@@ -4791,7 +4792,7 @@ fn render_reserved_block_panel(
 
     format!(
         r#"<section class="{panel_class}">
-  <div class="section-tag">{label}</div>
+  <div class="panel-title">{label}</div>
   {limit_warning}
   <div class="editline-row">
     <article class="block reserved-block reserved-block-{safe_id}">
@@ -4863,8 +4864,8 @@ fn render_doc_list_for_project(
     };
 
     format!(
-        r#"<div class="section-tag">Documents</div>
-<section class="panel">
+        r#"<section class="panel">
+  <div class="panel-title">Documents</div>
   <div class="doc-tree">{doc_items}</div>
   {add_doc_html}
 </section>"#,
@@ -4945,8 +4946,8 @@ pub fn render_document_page(
     } else {
         let items = render_doc_tree_items(project, child_docs, 0);
         format!(
-            r#"<div class="section-tag">Sub-documents</div>
-<section class="panel">
+            r#"<section class="panel">
+  <div class="panel-title">Sub-documents</div>
   <div class="doc-tree">{items}</div>
 </section>"#,
         )
@@ -8285,23 +8286,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       min-width: 0;
     }
 
-    .section-tag {
-      text-align: right;
+    .panel-title {
       font-size: 0.75em;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.05em;
       color: var(--fg);
       opacity: 0.35;
-      margin-bottom: var(--s-1);
-    }
-
-    .agent-context-section {
-      margin-bottom: 0;
-    }
-
-    .reserved-block-section {
-      margin-bottom: 0;
+      margin: 0 0 var(--s-3) 0;
     }
 
     .reserved-over-soft {

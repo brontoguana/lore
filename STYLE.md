@@ -233,13 +233,18 @@ A bordered, rounded container used to group related content throughout the UI.
 ### Typical structure
 ```html
 <section class="panel">
-  <div class="panel-header"><h2>Title</h2><p>Description</p></div>
+  <div class="panel-title">Title</div>
   <!-- content: sel-list, forms, text, etc. -->
 </section>
 ```
 
+Panels can omit `.panel-title` entirely — they just have no title. When present, `.panel-title` provides consistent bottom spacing (`var(--s-3)`) before the content.
+
+### `.panel-title`
+Small uppercase label inside a panel. `font-size: 0.75em`, `font-weight: 600`, `text-transform: uppercase`, `letter-spacing: 0.05em`, `color: var(--fg)`, `opacity: 0.35`. Always the first child inside the panel. Do NOT place titles outside panels — the title is part of the panel.
+
 ### `.panel-header`
-The title area inside a panel. `display: grid`, `gap: var(--s-2)`, no padding (panel provides it). Contains an `<h2>` and optional `<p>` description.
+The title area inside a panel. `display: grid`, `gap: var(--s-2)`, no padding (panel provides it). Contains an `<h2>` and optional `<p>` description. Used for admin sections with richer headings.
 
 ### Examples
 - Admin page sections (Users, Endpoints, Roles, etc.)
