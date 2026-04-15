@@ -173,7 +173,7 @@ A standard pattern for any list where items can be selected and a detail panel a
 
 | Class | Purpose |
 |---|---|
-| `.sel-list` | Container. Bordered, rounded, column flex. Margin `var(--s-5)` on all four sides. |
+| `.sel-list` | Container. Bordered, rounded, column flex. No margin (panel provides edge spacing). |
 | `.sel-item` | Row. Flex between, padded `var(--s-3) var(--s-4)`, bottom border, hover highlight. |
 | `.sel-item.active` | Selected state: `var(--bg-hover)` background + 4px `var(--accent)` left border. |
 | `.sel-item-name` | Primary label. `font-weight: 600`, mono font, `0.9rem`. |
@@ -222,9 +222,30 @@ Buttons inside `.sel-item-actions` should use `btn-sm` (28x28 icon buttons) with
 
 ---
 
-## Spacing Rule: Container Margins
+## Panel (`.panel`)
 
-Content blocks inside panels (lists, detail panels, form groups) must have margin on all four sides -- never flush against the edge of their parent. Use `var(--s-5)` (24px) as the default margin for major containers like `.sel-list`. This ensures breathing room around content and prevents items from butting up against the bottom of their parent div.
+A bordered, rounded container used to group related content throughout the UI.
+
+**CSS:** `background: var(--panel)`, `border: 1px solid var(--line)`, `border-radius: var(--radius)`, `box-shadow: var(--shadow)`, `backdrop-filter: blur(8px)`, `padding: var(--s-5)`.
+
+**Rule: internal content must never touch the panel borders.** The panel provides `var(--s-5)` padding on all sides. Children should not add their own side margins or padding to create edge spacing — the panel handles it. Use only top margins between sibling elements inside a panel for vertical spacing.
+
+### Typical structure
+```html
+<section class="panel">
+  <div class="panel-header"><h2>Title</h2><p>Description</p></div>
+  <!-- content: sel-list, forms, text, etc. -->
+</section>
+```
+
+### `.panel-header`
+The title area inside a panel. `display: grid`, `gap: var(--s-2)`, no padding (panel provides it). Contains an `<h2>` and optional `<p>` description.
+
+### Examples
+- Admin page sections (Users, Endpoints, Roles, etc.)
+- Settings page sections
+- Agent detail panels
+- Project document and agent-context sections
 
 ---
 

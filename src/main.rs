@@ -400,6 +400,13 @@ async fn run_server(data_root: String, bind: String) {
     }
 
     let store = FileBlockStore::new(data_root.clone());
+    if let Ok(infos) = store.list_project_infos() {
+        for info in &infos {
+            if let Err(e) = store.migrate_project_to_documents(&info.slug) {
+                eprintln!("warning: migration failed for {}: {e}", info.slug.as_str());
+            }
+        }
+    }
     let app = build_app(store);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await

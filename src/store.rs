@@ -1,7 +1,7 @@
 use crate::error::{LoreError, Result};
 use crate::model::{
-    Block, BlockId, BlockType, ContentRef, KeyFingerprint, MediaRef, NewBlock, OrderKey,
-    ProjectName, StoredBlock, UpdateBlock,
+    Block, BlockId, BlockType, ContentRef, DocumentId, KeyFingerprint, MediaRef, NewBlock,
+    OrderKey, ProjectName, StoredBlock, UpdateBlock, RESERVED_BLOCK_IDS,
 };
 use crate::order::generate_order_key;
 use crate::versioning::{
@@ -24,6 +24,8 @@ pub struct ProjectMeta {
     pub id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_context: Option<String>,
+    #[serde(default)]
+    pub storage_version: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +35,21 @@ pub struct ProjectInfo {
     pub parent: Option<String>,
     pub sort_order: u64,
     pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentMeta {
+    pub id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocumentInfo {
+    pub id: DocumentId,
+    pub display_name: String,
+    pub children: Vec<DocumentInfo>,
 }
 
 /// Result of resolving a lore:// link UUID.
@@ -120,6 +137,7 @@ impl FileBlockStore {
             sort_order: 0,
             id: Some(Uuid::new_v4().to_string()),
             agent_context: None,
+            storage_version: 0,
         }
     }
 
@@ -268,10 +286,23 @@ impl FileBlockStore {
                 ));
             }
         }
-        // Check blocks across all projects
+        // Check blocks across all projects (project-level and document-level)
         for info in &infos {
             if let Ok(blocks) = self.list_blocks(&info.slug) {
                 for block in &blocks {
+                    if block.id.as_str() == uuid {
+                        let preview = truncate_single_line(&block.content, 48);
+                        return Some(LoreLinkTarget::Block(
+                            info.slug.clone(),
+                            block.id.clone(),
+                            block.block_type,
+                            preview,
+                        ));
+                    }
+                }
+            }
+            if let Ok(doc_blocks) = self.list_all_blocks_across_docs(&info.slug) {
+                for (_doc_id, block) in &doc_blocks {
                     if block.id.as_str() == uuid {
                         let preview = truncate_single_line(&block.content, 48);
                         return Some(LoreLinkTarget::Block(
@@ -315,8 +346,10 @@ impl FileBlockStore {
             sort_order,
             id: Some(project_id.clone()),
             agent_context: None,
+            storage_version: 1,
         };
         self.write_project_meta(&slug, &meta)?;
+        self.ensure_reserved_blocks(&slug)?;
         Ok(ProjectInfo {
             display_name: display,
             parent: parent.map(|s| s.to_string()),
@@ -802,10 +835,885 @@ impl FileBlockStore {
         }
     }
 
+    pub fn doc_block_matches_snapshot(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+        snapshot: &StoredBlockSnapshot,
+    ) -> Result<bool> {
+        match self.get_doc_block(project, doc_id, block_id) {
+            Ok(block) => Ok(block_matches_snapshot(&block, snapshot)),
+            Err(LoreError::BlockNotFound(_)) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn restore_doc_block_snapshot(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        snapshot: &StoredBlockSnapshot,
+    ) -> Result<Block> {
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        let metadata_path = doc_dir
+            .join("blocks")
+            .join(format!("{}.json", snapshot.id.as_str()));
+        if metadata_path.exists() {
+            let existing: StoredBlock = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+            self.remove_external_blob_if_present(&snapshot.project, &existing.content)?;
+            self.remove_media_if_present(&snapshot.project, existing.media.as_ref())?;
+        }
+
+        let content_ref = self.persist_text_content(
+            &snapshot.project,
+            &snapshot.id,
+            snapshot.block_type,
+            &snapshot.content,
+        )?;
+        let media_ref = if let Some(media) = &snapshot.media {
+            let extension = media_extension(&media.media_type);
+            let blob_name = format!("{}.{}", snapshot.id.as_str(), extension);
+            let relative_path = format!("blobs/{blob_name}");
+            let blob_path = self.project_dir(&snapshot.project).join(&relative_path);
+            fs::write(blob_path, media_bytes(media)?)?;
+            Some(MediaRef {
+                relative_path,
+                media_type: media.media_type.clone(),
+            })
+        } else {
+            None
+        };
+
+        let stored = StoredBlock {
+            id: snapshot.id.clone(),
+            project: snapshot.project.clone(),
+            block_type: snapshot.block_type,
+            order: snapshot.order.clone(),
+            author: snapshot.author.clone(),
+            content: content_ref,
+            media: media_ref,
+            created_at: snapshot.created_at,
+            pinned: false,
+        };
+        let bytes = serde_json::to_vec_pretty(&stored)?;
+        fs::write(metadata_path, bytes)?;
+        self.inflate_block(stored)
+    }
+
+    // ---- Document CRUD ----
+
+    pub fn create_document(
+        &self,
+        project: &ProjectName,
+        parent_doc: Option<&DocumentId>,
+        display_name: &str,
+    ) -> Result<DocumentInfo> {
+        let trimmed = display_name.trim();
+        if trimmed.is_empty() {
+            return Err(LoreError::Validation(
+                "document name must not be empty".into(),
+            ));
+        }
+        let doc_id = DocumentId::new();
+        let parent_docs_dir = match parent_doc {
+            None => self.project_dir(project).join("docs"),
+            Some(pid) => self.find_doc_dir(project, pid)?.join("docs"),
+        };
+        let doc_dir = parent_docs_dir.join(doc_id.as_str());
+        fs::create_dir_all(doc_dir.join("blocks"))?;
+        fs::create_dir_all(doc_dir.join("blobs"))?;
+        fs::create_dir_all(doc_dir.join("docs"))?;
+        let meta = DocumentMeta {
+            id: doc_id.as_str().to_string(),
+            display_name: trimmed.to_string(),
+            created_at: Some(OffsetDateTime::now_utc()),
+        };
+        fs::write(doc_dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+        Ok(DocumentInfo {
+            id: doc_id,
+            display_name: trimmed.to_string(),
+            children: Vec::new(),
+        })
+    }
+
+    pub fn list_documents(&self, project: &ProjectName) -> Result<Vec<DocumentInfo>> {
+        let docs_dir = self.project_dir(project).join("docs");
+        self.list_documents_recursive(&docs_dir)
+    }
+
+    pub fn rename_document(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        new_name: &str,
+    ) -> Result<()> {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return Err(LoreError::Validation(
+                "document name must not be empty".into(),
+            ));
+        }
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        let meta_path = doc_dir.join("meta.json");
+        let mut meta: DocumentMeta = serde_json::from_slice(&fs::read(&meta_path)?)?;
+        meta.display_name = trimmed.to_string();
+        fs::write(meta_path, serde_json::to_vec_pretty(&meta)?)?;
+        Ok(())
+    }
+
+    pub fn delete_document(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+    ) -> Result<()> {
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        fs::remove_dir_all(doc_dir)?;
+        Ok(())
+    }
+
+    // ---- Document-scoped block operations ----
+
+    pub fn list_doc_blocks(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+    ) -> Result<Vec<Block>> {
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        let blocks_dir = doc_dir.join("blocks");
+        if !blocks_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut blocks = Vec::new();
+        for entry in fs::read_dir(blocks_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let stored: StoredBlock = serde_json::from_slice(&fs::read(&path)?)?;
+            blocks.push(self.inflate_block(stored)?);
+        }
+        blocks.sort_by(|a, b| {
+            a.order
+                .cmp(&b.order)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        Ok(blocks)
+    }
+
+    pub fn get_doc_block(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+    ) -> Result<Block> {
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        let path = doc_dir
+            .join("blocks")
+            .join(format!("{}.json", block_id.as_str()));
+        if !path.exists() {
+            return Err(LoreError::BlockNotFound(block_id.as_str().to_string()));
+        }
+        let stored: StoredBlock = serde_json::from_slice(&fs::read(path)?)?;
+        self.inflate_block(stored)
+    }
+
+    pub fn create_doc_block(&self, doc_id: &DocumentId, new_block: NewBlock) -> Result<Block> {
+        let author = KeyFingerprint::from_api_key(&new_block.author_key)?;
+        let doc_dir = self.find_doc_dir(&new_block.project, doc_id)?;
+        self.create_block_in_doc_dir(&doc_dir, new_block, author)
+    }
+
+    pub fn create_doc_block_as_project_writer(
+        &self,
+        doc_id: &DocumentId,
+        new_block: NewBlock,
+    ) -> Result<Block> {
+        let author = KeyFingerprint::from_user_name(&new_block.author_key)?;
+        let doc_dir = self.find_doc_dir(&new_block.project, doc_id)?;
+        self.create_block_in_doc_dir(&doc_dir, new_block, author)
+    }
+
+    pub fn update_doc_block(&self, doc_id: &DocumentId, update: UpdateBlock) -> Result<Block> {
+        let fingerprint = KeyFingerprint::from_api_key(&update.author_key)?;
+        let doc_dir = self.find_doc_dir(&update.project, doc_id)?;
+        self.update_block_in_doc_dir(&doc_dir, update, UpdateMode::AgentOwner(fingerprint))
+    }
+
+    pub fn update_doc_block_as_project_writer(
+        &self,
+        doc_id: &DocumentId,
+        update: UpdateBlock,
+    ) -> Result<Block> {
+        let fingerprint = KeyFingerprint::from_user_name(&update.author_key)?;
+        let doc_dir = self.find_doc_dir(&update.project, doc_id)?;
+        self.update_block_in_doc_dir(&doc_dir, update, UpdateMode::ProjectWriter(fingerprint))
+    }
+
+    pub fn delete_doc_block(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+        requesting_key: &str,
+    ) -> Result<()> {
+        let fingerprint = KeyFingerprint::from_api_key(requesting_key)?;
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        self.delete_block_in_doc_dir(&doc_dir, project, block_id, Some(&fingerprint))
+    }
+
+    pub fn delete_doc_block_as_project_writer(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+    ) -> Result<()> {
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        self.delete_block_in_doc_dir(&doc_dir, project, block_id, None)
+    }
+
+    pub fn resolve_after_doc_block(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        after_block_id: Option<&BlockId>,
+        exclude_block_id: Option<&BlockId>,
+    ) -> Result<(Option<OrderKey>, Option<OrderKey>)> {
+        let mut blocks = self.list_doc_blocks(project, doc_id)?;
+        if let Some(exclude) = exclude_block_id {
+            blocks.retain(|b| &b.id != exclude);
+        }
+        match after_block_id {
+            None => Ok((None, blocks.first().map(|b| b.order.clone()))),
+            Some(after_id) => {
+                let index = blocks
+                    .iter()
+                    .position(|b| &b.id == after_id)
+                    .ok_or_else(|| {
+                        LoreError::Validation("selected placement block was not found".into())
+                    })?;
+                let left = Some(blocks[index].order.clone());
+                let right = blocks.get(index + 1).map(|b| b.order.clone());
+                Ok((left, right))
+            }
+        }
+    }
+
+    pub fn move_doc_block_after(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+        after_block_id: Option<&BlockId>,
+        requesting_key: &str,
+    ) -> Result<Block> {
+        let existing = self.get_doc_block(project, doc_id, block_id)?;
+        let (left, right) =
+            self.resolve_after_doc_block(project, doc_id, after_block_id, Some(block_id))?;
+        self.update_doc_block(
+            doc_id,
+            UpdateBlock {
+                project: project.clone(),
+                block_id: block_id.clone(),
+                block_type: existing.block_type,
+                content: existing.content,
+                author_key: requesting_key.to_string(),
+                left,
+                right,
+                image_upload: None,
+            },
+        )
+    }
+
+    pub fn move_doc_block_after_as_project_writer(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+        after_block_id: Option<&BlockId>,
+        username: &str,
+    ) -> Result<Block> {
+        let existing = self.get_doc_block(project, doc_id, block_id)?;
+        let (left, right) =
+            self.resolve_after_doc_block(project, doc_id, after_block_id, Some(block_id))?;
+        self.update_doc_block_as_project_writer(
+            doc_id,
+            UpdateBlock {
+                project: project.clone(),
+                block_id: block_id.clone(),
+                block_type: existing.block_type,
+                content: existing.content,
+                author_key: username.to_string(),
+                left,
+                right,
+                image_upload: None,
+            },
+        )
+    }
+
+    pub fn snapshot_doc_block(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+    ) -> Result<StoredBlockSnapshot> {
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        let metadata_path = doc_dir
+            .join("blocks")
+            .join(format!("{}.json", block_id.as_str()));
+        if !metadata_path.exists() {
+            return Err(LoreError::BlockNotFound(block_id.as_str().to_string()));
+        }
+        let stored: StoredBlock = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        let content = match &stored.content {
+            ContentRef::Inline(content) => content.clone(),
+            ContentRef::External { relative_path } => {
+                let blob_path = self.project_dir(project).join(relative_path);
+                read_utf8(&blob_path)?
+            }
+        };
+        let media: Result<Option<(String, Vec<u8>)>> = match stored.media.as_ref() {
+            Some(media) => {
+                let blob_path = self.project_dir(project).join(&media.relative_path);
+                Ok(Some((media.media_type.clone(), fs::read(blob_path)?)))
+            }
+            None => Ok(None),
+        };
+        Ok(snapshot_from_stored_block(stored, content, media?))
+    }
+
+    pub fn list_all_blocks_across_docs(
+        &self,
+        project: &ProjectName,
+    ) -> Result<Vec<(DocumentId, Block)>> {
+        let docs = self.list_documents(project)?;
+        let mut result = Vec::new();
+        fn walk(
+            store: &FileBlockStore,
+            project: &ProjectName,
+            docs: &[DocumentInfo],
+            result: &mut Vec<(DocumentId, Block)>,
+        ) -> Result<()> {
+            for doc in docs {
+                let blocks = store.list_doc_blocks(project, &doc.id)?;
+                for block in blocks {
+                    result.push((doc.id.clone(), block));
+                }
+                walk(store, project, &doc.children, result)?;
+            }
+            Ok(())
+        }
+        walk(self, project, &docs, &mut result)?;
+        Ok(result)
+    }
+
+    pub fn find_block_document(
+        &self,
+        project: &ProjectName,
+        block_id: &BlockId,
+    ) -> Result<DocumentId> {
+        let docs = self.list_documents(project)?;
+        fn search(
+            store: &FileBlockStore,
+            project: &ProjectName,
+            docs: &[DocumentInfo],
+            block_id: &BlockId,
+        ) -> Result<Option<DocumentId>> {
+            for doc in docs {
+                let doc_dir = store.find_doc_dir(project, &doc.id)?;
+                let block_path = doc_dir
+                    .join("blocks")
+                    .join(format!("{}.json", block_id.as_str()));
+                if block_path.exists() {
+                    return Ok(Some(doc.id.clone()));
+                }
+                if let Some(found) = search(store, project, &doc.children, block_id)? {
+                    return Ok(Some(found));
+                }
+            }
+            Ok(None)
+        }
+        search(self, project, &docs, block_id)?
+            .ok_or_else(|| LoreError::BlockNotFound(block_id.as_str().to_string()))
+    }
+
+    pub fn read_doc_blocks_around(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<Block>> {
+        let blocks = self.list_doc_blocks(project, doc_id)?;
+        let index = blocks
+            .iter()
+            .position(|block| &block.id == block_id)
+            .ok_or_else(|| LoreError::BlockNotFound(block_id.as_str().to_string()))?;
+        let start = index.saturating_sub(before);
+        let end = (index + after + 1).min(blocks.len());
+        Ok(blocks[start..end].to_vec())
+    }
+
+    pub fn first_document_id(&self, project: &ProjectName) -> Result<Option<DocumentId>> {
+        let docs = self.list_documents(project)?;
+        Ok(docs.into_iter().next().map(|d| d.id))
+    }
+
+    pub fn read_doc_block_media(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+    ) -> Result<(String, Vec<u8>)> {
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        let metadata_path = doc_dir
+            .join("blocks")
+            .join(format!("{}.json", block_id.as_str()));
+        if !metadata_path.exists() {
+            return Err(LoreError::BlockNotFound(block_id.as_str().to_string()));
+        }
+        let stored: StoredBlock = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        let media = stored
+            .media
+            .ok_or_else(|| LoreError::Validation("block does not have uploaded media".into()))?;
+        let media_path = self.project_dir(project).join(media.relative_path);
+        let bytes = fs::read(media_path)?;
+        Ok((media.media_type, bytes))
+    }
+
+    // ---- Reserved blocks ----
+
+    pub fn ensure_reserved_blocks(&self, project: &ProjectName) -> Result<()> {
+        self.ensure_layout(project)?;
+        for &reserved_id in RESERVED_BLOCK_IDS {
+            let block_id = BlockId::reserved(reserved_id);
+            let path = self.block_metadata_path(project, &block_id);
+            if path.exists() {
+                continue;
+            }
+            let stored = StoredBlock {
+                id: block_id,
+                project: project.clone(),
+                block_type: BlockType::Markdown,
+                order: OrderKey::new("80000000".into())?,
+                author: KeyFingerprint::from_user_name("system")?,
+                content: ContentRef::Inline(String::new()),
+                media: None,
+                created_at: OffsetDateTime::now_utc(),
+                pinned: true,
+            };
+            fs::write(path, serde_json::to_vec_pretty(&stored)?)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_reserved_block(
+        &self,
+        project: &ProjectName,
+        reserved_id: &str,
+    ) -> Result<Block> {
+        let block_id = BlockId::from_string(reserved_id.to_string())?;
+        if !block_id.is_reserved() {
+            return Err(LoreError::Validation("not a reserved block id".into()));
+        }
+        self.get_block(project, &block_id)
+    }
+
+    pub fn update_reserved_block(
+        &self,
+        project: &ProjectName,
+        reserved_id: &str,
+        content: &str,
+        is_agent: bool,
+    ) -> Result<Block> {
+        let block_id = BlockId::from_string(reserved_id.to_string())?;
+        if !block_id.is_reserved() {
+            return Err(LoreError::Validation("not a reserved block id".into()));
+        }
+        if is_agent && reserved_id != "_map" {
+            return Err(LoreError::PermissionDenied);
+        }
+        match reserved_id {
+            "_overview" if content.len() > 2000 => {
+                return Err(LoreError::Validation(
+                    "overview exceeds 2000 character limit".into(),
+                ));
+            }
+            "_map" if content.len() > 4000 => {
+                return Err(LoreError::Validation(
+                    "file map exceeds 4000 character limit".into(),
+                ));
+            }
+            _ => {}
+        }
+        let metadata_path = self.block_metadata_path(project, &block_id);
+        if !metadata_path.exists() {
+            return Err(LoreError::BlockNotFound(reserved_id.to_string()));
+        }
+        let mut stored: StoredBlock = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        self.remove_external_blob_if_present(project, &stored.content)?;
+        stored.content =
+            self.persist_text_content(project, &block_id, BlockType::Markdown, content)?;
+        fs::write(&metadata_path, serde_json::to_vec_pretty(&stored)?)?;
+        self.inflate_block(stored)
+    }
+
+    // ---- Migration ----
+
+    pub fn migrate_project_to_documents(&self, project: &ProjectName) -> Result<bool> {
+        let meta = self.read_project_meta(project);
+        if meta.storage_version >= 1 {
+            return Ok(false);
+        }
+
+        let project_dir = self.project_dir(project);
+        let blocks_dir = project_dir.join("blocks");
+
+        self.ensure_layout(project)?;
+        self.ensure_reserved_blocks(project)?;
+
+        // Collect non-reserved block files
+        let mut block_files = Vec::new();
+        if blocks_dir.exists() {
+            for entry in fs::read_dir(&blocks_dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".json") || name.starts_with('_') {
+                    continue;
+                }
+                block_files.push(entry.path());
+            }
+        }
+
+        if !block_files.is_empty() {
+            // Create root document for migrated content
+            let doc_id = DocumentId::new();
+            let docs_dir = project_dir.join("docs");
+            let doc_dir = docs_dir.join(doc_id.as_str());
+            let doc_blocks_dir = doc_dir.join("blocks");
+            let doc_blobs_dir = doc_dir.join("blobs");
+            fs::create_dir_all(&doc_blocks_dir)?;
+            fs::create_dir_all(&doc_blobs_dir)?;
+            fs::create_dir_all(doc_dir.join("docs"))?;
+
+            let doc_meta = DocumentMeta {
+                id: doc_id.as_str().to_string(),
+                display_name: meta.display_name.clone(),
+                created_at: Some(OffsetDateTime::now_utc()),
+            };
+            fs::write(
+                doc_dir.join("meta.json"),
+                serde_json::to_vec_pretty(&doc_meta)?,
+            )?;
+
+            for block_path in &block_files {
+                let mut stored: StoredBlock =
+                    serde_json::from_slice(&fs::read(block_path)?)?;
+
+                if let ContentRef::External { ref relative_path } = stored.content {
+                    let old_blob = project_dir.join(relative_path);
+                    if old_blob.exists() {
+                        let blob_name = old_blob.file_name().unwrap();
+                        let new_blob = doc_blobs_dir.join(blob_name);
+                        fs::rename(&old_blob, &new_blob)?;
+                        stored.content = ContentRef::External {
+                            relative_path: new_blob
+                                .strip_prefix(&project_dir)
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned(),
+                        };
+                    }
+                }
+
+                if let Some(ref media_ref) = stored.media {
+                    let old_media = project_dir.join(&media_ref.relative_path);
+                    if old_media.exists() {
+                        let media_name = old_media.file_name().unwrap();
+                        let new_media = doc_blobs_dir.join(media_name);
+                        fs::rename(&old_media, &new_media)?;
+                        stored.media = Some(MediaRef {
+                            relative_path: new_media
+                                .strip_prefix(&project_dir)
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned(),
+                            media_type: media_ref.media_type.clone(),
+                        });
+                    }
+                }
+
+                let dest = doc_blocks_dir.join(block_path.file_name().unwrap());
+                fs::write(dest, serde_json::to_vec_pretty(&stored)?)?;
+                fs::remove_file(block_path)?;
+            }
+        }
+
+        // Populate _agent-context from project meta
+        if let Some(ctx) = &meta.agent_context {
+            if !ctx.trim().is_empty() {
+                let _ = self.update_reserved_block(project, "_agent-context", ctx, false);
+            }
+        }
+
+        // Mark as migrated
+        let mut meta = self.read_project_meta(project);
+        meta.storage_version = 1;
+        self.write_project_meta(project, &meta)?;
+
+        Ok(true)
+    }
+
     pub fn ensure_layout(&self, project: &ProjectName) -> Result<()> {
         fs::create_dir_all(self.project_dir(project).join("blocks"))?;
         fs::create_dir_all(self.project_dir(project).join("blobs"))?;
+        fs::create_dir_all(self.project_dir(project).join("docs"))?;
         Ok(())
+    }
+
+    fn find_doc_dir(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+    ) -> Result<PathBuf> {
+        let docs_root = self.project_dir(project).join("docs");
+        self.find_doc_dir_recursive(&docs_root, doc_id)
+            .ok_or_else(|| {
+                LoreError::Validation(format!("document '{}' not found", doc_id))
+            })
+    }
+
+    fn find_doc_dir_recursive(
+        &self,
+        parent_docs_dir: &Path,
+        doc_id: &DocumentId,
+    ) -> Option<PathBuf> {
+        if !parent_docs_dir.exists() {
+            return None;
+        }
+        for entry in fs::read_dir(parent_docs_dir).ok()? {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            if dir_name == doc_id.as_str() {
+                return Some(entry.path());
+            }
+            let child_docs = entry.path().join("docs");
+            if let Some(found) = self.find_doc_dir_recursive(&child_docs, doc_id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn list_documents_recursive(&self, docs_dir: &Path) -> Result<Vec<DocumentInfo>> {
+        if !docs_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut docs = Vec::new();
+        for entry in fs::read_dir(docs_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let meta_path = entry.path().join("meta.json");
+            if !meta_path.exists() {
+                continue;
+            }
+            let meta: DocumentMeta = serde_json::from_slice(&fs::read(&meta_path)?)?;
+            let doc_id = DocumentId::from_string(meta.id)?;
+            let children = self.list_documents_recursive(&entry.path().join("docs"))?;
+            docs.push(DocumentInfo {
+                id: doc_id,
+                display_name: meta.display_name,
+                children,
+            });
+        }
+        docs.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+        Ok(docs)
+    }
+
+    fn create_block_in_doc_dir(
+        &self,
+        doc_dir: &Path,
+        new_block: NewBlock,
+        author: KeyFingerprint,
+    ) -> Result<Block> {
+        new_block.validate()?;
+        let order = generate_order_key(new_block.left.as_ref(), new_block.right.as_ref())?;
+        let id = BlockId::new();
+        let created_at = OffsetDateTime::now_utc();
+        let project_dir = self.project_dir(&new_block.project);
+        let content_ref = self.persist_text_content_in(
+            doc_dir,
+            &project_dir,
+            &id,
+            new_block.block_type,
+            &new_block.content,
+        )?;
+        let media_ref = self.persist_uploaded_media_in(
+            doc_dir,
+            &project_dir,
+            &id,
+            new_block.image_upload,
+        )?;
+        let stored = StoredBlock {
+            id: id.clone(),
+            project: new_block.project.clone(),
+            block_type: new_block.block_type,
+            order,
+            author,
+            content: content_ref,
+            media: media_ref,
+            created_at,
+            pinned: false,
+        };
+        let metadata_path = doc_dir
+            .join("blocks")
+            .join(format!("{}.json", id.as_str()));
+        fs::write(metadata_path, serde_json::to_vec_pretty(&stored)?)?;
+        self.inflate_block(stored)
+    }
+
+    fn update_block_in_doc_dir(
+        &self,
+        doc_dir: &Path,
+        update: UpdateBlock,
+        mode: UpdateMode,
+    ) -> Result<Block> {
+        update.validate()?;
+        let metadata_path = doc_dir
+            .join("blocks")
+            .join(format!("{}.json", update.block_id.as_str()));
+        if !metadata_path.exists() {
+            return Err(LoreError::BlockNotFound(
+                update.block_id.as_str().to_string(),
+            ));
+        }
+        let mut stored: StoredBlock = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        match &mode {
+            UpdateMode::AgentOwner(fingerprint) => {
+                if stored.pinned {
+                    return Err(LoreError::BlockPinned);
+                }
+                if &stored.author != fingerprint {
+                    return Err(LoreError::PermissionDenied);
+                }
+            }
+            UpdateMode::ProjectWriter(_) => {}
+        }
+        self.remove_external_blob_if_present(&update.project, &stored.content)?;
+        self.remove_media_if_present(&update.project, stored.media.as_ref())?;
+        let project_dir = self.project_dir(&update.project);
+        stored.block_type = update.block_type;
+        stored.author = match mode {
+            UpdateMode::AgentOwner(fp) | UpdateMode::ProjectWriter(fp) => fp,
+        };
+        if update.left.is_some() || update.right.is_some() {
+            stored.order = generate_order_key(update.left.as_ref(), update.right.as_ref())?;
+        }
+        stored.content = self.persist_text_content_in(
+            doc_dir,
+            &project_dir,
+            &update.block_id,
+            update.block_type,
+            &update.content,
+        )?;
+        stored.media = self.persist_uploaded_media_in(
+            doc_dir,
+            &project_dir,
+            &update.block_id,
+            update.image_upload,
+        )?;
+        fs::write(&metadata_path, serde_json::to_vec_pretty(&stored)?)?;
+        self.inflate_block(stored)
+    }
+
+    fn delete_block_in_doc_dir(
+        &self,
+        doc_dir: &Path,
+        project: &ProjectName,
+        block_id: &BlockId,
+        owner_fingerprint: Option<&KeyFingerprint>,
+    ) -> Result<()> {
+        let metadata_path = doc_dir
+            .join("blocks")
+            .join(format!("{}.json", block_id.as_str()));
+        if !metadata_path.exists() {
+            return Err(LoreError::BlockNotFound(block_id.as_str().to_string()));
+        }
+        let stored: StoredBlock = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        if let Some(fp) = owner_fingerprint {
+            if stored.pinned {
+                return Err(LoreError::BlockPinned);
+            }
+            if &stored.author != fp {
+                return Err(LoreError::PermissionDenied);
+            }
+        }
+        if let ContentRef::External { relative_path } = &stored.content {
+            let blob_path = self.project_dir(project).join(relative_path);
+            if blob_path.exists() {
+                fs::remove_file(blob_path)?;
+            }
+        }
+        self.remove_media_if_present(project, stored.media.as_ref())?;
+        fs::remove_file(metadata_path)?;
+        Ok(())
+    }
+
+    fn persist_text_content_in(
+        &self,
+        container_dir: &Path,
+        project_dir: &Path,
+        block_id: &BlockId,
+        block_type: BlockType,
+        content: &str,
+    ) -> Result<ContentRef> {
+        if content.len() <= ContentRef::inline_limit() {
+            return Ok(ContentRef::Inline(content.to_string()));
+        }
+        let blob_name = format!("{}.{}", block_id.as_str(), block_type.default_extension());
+        let blob_path = container_dir.join("blobs").join(&blob_name);
+        let relative_path = blob_path
+            .strip_prefix(project_dir)
+            .map_err(|_| {
+                LoreError::Validation("internal: blob path not under project dir".into())
+            })?
+            .to_string_lossy()
+            .into_owned();
+        fs::write(&blob_path, content.as_bytes())?;
+        Ok(ContentRef::External { relative_path })
+    }
+
+    fn persist_uploaded_media_in(
+        &self,
+        container_dir: &Path,
+        project_dir: &Path,
+        block_id: &BlockId,
+        image_upload: Option<crate::model::ImageUpload>,
+    ) -> Result<Option<MediaRef>> {
+        let Some(image_upload) = image_upload else {
+            return Ok(None);
+        };
+        let extension = media_extension(&image_upload.media_type);
+        let blob_name = format!("{}.{}", block_id.as_str(), extension);
+        let blob_path = container_dir.join("blobs").join(&blob_name);
+        let relative_path = blob_path
+            .strip_prefix(project_dir)
+            .map_err(|_| {
+                LoreError::Validation("internal: blob path not under project dir".into())
+            })?
+            .to_string_lossy()
+            .into_owned();
+        fs::write(&blob_path, image_upload.bytes)?;
+        Ok(Some(MediaRef {
+            relative_path,
+            media_type: image_upload.media_type,
+        }))
     }
 
     fn project_dir(&self, project: &ProjectName) -> PathBuf {
@@ -1471,5 +2379,284 @@ mod tests {
         let meta = store.read_project_meta(&info.slug);
         assert!(meta.id.is_some());
         assert_eq!(meta.id.unwrap(), info.id);
+    }
+
+    #[test]
+    fn creates_and_lists_documents() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        store
+            .create_document(&project.slug, None, "Doc A")
+            .unwrap();
+        store
+            .create_document(&project.slug, None, "Doc B")
+            .unwrap();
+
+        let docs = store.list_documents(&project.slug).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].display_name, "Doc A");
+        assert_eq!(docs[1].display_name, "Doc B");
+    }
+
+    #[test]
+    fn creates_nested_documents() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        let parent = store
+            .create_document(&project.slug, None, "Parent")
+            .unwrap();
+        let child = store
+            .create_document(&project.slug, Some(&parent.id), "Child")
+            .unwrap();
+
+        let docs = store.list_documents(&project.slug).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].display_name, "Parent");
+        assert_eq!(docs[0].children.len(), 1);
+        assert_eq!(docs[0].children[0].display_name, "Child");
+        assert_eq!(docs[0].children[0].id, child.id);
+    }
+
+    #[test]
+    fn renames_document() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Old Name")
+            .unwrap();
+
+        store
+            .rename_document(&project.slug, &doc.id, "New Name")
+            .unwrap();
+
+        let docs = store.list_documents(&project.slug).unwrap();
+        assert_eq!(docs[0].display_name, "New Name");
+    }
+
+    #[test]
+    fn deletes_document_recursively() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        let parent = store
+            .create_document(&project.slug, None, "Parent")
+            .unwrap();
+        store
+            .create_document(&project.slug, Some(&parent.id), "Child")
+            .unwrap();
+
+        store
+            .create_doc_block(
+                &parent.id,
+                NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Markdown,
+                    content: "content".into(),
+                    author_key: "key-a".into(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+
+        store.delete_document(&project.slug, &parent.id).unwrap();
+        assert!(store.list_documents(&project.slug).unwrap().is_empty());
+    }
+
+    #[test]
+    fn doc_block_crud() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "My Doc")
+            .unwrap();
+
+        let block = store
+            .create_doc_block(
+                &doc.id,
+                NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Markdown,
+                    content: "hello".into(),
+                    author_key: "key-a".into(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(block.content, "hello");
+
+        let blocks = store.list_doc_blocks(&project.slug, &doc.id).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].content, "hello");
+
+        let fetched = store
+            .get_doc_block(&project.slug, &doc.id, &block.id)
+            .unwrap();
+        assert_eq!(fetched.content, "hello");
+
+        let updated = store
+            .update_doc_block(
+                &doc.id,
+                UpdateBlock {
+                    project: project.slug.clone(),
+                    block_id: block.id.clone(),
+                    block_type: BlockType::Markdown,
+                    content: "updated".into(),
+                    author_key: "key-a".into(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.content, "updated");
+
+        store
+            .delete_doc_block(&project.slug, &doc.id, &block.id, "key-a")
+            .unwrap();
+        assert!(store
+            .list_doc_blocks(&project.slug, &doc.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn reserved_blocks_created_with_project() {
+        use crate::model::{RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW};
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        for id in [RESERVED_AGENT_CONTEXT, RESERVED_OVERVIEW, RESERVED_MAP] {
+            let block = store.get_reserved_block(&project.slug, id).unwrap();
+            assert_eq!(block.content, "");
+            assert!(block.id.is_reserved());
+        }
+    }
+
+    #[test]
+    fn reserved_block_size_limits() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        let big = "x".repeat(2001);
+        let err = store
+            .update_reserved_block(&project.slug, "_overview", &big, false)
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+
+        let big = "x".repeat(4001);
+        let err = store
+            .update_reserved_block(&project.slug, "_map", &big, false)
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+
+        store
+            .update_reserved_block(&project.slug, "_map", "files here", true)
+            .unwrap();
+        let err = store
+            .update_reserved_block(&project.slug, "_overview", "nope", true)
+            .unwrap_err();
+        assert!(matches!(err, LoreError::PermissionDenied));
+    }
+
+    #[test]
+    fn migrates_project_blocks_to_document() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = ProjectName::new("legacy").unwrap();
+
+        let b1 = store
+            .create_block(NewBlock {
+                project: project.clone(),
+                block_type: BlockType::Markdown,
+                content: "first block".into(),
+                author_key: "key-a".into(),
+                left: None,
+                right: None,
+                image_upload: None,
+            })
+            .unwrap();
+
+        store
+            .create_block(NewBlock {
+                project: project.clone(),
+                block_type: BlockType::Markdown,
+                content: "second block".into(),
+                author_key: "key-a".into(),
+                left: Some(b1.order.clone()),
+                right: None,
+                image_upload: None,
+            })
+            .unwrap();
+
+        store.write_agent_context(&project, "be helpful").unwrap();
+
+        let migrated = store.migrate_project_to_documents(&project).unwrap();
+        assert!(migrated);
+
+        let project_blocks = store.list_blocks(&project).unwrap();
+        assert!(project_blocks.iter().all(|b| b.id.is_reserved()));
+        assert_eq!(project_blocks.len(), 3);
+
+        let docs = store.list_documents(&project).unwrap();
+        assert_eq!(docs.len(), 1);
+
+        let doc_blocks = store.list_doc_blocks(&project, &docs[0].id).unwrap();
+        assert_eq!(doc_blocks.len(), 2);
+        assert_eq!(doc_blocks[0].content, "first block");
+        assert_eq!(doc_blocks[1].content, "second block");
+
+        let ctx = store
+            .get_reserved_block(&project, "_agent-context")
+            .unwrap();
+        assert_eq!(ctx.content, "be helpful");
+
+        let migrated_again = store.migrate_project_to_documents(&project).unwrap();
+        assert!(!migrated_again);
+    }
+
+    #[test]
+    fn doc_blocks_with_large_content() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Big Doc")
+            .unwrap();
+
+        let big_content = "x".repeat(20_000);
+        let block = store
+            .create_doc_block(
+                &doc.id,
+                NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Markdown,
+                    content: big_content.clone(),
+                    author_key: "key-a".into(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(block.content.len(), 20_000);
+
+        let fetched = store
+            .get_doc_block(&project.slug, &doc.id, &block.id)
+            .unwrap();
+        assert_eq!(fetched.content, big_content);
     }
 }

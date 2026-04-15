@@ -1865,6 +1865,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         }
     }
 
+    let has_endpoint = body["endpoint_id"].as_str().is_some();
     let backend = cli_backend_override.unwrap_or_else(|| {
         body["backend"]
             .as_str()
@@ -1887,7 +1888,8 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
             let trimmed = content.trim();
             if trimmed == "/compact" {
                 eprintln!("[agent] Received /compact command");
-                do_compact(context, agent_name, true, backend).await?;
+                let cb = if has_endpoint { AgentBackend::OpenAi } else { backend };
+                do_compact(context, agent_name, true, cb).await?;
                 return Ok(());
             } else if trimmed == "/stop" {
                 eprintln!("[agent] Received /stop command");
@@ -2099,63 +2101,58 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         let _ = fs::write(lore_dir.join("context.txt"), &full_prompt);
     }
 
-    // Read model/effort overrides from conversation state
-    let model_override = history["model"].as_str().map(|s| s.to_string());
-    let effort_override = history["effort"].as_str().map(|s| s.to_string());
+    let full_response = if has_endpoint {
+        // API mode: run local agentic loop, proxy LLM calls through the server
+        eprintln!("[agent] Using API endpoint mode");
+        let model_override = history["model"].as_str().map(|s| s.to_string());
+        run_api_agent_turn(context, agent_name, &full_prompt, model_override.as_deref()).await?
+    } else {
+        // CLI mode: spawn backend process
+        let model_override = history["model"].as_str().map(|s| s.to_string());
+        let effort_override = history["effort"].as_str().map(|s| s.to_string());
+        let mut child = spawn_backend(backend, &full_prompt, model_override.as_deref(), effort_override.as_deref()).await?;
 
-    // Spawn the backend CLI process
-    let mut child = spawn_backend(backend, &full_prompt, model_override.as_deref(), effort_override.as_deref()).await?;
+        let stdout = child.stdout.take().ok_or("no stdout")?;
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let mut response = String::new();
 
-    // Read streaming JSON from stdout
-    let stdout = child.stdout.take().ok_or("no stdout")?;
-    let reader = tokio::io::BufReader::new(stdout);
-    let mut lines = reader.lines();
-    let mut full_response = String::new();
-
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-
-        let parsed: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        for event in parse_backend_line(backend, &parsed) {
-            match event {
-                BackendEvent::Text(text) => {
-                    full_response.push_str(&text);
-                    let _ = context
-                        .client
-                        .post(format!("{}/v1/chat/respond", context.url))
-                        .header("x-lore-key", token)
-                        .json(&serde_json::json!({ "text": text }))
-                        .send()
-                        .await;
-                }
-                BackendEvent::ToolUse(detail) => {
-                    let _ = context
-                        .client
-                        .post(format!("{}/v1/chat/respond", context.url))
-                        .header("x-lore-key", token)
-                        .json(&serde_json::json!({ "tool_use": detail }))
-                        .send()
-                        .await;
-                }
-                BackendEvent::Result(text) => {
-                    if full_response.is_empty() && !text.is_empty() {
-                        full_response = text;
+        while let Some(line) = lines.next_line().await? {
+            let line = line.trim().to_string();
+            if line.is_empty() { continue; }
+            let parsed: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for event in parse_backend_line(backend, &parsed) {
+                match event {
+                    BackendEvent::Text(text) => {
+                        response.push_str(&text);
+                        let _ = context.client
+                            .post(format!("{}/v1/chat/respond", context.url))
+                            .header("x-lore-key", token)
+                            .json(&serde_json::json!({ "text": text }))
+                            .send().await;
                     }
+                    BackendEvent::ToolUse(detail) => {
+                        let _ = context.client
+                            .post(format!("{}/v1/chat/respond", context.url))
+                            .header("x-lore-key", token)
+                            .json(&serde_json::json!({ "tool_use": detail }))
+                            .send().await;
+                    }
+                    BackendEvent::Result(text) => {
+                        if response.is_empty() && !text.is_empty() {
+                            response = text;
+                        }
+                    }
+                    BackendEvent::Skip => {}
                 }
-                BackendEvent::Skip => {}
             }
         }
-    }
-
-    // Wait for process to finish
-    let _ = child.wait().await;
+        let _ = child.wait().await;
+        response
+    };
 
     // Send the complete response
     let _ = context
@@ -2184,11 +2181,936 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     }
 
     // Check if compaction is needed
-    if let Err(e) = maybe_auto_compact(context, agent_name, backend).await {
+    let compact_backend = if has_endpoint { AgentBackend::OpenAi } else { backend };
+    if let Err(e) = maybe_auto_compact(context, agent_name, compact_backend).await {
         eprintln!("[agent] Compaction error: {e}");
     }
 
+    // Manager turn: run locally if manage mode is enabled
+    if let Err(e) = maybe_run_manager(context, agent_name).await {
+        eprintln!("[manager] Error: {e}");
+    }
+
     Ok(())
+}
+
+async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<()> {
+    let token = context.token.as_deref().ok_or("no token configured")?;
+
+    let resp = context
+        .client
+        .get(format!("{}/v1/chat/manage", context.url))
+        .header("x-lore-key", token)
+        .send()
+        .await?
+        .error_for_status()?;
+    let manage: serde_json::Value = resp.json().await?;
+
+    if !manage["enabled"].as_bool().unwrap_or(false) {
+        return Ok(());
+    }
+
+    let system_prompt = manage["system_prompt"].as_str().unwrap_or("").to_string();
+    let messages = manage["messages"].as_array();
+    let backend_str = manage["backend"].as_str().unwrap_or("");
+
+    if system_prompt.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!("[manager] Running manager turn");
+
+    let has_endpoint = manage["has_endpoint"].as_bool().unwrap_or(false);
+    let manager_response = if has_endpoint {
+        run_manager_endpoint(context, &system_prompt, messages).await?
+    } else {
+        let backend: AgentBackend = backend_str.parse().unwrap_or(AgentBackend::Claude);
+        run_manager_cli(agent_name, backend, &system_prompt, messages).await?
+    };
+
+    if manager_response.is_empty() {
+        eprintln!("[manager] Empty response, skipping");
+        return Ok(());
+    }
+
+    let has_stop = manager_response.contains("STOPPING_POINT");
+    let has_red = manager_response.contains("RED_FLAG_POINT");
+    let stopped = has_stop || has_red;
+
+    let display = if has_stop {
+        manager_response.replace("STOPPING_POINT", "\u{2705}")
+    } else if has_red {
+        manager_response.replace("RED_FLAG_POINT", "\u{1f6a9}")
+    } else {
+        manager_response.clone()
+    };
+
+    eprintln!("[manager] Reporting to server (stopped={stopped})");
+
+    let _ = context
+        .client
+        .post(format!("{}/v1/chat/manager", context.url))
+        .header("x-lore-key", token)
+        .json(&serde_json::json!({
+            "content": display,
+            "stopped": stopped,
+        }))
+        .send()
+        .await;
+
+    // Log manager response
+    {
+        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let _ = fs::create_dir_all(&lore_dir);
+        let ts = time::OffsetDateTime::now_utc();
+        let timestamp = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            ts.year(), ts.month() as u8, ts.day(), ts.hour(), ts.minute(), ts.second());
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(lore_dir.join("lore.log")) {
+            use std::io::Write;
+            let _ = write!(f, "[{timestamp}] MANAGER:\n{display}\n\n");
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_manager_cli(
+    agent_name: &str,
+    backend: AgentBackend,
+    system_prompt: &str,
+    messages: Option<&Vec<serde_json::Value>>,
+) -> CliResult<String> {
+    let mut prompt_parts = Vec::new();
+    prompt_parts.push(system_prompt.to_string());
+
+    prompt_parts.push("\n## Recent Conversation\n".to_string());
+    if let Some(msgs) = messages {
+        for msg in msgs {
+            let role = msg["role"].as_str().unwrap_or("user");
+            let content = msg["content"].as_str().unwrap_or("");
+            let label = if role == "user" { "User" } else { "Agent" };
+            let truncated: String = content.chars().take(4000).collect();
+            prompt_parts.push(format!("--- {label} ---\n{truncated}"));
+        }
+    }
+
+    prompt_parts.push("\n## Instructions\n\nReview the conversation above and provide your guidance. You may READ files from the working directory if needed to verify periodic checks, but you must NEVER edit, create, delete, or execute any files or commands. Your only output should be your guidance text.".to_string());
+
+    let full_prompt = prompt_parts.join("\n\n");
+
+    // Save manager context for debugging
+    {
+        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let _ = fs::create_dir_all(&lore_dir);
+        let _ = fs::write(lore_dir.join("manager_context.txt"), &full_prompt);
+    }
+
+    let mut child = spawn_backend(backend, &full_prompt, None, None).await?;
+
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let reader = tokio::io::BufReader::new(stdout);
+    let mut lines = reader.lines();
+    let mut full_response = String::new();
+
+    let read_output = async {
+        while let Some(line) = lines.next_line().await? {
+            let line = line.trim().to_string();
+            if line.is_empty() { continue; }
+            let parsed: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for event in parse_backend_line(backend, &parsed) {
+                match event {
+                    BackendEvent::Text(text) => full_response.push_str(&text),
+                    BackendEvent::Result(text) => {
+                        if full_response.is_empty() && !text.is_empty() {
+                            full_response = text;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(300), read_output).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("[manager] CLI read error: {e}"),
+        Err(_) => {
+            eprintln!("[manager] CLI timed out after 5 minutes, killing process");
+            let _ = child.kill().await;
+            if full_response.is_empty() {
+                full_response = "[Manager timed out after 5 minutes]".to_string();
+            }
+        }
+    }
+
+    let _ = child.wait().await;
+    Ok(full_response)
+}
+
+async fn run_manager_endpoint(
+    context: &CliContext,
+    system_prompt: &str,
+    messages: Option<&Vec<serde_json::Value>>,
+) -> CliResult<String> {
+    let token = context.token.as_deref().ok_or("no token configured")?;
+
+    let mut api_messages = vec![
+        serde_json::json!({ "role": "system", "content": system_prompt }),
+    ];
+    if let Some(msgs) = messages {
+        for msg in msgs {
+            api_messages.push(serde_json::json!({
+                "role": msg["role"].as_str().unwrap_or("user"),
+                "content": msg["content"].as_str().unwrap_or(""),
+            }));
+        }
+    }
+
+    let body = serde_json::json!({
+        "messages": api_messages,
+        "stream": false,
+        "temperature": 0.3,
+        "max_tokens": 2048,
+    });
+
+    let resp = context.client
+        .post(format!("{}/v1/chat/manager/completions", context.url))
+        .header("x-lore-key", token)
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(60))
+        .json(&body)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp.json().await?;
+
+    if !status.is_success() {
+        let err = resp_body["error"]["message"].as_str()
+            .or_else(|| resp_body["error"].as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("Manager endpoint error ({}): {}", status, err).into());
+    }
+
+    let text = resp_body["choices"].as_array()
+        .and_then(|c| c.first())
+        .and_then(|c| c["message"]["content"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(text)
+}
+
+// --- API agent loop (runs on machine, proxies LLM calls through server) ---
+
+const API_AGENT_MAX_TURNS: usize = 500;
+const API_AGENT_MAX_CONTEXT_CHARS: usize = 400_000;
+const API_AGENT_RATE_LIMIT_WAIT_SECS: u64 = 30;
+const API_AGENT_MAX_RETRIES: usize = 2;
+const API_AGENT_TRIMMED_STUB: &str = "[Content trimmed \u{2014} re-read if needed]";
+
+async fn run_api_agent_turn(
+    context: &CliContext,
+    agent_name: &str,
+    full_prompt: &str,
+    model_override: Option<&str>,
+) -> CliResult<String> {
+    let token = context.token.as_deref().ok_or("no token configured")?;
+    let mut tools = build_local_tools();
+
+    let lore_tool_names = fetch_lore_tools(context).await;
+    for t in &lore_tool_names {
+        tools.push(t.clone());
+    }
+    let lore_names: std::collections::HashSet<String> = lore_tool_names.iter()
+        .filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    let system_content = if lore_names.is_empty() {
+        "You are an AI coding assistant with tools to read, write, and edit files, run shell commands, and search codebases. Use these tools to help the user.\n\nGuidelines:\n- Read files before editing them\n- Use edit_file for targeted changes, write_file for new files or full rewrites\n- The edit_file old_string must match exactly including whitespace\n- Test changes by running relevant commands\n- Be concise in responses".to_string()
+    } else {
+        "You are an AI coding assistant with tools to read, write, and edit files, run shell commands, and search codebases. You also have Lore knowledge base tools to manage structured content: list_projects, list_documents, list_blocks, read_block (with offset/limit), edit_block (find/replace), update_block, create_block, delete_block, grep_blocks, create_document, rename_document, delete_document. Use these tools to help the user.\n\nGuidelines:\n- Read files before editing them\n- Use edit_file for targeted changes, write_file for new files or full rewrites\n- The edit_file old_string must match exactly including whitespace\n- For Lore content: use list_documents to see the doc tree, list_blocks for block structure, read_block for content, edit_block for targeted edits\n- Test changes by running relevant commands\n- Be concise in responses".to_string()
+    };
+
+    let mut messages: Vec<serde_json::Value> = vec![
+        serde_json::json!({
+            "role": "system",
+            "content": system_content
+        }),
+        serde_json::json!({
+            "role": "user",
+            "content": full_prompt
+        }),
+    ];
+
+    let mut accumulated_text = String::new();
+    let mut rate_limit_retried = false;
+    let mut timeout_retries = 0usize;
+
+    for turn in 0..API_AGENT_MAX_TURNS {
+        trim_api_context(&mut messages);
+
+        let mut body = serde_json::json!({
+            "messages": messages,
+            "tools": tools,
+            "stream": false,
+            "max_tokens": 16384,
+        });
+        if let Some(m) = model_override {
+            body["model"] = serde_json::json!(m);
+        }
+
+        let resp = context.client
+            .post(format!("{}/v1/chat/completions", context.url))
+            .header("x-lore-key", token)
+            .timeout(std::time::Duration::from_secs(120))
+            .json(&body)
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => { timeout_retries = 0; r }
+            Err(e) => {
+                if e.is_timeout() && timeout_retries < API_AGENT_MAX_RETRIES {
+                    timeout_retries += 1;
+                    let _ = context.client
+                        .post(format!("{}/v1/chat/respond", context.url))
+                        .header("x-lore-key", token)
+                        .json(&serde_json::json!({ "tool_use": format!("\u{23f3} Request timed out, retrying ({timeout_retries}/{API_AGENT_MAX_RETRIES})...") }))
+                        .send().await;
+                    continue;
+                }
+                let err_text = format!("API request error: {e}");
+                accumulated_text.push_str(&format!("\n\n[{err_text}]"));
+                break;
+            }
+        };
+
+        let status = resp.status();
+        let resp_body: serde_json::Value = resp.json().await?;
+
+        if !status.is_success() {
+            let err = resp_body["error"]["message"].as_str()
+                .or_else(|| resp_body["error"].as_str())
+                .unwrap_or("unknown error");
+
+            if status.as_u16() == 429 && !rate_limit_retried {
+                rate_limit_retried = true;
+                let _ = context.client
+                    .post(format!("{}/v1/chat/respond", context.url))
+                    .header("x-lore-key", token)
+                    .json(&serde_json::json!({ "tool_use": format!("\u{23f3} Rate limited, retrying in {API_AGENT_RATE_LIMIT_WAIT_SECS}s...") }))
+                    .send().await;
+                tokio::time::sleep(std::time::Duration::from_secs(API_AGENT_RATE_LIMIT_WAIT_SECS)).await;
+                continue;
+            }
+
+            if status.as_u16() == 400 {
+                let has_untrimmed = messages.iter().any(|m|
+                    m["role"].as_str() == Some("tool") &&
+                    m["content"].as_str().map(|s| s != API_AGENT_TRIMMED_STUB).unwrap_or(false)
+                );
+                if has_untrimmed {
+                    aggressive_trim_api_context(&mut messages);
+                    let _ = context.client
+                        .post(format!("{}/v1/chat/respond", context.url))
+                        .header("x-lore-key", token)
+                        .json(&serde_json::json!({ "tool_use": "\u{2702}\u{fe0f} Context too large, trimming and retrying..." }))
+                        .send().await;
+                    continue;
+                }
+            }
+
+            accumulated_text.push_str(&format!("\n\n[API error ({status}): {err}]"));
+            break;
+        }
+
+        rate_limit_retried = false;
+
+        let choice = resp_body["choices"].as_array().and_then(|c| c.first());
+        let message = choice.and_then(|c| c.get("message"));
+        let content = message.and_then(|m| m["content"].as_str()).unwrap_or("").to_string();
+        let finish_reason = choice.and_then(|c| c["finish_reason"].as_str()).unwrap_or("");
+        let tool_calls = message.and_then(|m| m["tool_calls"].as_array()).cloned();
+
+        if !content.is_empty() {
+            accumulated_text.push_str(&content);
+            let _ = context.client
+                .post(format!("{}/v1/chat/respond", context.url))
+                .header("x-lore-key", token)
+                .json(&serde_json::json!({ "text": &content }))
+                .send().await;
+        }
+
+        if let Some(ref tcs) = tool_calls {
+            if !tcs.is_empty() {
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": if content.is_empty() { serde_json::Value::Null } else { serde_json::json!(content) },
+                    "tool_calls": tcs,
+                }));
+
+                for tc in tcs {
+                    let tool_id = tc["id"].as_str().unwrap_or("").to_string();
+                    let func = tc.get("function");
+                    let tool_name = func.and_then(|f| f["name"].as_str()).unwrap_or("");
+                    let raw_args = func.and_then(|f| f["arguments"].as_str()).unwrap_or("{}");
+
+                    let (tool_args, parse_error) = match serde_json::from_str::<serde_json::Value>(raw_args) {
+                        Ok(v) => (v, false),
+                        Err(_) => (serde_json::json!({}), true),
+                    };
+
+                    let is_lore_tool = lore_names.contains(tool_name);
+                    let display = if is_lore_tool {
+                        format_lore_tool_display(tool_name, &tool_args)
+                    } else {
+                        format_local_tool_display(tool_name, &tool_args)
+                    };
+                    let _ = context.client
+                        .post(format!("{}/v1/chat/respond", context.url))
+                        .header("x-lore-key", token)
+                        .json(&serde_json::json!({ "tool_use": display }))
+                        .send().await;
+
+                    let result_text = if parse_error {
+                        "Error: Failed to parse tool arguments (malformed JSON). Retry with valid JSON.".to_string()
+                    } else if is_lore_tool {
+                        let raw = execute_lore_tool(context, tool_name, &tool_args).await;
+                        truncate_local_tool_result(&raw)
+                    } else {
+                        let raw = execute_local_tool(tool_name, &tool_args).await;
+                        truncate_local_tool_result(&raw)
+                    };
+
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": result_text,
+                    }));
+                }
+
+                if [300, 400, 475].contains(&turn) {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!(
+                            "You have used {turn} of {API_AGENT_MAX_TURNS} tool-calling turns. \
+                            You have {} turns remaining. Wrap up your work soon.",
+                            API_AGENT_MAX_TURNS - turn
+                        ),
+                    }));
+                }
+                continue;
+            }
+        }
+
+        if finish_reason == "length" && content.trim().is_empty() {
+            messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+            messages.push(serde_json::json!({ "role": "user", "content": "Your response was truncated. Please continue." }));
+            continue;
+        }
+        if finish_reason == "length" && !content.is_empty() {
+            accumulated_text.push_str("\n\n\u{26a0}\u{fe0f} Response was truncated (hit output token limit).");
+        }
+
+        break;
+    }
+
+    if accumulated_text.is_empty() {
+        accumulated_text = "(no response)".to_string();
+    }
+
+    // Save API agent context for debugging
+    {
+        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let _ = fs::create_dir_all(&lore_dir);
+        let debug: String = messages.iter().map(|m| {
+            let role = m["role"].as_str().unwrap_or("?");
+            let content = m["content"].as_str().unwrap_or("").chars().take(200).collect::<String>();
+            format!("[{role}] {content}\n")
+        }).collect();
+        let _ = fs::write(lore_dir.join("api_context.txt"), &debug);
+    }
+
+    Ok(accumulated_text)
+}
+
+fn trim_api_context(messages: &mut Vec<serde_json::Value>) {
+    let size: usize = messages.iter().map(|m| {
+        serde_json::to_string(m).map(|s| s.len()).unwrap_or(0)
+    }).sum();
+    if size <= API_AGENT_MAX_CONTEXT_CHARS { return; }
+
+    for m in messages.iter_mut() {
+        let role = m["role"].as_str().unwrap_or("");
+        if role == "tool" {
+            if let Some(s) = m["content"].as_str() {
+                if s.len() > 500 && s != API_AGENT_TRIMMED_STUB {
+                    m["content"] = serde_json::json!(API_AGENT_TRIMMED_STUB);
+                }
+            }
+        } else if role == "assistant" {
+            if let Some(s) = m["content"].as_str() {
+                if s.len() > 2000 {
+                    let preview: String = s.chars().take(500).collect();
+                    m["content"] = serde_json::json!(format!("{preview}\n[Earlier analysis trimmed]"));
+                }
+            }
+        }
+    }
+}
+
+fn aggressive_trim_api_context(messages: &mut Vec<serde_json::Value>) {
+    for m in messages.iter_mut() {
+        let role = m["role"].as_str().unwrap_or("");
+        if role == "tool" {
+            if let Some(s) = m["content"].as_str() {
+                if s != API_AGENT_TRIMMED_STUB {
+                    m["content"] = serde_json::json!(API_AGENT_TRIMMED_STUB);
+                }
+            }
+        }
+    }
+}
+
+fn truncate_local_tool_result(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= 1000 && text.len() <= 100_000 {
+        return text.to_string();
+    }
+    let shown = if lines.len() > 1000 { 1000 } else { lines.len() };
+    let truncated: String = lines[..shown].join("\n");
+    format!("{truncated}\n\n[Output truncated \u{2014} {shown} of {} lines shown]", lines.len())
+}
+
+fn format_local_tool_display(name: &str, args: &serde_json::Value) -> String {
+    let get_str = |key: &str| -> &str {
+        args.get(key).and_then(|v| v.as_str()).unwrap_or("")
+    };
+    match name {
+        "read_file" => format!("Read {}", short_path(get_str("path"))),
+        "write_file" => format!("Write {}", short_path(get_str("path"))),
+        "edit_file" => format!("Edit {}", short_path(get_str("path"))),
+        "bash" => {
+            let cmd = get_str("command");
+            let truncated: String = cmd.chars().take(120).collect();
+            format!("Bash: {truncated}")
+        }
+        "grep" => {
+            let pattern = get_str("pattern");
+            let path = if get_str("path").is_empty() { "." } else { get_str("path") };
+            format!("Grep \"{pattern}\" in {}", short_path(path))
+        }
+        "glob" => format!("Glob {}", get_str("pattern")),
+        "list_directory" => format!("List {}", short_path(get_str("path"))),
+        _ => name.to_string(),
+    }
+}
+
+async fn fetch_lore_tools(context: &CliContext) -> Vec<serde_json::Value> {
+    let token = match context.token.as_deref() {
+        Some(t) => t,
+        None => return vec![],
+    };
+    let resp = context.client
+        .get(format!("{}/v1/chat/lore-tools", context.url))
+        .header("x-lore-key", token)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            if let Ok(body) = r.json::<serde_json::Value>().await {
+                body["tools"].as_array().cloned().unwrap_or_default()
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    }
+}
+
+async fn execute_lore_tool(context: &CliContext, name: &str, args: &serde_json::Value) -> String {
+    let token = match context.token.as_deref() {
+        Some(t) => t,
+        None => return "Error: no token configured".to_string(),
+    };
+    let resp = context.client
+        .post(format!("{}/v1/chat/lore-tools", context.url))
+        .header("x-lore-key", token)
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&serde_json::json!({ "name": name, "arguments": args }))
+        .send()
+        .await;
+    match resp {
+        Ok(r) => {
+            if let Ok(body) = r.json::<serde_json::Value>().await {
+                body["result"].as_str().unwrap_or("(empty result)").to_string()
+            } else {
+                "Error: failed to parse server response".to_string()
+            }
+        }
+        Err(e) => format!("Error calling Lore tool: {e}"),
+    }
+}
+
+fn format_lore_tool_display(name: &str, args: &serde_json::Value) -> String {
+    let get_str = |key: &str| -> &str {
+        args.get(key).and_then(|v| v.as_str()).unwrap_or("")
+    };
+    let short_id = |key: &str| -> String {
+        let id = get_str(key);
+        if id.starts_with('_') {
+            id.to_string()
+        } else if id.len() > 8 {
+            id[..8].to_string()
+        } else {
+            id.to_string()
+        }
+    };
+    match name {
+        "list_projects" => "\u{1f4cb} list_projects".into(),
+        "list_documents" => format!("\u{1f4c1} list_documents {}", get_str("project")),
+        "create_document" => format!("\u{1f4c4} create_document \"{}\"", get_str("name")),
+        "rename_document" => format!("\u{1f4c4} rename_document \"{}\"", get_str("name")),
+        "delete_document" => format!("\u{1f5d1}\u{fe0f} delete_document {}", short_id("document_id")),
+        "list_blocks" => format!("\u{1f4cb} list_blocks {}", short_id("document_id")),
+        "read_block" => format!("\u{1f4d6} read_block {}", short_id("block_id")),
+        "update_block" => format!("\u{270f}\u{fe0f} update_block {}", short_id("block_id")),
+        "edit_block" => format!("\u{270f}\u{fe0f} edit_block {}", short_id("block_id")),
+        "create_block" => format!("\u{270f}\u{fe0f} create_block {}", short_id("document_id")),
+        "delete_block" => format!("\u{1f5d1}\u{fe0f} delete_block {}", short_id("block_id")),
+        "move_block" => format!("\u{1f4e6} move_block {}", short_id("block_id")),
+        "grep_blocks" => format!("\u{1f50d} grep_blocks \"{}\"", get_str("query")),
+        _ => format!("\u{1f527} {name}"),
+    }
+}
+
+fn build_local_tools() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file's contents with line numbers. Use offset and limit for large files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path (absolute or relative)" },
+                        "offset": { "type": "integer", "description": "Starting line number (1-based)" },
+                        "limit": { "type": "integer", "description": "Max number of lines to read" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write content to a file, creating parent directories as needed. Overwrites existing content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path to write to" },
+                        "content": { "type": "string", "description": "Content to write" }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Replace exact text in a file. old_string must match exactly (including whitespace) and must be unique in the file. Read the file first.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path to edit" },
+                        "old_string": { "type": "string", "description": "Exact text to find (must be unique in file)" },
+                        "new_string": { "type": "string", "description": "Replacement text" }
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a shell command. Returns stdout, stderr, and exit code. Times out after 120 seconds.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Shell command to execute" }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Search for a regex pattern in files recursively. Returns matching lines with file paths and line numbers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Regex pattern to search for" },
+                        "path": { "type": "string", "description": "Directory or file to search (default: current dir)" },
+                        "include": { "type": "string", "description": "File glob to include (e.g. '*.rs')" }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "glob",
+                "description": "Find files matching a glob pattern.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Glob pattern (e.g. '*.rs', '**/*.ts')" },
+                        "path": { "type": "string", "description": "Base directory (default: current dir)" }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "List files and directories in a path. Directories end with /.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory to list (default: current dir)" }
+                    }
+                }
+            }
+        }),
+    ]
+}
+
+async fn execute_local_tool(name: &str, args: &serde_json::Value) -> String {
+    match name {
+        "read_file" => execute_read_file(args).await,
+        "write_file" => execute_write_file(args),
+        "edit_file" => execute_edit_file(args),
+        "bash" => execute_bash(args).await,
+        "grep" => execute_grep(args).await,
+        "glob" => execute_glob(args).await,
+        "list_directory" => execute_list_directory(args),
+        _ => format!("Unknown tool: {name}"),
+    }
+}
+
+async fn execute_read_file(args: &serde_json::Value) -> String {
+    let path = match args["path"].as_str() {
+        Some(p) => p,
+        None => return "Error: path is required".to_string(),
+    };
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = args["limit"].as_u64().map(|l| l as usize);
+
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = if offset > 0 { offset.saturating_sub(1) } else { 0 };
+            let end = match limit {
+                Some(l) => (start + l).min(lines.len()),
+                None => lines.len(),
+            };
+            if start >= lines.len() {
+                return format!("Error: offset {offset} beyond end of file ({} lines)", lines.len());
+            }
+            let mut result = String::new();
+            for (i, line) in lines[start..end].iter().enumerate() {
+                result.push_str(&format!("{:>6}\t{}\n", start + i + 1, line));
+            }
+            if result.is_empty() { "(empty file)".to_string() } else { result }
+        }
+        Err(e) => format!("Error reading {path}: {e}"),
+    }
+}
+
+fn execute_write_file(args: &serde_json::Value) -> String {
+    let path = match args["path"].as_str() {
+        Some(p) => p,
+        None => return "Error: path is required".to_string(),
+    };
+    let content = args["content"].as_str().unwrap_or("");
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::write(path, content) {
+        Ok(()) => format!("Wrote {} bytes to {path}", content.len()),
+        Err(e) => format!("Error writing {path}: {e}"),
+    }
+}
+
+fn execute_edit_file(args: &serde_json::Value) -> String {
+    let path = match args["path"].as_str() {
+        Some(p) => p,
+        None => return "Error: path is required".to_string(),
+    };
+    let old_string = match args["old_string"].as_str() {
+        Some(s) => s,
+        None => return "Error: old_string is required".to_string(),
+    };
+    let new_string = args["new_string"].as_str().unwrap_or("");
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return format!("Error reading {path}: {e}"),
+    };
+    let count = content.matches(old_string).count();
+    if count == 0 {
+        return format!("Error: old_string not found in {path}");
+    }
+    if count > 1 {
+        return format!("Error: old_string found {count} times in {path} \u{2014} must be unique. Provide more surrounding context.");
+    }
+    let new_content = content.replacen(old_string, new_string, 1);
+    match fs::write(path, new_content) {
+        Ok(()) => format!("Edited {path}: replaced 1 occurrence"),
+        Err(e) => format!("Error writing {path}: {e}"),
+    }
+}
+
+async fn execute_bash(args: &serde_json::Value) -> String {
+    let command = match args["command"].as_str() {
+        Some(c) => c,
+        None => return "Error: command is required".to_string(),
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new("bash")
+            .args(["-lc", command])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+    ).await;
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let exit_code = output.status.code().unwrap_or(-1);
+            let mut r = String::new();
+            if !stdout.is_empty() { r.push_str(&stdout); }
+            if !stderr.is_empty() {
+                if !r.is_empty() { r.push('\n'); }
+                r.push_str(&format!("(stderr) {stderr}"));
+            }
+            if exit_code != 0 { r.push_str(&format!("\n(exit code: {exit_code})")); }
+            if r.is_empty() { format!("(no output, exit code: {exit_code})") } else { r }
+        }
+        Ok(Err(e)) => format!("Error running command: {e}"),
+        Err(_) => "Error: command timed out after 120 seconds".to_string(),
+    }
+}
+
+async fn execute_grep(args: &serde_json::Value) -> String {
+    let pattern = match args["pattern"].as_str() {
+        Some(p) => p,
+        None => return "Error: pattern is required".to_string(),
+    };
+    let path = args["path"].as_str().unwrap_or(".");
+    let include = args["include"].as_str();
+    let mut cmd = tokio::process::Command::new("grep");
+    cmd.args(["-rn", "--color=never"]);
+    if let Some(inc) = include { cmd.args(["--include", inc]); }
+    cmd.arg("--").arg(pattern).arg(path);
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.is_empty() { "No matches found".to_string() } else { stdout.to_string() }
+        }
+        Ok(Err(e)) => format!("Error: {e}"),
+        Err(_) => "Error: grep timed out".to_string(),
+    }
+}
+
+async fn execute_glob(args: &serde_json::Value) -> String {
+    let pattern = match args["pattern"].as_str() {
+        Some(p) => p,
+        None => return "Error: pattern is required".to_string(),
+    };
+    let path = args["path"].as_str().unwrap_or(".");
+    let mut cmd = tokio::process::Command::new("find");
+    cmd.arg(path).args(["-name", pattern, "-type", "f"]);
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    match tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.is_empty() { "No files found".to_string() } else { stdout.to_string() }
+        }
+        Ok(Err(e)) => format!("Error: {e}"),
+        Err(_) => "Error: glob search timed out".to_string(),
+    }
+}
+
+fn execute_list_directory(args: &serde_json::Value) -> String {
+    let path = args["path"].as_str().unwrap_or(".");
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            let mut items: Vec<String> = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                items.push(if is_dir { format!("{name}/") } else { name });
+            }
+            items.sort();
+            if items.is_empty() { "(empty directory)".to_string() } else { items.join("\n") }
+        }
+        Err(e) => format!("Error listing {path}: {e}"),
+    }
+}
+
+// --- API-based compaction (for API agents without CLI) ---
+
+async fn run_api_compaction(context: &CliContext, prompt: &str) -> CliResult<String> {
+    let token = context.token.as_deref().ok_or("no token configured")?;
+
+    let body = serde_json::json!({
+        "messages": [
+            { "role": "system", "content": "You are a conversation compactor. Produce a concise summary." },
+            { "role": "user", "content": prompt },
+        ],
+        "stream": false,
+        "max_tokens": 4096,
+        "temperature": 0.3,
+    });
+
+    let resp = context.client
+        .post(format!("{}/v1/chat/completions", context.url))
+        .header("x-lore-key", token)
+        .timeout(std::time::Duration::from_secs(60))
+        .json(&body)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        let err = resp_body["error"]["message"].as_str().unwrap_or("unknown error");
+        return Err(format!("Compaction error ({status}): {err}").into());
+    }
+
+    let text = resp_body["choices"].as_array()
+        .and_then(|c| c.first())
+        .and_then(|c| c["message"]["content"].as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(text)
 }
 
 const COMPACTION_SYSTEM_PROMPT: &str = r#"You are compacting conversation history for an LLM that will continue this work in a future session. The LLM cannot see these messages — only your summary. Write high-signal notes that help it pick up where things left off.
@@ -2277,7 +3199,7 @@ async fn do_compact(context: &CliContext, agent_name: &str, aggressive: bool, ba
 
     // Run compaction through the agent's backend
     let full_prompt = format!("{COMPACTION_SYSTEM_PROMPT}\n\n{input}");
-    let new_summary = run_compaction(backend, &full_prompt).await?;
+    let new_summary = run_compaction(context, backend, &full_prompt).await?;
 
     if new_summary.is_empty() {
         eprintln!("[agent] Compaction produced empty summary, skipping");
@@ -2565,7 +3487,7 @@ fn parse_codex_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
 
 /// Run a prompt through the backend and collect the full text output.
 /// Used for compaction where we need the complete response, not streaming.
-async fn run_compaction(backend: AgentBackend, prompt: &str) -> CliResult<String> {
+async fn run_compaction(context: &CliContext, backend: AgentBackend, prompt: &str) -> CliResult<String> {
     match backend {
         AgentBackend::Claude => {
             // Claude without --output-format returns plain text
@@ -2617,7 +3539,7 @@ async fn run_compaction(backend: AgentBackend, prompt: &str) -> CliResult<String
             Ok(result.trim().to_string())
         }
         AgentBackend::OpenAi => {
-            Err("OpenAI backend is not yet implemented".into())
+            run_api_compaction(context, prompt).await
         }
     }
 }

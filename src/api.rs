@@ -22,16 +22,18 @@ use crate::librarian::{
     build_prompt,
 };
 use crate::model::{
-    Block, BlockId, BlockType, ImageUpload, NewBlock, OrderKey, ProjectName, UpdateBlock,
+    Block, BlockId, BlockType, DocumentId, ImageUpload, NewBlock, OrderKey, ProjectName,
+    UpdateBlock, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW,
 };
 use crate::store::FileBlockStore;
 use crate::ui::{
     AgentTokenSummary, ChatAgentSummary, ProjectListEntry, UiAuditEvent, UiDiffLine,
     UiDiffLineKind, UiLibrarianAnswer, UiPendingLibrarianAction, UiProjectVersion,
     UiProjectVersionOperation, UiUserSummary, UserProjectAccess, render_admin_audit_page,
-    render_admin_page, render_agent_guide_page, render_chat_page, render_login_page,
-    render_project_audit_page, render_project_history_page, render_project_page,
-    render_agents_page, render_projects_page, render_settings_page, render_setup_page,
+    render_admin_page, render_agent_guide_page, render_chat_page, render_document_page,
+    render_login_page, render_project_audit_page, render_project_history_page,
+    render_project_page, render_agents_page, render_projects_page, render_settings_page,
+    render_setup_page,
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
@@ -465,7 +467,11 @@ fn build_app_with_librarian(
         .route("/v1/chat/history", get(chat_agent_history))
         .route("/v1/chat/compact", post(chat_agent_compact))
         .route("/v1/chat/config", get(chat_agent_config))
+        .route("/v1/chat/manage", get(chat_agent_get_manage))
+        .route("/v1/chat/manager", post(chat_agent_manager_report))
+        .route("/v1/chat/manager/completions", post(chat_manager_proxy_completions))
         .route("/v1/chat/completions", post(chat_proxy_completions))
+        .route("/v1/chat/lore-tools", get(chat_agent_lore_tools).post(chat_agent_lore_tool_call))
         .route(
             "/v1/projects/{project}/blocks",
             get(list_project_blocks).post(create_project_block),
@@ -482,6 +488,40 @@ fn build_app_with_librarian(
         )
         .route("/v1/projects/{project}/blocks/{id}/move", post(move_block))
         .route("/v1/projects/{project}/grep", get(grep_blocks))
+        .route(
+            "/v1/projects/{project}/documents",
+            get(api_list_documents).post(api_create_document),
+        )
+        .route(
+            "/v1/projects/{project}/documents/{doc_id}",
+            put(api_rename_document).delete(api_delete_document),
+        )
+        .route(
+            "/v1/projects/{project}/documents/{doc_id}/blocks",
+            get(api_list_doc_blocks).post(api_create_doc_block),
+        )
+        .route(
+            "/v1/projects/{project}/documents/{doc_id}/blocks/{block_id}",
+            get(api_read_doc_block)
+                .patch(api_update_doc_block)
+                .delete(api_delete_doc_block),
+        )
+        .route(
+            "/v1/projects/{project}/documents/{doc_id}/blocks/{block_id}/move",
+            post(api_move_doc_block),
+        )
+        .route(
+            "/v1/projects/{project}/documents/{doc_id}/blocks/{block_id}/edit",
+            post(api_edit_doc_block),
+        )
+        .route(
+            "/v1/projects/{project}/documents/{doc_id}/grep",
+            get(api_grep_doc_blocks),
+        )
+        .route(
+            "/v1/projects/{project}/reserved/{block_id}",
+            get(api_read_reserved_block).patch(api_update_reserved_block),
+        )
         .route(
             "/v1/projects/{project}/librarian/answer",
             post(answer_librarian),
@@ -533,6 +573,11 @@ fn build_app_with_librarian(
         )
         .route("/ui/chat", get(chat_page))
         .route("/ui/chat/stream", get(chat_sse_stream))
+        .route("/ui/chat/librarian/history", get(librarian_chat_history))
+        .route("/ui/chat/librarian/ask", post(librarian_chat_ask))
+        .route("/ui/chat/librarian/config", get(librarian_chat_get_config).post(librarian_chat_save_config))
+        .route("/ui/chat/librarian/action/{id}/approve", post(librarian_chat_approve_action))
+        .route("/ui/chat/librarian/action/{id}/reject", post(librarian_chat_reject_action))
         .route("/ui/chat/{agent}/send", post(chat_send_message))
         .route("/ui/chat/{agent}/command", post(chat_slash_command))
         .route("/ui/chat/{agent}/config", post(chat_save_config).get(chat_get_config))
@@ -647,6 +692,16 @@ fn build_app_with_librarian(
         )
         .route("/ui/{project}", axum::routing::get(project_page))
         .route("/ui/{project}/context", post(update_agent_context_from_ui))
+        .route("/ui/{project}/reserved/{block_id}", post(update_reserved_block_from_ui))
+        .route("/ui/{project}/documents", post(create_document_from_ui))
+        .route("/ui/{project}/doc/{doc_id}", axum::routing::get(document_page))
+        .route("/ui/{project}/doc/{doc_id}/rename", post(rename_document_from_ui))
+        .route("/ui/{project}/doc/{doc_id}/delete", post(delete_document_from_ui))
+        .route("/ui/{project}/doc/{doc_id}/blocks", post(create_doc_block_from_form))
+        .route("/ui/{project}/doc/{doc_id}/blocks/{id}/edit", post(update_doc_block_from_form))
+        .route("/ui/{project}/doc/{doc_id}/blocks/{id}/delete", post(delete_doc_block_from_form))
+        .route("/ui/{project}/doc/{doc_id}/blocks/{id}/pin", post(toggle_doc_block_pin_from_form))
+        .route("/ui/{project}/doc/{doc_id}/blocks/{id}/media", axum::routing::get(doc_block_media))
         .route("/ui/{project}/rename", post(rename_project_from_ui))
         .route("/ui/{project}/move", post(move_project_from_ui))
         .route("/ui/{project}/delete", post(delete_project_from_ui))
@@ -775,11 +830,6 @@ struct AgentsPageQuery {
 #[derive(Debug, Deserialize)]
 struct ProjectPageQuery {
     flash: Option<String>,
-    q: Option<String>,
-    block_type: Option<String>,
-    author: Option<String>,
-    since_days: Option<u32>,
-    include_history: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -835,6 +885,78 @@ struct ProjectBlockUpdateRequest {
 #[derive(Debug, Deserialize)]
 struct MoveBlockRequest {
     after_block_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDocumentRequest {
+    name: String,
+    #[serde(default)]
+    parent_document_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameDocumentRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocBlockCreateRequest {
+    block_type: BlockType,
+    content: String,
+    after_block_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocBlockUpdateRequest {
+    block_type: BlockType,
+    content: String,
+    after_block_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocBlockEditRequest {
+    old_string: String,
+    new_string: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadBlockRangeQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocGrepQuery {
+    q: String,
+    #[serde(default)]
+    context_lines: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct DocGrepMatch {
+    block_id: String,
+    block_type: String,
+    line: usize,
+    content: String,
+    context_before: Vec<String>,
+    context_after: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectDocGrepMatch {
+    document_id: String,
+    document_name: String,
+    block_id: String,
+    block_type: String,
+    line: usize,
+    content: String,
+    context_before: Vec<String>,
+    context_after: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReservedBlockUpdateRequest {
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -903,6 +1025,32 @@ struct AgentContextUiForm {
     csrf_token: String,
     #[serde(default)]
     agent_context: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReservedBlockUiForm {
+    csrf_token: String,
+    #[serde(default)]
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDocumentUiForm {
+    csrf_token: String,
+    name: String,
+    #[serde(default)]
+    parent_document_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameDocumentUiForm {
+    csrf_token: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteDocumentUiForm {
+    csrf_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1908,6 +2056,415 @@ async fn grep_blocks(
     Ok(Json(matches))
 }
 
+// ---- Document endpoints ----
+
+async fn api_list_documents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let project = ProjectName::new(project)?;
+    authorize_project_read(&state, &headers, &project)?;
+    let docs = state.store.list_documents(&project)?;
+    Ok(Json(json!({ "documents": serialize_doc_tree(&docs) })))
+}
+
+fn serialize_doc_tree(docs: &[crate::store::DocumentInfo]) -> Vec<Value> {
+    docs.iter()
+        .map(|d| {
+            json!({
+                "id": d.id.as_str(),
+                "name": d.display_name,
+                "children": serialize_doc_tree(&d.children),
+            })
+        })
+        .collect()
+}
+
+async fn api_create_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(body): Json<CreateDocumentRequest>,
+) -> ApiResult<Json<Value>> {
+    let project = ProjectName::new(project)?;
+    authorize_project_write(&state, &headers, &project)?;
+    let parent_doc = body
+        .parent_document_id
+        .map(DocumentId::from_string)
+        .transpose()?;
+    let doc = state
+        .store
+        .create_document(&project, parent_doc.as_ref(), &body.name)?;
+    Ok(Json(json!({
+        "id": doc.id.as_str(),
+        "name": doc.display_name,
+    })))
+}
+
+async fn api_rename_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    Json(body): Json<RenameDocumentRequest>,
+) -> ApiResult<Json<Value>> {
+    let project = ProjectName::new(project)?;
+    authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    state.store.rename_document(&project, &doc_id, &body.name)?;
+    Ok(Json(json!({ "renamed": true })))
+}
+
+async fn api_delete_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    let project = ProjectName::new(project)?;
+    authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    state.store.delete_document(&project, &doc_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_list_doc_blocks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+) -> ApiResult<Json<Vec<Block>>> {
+    let project = ProjectName::new(project)?;
+    authorize_project_read(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    Ok(Json(state.store.list_doc_blocks(&project, &doc_id)?))
+}
+
+async fn api_read_doc_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, block_id)): Path<(String, String, String)>,
+    Query(query): Query<ReadBlockRangeQuery>,
+) -> ApiResult<Json<Value>> {
+    let project = ProjectName::new(project)?;
+    authorize_project_read(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let block_id = BlockId::from_string(block_id)?;
+    let block = state.store.get_doc_block(&project, &doc_id, &block_id)?;
+    if query.offset.is_some() || query.limit.is_some() {
+        let lines: Vec<&str> = block.content.lines().collect();
+        let total = lines.len();
+        let start = query.offset.unwrap_or(0).min(total);
+        let end = match query.limit {
+            Some(l) => (start + l).min(total),
+            None => total,
+        };
+        let sliced: String = lines[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{}\t{}", start + i + 1, l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(Json(json!({
+            "block_id": block.id.as_str(),
+            "block_type": format!("{:?}", block.block_type).to_lowercase(),
+            "total_lines": total,
+            "offset": start,
+            "limit": end - start,
+            "content": sliced,
+        })))
+    } else {
+        Ok(Json(json!({ "block": block })))
+    }
+}
+
+async fn api_create_doc_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    Json(body): Json<DocBlockCreateRequest>,
+) -> ApiResult<Json<Block>> {
+    let project = ProjectName::new(project)?;
+    let actor = authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let after_block_id = body.after_block_id.map(BlockId::from_string).transpose()?;
+    let (left, right) =
+        state
+            .store
+            .resolve_after_doc_block(&project, &doc_id, after_block_id.as_ref(), None)?;
+    let new_block = NewBlock {
+        project: project.clone(),
+        block_type: body.block_type,
+        content: body.content,
+        author_key: actor_author_value(&actor),
+        left,
+        right,
+        image_upload: None,
+    };
+    let block = match actor {
+        RequestActor::Agent(_) => state.store.create_doc_block(&doc_id, new_block)?,
+        RequestActor::User(_) => state
+            .store
+            .create_doc_block_as_project_writer(&doc_id, new_block)?,
+    };
+    let version_op = create_doc_version_operation(&state, &project, &doc_id, &block.id)?;
+    record_project_version(
+        &state,
+        &project_version_actor_for_request_actor(&actor),
+        &project,
+        "create document block",
+        vec![version_op],
+    )?;
+    Ok(Json(block))
+}
+
+async fn api_update_doc_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, block_id)): Path<(String, String, String)>,
+    Json(body): Json<DocBlockUpdateRequest>,
+) -> ApiResult<Json<Block>> {
+    let project = ProjectName::new(project)?;
+    let actor = authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let block_id = BlockId::from_string(block_id)?;
+    let has_after = body.after_block_id.is_some();
+    let after_block_id = body.after_block_id.map(BlockId::from_string).transpose()?;
+    let (left, right) = if has_after {
+        state.store.resolve_after_doc_block(
+            &project,
+            &doc_id,
+            after_block_id.as_ref(),
+            Some(&block_id),
+        )?
+    } else {
+        (None, None)
+    };
+    let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+    let update = UpdateBlock {
+        project: project.clone(),
+        block_id,
+        block_type: body.block_type,
+        content: body.content,
+        author_key: actor_author_value(&actor),
+        left,
+        right,
+        image_upload: None,
+    };
+    let block = match actor {
+        RequestActor::Agent(_) => state.store.update_doc_block(&doc_id, update)?,
+        RequestActor::User(_) => state
+            .store
+            .update_doc_block_as_project_writer(&doc_id, update)?,
+    };
+    let version_op = update_doc_version_operation(
+        &state, &project, &doc_id, &block.id, before,
+        ProjectVersionOperationType::UpdateBlock,
+    )?;
+    record_project_version(
+        &state,
+        &project_version_actor_for_request_actor(&actor),
+        &project,
+        "update document block",
+        vec![version_op],
+    )?;
+    Ok(Json(block))
+}
+
+async fn api_delete_doc_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, block_id)): Path<(String, String, String)>,
+) -> ApiResult<StatusCode> {
+    let project = ProjectName::new(project)?;
+    let actor = authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let block_id = BlockId::from_string(block_id)?;
+    let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+    match actor {
+        RequestActor::Agent(ref agent) => {
+            state
+                .store
+                .delete_doc_block(&project, &doc_id, &block_id, &agent.token)?
+        }
+        RequestActor::User(_) => state
+            .store
+            .delete_doc_block_as_project_writer(&project, &doc_id, &block_id)?,
+    }
+    let version_op = StoredProjectVersionOperation {
+        operation_type: ProjectVersionOperationType::DeleteBlock,
+        block_id,
+        before: Some(before),
+        after: None,
+        document_id: Some(doc_id.as_str().to_string()),
+    };
+    record_project_version(
+        &state,
+        &project_version_actor_for_request_actor(&actor),
+        &project,
+        "delete document block",
+        vec![version_op],
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_move_doc_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, block_id)): Path<(String, String, String)>,
+    Json(body): Json<MoveBlockRequest>,
+) -> ApiResult<Json<Block>> {
+    let project = ProjectName::new(project)?;
+    let actor = authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let block_id = BlockId::from_string(block_id)?;
+    let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+    let after_block_id = body.after_block_id.map(BlockId::from_string).transpose()?;
+    let block = match actor {
+        RequestActor::Agent(ref agent) => state.store.move_doc_block_after(
+            &project,
+            &doc_id,
+            &block_id,
+            after_block_id.as_ref(),
+            &agent.token,
+        )?,
+        RequestActor::User(ref user) => state.store.move_doc_block_after_as_project_writer(
+            &project,
+            &doc_id,
+            &block_id,
+            after_block_id.as_ref(),
+            user.username.as_str(),
+        )?,
+    };
+    let version_op = update_doc_version_operation(
+        &state, &project, &doc_id, &block.id, before,
+        ProjectVersionOperationType::MoveBlock,
+    )?;
+    record_project_version(
+        &state,
+        &project_version_actor_for_request_actor(&actor),
+        &project,
+        "move document block",
+        vec![version_op],
+    )?;
+    Ok(Json(block))
+}
+
+async fn api_edit_doc_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, block_id)): Path<(String, String, String)>,
+    Json(body): Json<DocBlockEditRequest>,
+) -> ApiResult<Json<Block>> {
+    let project = ProjectName::new(project)?;
+    let actor = authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let block_id = BlockId::from_string(block_id)?;
+    let existing = state.store.get_doc_block(&project, &doc_id, &block_id)?;
+    let count = existing.content.matches(&body.old_string).count();
+    if count == 0 {
+        return Err(LoreError::Validation("old_string not found in block".into()).into());
+    }
+    if count > 1 {
+        return Err(LoreError::Validation(format!(
+            "old_string found {count} times — must be unique. Provide more context."
+        ))
+        .into());
+    }
+    let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+    let new_content = existing.content.replacen(&body.old_string, &body.new_string, 1);
+    let update = UpdateBlock {
+        project: project.clone(),
+        block_id,
+        block_type: existing.block_type,
+        content: new_content,
+        author_key: actor_author_value(&actor),
+        left: None,
+        right: None,
+        image_upload: None,
+    };
+    let block = match actor {
+        RequestActor::Agent(_) => state.store.update_doc_block(&doc_id, update)?,
+        RequestActor::User(_) => state
+            .store
+            .update_doc_block_as_project_writer(&doc_id, update)?,
+    };
+    let version_op = update_doc_version_operation(
+        &state, &project, &doc_id, &block.id, before,
+        ProjectVersionOperationType::UpdateBlock,
+    )?;
+    record_project_version(
+        &state,
+        &project_version_actor_for_request_actor(&actor),
+        &project,
+        "edit document block",
+        vec![version_op],
+    )?;
+    Ok(Json(block))
+}
+
+async fn api_grep_doc_blocks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    Query(query): Query<DocGrepQuery>,
+) -> ApiResult<Json<Vec<DocGrepMatch>>> {
+    let project = ProjectName::new(project)?;
+    authorize_project_read(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let blocks = state.store.list_doc_blocks(&project, &doc_id)?;
+    let ctx_lines = query.context_lines.unwrap_or(2);
+    let needle = query.q.to_lowercase();
+    let matches = grep_blocks_with_lines(&blocks, &needle, ctx_lines);
+    Ok(Json(matches))
+}
+
+fn grep_blocks_with_lines(blocks: &[Block], needle: &str, ctx_lines: usize) -> Vec<DocGrepMatch> {
+    let mut results = Vec::new();
+    for block in blocks {
+        let lines: Vec<&str> = block.content.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.to_lowercase().contains(needle) {
+                let start = i.saturating_sub(ctx_lines);
+                let end = (i + ctx_lines + 1).min(lines.len());
+                results.push(DocGrepMatch {
+                    block_id: block.id.as_str().to_string(),
+                    block_type: format!("{:?}", block.block_type).to_lowercase(),
+                    line: i + 1,
+                    content: line.to_string(),
+                    context_before: lines[start..i].iter().map(|s| s.to_string()).collect(),
+                    context_after: lines[i + 1..end].iter().map(|s| s.to_string()).collect(),
+                });
+            }
+        }
+    }
+    results
+}
+
+async fn api_read_reserved_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, block_id)): Path<(String, String)>,
+) -> ApiResult<Json<Block>> {
+    let project = ProjectName::new(project)?;
+    authorize_project_read(&state, &headers, &project)?;
+    let block = state.store.get_reserved_block(&project, &block_id)?;
+    Ok(Json(block))
+}
+
+async fn api_update_reserved_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, block_id)): Path<(String, String)>,
+    Json(body): Json<ReservedBlockUpdateRequest>,
+) -> ApiResult<Json<Block>> {
+    let project = ProjectName::new(project)?;
+    let actor = authorize_project_write(&state, &headers, &project)?;
+    let is_agent = matches!(actor, RequestActor::Agent(_));
+    let block = state
+        .store
+        .update_reserved_block(&project, &block_id, &body.content, is_agent)?;
+    Ok(Json(block))
+}
+
 async fn list_agent_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2729,6 +3286,7 @@ async fn delete_block(
             block_id: block_id.clone(),
             before: Some(before),
             after: None,
+            document_id: None,
         }],
     )?;
     Ok(StatusCode::NO_CONTENT)
@@ -2763,6 +3321,7 @@ async fn delete_project_block(
             block_id: block_id.clone(),
             before: Some(before),
             after: None,
+            document_id: None,
         }],
     )?;
     Ok(StatusCode::NO_CONTENT)
@@ -2923,12 +3482,19 @@ async fn projects_page(
             project: info.slug,
         })
         .collect();
+    let mut project_docs = std::collections::HashMap::new();
+    for entry in &visible {
+        if let Ok(docs) = state.store.list_documents(&entry.project) {
+            project_docs.insert(entry.project.as_str().to_string(), docs);
+        }
+    }
     Ok(Html(render_projects_page(
         resolved_theme(&session.user, &server_config),
         resolved_color_mode(&session.user),
         session.user.username.as_str(),
         session.user.is_admin,
         &visible,
+        &project_docs,
         &session.csrf_token,
         query.flash.as_deref(),
     )))
@@ -3313,6 +3879,307 @@ async fn update_agent_context_from_ui(
     Ok(Redirect::to(&format!(
         "/ui/{}?flash=Agent%20context%20saved",
         project.as_str(),
+    )))
+}
+
+async fn update_reserved_block_from_ui(
+    State(state): State<AppState>,
+    Path((project, block_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(form): Form<ReservedBlockUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    state.store.update_reserved_block(&project, &block_id, &form.content, false)?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}?flash=Saved",
+        project.as_str(),
+    )))
+}
+
+async fn document_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    Query(query): Query<ProjectPageQuery>,
+) -> UiResult<Html<String>> {
+    let project = ProjectName::new(project)?;
+    let session = require_ui_session(&state, &headers)?;
+    state.auth.authorize_read(&session.user, &project)?;
+    let meta = state.store.read_project_meta(&project);
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let blocks = state.store.list_doc_blocks(&project, &doc_id)?;
+    let all_docs = state.store.list_documents(&project).unwrap_or_default();
+    let child_docs = find_doc_children(&all_docs, &doc_id);
+    let doc_name = find_doc_name(&all_docs, &doc_id).unwrap_or_else(|| "Document".to_string());
+    let server_config = state.config.load()?;
+    let page = render_document_page(
+        resolved_theme(&session.user, &server_config),
+        resolved_color_mode(&session.user),
+        &project,
+        &meta.display_name,
+        doc_id.as_str(),
+        &doc_name,
+        &blocks,
+        &child_docs,
+        query.flash.as_deref(),
+        session.user.username.as_str(),
+        session.user.can_write(&project),
+        session.user.is_admin,
+        &session.csrf_token,
+        &state.store,
+    );
+    Ok(Html(page))
+}
+
+fn find_doc_name(docs: &[crate::store::DocumentInfo], target: &DocumentId) -> Option<String> {
+    for doc in docs {
+        if doc.id == *target {
+            return Some(doc.display_name.clone());
+        }
+        if let Some(name) = find_doc_name(&doc.children, target) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn find_doc_children(docs: &[crate::store::DocumentInfo], target: &DocumentId) -> Vec<crate::store::DocumentInfo> {
+    for doc in docs {
+        if doc.id == *target {
+            return doc.children.clone();
+        }
+        let found = find_doc_children(&doc.children, target);
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    Vec::new()
+}
+
+async fn create_document_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<CreateDocumentUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    let parent_doc = form
+        .parent_document_id
+        .filter(|s| !s.is_empty())
+        .map(DocumentId::from_string)
+        .transpose()?;
+    let doc = state.store.create_document(&project, parent_doc.as_ref(), &form.name)?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}/doc/{}?flash=Document%20created",
+        project.as_str(),
+        doc.id.as_str(),
+    )))
+}
+
+async fn rename_document_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    Form(form): Form<RenameDocumentUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    state.store.rename_document(&project, &doc_id, &form.name)?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}/doc/{}?flash=Document%20renamed",
+        project.as_str(),
+        doc_id.as_str(),
+    )))
+}
+
+async fn delete_document_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    Form(form): Form<DeleteDocumentUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    state.store.delete_document(&project, &doc_id)?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}?flash=Document%20deleted",
+        project.as_str(),
+    )))
+}
+
+async fn create_doc_block_from_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    multipart: Multipart,
+) -> UiResult<Redirect> {
+    let project = ProjectName::new(project)?;
+    let session = require_ui_session(&state, &headers)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    let form = parse_create_block_form(multipart).await?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let after_block_id = form.after_block_id.map(BlockId::from_string).transpose()?;
+    let (left, right) = state
+        .store
+        .resolve_after_doc_block(&project, &doc_id, after_block_id.as_ref(), None)?;
+    let new_block = NewBlock {
+        project: project.clone(),
+        block_type: form.block_type,
+        content: form.content,
+        author_key: session.user.username.as_str().to_string(),
+        left,
+        right,
+        image_upload: form.image_upload,
+    };
+    let block = state.store.create_doc_block_as_project_writer(&doc_id, new_block)?;
+    let version_op = create_doc_version_operation(&state, &project, &doc_id, &block.id)?;
+    let actor = ProjectVersionActor {
+        kind: ProjectVersionActorKind::User,
+        name: session.user.username.as_str().to_string(),
+    };
+    record_project_version(
+        &state, &actor, &project, "create document block", vec![version_op],
+    )?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}/doc/{}?flash=Block%20created",
+        project.as_str(),
+        doc_id.as_str(),
+    )))
+}
+
+async fn update_doc_block_from_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, id)): Path<(String, String, String)>,
+    multipart: Multipart,
+) -> UiResult<Redirect> {
+    let project = ProjectName::new(project)?;
+    let session = require_ui_session(&state, &headers)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    let doc_id_parsed = DocumentId::from_string(doc_id.clone())?;
+    let block_id = BlockId::from_string(id)?;
+    let form = parse_update_block_form(multipart).await?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let block_type = match form.block_type {
+        Some(bt) => bt,
+        None => {
+            let existing = state.store.get_doc_block(&project, &doc_id_parsed, &block_id)?;
+            existing.block_type
+        }
+    };
+    let (left, right) = match form.after_block_id {
+        Some(aid) => {
+            let after_id = BlockId::from_string(aid)?;
+            state.store.resolve_after_doc_block(&project, &doc_id_parsed, Some(&after_id), Some(&block_id))?
+        }
+        None => (None, None),
+    };
+    let before = state.store.snapshot_doc_block(&project, &doc_id_parsed, &block_id)?;
+    let update = UpdateBlock {
+        project: project.clone(),
+        block_id: block_id.clone(),
+        block_type,
+        content: form.content,
+        author_key: session.user.username.as_str().to_string(),
+        left,
+        right,
+        image_upload: form.image_upload,
+    };
+    state.store.update_doc_block_as_project_writer(&doc_id_parsed, update)?;
+    let version_op = update_doc_version_operation(
+        &state, &project, &doc_id_parsed, &block_id, before,
+        ProjectVersionOperationType::UpdateBlock,
+    )?;
+    let actor = ProjectVersionActor {
+        kind: ProjectVersionActorKind::User,
+        name: session.user.username.as_str().to_string(),
+    };
+    record_project_version(
+        &state, &actor, &project, "update document block", vec![version_op],
+    )?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}/doc/{}?flash=Block%20saved",
+        project.as_str(),
+        doc_id,
+    )))
+}
+
+async fn delete_doc_block_from_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, id)): Path<(String, String, String)>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    let doc_id_parsed = DocumentId::from_string(doc_id.clone())?;
+    let block_id = BlockId::from_string(id)?;
+    let before = state.store.snapshot_doc_block(&project, &doc_id_parsed, &block_id)?;
+    state.store.delete_doc_block_as_project_writer(&project, &doc_id_parsed, &block_id)?;
+    let version_op = StoredProjectVersionOperation {
+        operation_type: ProjectVersionOperationType::DeleteBlock,
+        block_id,
+        before: Some(before),
+        after: None,
+        document_id: Some(doc_id.clone()),
+    };
+    let actor = ProjectVersionActor {
+        kind: ProjectVersionActorKind::User,
+        name: session.user.username.as_str().to_string(),
+    };
+    record_project_version(
+        &state, &actor, &project, "delete document block", vec![version_op],
+    )?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}/doc/{}?flash=Block%20deleted",
+        project.as_str(),
+        doc_id,
+    )))
+}
+
+async fn toggle_doc_block_pin_from_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, id)): Path<(String, String, String)>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(&project)?;
+    state.auth.authorize_write(&session.user, &project)?;
+    let doc_id_parsed = DocumentId::from_string(doc_id.clone())?;
+    let block_id = BlockId::from_string(id)?;
+    let block = state.store.get_doc_block(&project, &doc_id_parsed, &block_id)?;
+    let update = UpdateBlock {
+        project: project.clone(),
+        block_id,
+        block_type: block.block_type,
+        content: block.content,
+        author_key: session.user.username.as_str().to_string(),
+        left: None,
+        right: None,
+        image_upload: None,
+    };
+    state.store.update_doc_block_as_project_writer(&doc_id_parsed, update)?;
+    Ok(Redirect::to(&format!(
+        "/ui/{}/doc/{}",
+        project.as_str(),
+        doc_id,
     )))
 }
 
@@ -4191,28 +5058,14 @@ async fn project_page(
     let session = require_ui_session(&state, &headers)?;
     state.auth.authorize_read(&session.user, &project)?;
     let meta = state.store.read_project_meta(&project);
-    let all_blocks = state.store.list_blocks(&project)?;
-    let filters = block_filters_from_parts(
-        query.block_type.as_deref(),
-        query.author.as_deref(),
-        query.since_days,
-    )?;
-    let blocks = if let Some(search) = query.q.as_deref() {
-        state
-            .store
-            .search_blocks(&project, search)?
-            .into_iter()
-            .filter(|block| block_matches_filters(block, &filters))
-            .collect::<Vec<_>>()
-    } else {
-        all_blocks
-            .clone()
-            .into_iter()
-            .filter(|block| block_matches_filters(block, &filters))
-            .collect::<Vec<_>>()
-    };
-    let librarian_history = state.librarian_history.list_recent_project(&project, 8)?;
-    let pending_actions = state.pending_librarian_actions.list_project(&project, 8)?;
+    let _ = state.store.ensure_reserved_blocks(&project);
+    let mut reserved_blocks = Vec::new();
+    for &rid in crate::model::RESERVED_BLOCK_IDS {
+        if let Ok(block) = state.store.get_reserved_block(&project, rid) {
+            reserved_blocks.push(block);
+        }
+    }
+    let documents = state.store.list_documents(&project).unwrap_or_default();
     let server_config = state.config.load()?;
     let page = render_project_page(
         resolved_theme(&session.user, &server_config),
@@ -4220,21 +5073,13 @@ async fn project_page(
         &project,
         &meta.display_name,
         meta.id.as_deref().unwrap_or(""),
-        meta.agent_context.as_deref(),
-        &blocks,
+        &reserved_blocks,
+        &documents,
         query.flash.as_deref(),
-        query.q.as_deref(),
-        query.block_type.as_deref(),
-        query.author.as_deref(),
-        query.include_history.as_deref() == Some("1"),
         session.user.username.as_str(),
         session.user.can_write(&project),
         session.user.is_admin,
         &session.csrf_token,
-        None,
-        &ui_librarian_answers_from_history(&state.store, &project, librarian_history)?,
-        &ui_pending_librarian_actions(&state.store, &project, pending_actions)?,
-        &state.store,
     );
     Ok(Html(page))
 }
@@ -4344,15 +5189,15 @@ async fn answer_librarian_from_ui(
     headers: HeaderMap,
     Path(project): Path<String>,
     Form(form): Form<AskLibrarianForm>,
-) -> UiResult<Html<String>> {
+) -> UiResult<Response> {
     let project = ProjectName::new(project)?;
     let session = require_ui_session(&state, &headers)?;
     state.auth.authorize_read(&session.user, &project)?;
     verify_csrf(&session, &form.csrf_token)?;
     let options = librarian_options_from_form(&form)?;
     let allow_edits = form.allow_edits.as_deref() == Some("1");
-    let (current_answer, flash) = if allow_edits && session.user.can_write(&project) {
-        let result = execute_project_librarian_action(
+    if allow_edits && session.user.can_write(&project) {
+        let _ = execute_project_librarian_action(
             &state,
             &project,
             form.question,
@@ -4360,15 +5205,8 @@ async fn answer_librarian_from_ui(
             &session.user,
         )
         .await?;
-        let answer = UiLibrarianAnswer::from(result);
-        let flash = if answer.status == LibrarianRunStatus::PendingApproval {
-            "Librarian action planned and queued for approval"
-        } else {
-            "Librarian responded"
-        };
-        (answer, flash)
     } else {
-        let result = answer_librarian_for_project(
+        let _ = answer_librarian_for_project(
             &state,
             &project,
             form.question,
@@ -4376,41 +5214,11 @@ async fn answer_librarian_from_ui(
             librarian_actor_for_user(&session.user),
         )
         .await?;
-        (UiLibrarianAnswer::from(result), "Librarian responded")
     };
-    let meta = state.store.read_project_meta(&project);
-    let all_blocks = state.store.list_blocks(&project)?;
-    let librarian_history = state.librarian_history.list_recent_project(&project, 8)?;
-    let history_answers =
-        ui_librarian_answers_from_history(&state.store, &project, librarian_history)?;
-    let server_config = state.config.load()?;
-    let page = render_project_page(
-        resolved_theme(&session.user, &server_config),
-        resolved_color_mode(&session.user),
-        &project,
-        &meta.display_name,
-        meta.id.as_deref().unwrap_or(""),
-        meta.agent_context.as_deref(),
-        &all_blocks,
-        Some(flash),
-        None,
-        None,
-        None,
-        false,
-        session.user.username.as_str(),
-        session.user.can_write(&project),
-        session.user.is_admin,
-        &session.csrf_token,
-        Some(&current_answer),
-        &history_answers,
-        &ui_pending_librarian_actions(
-            &state.store,
-            &project,
-            state.pending_librarian_actions.list_project(&project, 8)?,
-        )?,
-        &state.store,
-    );
-    Ok(Html(page))
+    Ok(Redirect::to(&format!(
+        "/ui/chat?agent=librarian&project={}",
+        urlencoding::encode(project.as_str())
+    )).into_response())
 }
 
 async fn run_project_librarian_action(
@@ -4437,12 +5245,12 @@ async fn run_project_librarian_action_from_ui(
     headers: HeaderMap,
     Path(project): Path<String>,
     Form(form): Form<ProjectLibrarianActionForm>,
-) -> UiResult<Html<String>> {
+) -> UiResult<Response> {
     let project = ProjectName::new(project)?;
     let session = require_ui_session(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     let options = action_librarian_options_from_form(&form)?;
-    let action = execute_project_librarian_action(
+    let _ = execute_project_librarian_action(
         &state,
         &project,
         form.instruction,
@@ -4450,47 +5258,10 @@ async fn run_project_librarian_action_from_ui(
         &session.user,
     )
     .await?;
-    let meta = state.store.read_project_meta(&project);
-    let all_blocks = state.store.list_blocks(&project)?;
-    let librarian_history = state.librarian_history.list_recent_project(&project, 8)?;
-    let current_answer = UiLibrarianAnswer::from(action);
-    let history_answers =
-        ui_librarian_answers_from_history(&state.store, &project, librarian_history)?;
-    let pending_actions = ui_pending_librarian_actions(
-        &state.store,
-        &project,
-        state.pending_librarian_actions.list_project(&project, 8)?,
-    )?;
-    let server_config = state.config.load()?;
-    let page = render_project_page(
-        resolved_theme(&session.user, &server_config),
-        resolved_color_mode(&session.user),
-        &project,
-        &meta.display_name,
-        meta.id.as_deref().unwrap_or(""),
-        meta.agent_context.as_deref(),
-        &all_blocks,
-        Some(
-            if current_answer.status == LibrarianRunStatus::PendingApproval {
-                "Librarian action planned and queued for approval"
-            } else {
-                "Librarian responded"
-            },
-        ),
-        None,
-        None,
-        None,
-        false,
-        session.user.username.as_str(),
-        session.user.can_write(&project),
-        session.user.is_admin,
-        &session.csrf_token,
-        Some(&current_answer),
-        &history_answers,
-        &pending_actions,
-        &state.store,
-    );
-    Ok(Html(page))
+    Ok(Redirect::to(&format!(
+        "/ui/chat?agent=librarian&project={}",
+        urlencoding::encode(project.as_str())
+    )).into_response())
 }
 
 async fn approve_project_librarian_action(
@@ -4750,6 +5521,7 @@ async fn delete_block_from_form(
             block_id,
             before: Some(before),
             after: None,
+            document_id: None,
         }],
     )?;
     Ok(Redirect::to(&format!(
@@ -4874,6 +5646,27 @@ async fn block_media(
         .into_response())
 }
 
+async fn doc_block_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, id)): Path<(String, String, String)>,
+) -> UiResult<Response> {
+    let project = ProjectName::new(project)?;
+    let session = require_ui_session(&state, &headers)?;
+    state.auth.authorize_read(&session.user, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let block_id = BlockId::from_string(id)?;
+    let (media_type, bytes) = state.store.read_doc_block_media(&project, &doc_id, &block_id)?;
+    let content_type = HeaderValue::from_str(&media_type)
+        .map_err(|_| LoreError::Validation("stored media type is invalid".into()))?;
+
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
 fn extract_agent_token_candidate(headers: &HeaderMap) -> Result<Option<String>, LoreError> {
     if let Some(value) = headers.get(API_KEY_HEADER) {
         let value = value.to_str().map_err(|_| {
@@ -4908,11 +5701,33 @@ fn collect_project_context(state: &AppState, grants: &[crate::auth::ProjectGrant
     let mut parts: Vec<String> = Vec::new();
     for grant in grants {
         let meta = state.store.read_project_meta(&grant.project);
-        if let Some(ctx) = meta.agent_context {
-            let trimmed = ctx.trim();
-            if !trimmed.is_empty() {
-                parts.push(format!("# {}\n{}", meta.display_name, trimmed));
+        let mut project_parts: Vec<String> = Vec::new();
+
+        let agent_ctx = state
+            .store
+            .get_reserved_block(&grant.project, RESERVED_AGENT_CONTEXT)
+            .ok()
+            .map(|b| b.content)
+            .or(meta.agent_context)
+            .unwrap_or_default();
+        if !agent_ctx.trim().is_empty() {
+            project_parts.push(agent_ctx.trim().to_string());
+        }
+
+        if let Ok(overview) = state.store.get_reserved_block(&grant.project, RESERVED_OVERVIEW) {
+            if !overview.content.trim().is_empty() {
+                project_parts.push(format!("## Overview\n{}", overview.content.trim()));
             }
+        }
+
+        if let Ok(map) = state.store.get_reserved_block(&grant.project, RESERVED_MAP) {
+            if !map.content.trim().is_empty() {
+                project_parts.push(format!("## File Map\n{}", map.content.trim()));
+            }
+        }
+
+        if !project_parts.is_empty() {
+            parts.push(format!("# {}\n{}", meta.display_name, project_parts.join("\n\n")));
         }
     }
     parts.join("\n\n")
@@ -6191,11 +7006,22 @@ fn build_librarian_context(
     question: &str,
     options: &LibrarianOptions,
 ) -> Result<Vec<Block>, LoreError> {
-    let all_blocks = store
+    let mut all_blocks: Vec<Block> = store
         .list_blocks(project)?
         .into_iter()
         .filter(|block| block_matches_filters(block, &options.filters))
-        .collect::<Vec<_>>();
+        .collect();
+    let doc_blocks = store.list_all_blocks_across_docs(project)?;
+    let doc_map: std::collections::HashMap<String, DocumentId> = doc_blocks
+        .iter()
+        .map(|(doc_id, block)| (block.id.as_str().to_string(), doc_id.clone()))
+        .collect();
+    all_blocks.extend(
+        doc_blocks
+            .into_iter()
+            .map(|(_, block)| block)
+            .filter(|block| block_matches_filters(block, &options.filters)),
+    );
     if all_blocks.is_empty() {
         return Ok(Vec::new());
     }
@@ -6217,8 +7043,13 @@ fn build_librarian_context(
     };
 
     let mut context_by_id = BTreeMap::new();
-    for block_id in anchor_ids {
-        for block in store.read_blocks_around(project, &block_id, options.around, options.around)? {
+    for block_id in &anchor_ids {
+        let around_blocks = if let Some(doc_id) = doc_map.get(block_id.as_str()) {
+            store.read_doc_blocks_around(project, doc_id, block_id, options.around, options.around)?
+        } else {
+            store.read_blocks_around(project, block_id, options.around, options.around)?
+        };
+        for block in around_blocks {
             if !block_matches_filters(&block, &options.filters) {
                 continue;
             }
@@ -6381,9 +7212,15 @@ fn validate_plan_block_ids_in_project(
     project: &ProjectName,
     operations: &[ProjectLibrarianOperation],
 ) -> Result<(), LoreError> {
-    let project_blocks = state.store.list_blocks(project)?;
-    let valid_ids: std::collections::HashSet<&str> =
-        project_blocks.iter().map(|b| b.id.as_str()).collect();
+    let mut valid_ids: std::collections::HashSet<String> = state
+        .store
+        .list_blocks(project)?
+        .iter()
+        .map(|b| b.id.as_str().to_string())
+        .collect();
+    for (_, block) in state.store.list_all_blocks_across_docs(project)? {
+        valid_ids.insert(block.id.as_str().to_string());
+    }
     for op in operations {
         let ids: Vec<&str> = match op {
             ProjectLibrarianOperation::CreateBlock { after_block_id, .. } => {
@@ -6442,25 +7279,47 @@ fn execute_project_librarian_plan(
                 content,
                 after_block_id,
             } => {
-                let (left, right) =
-                    state
-                        .store
-                        .resolve_after_block(project, after_block_id.as_ref(), None)?;
-                let block = state.store.create_block_as_project_writer(NewBlock {
-                    project: project.clone(),
-                    block_type: *block_type,
-                    content: content.clone(),
-                    author_key: user.username.as_str().to_string(),
-                    left,
-                    right,
-                    image_upload: None,
-                })?;
-                recorded.push(create_version_operation(
-                    state,
-                    project,
-                    &block.id,
-                    Some(ProjectVersionOperationType::CreateBlock),
-                )?);
+                let target_doc = if let Some(after_id) = after_block_id {
+                    state.store.find_block_document(project, after_id).ok()
+                } else {
+                    state.store.first_document_id(project)?.or(None)
+                };
+                if let Some(doc_id) = target_doc {
+                    let (left, right) = state.store.resolve_after_doc_block(
+                        project, &doc_id, after_block_id.as_ref(), None,
+                    )?;
+                    let block = state.store.create_doc_block_as_project_writer(
+                        &doc_id,
+                        NewBlock {
+                            project: project.clone(),
+                            block_type: *block_type,
+                            content: content.clone(),
+                            author_key: user.username.as_str().to_string(),
+                            left,
+                            right,
+                            image_upload: None,
+                        },
+                    )?;
+                    recorded.push(create_doc_version_operation(
+                        state, project, &doc_id, &block.id,
+                    )?);
+                } else {
+                    let (left, right) =
+                        state.store.resolve_after_block(project, after_block_id.as_ref(), None)?;
+                    let block = state.store.create_block_as_project_writer(NewBlock {
+                        project: project.clone(),
+                        block_type: *block_type,
+                        content: content.clone(),
+                        author_key: user.username.as_str().to_string(),
+                        left,
+                        right,
+                        image_upload: None,
+                    })?;
+                    recorded.push(create_version_operation(
+                        state, project, &block.id,
+                        Some(ProjectVersionOperationType::CreateBlock),
+                    )?);
+                }
             }
             ProjectLibrarianOperation::UpdateBlock {
                 block_id,
@@ -6468,66 +7327,109 @@ fn execute_project_librarian_plan(
                 content,
                 after_block_id,
             } => {
-                let before = state.store.snapshot_block(project, block_id)?;
-                let existing = state.store.get_block(project, block_id)?;
-                let (left, right) =
-                    if block_type.is_some() || content.is_some() || after_block_id.is_some() {
-                        state.store.resolve_after_block(
-                            project,
-                            after_block_id.as_ref(),
-                            Some(block_id),
-                        )?
-                    } else {
-                        (None, None)
-                    };
-                let block = state.store.update_block_as_project_writer(UpdateBlock {
-                    project: project.clone(),
-                    block_id: block_id.clone(),
-                    block_type: block_type.unwrap_or(existing.block_type),
-                    content: content.clone().unwrap_or(existing.content),
-                    author_key: user.username.as_str().to_string(),
-                    left,
-                    right,
-                    image_upload: None,
-                })?;
-                recorded.push(update_version_operation(
-                    state,
-                    project,
-                    &block.id,
-                    before,
-                    ProjectVersionOperationType::UpdateBlock,
-                )?);
+                if let Ok(doc_id) = state.store.find_block_document(project, block_id) {
+                    let before = state.store.snapshot_doc_block(project, &doc_id, block_id)?;
+                    let existing = state.store.get_doc_block(project, &doc_id, block_id)?;
+                    let (left, right) =
+                        if block_type.is_some() || content.is_some() || after_block_id.is_some() {
+                            state.store.resolve_after_doc_block(
+                                project, &doc_id, after_block_id.as_ref(), Some(block_id),
+                            )?
+                        } else {
+                            (None, None)
+                        };
+                    let block = state.store.update_doc_block_as_project_writer(
+                        &doc_id,
+                        UpdateBlock {
+                            project: project.clone(),
+                            block_id: block_id.clone(),
+                            block_type: block_type.unwrap_or(existing.block_type),
+                            content: content.clone().unwrap_or(existing.content),
+                            author_key: user.username.as_str().to_string(),
+                            left,
+                            right,
+                            image_upload: None,
+                        },
+                    )?;
+                    recorded.push(update_doc_version_operation(
+                        state, project, &doc_id, &block.id, before,
+                        ProjectVersionOperationType::UpdateBlock,
+                    )?);
+                } else {
+                    let before = state.store.snapshot_block(project, block_id)?;
+                    let existing = state.store.get_block(project, block_id)?;
+                    let (left, right) =
+                        if block_type.is_some() || content.is_some() || after_block_id.is_some() {
+                            state.store.resolve_after_block(
+                                project, after_block_id.as_ref(), Some(block_id),
+                            )?
+                        } else {
+                            (None, None)
+                        };
+                    let block = state.store.update_block_as_project_writer(UpdateBlock {
+                        project: project.clone(),
+                        block_id: block_id.clone(),
+                        block_type: block_type.unwrap_or(existing.block_type),
+                        content: content.clone().unwrap_or(existing.content),
+                        author_key: user.username.as_str().to_string(),
+                        left,
+                        right,
+                        image_upload: None,
+                    })?;
+                    recorded.push(update_version_operation(
+                        state, project, &block.id, before,
+                        ProjectVersionOperationType::UpdateBlock,
+                    )?);
+                }
             }
             ProjectLibrarianOperation::MoveBlock {
                 block_id,
                 after_block_id,
             } => {
-                let before = state.store.snapshot_block(project, block_id)?;
-                let block = state.store.move_block_after_as_project_writer(
-                    project,
-                    block_id,
-                    after_block_id.as_ref(),
-                    user.username.as_str(),
-                )?;
-                recorded.push(update_version_operation(
-                    state,
-                    project,
-                    &block.id,
-                    before,
-                    ProjectVersionOperationType::MoveBlock,
-                )?);
+                if let Ok(doc_id) = state.store.find_block_document(project, block_id) {
+                    let before = state.store.snapshot_doc_block(project, &doc_id, block_id)?;
+                    let block = state.store.move_doc_block_after_as_project_writer(
+                        project, &doc_id, block_id, after_block_id.as_ref(),
+                        user.username.as_str(),
+                    )?;
+                    recorded.push(update_doc_version_operation(
+                        state, project, &doc_id, &block.id, before,
+                        ProjectVersionOperationType::MoveBlock,
+                    )?);
+                } else {
+                    let before = state.store.snapshot_block(project, block_id)?;
+                    let block = state.store.move_block_after_as_project_writer(
+                        project, block_id, after_block_id.as_ref(),
+                        user.username.as_str(),
+                    )?;
+                    recorded.push(update_version_operation(
+                        state, project, &block.id, before,
+                        ProjectVersionOperationType::MoveBlock,
+                    )?);
+                }
             }
             ProjectLibrarianOperation::DeleteBlock { block_id } => {
-                let before = state.store.snapshot_block(project, block_id)?;
-                state
-                    .store
-                    .delete_block_as_project_writer(project, block_id)?;
-                recorded.push(StoredProjectVersionOperation {
-                    operation_type: ProjectVersionOperationType::DeleteBlock,
-                    block_id: block_id.clone(),
-                    before: Some(before),
-                    after: None,
-                });
+                if let Ok(doc_id) = state.store.find_block_document(project, block_id) {
+                    let before = state.store.snapshot_doc_block(project, &doc_id, block_id)?;
+                    state.store.delete_doc_block_as_project_writer(project, &doc_id, block_id)?;
+                    recorded.push(StoredProjectVersionOperation {
+                        operation_type: ProjectVersionOperationType::DeleteBlock,
+                        block_id: block_id.clone(),
+                        before: Some(before),
+                        after: None,
+                        document_id: Some(doc_id.as_str().to_string()),
+                    });
+                } else {
+                    let before = state.store.snapshot_block(project, block_id)?;
+                    state.store.delete_block_as_project_writer(project, block_id)?;
+                    recorded.push(StoredProjectVersionOperation {
+                        operation_type: ProjectVersionOperationType::DeleteBlock,
+                        block_id: block_id.clone(),
+                        before: Some(before),
+                        after: None,
+                        document_id: None,
+                    });
+                }
             }
         }
     }
@@ -6570,6 +7472,7 @@ fn create_version_operation(
         block_id: block_id.clone(),
         before: None,
         after: Some(state.store.snapshot_block(project, block_id)?),
+        document_id: None,
     })
 }
 
@@ -6585,6 +7488,39 @@ fn update_version_operation(
         block_id: block_id.clone(),
         before: Some(before),
         after: Some(state.store.snapshot_block(project, block_id)?),
+        document_id: None,
+    })
+}
+
+fn create_doc_version_operation(
+    state: &AppState,
+    project: &ProjectName,
+    doc_id: &DocumentId,
+    block_id: &BlockId,
+) -> Result<StoredProjectVersionOperation, LoreError> {
+    Ok(StoredProjectVersionOperation {
+        operation_type: ProjectVersionOperationType::CreateBlock,
+        block_id: block_id.clone(),
+        before: None,
+        after: Some(state.store.snapshot_doc_block(project, doc_id, block_id)?),
+        document_id: Some(doc_id.as_str().to_string()),
+    })
+}
+
+fn update_doc_version_operation(
+    state: &AppState,
+    project: &ProjectName,
+    doc_id: &DocumentId,
+    block_id: &BlockId,
+    before: StoredBlockSnapshot,
+    operation_type: ProjectVersionOperationType,
+) -> Result<StoredProjectVersionOperation, LoreError> {
+    Ok(StoredProjectVersionOperation {
+        operation_type,
+        block_id: block_id.clone(),
+        before: Some(before),
+        after: Some(state.store.snapshot_doc_block(project, doc_id, block_id)?),
+        document_id: Some(doc_id.as_str().to_string()),
     })
 }
 
@@ -6688,23 +7624,42 @@ fn revert_recorded_project_version(
     }
     ensure_version_can_be_reverted(state, &version)?;
     for operation in version.operations.iter().rev() {
+        let doc_id = operation
+            .document_id
+            .as_ref()
+            .map(|s| DocumentId::from_string(s.clone()))
+            .transpose()?;
         match operation.operation_type {
             ProjectVersionOperationType::CreateBlock => {
-                state
-                    .store
-                    .delete_block_as_project_writer(project, &operation.block_id)?;
+                if let Some(ref did) = doc_id {
+                    state
+                        .store
+                        .delete_doc_block_as_project_writer(project, did, &operation.block_id)?;
+                } else {
+                    state
+                        .store
+                        .delete_block_as_project_writer(project, &operation.block_id)?;
+                }
             }
             ProjectVersionOperationType::UpdateBlock | ProjectVersionOperationType::MoveBlock => {
                 let before = operation.before.as_ref().ok_or_else(|| {
                     LoreError::Validation("recorded version is missing a before snapshot".into())
                 })?;
-                state.store.restore_block_snapshot(before)?;
+                if let Some(ref did) = doc_id {
+                    state.store.restore_doc_block_snapshot(project, did, before)?;
+                } else {
+                    state.store.restore_block_snapshot(before)?;
+                }
             }
             ProjectVersionOperationType::DeleteBlock => {
                 let before = operation.before.as_ref().ok_or_else(|| {
                     LoreError::Validation("recorded version is missing a deleted snapshot".into())
                 })?;
-                state.store.restore_block_snapshot(before)?;
+                if let Some(ref did) = doc_id {
+                    state.store.restore_doc_block_snapshot(project, did, before)?;
+                } else {
+                    state.store.restore_block_snapshot(before)?;
+                }
             }
         }
     }
@@ -6736,6 +7691,11 @@ fn ensure_version_can_be_reverted(
     version: &StoredProjectVersion,
 ) -> Result<(), LoreError> {
     for operation in &version.operations {
+        let doc_id = operation
+            .document_id
+            .as_ref()
+            .map(|s| DocumentId::from_string(s.clone()))
+            .transpose()?;
         match operation.operation_type {
             ProjectVersionOperationType::CreateBlock
             | ProjectVersionOperationType::UpdateBlock
@@ -6743,22 +7703,39 @@ fn ensure_version_can_be_reverted(
                 let after = operation.after.as_ref().ok_or_else(|| {
                     LoreError::Validation("recorded version is missing an after snapshot".into())
                 })?;
-                if !state.store.block_matches_snapshot(
-                    &version.project,
-                    &operation.block_id,
-                    after,
-                )? {
+                let matches = if let Some(ref did) = doc_id {
+                    state.store.doc_block_matches_snapshot(
+                        &version.project,
+                        did,
+                        &operation.block_id,
+                        after,
+                    )?
+                } else {
+                    state.store.block_matches_snapshot(
+                        &version.project,
+                        &operation.block_id,
+                        after,
+                    )?
+                };
+                if !matches {
                     return Err(LoreError::Validation(
                         "this version can no longer be reverted cleanly because later changes touched the same block".into(),
                     ));
                 }
             }
             ProjectVersionOperationType::DeleteBlock => {
-                if state
-                    .store
-                    .get_block(&version.project, &operation.block_id)
-                    .is_ok()
-                {
+                let block_exists = if let Some(ref did) = doc_id {
+                    state
+                        .store
+                        .get_doc_block(&version.project, did, &operation.block_id)
+                        .is_ok()
+                } else {
+                    state
+                        .store
+                        .get_block(&version.project, &operation.block_id)
+                        .is_ok()
+                };
+                if block_exists {
                     return Err(LoreError::Validation(
                         "this version can no longer be reverted cleanly because the deleted block already exists again".into(),
                     ));
@@ -6791,6 +7768,7 @@ fn build_revert_operations(
             block_id: operation.block_id.clone(),
             before: operation.after.clone(),
             after: operation.before.clone(),
+            document_id: operation.document_id.clone(),
         })
         .collect()
 }
@@ -7489,135 +8467,311 @@ fn call_mcp_tool(
                 .list_projects()?
                 .into_iter()
                 .filter(|project| agent.can_read(project))
-                .map(|project| json!({ "project": project.as_str() }))
+                .map(|project| {
+                    let perm = if agent.can_write(&project) {
+                        "read-write"
+                    } else {
+                        "read"
+                    };
+                    json!({ "project": project.as_str(), "permission": perm })
+                })
                 .collect::<Vec<_>>();
             json!({ "projects": projects })
+        }
+        "list_documents" => {
+            let project = required_project(&args, "project")?;
+            authorize_agent_read(agent, &project)?;
+            let docs = state.store.list_documents(&project)?;
+            json!({ "documents": serialize_doc_tree(&docs) })
+        }
+        "create_document" => {
+            let project = required_project(&args, "project")?;
+            authorize_agent_write(agent, &project)?;
+            let doc_name = required_string(&args, "name")?;
+            let parent_doc = optional_string(&args, "parent_document_id")
+                .map(DocumentId::from_string)
+                .transpose()?;
+            let doc = state
+                .store
+                .create_document(&project, parent_doc.as_ref(), &doc_name)?;
+            json!({ "document_id": doc.id.as_str(), "name": doc.display_name })
+        }
+        "rename_document" => {
+            let project = required_project(&args, "project")?;
+            authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
+            let new_name = required_string(&args, "name")?;
+            state.store.rename_document(&project, &doc_id, &new_name)?;
+            json!({ "renamed": true, "document_id": doc_id.as_str() })
+        }
+        "delete_document" => {
+            let project = required_project(&args, "project")?;
+            authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
+            state.store.delete_document(&project, &doc_id)?;
+            json!({ "deleted": true, "document_id": doc_id.as_str() })
         }
         "list_blocks" => {
             let project = required_project(&args, "project")?;
             authorize_agent_read(agent, &project)?;
-            json!({ "blocks": state.store.list_blocks(&project)? })
+            let doc_id = required_document_id(&args, "document_id")?;
+            let blocks = state.store.list_doc_blocks(&project, &doc_id)?;
+            let summaries: Vec<Value> = blocks
+                .iter()
+                .map(|b| {
+                    let preview = b.content.lines().next().unwrap_or("").chars().take(80).collect::<String>();
+                    json!({
+                        "block_id": b.id.as_str(),
+                        "block_type": format!("{:?}", b.block_type).to_lowercase(),
+                        "preview": preview,
+                        "lines": b.content.lines().count(),
+                    })
+                })
+                .collect();
+            json!({ "blocks": summaries })
         }
         "read_block" => {
             let project = required_project(&args, "project")?;
             authorize_agent_read(agent, &project)?;
             let block_id = required_block_id(&args, "block_id")?;
-            json!({ "block": state.store.get_block(&project, &block_id)? })
-        }
-        "read_blocks_around" => {
-            let project = required_project(&args, "project")?;
-            authorize_agent_read(agent, &project)?;
-            let block_id = required_block_id(&args, "block_id")?;
-            let before = optional_usize(&args, "before").unwrap_or(2);
-            let after = optional_usize(&args, "after").unwrap_or(2);
-            json!({
-                "anchor": block_id.as_str(),
-                "blocks": state.store.read_blocks_around(&project, &block_id, before, after)?
-            })
-        }
-        "grep_blocks" => {
-            let project = required_project(&args, "project")?;
-            authorize_agent_read(agent, &project)?;
-            let query = required_string(&args, "query")?;
-            let matches = state
-                .store
-                .search_blocks(&project, &query)?
-                .into_iter()
-                .map(|block| {
-                    json!({
-                        "block": block.clone(),
-                        "preview": grep_preview(&block.content, &query),
-                    })
+            let block = if block_id.is_reserved() {
+                state.store.get_reserved_block(&project, block_id.as_str())?
+            } else {
+                let doc_id = required_document_id(&args, "document_id")?;
+                state.store.get_doc_block(&project, &doc_id, &block_id)?
+            };
+            let offset = optional_usize(&args, "offset");
+            let limit = optional_usize(&args, "limit");
+            if offset.is_some() || limit.is_some() {
+                let lines: Vec<&str> = block.content.lines().collect();
+                let total = lines.len();
+                let start = offset.unwrap_or(0).min(total);
+                let end = match limit {
+                    Some(l) => (start + l).min(total),
+                    None => total,
+                };
+                let numbered: String = lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| format!("{}\t{}", start + i + 1, l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                json!({
+                    "block_id": block.id.as_str(),
+                    "block_type": format!("{:?}", block.block_type).to_lowercase(),
+                    "total_lines": total,
+                    "offset": start,
+                    "limit": end - start,
+                    "content": numbered,
                 })
-                .collect::<Vec<_>>();
-            json!({ "matches": matches })
-        }
-        "create_block" => {
-            let project = required_project(&args, "project")?;
-            authorize_agent_write(agent, &project)?;
-            let after_block_id = optional_block_id(&args, "after_block_id")?;
-            let (left, right) =
-                state
-                    .store
-                    .resolve_after_block(&project, after_block_id.as_ref(), None)?;
-            let block = state.store.create_block(NewBlock {
-                project,
-                block_type: required_block_type(&args, "block_type")?,
-                content: required_string(&args, "content")?,
-                author_key: agent.token.clone(),
-                left,
-                right,
-                image_upload: None,
-            })?;
-            json!({ "block": block })
+            } else {
+                json!({ "block": block })
+            }
         }
         "update_block" => {
             let project = required_project(&args, "project")?;
             authorize_agent_write(agent, &project)?;
             let block_id = required_block_id(&args, "block_id")?;
-            let existing = state.store.get_block(&project, &block_id)?;
-            let after_block_id = optional_block_id(&args, "after_block_id")?;
-            let (left, right) = if args.contains_key("after_block_id") {
-                state.store.resolve_after_block(
-                    &project,
-                    after_block_id.as_ref(),
-                    Some(&block_id),
-                )?
+            let content = required_string(&args, "content")?;
+            if block_id.is_reserved() {
+                let block = state
+                    .store
+                    .update_reserved_block(&project, block_id.as_str(), &content, true)?;
+                json!({ "block": block })
             } else {
-                (None, None)
+                let doc_id = required_document_id(&args, "document_id")?;
+                let existing = state.store.get_doc_block(&project, &doc_id, &block_id)?;
+                let block_type = optional_block_type(&args, "block_type")?
+                    .unwrap_or(existing.block_type);
+                let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+                let block = state.store.update_doc_block(
+                    &doc_id,
+                    UpdateBlock {
+                        project: project.clone(),
+                        block_id: block_id.clone(),
+                        block_type,
+                        content,
+                        author_key: agent.token.clone(),
+                        left: None,
+                        right: None,
+                        image_upload: None,
+                    },
+                )?;
+                let version_op = update_doc_version_operation(
+                    state, &project, &doc_id, &block_id, before,
+                    ProjectVersionOperationType::UpdateBlock,
+                )?;
+                let actor = ProjectVersionActor {
+                    kind: ProjectVersionActorKind::Agent,
+                    name: agent.name.clone(),
+                };
+                record_project_version(state, &actor, &project, "update document block (MCP)", vec![version_op])?;
+                json!({ "block": block })
+            }
+        }
+        "edit_block" => {
+            let project = required_project(&args, "project")?;
+            authorize_agent_write(agent, &project)?;
+            let block_id = required_block_id(&args, "block_id")?;
+            let old_string = required_string(&args, "old_string")?;
+            let new_string = required_string(&args, "new_string")?;
+            if block_id.is_reserved() {
+                let existing = state.store.get_reserved_block(&project, block_id.as_str())?;
+                let count = existing.content.matches(&old_string).count();
+                if count == 0 {
+                    return Err(LoreError::Validation("old_string not found in block".into()));
+                }
+                if count > 1 {
+                    return Err(LoreError::Validation(format!(
+                        "old_string found {count} times — must be unique"
+                    )));
+                }
+                let new_content = existing.content.replacen(&old_string, &new_string, 1);
+                let block = state
+                    .store
+                    .update_reserved_block(&project, block_id.as_str(), &new_content, true)?;
+                json!({ "edited": true, "block": block })
+            } else {
+                let doc_id = required_document_id(&args, "document_id")?;
+                let existing = state.store.get_doc_block(&project, &doc_id, &block_id)?;
+                let count = existing.content.matches(&old_string).count();
+                if count == 0 {
+                    return Err(LoreError::Validation("old_string not found in block".into()));
+                }
+                if count > 1 {
+                    return Err(LoreError::Validation(format!(
+                        "old_string found {count} times — must be unique"
+                    )));
+                }
+                let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+                let new_content = existing.content.replacen(&old_string, &new_string, 1);
+                let block = state.store.update_doc_block(
+                    &doc_id,
+                    UpdateBlock {
+                        project: project.clone(),
+                        block_id: block_id.clone(),
+                        block_type: existing.block_type,
+                        content: new_content,
+                        author_key: agent.token.clone(),
+                        left: None,
+                        right: None,
+                        image_upload: None,
+                    },
+                )?;
+                let version_op = update_doc_version_operation(
+                    state, &project, &doc_id, &block_id, before,
+                    ProjectVersionOperationType::UpdateBlock,
+                )?;
+                let actor = ProjectVersionActor {
+                    kind: ProjectVersionActorKind::Agent,
+                    name: agent.name.clone(),
+                };
+                record_project_version(state, &actor, &project, "edit document block (MCP)", vec![version_op])?;
+                json!({ "edited": true, "block": block })
+            }
+        }
+        "create_block" => {
+            let project = required_project(&args, "project")?;
+            authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
+            let after_block_id = optional_block_id(&args, "after_block_id")?;
+            let (left, right) = state.store.resolve_after_doc_block(
+                &project,
+                &doc_id,
+                after_block_id.as_ref(),
+                None,
+            )?;
+            let block_type = optional_block_type(&args, "block_type")?
+                .unwrap_or(BlockType::Markdown);
+            let block = state.store.create_doc_block(
+                &doc_id,
+                NewBlock {
+                    project: project.clone(),
+                    block_type,
+                    content: required_string(&args, "content")?,
+                    author_key: agent.token.clone(),
+                    left,
+                    right,
+                    image_upload: None,
+                },
+            )?;
+            let version_op = create_doc_version_operation(state, &project, &doc_id, &block.id)?;
+            let actor = ProjectVersionActor {
+                kind: ProjectVersionActorKind::Agent,
+                name: agent.name.clone(),
             };
-            let block = state.store.update_block(UpdateBlock {
-                project,
-                block_id,
-                block_type: optional_block_type(&args, "block_type")?
-                    .unwrap_or(existing.block_type),
-                content: optional_string(&args, "content").unwrap_or(existing.content),
-                author_key: agent.token.clone(),
-                left,
-                right,
-                image_upload: None,
-            })?;
+            record_project_version(state, &actor, &project, "create document block (MCP)", vec![version_op])?;
             json!({ "block": block })
         }
         "move_block" => {
             let project = required_project(&args, "project")?;
             authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
             let block_id = required_block_id(&args, "block_id")?;
             let after_block_id = optional_block_id(&args, "after_block_id")?;
-            let block = state.store.move_block_after(
+            let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+            let block = state.store.move_doc_block_after(
                 &project,
+                &doc_id,
                 &block_id,
                 after_block_id.as_ref(),
                 &agent.token,
             )?;
+            let version_op = update_doc_version_operation(
+                state, &project, &doc_id, &block.id, before,
+                ProjectVersionOperationType::MoveBlock,
+            )?;
+            let actor = ProjectVersionActor {
+                kind: ProjectVersionActorKind::Agent,
+                name: agent.name.clone(),
+            };
+            record_project_version(state, &actor, &project, "move document block (MCP)", vec![version_op])?;
             json!({ "block": block })
         }
         "delete_block" => {
             let project = required_project(&args, "project")?;
             authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
             let block_id = required_block_id(&args, "block_id")?;
+            let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
             state
                 .store
-                .delete_block(&project, &block_id, &agent.token)?;
+                .delete_doc_block(&project, &doc_id, &block_id, &agent.token)?;
+            let version_op = StoredProjectVersionOperation {
+                operation_type: ProjectVersionOperationType::DeleteBlock,
+                block_id: block_id.clone(),
+                before: Some(before),
+                after: None,
+                document_id: Some(doc_id.as_str().to_string()),
+            };
+            let actor = ProjectVersionActor {
+                kind: ProjectVersionActorKind::Agent,
+                name: agent.name.clone(),
+            };
+            record_project_version(state, &actor, &project, "delete document block (MCP)", vec![version_op])?;
             json!({ "deleted": true, "block_id": block_id.as_str() })
         }
-        "get_context" => {
-            let projects = state.store.list_projects()?;
-            let mut parts: Vec<String> = Vec::new();
-            for project in projects.iter().filter(|p| agent.can_read(p)) {
-                let meta = state.store.read_project_meta(project);
-                if let Some(ctx) = meta.agent_context {
-                    if !ctx.trim().is_empty() {
-                        parts.push(format!("# {}\n{}", meta.display_name, ctx));
-                    }
+        "grep_blocks" => {
+            let project = required_project(&args, "project")?;
+            authorize_agent_read(agent, &project)?;
+            let query = required_string(&args, "query")?;
+            let ctx_lines = optional_usize(&args, "context_lines").unwrap_or(2);
+            let needle = query.to_lowercase();
+            let doc_id = optional_string(&args, "document_id")
+                .map(DocumentId::from_string)
+                .transpose()?;
+            match doc_id {
+                Some(did) => {
+                    let blocks = state.store.list_doc_blocks(&project, &did)?;
+                    let matches = grep_blocks_with_lines(&blocks, &needle, ctx_lines);
+                    json!({ "matches": matches })
+                }
+                None => {
+                    let docs = state.store.list_documents(&project)?;
+                    let matches = grep_all_docs(state, &project, &docs, &needle, ctx_lines);
+                    json!({ "matches": matches })
                 }
             }
-            let text = if parts.is_empty() {
-                "No agent context set on any readable project.".to_string()
-            } else {
-                parts.join("\n\n")
-            };
-            json!({ "context": text })
         }
         other => {
             return Err(LoreError::Validation(format!("unknown tool: {other}")));
@@ -7628,6 +8782,41 @@ fn call_mcp_tool(
         "content": [{ "type": "text", "text": structured.to_string() }],
         "structuredContent": structured
     }))
+}
+
+fn required_document_id(
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<DocumentId, LoreError> {
+    DocumentId::from_string(required_string(args, key)?)
+}
+
+fn grep_all_docs(
+    state: &AppState,
+    project: &ProjectName,
+    docs: &[crate::store::DocumentInfo],
+    needle: &str,
+    ctx_lines: usize,
+) -> Vec<ProjectDocGrepMatch> {
+    let mut results = Vec::new();
+    for doc in docs {
+        if let Ok(blocks) = state.store.list_doc_blocks(project, &doc.id) {
+            for m in grep_blocks_with_lines(&blocks, needle, ctx_lines) {
+                results.push(ProjectDocGrepMatch {
+                    document_id: doc.id.as_str().to_string(),
+                    document_name: doc.display_name.clone(),
+                    block_id: m.block_id,
+                    block_type: m.block_type,
+                    line: m.line,
+                    content: m.content,
+                    context_before: m.context_before,
+                    context_after: m.context_after,
+                });
+            }
+        }
+        results.extend(grep_all_docs(state, project, &doc.children, needle, ctx_lines));
+    }
+    results
 }
 
 fn require_mcp_agent(
@@ -7746,12 +8935,6 @@ fn optional_usize(args: &serde_json::Map<String, Value>, key: &str) -> Option<us
         .and_then(|value| usize::try_from(value).ok())
 }
 
-fn required_block_type(
-    args: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<BlockType, LoreError> {
-    parse_block_type(&required_string(args, key)?)
-}
 
 fn optional_block_type(
     args: &serde_json::Map<String, Value>,
@@ -7812,107 +8995,160 @@ fn mcp_tools() -> Vec<Value> {
         json!({
             "name": "list_projects",
             "title": "List Projects",
-            "description": "List projects visible to the connected agent token.",
+            "description": "List projects the agent has access to, with names and permission levels.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
-            "name": "list_blocks",
-            "title": "List Blocks",
-            "description": "List ordered blocks in a project.",
+            "name": "list_documents",
+            "title": "List Documents",
+            "description": "List documents under a project as a tree. Returns document IDs, names, and nesting structure.",
             "inputSchema": schema_with_required_property("project", "string", "Lore project name")
         }),
         json!({
-            "name": "read_block",
-            "title": "Read Block",
-            "description": "Read a single block by id.",
-            "inputSchema": schema_with_required_properties(&[
-                ("project", "string", "Lore project name"),
-                ("block_id", "string", "Block UUID")
-            ])
-        }),
-        json!({
-            "name": "read_blocks_around",
-            "title": "Read Blocks Around",
-            "description": "Read an anchor block with neighboring context.",
+            "name": "create_document",
+            "title": "Create Document",
+            "description": "Create a new document under a project or parent document.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Lore project name" },
-                    "block_id": { "type": "string", "description": "Block UUID" },
-                    "before": { "type": "integer", "minimum": 0 },
-                    "after": { "type": "integer", "minimum": 0 }
+                    "name": { "type": "string", "description": "Document display name" },
+                    "parent_document_id": { "type": ["string", "null"], "description": "Parent document ID for nesting (null = directly under project)" }
                 },
-                "required": ["project", "block_id"]
+                "required": ["project", "name"]
             }
         }),
         json!({
-            "name": "grep_blocks",
-            "title": "Grep Blocks",
-            "description": "Search a project and return matching blocks with previews.",
+            "name": "rename_document",
+            "title": "Rename Document",
+            "description": "Rename an existing document.",
             "inputSchema": schema_with_required_properties(&[
                 ("project", "string", "Lore project name"),
-                ("query", "string", "Search query")
+                ("document_id", "string", "Document UUID"),
+                ("name", "string", "New display name")
             ])
         }),
         json!({
-            "name": "create_block",
-            "title": "Create Block",
-            "description": "Create a new block after an optional anchor block.",
+            "name": "delete_document",
+            "title": "Delete Document",
+            "description": "Delete a document and all its contents (blocks and sub-documents).",
+            "inputSchema": schema_with_required_properties(&[
+                ("project", "string", "Lore project name"),
+                ("document_id", "string", "Document UUID")
+            ])
+        }),
+        json!({
+            "name": "list_blocks",
+            "title": "List Blocks",
+            "description": "List all blocks in a document. Returns block IDs, types, and first-line previews.",
+            "inputSchema": schema_with_required_properties(&[
+                ("project", "string", "Lore project name"),
+                ("document_id", "string", "Document UUID")
+            ])
+        }),
+        json!({
+            "name": "read_block",
+            "title": "Read Block",
+            "description": "Read a block's content or a line range within it. Use offset/limit for large blocks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": { "type": "string" },
-                    "block_type": { "type": "string", "enum": ["markdown", "html", "svg", "image"] },
-                    "content": { "type": "string" },
-                    "after_block_id": { "type": ["string", "null"] }
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": "string", "description": "Document UUID" },
+                    "block_id": { "type": "string", "description": "Block UUID or reserved ID (_agent-context, _overview, _map)" },
+                    "offset": { "type": "integer", "description": "Starting line (0-based). Omit to read from beginning.", "minimum": 0 },
+                    "limit": { "type": "integer", "description": "Max lines to read. Omit to read all.", "minimum": 1 }
                 },
-                "required": ["project", "block_type", "content"]
+                "required": ["project", "block_id"]
             }
         }),
         json!({
             "name": "update_block",
             "title": "Update Block",
-            "description": "Update block content, type, and optional placement.",
+            "description": "Replace the entire content of a block. Use for small blocks or full rewrites.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": { "type": "string" },
-                    "block_id": { "type": "string" },
-                    "block_type": { "type": ["string", "null"], "enum": ["markdown", "html", "svg", "image", null] },
-                    "content": { "type": ["string", "null"] },
-                    "after_block_id": { "type": ["string", "null"] }
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": "string", "description": "Document UUID" },
+                    "block_id": { "type": "string", "description": "Block UUID or _map" },
+                    "content": { "type": "string", "description": "New content" },
+                    "block_type": { "type": ["string", "null"], "enum": ["markdown", "html", "svg", "image", null] }
                 },
-                "required": ["project", "block_id"]
+                "required": ["project", "block_id", "content"]
             }
         }),
         json!({
-            "name": "move_block",
-            "title": "Move Block",
-            "description": "Move a block after another block.",
+            "name": "edit_block",
+            "title": "Edit Block",
+            "description": "Apply a targeted find-and-replace within a block. The old_string must match exactly once.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": { "type": "string" },
-                    "block_id": { "type": "string" },
-                    "after_block_id": { "type": ["string", "null"] }
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": "string", "description": "Document UUID" },
+                    "block_id": { "type": "string", "description": "Block UUID or _map" },
+                    "old_string": { "type": "string", "description": "Exact text to find (must be unique)" },
+                    "new_string": { "type": "string", "description": "Replacement text" }
                 },
-                "required": ["project", "block_id"]
+                "required": ["project", "block_id", "old_string", "new_string"]
+            }
+        }),
+        json!({
+            "name": "create_block",
+            "title": "Create Block",
+            "description": "Create a new typed block in a document (default type: markdown).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": "string", "description": "Document UUID" },
+                    "block_type": { "type": "string", "enum": ["markdown", "html", "svg", "image"], "description": "Block type (default: markdown)" },
+                    "content": { "type": "string", "description": "Block content" },
+                    "after_block_id": { "type": ["string", "null"], "description": "Place after this block (null = at start)" }
+                },
+                "required": ["project", "document_id", "content"]
             }
         }),
         json!({
             "name": "delete_block",
             "title": "Delete Block",
-            "description": "Delete a block the connected agent owns.",
+            "description": "Delete a block from a document.",
             "inputSchema": schema_with_required_properties(&[
                 ("project", "string", "Lore project name"),
+                ("document_id", "string", "Document UUID"),
                 ("block_id", "string", "Block UUID")
             ])
         }),
         json!({
-            "name": "get_context",
-            "title": "Get Agent Context",
-            "description": "Get concatenated agent context from all readable projects.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "name": "move_block",
+            "title": "Move Block",
+            "description": "Reorder a block within a document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": "string", "description": "Document UUID" },
+                    "block_id": { "type": "string", "description": "Block UUID" },
+                    "after_block_id": { "type": ["string", "null"], "description": "Place after this block (null = move to start)" }
+                },
+                "required": ["project", "document_id", "block_id"]
+            }
+        }),
+        json!({
+            "name": "grep_blocks",
+            "title": "Grep Blocks",
+            "description": "Search across block content in a document or all documents in a project. Returns block IDs, line numbers, and context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": ["string", "null"], "description": "Document UUID (null = search all documents in project)" },
+                    "query": { "type": "string", "description": "Search query (case-insensitive substring match)" },
+                    "context_lines": { "type": "integer", "description": "Lines of context before/after each match (default: 2)", "minimum": 0 }
+                },
+                "required": ["project", "query"]
+            }
         }),
     ]
 }
@@ -8181,6 +9417,7 @@ fn grep_preview(content: &str, needle: &str) -> String {
 #[derive(Debug, Deserialize)]
 struct ChatPageQuery {
     agent: Option<String>,
+    project: Option<String>,
 }
 
 async fn chat_page(
@@ -8227,20 +9464,31 @@ async fn chat_page(
         });
     }
 
+    let project_infos = state.store.list_project_infos().unwrap_or_default();
+    let projects_for_ui: Vec<(String, String)> = project_infos
+        .iter()
+        .filter(|p| session.user.is_admin || session.user.can_read(&p.slug))
+        .map(|p| (p.slug.as_str().to_string(), p.display_name.clone()))
+        .collect();
+
     let (messages_json, selected) = if let Some(ref agent_name) = query.agent {
-        let owner = session.user.username.as_str();
-        let conv = state.chat.load_conversation(owner, agent_name)?;
-        let msgs: Vec<Value> = conv
-            .messages
-            .iter()
-            .map(|m| {
-                json!({
-                    "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant" },
-                    "content": m.content,
+        if agent_name == "librarian" {
+            ("[]".to_string(), Some("librarian"))
+        } else {
+            let owner = session.user.username.as_str();
+            let conv = state.chat.load_conversation(owner, agent_name)?;
+            let msgs: Vec<Value> = conv
+                .messages
+                .iter()
+                .map(|m| {
+                    json!({
+                        "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant" },
+                        "content": m.content,
+                    })
                 })
-            })
-            .collect();
-        (serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()), Some(agent_name.as_str()))
+                .collect();
+            (serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()), Some(agent_name.as_str()))
+        }
     } else {
         ("[]".to_string(), None)
     };
@@ -8255,7 +9503,229 @@ async fn chat_page(
         selected,
         &messages_json,
         None,
+        &projects_for_ui,
     )))
+}
+
+#[derive(Debug, Deserialize)]
+struct LibrarianChatHistoryQuery {
+    project: Option<String>,
+}
+
+async fn librarian_chat_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LibrarianChatHistoryQuery>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    let project_slug = match query.project {
+        Some(ref p) if !p.is_empty() => p.clone(),
+        _ => return Ok(Json(json!({ "messages": [], "pending_actions": [] }))),
+    };
+    let project = ProjectName::new(project_slug)?;
+    state.auth.authorize_read(&session.user, &project)?;
+
+    let runs = state.librarian_history.list_recent_project(&project, 50)?;
+    let pending = state.pending_librarian_actions.list_project(&project, 20)?;
+
+    let mut messages: Vec<Value> = Vec::new();
+    for run in &runs {
+        messages.push(json!({
+            "role": "user",
+            "content": run.question.clone(),
+            "timestamp": run.created_at.unix_timestamp(),
+        }));
+        let content = if let Some(ref answer) = run.answer {
+            answer.clone()
+        } else if let Some(ref error) = run.error {
+            format!("Error: {}", error)
+        } else {
+            "No response.".to_string()
+        };
+        let status = format!("{:?}", run.status);
+        messages.push(json!({
+            "role": "assistant",
+            "content": content,
+            "status": status,
+            "run_id": run.id,
+            "context_block_count": run.source_block_ids.len(),
+        }));
+    }
+
+    let pending_json: Vec<Value> = pending
+        .iter()
+        .map(|action| {
+            json!({
+                "id": action.id,
+                "summary": action.summary,
+                "operation_count": action.operations.len(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "messages": messages, "pending_actions": pending_json })))
+}
+
+#[derive(Debug, Deserialize)]
+struct LibrarianChatAskForm {
+    csrf_token: String,
+    project: String,
+    question: String,
+    include_history: Option<String>,
+    allow_edits: Option<String>,
+}
+
+async fn librarian_chat_ask(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LibrarianChatAskForm>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let project = ProjectName::new(form.project)?;
+    state.auth.authorize_read(&session.user, &project)?;
+
+    let options = librarian_options_from_parts(
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+
+    let allow_edits = form.allow_edits.as_deref() == Some("1");
+
+    let result = if allow_edits && session.user.can_write(&project) {
+        let action_result = execute_project_librarian_action(
+            &state,
+            &project,
+            form.question.clone(),
+            options,
+            &session.user,
+        )
+        .await?;
+        json!({
+            "ok": true,
+            "answer": action_result.summary,
+            "pending": action_result.requires_approval,
+        })
+    } else {
+        let answer = answer_librarian_for_project(
+            &state,
+            &project,
+            form.question.clone(),
+            options,
+            librarian_actor_for_user(&session.user),
+        )
+        .await?;
+        json!({
+            "ok": true,
+            "answer": answer.answer,
+            "error": answer.error,
+            "status": format!("{:?}", answer.status),
+        })
+    };
+
+    Ok(Json(result))
+}
+
+async fn librarian_chat_get_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    let config = state.librarian_config.load()?;
+    let endpoints = state.endpoint_store.list()?;
+    let status = state.librarian_provider_status.load().ok().flatten();
+
+    let endpoint_options: Vec<Value> = endpoints
+        .iter()
+        .map(|ep| json!({ "id": ep.id, "name": ep.name, "model": ep.model }))
+        .collect();
+
+    Ok(Json(json!({
+        "endpoint_id": config.endpoint_id,
+        "request_timeout_secs": config.request_timeout_secs,
+        "max_concurrent_runs": config.max_concurrent_runs,
+        "action_requires_approval": config.action_requires_approval,
+        "is_configured": config.is_configured(),
+        "endpoints": endpoint_options,
+        "status": status.map(|s| s.detail),
+        "is_admin": session.user.is_admin,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct LibrarianChatConfigForm {
+    csrf_token: String,
+    endpoint_id: Option<String>,
+    request_timeout_secs: Option<u64>,
+    max_concurrent_runs: Option<usize>,
+    action_requires_approval: Option<String>,
+}
+
+async fn librarian_chat_save_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LibrarianChatConfigForm>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    if !session.user.is_admin {
+        return Err(LoreError::PermissionDenied.into());
+    }
+    let existing = state.librarian_config.load()?;
+    state.librarian_config.update(
+        form.endpoint_id.clone().filter(|s| !s.is_empty()),
+        form.request_timeout_secs.unwrap_or(existing.request_timeout_secs),
+        form.max_concurrent_runs.unwrap_or(existing.max_concurrent_runs),
+        form.action_requires_approval.as_deref() == Some("true")
+            || form.action_requires_approval.as_deref() == Some("1"),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct LibrarianActionForm {
+    csrf_token: String,
+}
+
+async fn librarian_chat_approve_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<LibrarianActionForm>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let all_pending = state.pending_librarian_actions.list_all(200)?;
+    let pending = all_pending
+        .iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| LoreError::Validation("pending action does not exist".into()))?;
+    let project = pending.project.clone();
+    state.auth.authorize_write(&session.user, &project)?;
+    approve_pending_project_librarian_action(&state, &project, &id, &session.user).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn librarian_chat_reject_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<LibrarianActionForm>,
+) -> UiResult<Json<Value>> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let all_pending = state.pending_librarian_actions.list_all(200)?;
+    let pending = all_pending
+        .iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| LoreError::Validation("pending action does not exist".into()))?;
+    let project = pending.project.clone();
+    state.auth.authorize_write(&session.user, &project)?;
+    reject_pending_project_librarian_action(&state, &project, &id, &session.user)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -8296,30 +9766,7 @@ async fn chat_send_message(
         data: json!({ "id": msg.id, "content": msg.content }),
     });
 
-    // Check if this is an API agent (has endpoint_id)
-    let agent_token = agents.iter().find(|a| a.name == agent_name);
-    if let Some(token) = agent_token {
-        if token.endpoint_id.is_some() {
-            let agent_auth = AuthenticatedAgent {
-                token: format!("api-agent-{}", agent_name),
-                name: agent_name.clone(),
-                owner: Some(session.user.username.clone()),
-                grants: token.grants.clone(),
-                backend: token.backend,
-                endpoint_id: token.endpoint_id.clone(),
-                machine_name: None,
-            };
-            let state_clone = state.clone();
-            let owner_str = owner.to_string();
-            state.chat_agent_stops.lock().unwrap().remove(&format!("{owner}_{agent_name}"));
-            tokio::spawn(async move {
-                run_api_agent_loop(state_clone, agent_auth, owner_str, agent_name).await;
-            });
-            return Ok(StatusCode::OK.into_response());
-        }
-    }
-
-    // Process-based agent: notify if it's polling
+    // Notify the machine if it's polling
     let notifier_key = format!("{owner}_{agent_name}");
     if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
         notify.notify_one();
@@ -8458,9 +9905,13 @@ async fn chat_agent_poll(
     };
 
     let poll_backend = agent.backend.to_string();
+    let poll_endpoint_id = agent.endpoint_id.clone();
 
     let build_poll_response = |msgs: Vec<Value>| -> Json<Value> {
         let mut resp = json!({ "messages": msgs, "backend": poll_backend });
+        if let Some(ref eid) = poll_endpoint_id {
+            resp["endpoint_id"] = json!(eid);
+        }
         if let Some(ref ver) = update_to {
             resp["update_to"] = json!(ver);
             if let Some(ref config) = update_config {
@@ -8574,46 +10025,16 @@ async fn chat_agent_respond(
             data: json!({ "status": "idle" }),
         });
 
-        // Manager turn for process agents
+        // Auto-repeat: if set AND manage mode is not active, queue the auto_message
         let state2 = state.clone();
         let owner2 = owner_str.to_string();
         let agent_name2 = agent.name.clone();
         tokio::spawn(async move {
-            match run_manager_turn(&state2, &owner2, &agent_name2).await {
-                Some(ManagerAction::Continue(guidance)) => {
-                    if let Ok(mgr_msg) = state2.chat.append_message(
-                        &owner2, &agent_name2, ChatRole::User, format!("[manager] {guidance}"),
-                    ) {
-                        push_chat_event(&state2, &owner2, ChatEvent {
-                            event_type: "message".into(),
-                            agent: agent_name2.clone(),
-                            owner: owner2.clone(),
-                            data: json!({ "id": mgr_msg.id, "role": "user", "content": mgr_msg.content }),
-                        });
-                        let notifier_key = format!("{}_{}", owner2, agent_name2);
-                        if let Some(notify) = state2.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
-                            notify.notify_one();
-                        }
-                    }
-                    return;
-                }
-                Some(ManagerAction::Stop(display)) => {
-                    if let Ok(stop_msg) = state2.chat.append_message(
-                        &owner2, &agent_name2, ChatRole::User, format!("[manager] {display}"),
-                    ) {
-                        push_chat_event(&state2, &owner2, ChatEvent {
-                            event_type: "message".into(),
-                            agent: agent_name2.clone(),
-                            owner: owner2.clone(),
-                            data: json!({ "id": stop_msg.id, "role": "user", "content": stop_msg.content }),
-                        });
-                    }
-                    return;
-                }
-                None => {}
+            let manage_active = state2.chat.get_manage_config(&owner2, &agent_name2)
+                .ok().flatten().map(|mc| mc.enabled).unwrap_or(false);
+            if manage_active {
+                return;
             }
-
-            // Auto-repeat: if set, queue the auto_message as a user message
             if let Ok(conv) = state2.chat.load_conversation(&owner2, &agent_name2) {
                 if let Some(auto_msg) = &conv.auto_message {
                     if let Ok(auto_stored) = state2.chat.append_message(
@@ -8794,6 +10215,167 @@ async fn chat_agent_config(
     Ok(Json(resp))
 }
 
+async fn chat_agent_lore_tools(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let _agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let tools: Vec<Value> = mcp_tools().into_iter().map(|t| {
+        json!({
+            "type": "function",
+            "function": {
+                "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                "description": t.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                "parameters": t.get("inputSchema").cloned().unwrap_or(json!({"type": "object"})),
+            }
+        })
+    }).collect();
+    Ok(Json(json!({ "tools": tools })))
+}
+
+async fn chat_agent_lore_tool_call(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let name = body["name"].as_str()
+        .ok_or_else(|| LoreError::Validation("name is required".into()))?;
+    let args = body.get("arguments").cloned().unwrap_or(json!({}));
+    let params = json!({ "name": name, "arguments": args });
+    let result = call_mcp_tool(&state, &agent, Some(&params))?;
+    let text = result["content"].as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|c| c["text"].as_str())
+        .unwrap_or("");
+    Ok(Json(json!({ "result": text })))
+}
+
+async fn chat_agent_get_manage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    let mc = state.chat.get_manage_config(owner_str, &agent.name)?
+        .unwrap_or_default();
+
+    if !mc.enabled {
+        return Ok(Json(json!({ "enabled": false })));
+    }
+
+    let turn_in_cycle = mc.turn_counter % 5;
+    let system_prompt = build_manager_prompt(&mc, turn_in_cycle);
+
+    let conv = state.chat.load_conversation(owner_str, &agent.name)?;
+    let boundaries = exchange_boundaries(&conv.messages);
+    let last_10_start = if boundaries.len() > 10 {
+        boundaries[boundaries.len() - 10]
+    } else {
+        0
+    };
+    let recent_msgs: Vec<Value> = conv.messages[last_10_start..].iter().map(|m| {
+        json!({
+            "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant" },
+            "content": m.content,
+        })
+    }).collect();
+
+    let has_endpoint = !mc.endpoint_id.is_empty()
+        && state.endpoint_store.get(&mc.endpoint_id).ok().flatten().is_some();
+
+    Ok(Json(json!({
+        "enabled": true,
+        "system_prompt": system_prompt,
+        "messages": recent_msgs,
+        "backend": mc.backend,
+        "has_endpoint": has_endpoint,
+        "turn_counter": mc.turn_counter,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagerReportBody {
+    content: String,
+    #[serde(default)]
+    stopped: bool,
+}
+
+async fn chat_agent_manager_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ManagerReportBody>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    state.chat_audit.log(&agent.name, owner_str, "manager", &body.content);
+
+    let display = format!("[manager] {}", body.content);
+    if let Ok(msg) = state.chat.append_message(owner_str, &agent.name, ChatRole::User, display.clone()) {
+        push_chat_event(&state, owner_str, ChatEvent {
+            event_type: "message".into(),
+            agent: agent.name.clone(),
+            owner: owner_str.to_string(),
+            data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
+        });
+    }
+
+    if let Ok(Some(mut mc)) = state.chat.get_manage_config(owner_str, &agent.name) {
+        mc.turn_counter += 1;
+        if body.stopped {
+            mc.enabled = false;
+        }
+        let _ = state.chat.save_manage_config(owner_str, &agent.name, &mc);
+    }
+
+    if !body.stopped {
+        let notifier_key = format!("{}_{}", owner_str, agent.name);
+        if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+            notify.notify_one();
+        }
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn chat_manager_proxy_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<crate::librarian::ProxyChatRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    let mc = state.chat.get_manage_config(owner_str, &agent.name)?
+        .ok_or_else(|| LoreError::Validation("no manage config".into()))?;
+    let endpoint = state.endpoint_store.get(&mc.endpoint_id)?
+        .ok_or_else(|| LoreError::Validation("manager endpoint not found".into()))?;
+
+    let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
+    let result = crate::librarian::proxy_non_streaming_raw(
+        &state.librarian_client_http, &endpoint, &url, &body, 60,
+    ).await;
+
+    match result {
+        Ok((status, response)) if status.is_success() => Ok(Json(response)),
+        Ok((_, response)) => {
+            let err = crate::librarian::extract_provider_error(&response);
+            Err(ApiError(LoreError::Validation(format!("Manager endpoint error: {err}"))))
+        }
+        Err(e) => Err(ApiError(LoreError::Validation(format!("Manager request failed: {e}")))),
+    }
+}
+
 // --- Exchange helpers ---
 // An "exchange" = one user message + all following assistant messages until the next user message.
 // This matches Snoot's MessagePair concept. Window size, compaction, and context
@@ -8951,12 +10533,7 @@ async fn do_exchange_compact(
     Ok(format!("Context compacted. {summarized_exchanges} exchanges summarized, {kept_exchanges} kept."))
 }
 
-// --- Manager loop ---
-
-enum ManagerAction {
-    Continue(String),
-    Stop(String),
-}
+// --- Manager prompt ---
 
 fn build_manager_prompt(mc: &ManageConfig, turn_in_cycle: u32) -> String {
     let base = format!(
@@ -8994,139 +10571,10 @@ fn build_manager_prompt(mc: &ManageConfig, turn_in_cycle: u32) -> String {
     }
 }
 
-async fn run_manager_turn(
-    state: &AppState,
-    owner: &str,
-    agent_name: &str,
-) -> Option<ManagerAction> {
-    let mc = match state.chat.get_manage_config(owner, agent_name) {
-        Ok(Some(mc)) if mc.enabled && !mc.endpoint_id.is_empty() => mc,
-        _ => return None,
-    };
+// --- API agent helpers (used by btw) ---
 
-    let endpoint = match state.endpoint_store.get(&mc.endpoint_id) {
-        Ok(Some(ep)) => ep,
-        _ => {
-            eprintln!("[manager] Endpoint {} not found, disabling manage", mc.endpoint_id);
-            let mut mc2 = mc.clone();
-            mc2.enabled = false;
-            let _ = state.chat.save_manage_config(owner, agent_name, &mc2);
-            return None;
-        }
-    };
-
-    let turn_in_cycle = mc.turn_counter % 5;
-    let system_prompt = build_manager_prompt(&mc, turn_in_cycle);
-
-    let conv = match state.chat.load_conversation(owner, agent_name) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-
-    let boundaries = exchange_boundaries(&conv.messages);
-    let last_10_start = if boundaries.len() > 10 {
-        boundaries[boundaries.len() - 10]
-    } else {
-        0
-    };
-    let recent = &conv.messages[last_10_start..];
-
-    let mut api_messages = vec![
-        crate::librarian::ProxyChatMessage {
-            role: "system".into(),
-            content: Some(json!(system_prompt)),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        },
-    ];
-    for msg in recent {
-        let role = match msg.role {
-            ChatRole::User => "user",
-            ChatRole::Assistant => "assistant",
-        };
-        api_messages.push(crate::librarian::ProxyChatMessage {
-            role: role.into(),
-            content: Some(json!(msg.content)),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        });
-    }
-
-    let req = crate::librarian::ProxyChatRequest {
-        messages: api_messages,
-        model: None,
-        stream: Some(false),
-        tools: None,
-        temperature: Some(0.3),
-        max_tokens: Some(2048),
-        top_p: None,
-        stop: None,
-    };
-    let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
-    let result = crate::librarian::proxy_non_streaming_raw(
-        &state.librarian_client_http, &endpoint, &url, &body, 60,
-    ).await;
-
-    let response_text = match result {
-        Ok((status, ref resp)) if status.is_success() => {
-            resp.get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|c| c.first())
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string()
-        }
-        Ok((_, ref resp)) => {
-            let err = crate::librarian::extract_provider_error(resp);
-            eprintln!("[manager] API error: {err}");
-            return None;
-        }
-        Err(e) => {
-            eprintln!("[manager] Request failed: {e}");
-            return None;
-        }
-    };
-
-    if response_text.is_empty() {
-        return None;
-    }
-
-    state.chat_audit.log(agent_name, owner, "manager", &response_text);
-
-    let mut updated = mc.clone();
-    updated.turn_counter += 1;
-
-    let has_stop = response_text.contains("STOPPING_POINT");
-    let has_red = response_text.contains("RED_FLAG_POINT");
-
-    if has_stop || has_red {
-        updated.enabled = false;
-        let _ = state.chat.save_manage_config(owner, agent_name, &updated);
-
-        let display = if has_stop {
-            response_text.replace("STOPPING_POINT", "\u{2705}")
-        } else {
-            response_text.replace("RED_FLAG_POINT", "\u{1f6a9}")
-        };
-        Some(ManagerAction::Stop(display))
-    } else {
-        let _ = state.chat.save_manage_config(owner, agent_name, &updated);
-        Some(ManagerAction::Continue(response_text))
-    }
-}
-
-// --- API agent loop ---
-
-const API_AGENT_MAX_TURNS: usize = 500;
-const API_AGENT_TURN_WARNINGS: &[usize] = &[300, 400, 475];
 const API_AGENT_TOOL_RESULT_CAP: usize = 30_000;
 const API_AGENT_MAX_CONTEXT_CHARS: usize = 400_000;
-const API_AGENT_MAX_RETRIES: usize = 2;
-const API_AGENT_RATE_LIMIT_WAIT_SECS: u64 = 30;
 const API_AGENT_TRIMMED_STUB: &str = "[Content trimmed to save context \u{2014} re-read if needed]";
 const API_AGENT_TRIMMED_ASSISTANT: &str = "[Earlier analysis trimmed to save context]";
 
@@ -9178,18 +10626,6 @@ fn trim_old_context(messages: &mut Vec<crate::librarian::ProxyChatMessage>, tool
     }
 }
 
-fn aggressive_trim_all_tool_results(messages: &mut [crate::librarian::ProxyChatMessage]) {
-    for m in messages.iter_mut() {
-        if m.role == "tool" {
-            if let Some(Value::String(s)) = &m.content {
-                if s != API_AGENT_TRIMMED_STUB {
-                    m.content = Some(json!(API_AGENT_TRIMMED_STUB));
-                }
-            }
-        }
-    }
-}
-
 fn truncate_tool_result(tool_name: &str, text: &str) -> String {
     if text.len() <= API_AGENT_TOOL_RESULT_CAP { return text.to_string(); }
 
@@ -9207,423 +10643,6 @@ fn truncate_tool_result(tool_name: &str, text: &str) -> String {
     };
     format!("{}\n\n[Output truncated \u{2014} showing ~{shown_lines} of {total_lines} lines. {hint}]",
         &text[..cut_at])
-}
-
-async fn run_api_agent_loop(
-    state: AppState,
-    agent: AuthenticatedAgent,
-    owner: String,
-    agent_name: String,
-) {
-    'outer: loop {
-        let _ = state.chat.update_agent_status(&owner, &agent_name, AgentChatStatus::Thinking);
-        push_chat_event(&state, &owner, ChatEvent {
-            event_type: "status".into(),
-            agent: agent_name.clone(),
-            owner: owner.clone(),
-            data: json!({ "status": "thinking" }),
-        });
-
-        let endpoint_id = match agent.endpoint_id.as_deref() {
-            Some(id) => id,
-            None => {
-                finish_api_agent(&state, &owner, &agent_name, "No endpoint configured for this agent.");
-                return;
-            }
-        };
-        let endpoint = match state.endpoint_store.get(endpoint_id) {
-            Ok(Some(ep)) => ep,
-            Ok(None) => {
-                finish_api_agent(&state, &owner, &agent_name, "Configured endpoint not found.");
-                return;
-            }
-            Err(e) => {
-                finish_api_agent(&state, &owner, &agent_name, &format!("Endpoint error: {e}"));
-                return;
-            }
-        };
-
-        let conv = match state.chat.load_conversation(&owner, &agent_name) {
-            Ok(c) => c,
-            Err(e) => {
-                finish_api_agent(&state, &owner, &agent_name, &format!("Failed to load conversation: {e}"));
-                return;
-            }
-        };
-
-        let system_prompt = build_api_agent_system_prompt(&state, &agent, &conv);
-        let tools = build_api_agent_tools();
-        let tool_count = tools.len();
-
-        let mut messages: Vec<crate::librarian::ProxyChatMessage> = Vec::new();
-        messages.push(crate::librarian::ProxyChatMessage {
-            role: "system".into(),
-            content: Some(json!(system_prompt)),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        });
-
-        if !conv.summary.is_empty() {
-            messages.push(crate::librarian::ProxyChatMessage {
-                role: "user".into(),
-                content: Some(json!(format!("[Conversation summary from earlier messages]\n{}", conv.summary))),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            });
-            messages.push(crate::librarian::ProxyChatMessage {
-                role: "assistant".into(),
-                content: Some(json!("Understood, I have the conversation context.")),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            });
-        }
-
-        for msg in &conv.messages {
-            messages.push(crate::librarian::ProxyChatMessage {
-                role: match msg.role {
-                    ChatRole::User => "user".into(),
-                    ChatRole::Assistant => "assistant".into(),
-                },
-                content: Some(json!(msg.content)),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            });
-        }
-
-        let mut accumulated_text = String::new();
-        let mut rate_limit_retried = false;
-        let mut timeout_retries = 0usize;
-
-        for turn in 0..API_AGENT_MAX_TURNS {
-            if state.chat_agent_stops.lock().unwrap().remove(&format!("{owner}_{agent_name}")) {
-                let final_text = if accumulated_text.is_empty() {
-                    "Stopped.".to_string()
-                } else {
-                    format!("{accumulated_text}\n\n[Stopped by user]")
-                };
-                finish_api_agent(&state, &owner, &agent_name, &final_text);
-                return;
-            }
-
-            trim_old_context(&mut messages, tool_count);
-
-            let req = crate::librarian::ProxyChatRequest {
-                messages: messages.clone(),
-                model: None,
-                stream: Some(false),
-                tools: Some(tools.clone()),
-                temperature: None,
-                max_tokens: Some(16384),
-                top_p: None,
-                stop: None,
-            };
-
-            let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
-            let raw_result = crate::librarian::proxy_non_streaming_raw(
-                &state.librarian_client_http, &endpoint, &url, &body, 120,
-            ).await;
-
-            let (http_status, response) = match raw_result {
-                Ok(pair) => {
-                    timeout_retries = 0;
-                    pair
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    if err_msg.contains("timed out") || err_msg.contains("timeout") {
-                        if timeout_retries < API_AGENT_MAX_RETRIES {
-                            timeout_retries += 1;
-                            push_chat_event(&state, &owner, ChatEvent {
-                                event_type: "tool_use".into(),
-                                agent: agent_name.clone(),
-                                owner: owner.clone(),
-                                data: json!({ "detail": format!("\u{23f3} Request timed out, retrying ({timeout_retries}/{API_AGENT_MAX_RETRIES})...") }),
-                            });
-                            continue;
-                        }
-                    }
-                    let final_text = if accumulated_text.is_empty() {
-                        format!("Provider error: {e}")
-                    } else {
-                        format!("{accumulated_text}\n\n[Provider error: {e}]")
-                    };
-                    finish_api_agent(&state, &owner, &agent_name, &final_text);
-                    return;
-                }
-            };
-
-            if !http_status.is_success() {
-                let status_code = http_status.as_u16();
-                let err_detail = crate::librarian::extract_provider_error(&response);
-
-                if status_code == 429 && !rate_limit_retried {
-                    rate_limit_retried = true;
-                    push_chat_event(&state, &owner, ChatEvent {
-                        event_type: "tool_use".into(),
-                        agent: agent_name.clone(),
-                        owner: owner.clone(),
-                        data: json!({ "detail": format!("\u{23f3} Rate limited, retrying in {API_AGENT_RATE_LIMIT_WAIT_SECS}s...") }),
-                    });
-                    tokio::time::sleep(std::time::Duration::from_secs(API_AGENT_RATE_LIMIT_WAIT_SECS)).await;
-                    continue;
-                }
-
-                if status_code == 400 {
-                    let has_untrimmed = messages.iter().any(|m|
-                        m.role == "tool" && m.content.as_ref()
-                            .and_then(|c| c.as_str())
-                            .map(|s| s != API_AGENT_TRIMMED_STUB)
-                            .unwrap_or(false)
-                    );
-                    if has_untrimmed {
-                        aggressive_trim_all_tool_results(&mut messages);
-                        push_chat_event(&state, &owner, ChatEvent {
-                            event_type: "tool_use".into(),
-                            agent: agent_name.clone(),
-                            owner: owner.clone(),
-                            data: json!({ "detail": "\u{2702}\u{fe0f} Context too large, trimming and retrying..." }),
-                        });
-                        continue;
-                    }
-                    let final_text = if accumulated_text.is_empty() {
-                        format!("Context/token limit exceeded even after trimming: {err_detail}")
-                    } else {
-                        format!("{accumulated_text}\n\n[Context limit: {err_detail}]")
-                    };
-                    finish_api_agent(&state, &owner, &agent_name, &final_text);
-                    return;
-                }
-
-                if status_code >= 500 {
-                    let final_text = if accumulated_text.is_empty() {
-                        format!("API error ({status_code}): {err_detail}")
-                    } else {
-                        format!("{accumulated_text}\n\n[API error ({status_code}): {err_detail}]")
-                    };
-                    finish_api_agent(&state, &owner, &agent_name, &final_text);
-                    return;
-                }
-
-                let final_text = if accumulated_text.is_empty() {
-                    format!("Provider error ({status_code}): {err_detail}")
-                } else {
-                    format!("{accumulated_text}\n\n[Provider error ({status_code}): {err_detail}]")
-                };
-                finish_api_agent(&state, &owner, &agent_name, &final_text);
-                return;
-            }
-
-            rate_limit_retried = false;
-
-            let choice = response.get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|c| c.first());
-            let message = choice.and_then(|c| c.get("message"));
-            let content = message.and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str()).unwrap_or("").to_string();
-            let finish_reason = choice.and_then(|c| c.get("finish_reason"))
-                .and_then(|f| f.as_str()).unwrap_or("");
-            let tool_calls = message.and_then(|m| m.get("tool_calls"))
-                .and_then(|t| t.as_array()).cloned();
-
-            accumulated_text.push_str(&content);
-
-            if let Some(ref tcs) = tool_calls {
-                if !tcs.is_empty() {
-                    if finish_reason == "length" {
-                        push_chat_event(&state, &owner, ChatEvent {
-                            event_type: "tool_use".into(),
-                            agent: agent_name.clone(),
-                            owner: owner.clone(),
-                            data: json!({ "detail": "\u{26a0}\u{fe0f} Tool call may be truncated (hit token limit)" }),
-                        });
-                    }
-
-                    messages.push(crate::librarian::ProxyChatMessage {
-                        role: "assistant".into(),
-                        content: if content.is_empty() { None } else { Some(json!(content)) },
-                        tool_calls: Some(tcs.clone()),
-                        tool_call_id: None,
-                        name: None,
-                    });
-
-                    for tc in tcs {
-                        let tool_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                        let func = tc.get("function");
-                        let tool_name = func.and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str()).unwrap_or("");
-                        let raw_args = func.and_then(|f| f.get("arguments"))
-                            .and_then(|a| a.as_str()).unwrap_or("{}");
-
-                        let (tool_args, parse_error) = match serde_json::from_str::<Value>(raw_args) {
-                            Ok(v) => (v, false),
-                            Err(_) => (json!({}), true),
-                        };
-
-                        let detail = format_api_tool_display(tool_name, &tool_args);
-                        push_chat_event(&state, &owner, ChatEvent {
-                            event_type: "tool_use".into(),
-                            agent: agent_name.clone(),
-                            owner: owner.clone(),
-                            data: json!({ "detail": detail }),
-                        });
-                        record_api_tool_activity(&state, &owner, &agent_name, tool_name, &tool_args);
-
-                        let result_text = if parse_error {
-                            format!("Error: Failed to parse tool arguments (malformed JSON). \
-                                Your tool call for {tool_name} had invalid/truncated arguments. \
-                                Please retry with valid JSON.")
-                        } else {
-                            match call_mcp_tool(&state, &agent, Some(&json!({
-                                "name": tool_name,
-                                "arguments": tool_args,
-                            }))) {
-                                Ok(val) => {
-                                    let text = val.get("content")
-                                        .and_then(|c| c.as_array())
-                                        .and_then(|a| a.first())
-                                        .and_then(|t| t.get("text"))
-                                        .and_then(|t| t.as_str())
-                                        .unwrap_or("");
-                                    truncate_tool_result(tool_name, text)
-                                }
-                                Err(e) => format!("Error: {e}"),
-                            }
-                        };
-
-                        messages.push(crate::librarian::ProxyChatMessage {
-                            role: "tool".into(),
-                            content: Some(json!(result_text)),
-                            tool_calls: None,
-                            tool_call_id: Some(tool_id),
-                            name: Some(tool_name.to_string()),
-                        });
-                    }
-
-                    if API_AGENT_TURN_WARNINGS.contains(&turn) {
-                        messages.push(crate::librarian::ProxyChatMessage {
-                            role: "user".into(),
-                            content: Some(json!(format!(
-                                "You have used {turn} of {API_AGENT_MAX_TURNS} tool-calling turns. \
-                                You have {} turns remaining. Please wrap up your work and provide a final response soon.",
-                                API_AGENT_MAX_TURNS - turn
-                            ))),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                        });
-                    }
-
-                    continue;
-                }
-            }
-
-            // Empty response with finish_reason=length: likely truncated tool call
-            if finish_reason == "length" && content.trim().is_empty() {
-                messages.push(crate::librarian::ProxyChatMessage {
-                    role: "assistant".into(),
-                    content: Some(json!(content)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                });
-                messages.push(crate::librarian::ProxyChatMessage {
-                    role: "user".into(),
-                    content: Some(json!("Your previous response was truncated. Please continue \u{2014} try to use fewer tool calls per turn if needed.")),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                });
-                continue;
-            }
-
-            // Final response with length truncation warning
-            if finish_reason == "length" && !content.is_empty() {
-                accumulated_text.push_str(
-                    "\n\n\u{26a0}\u{fe0f} Response was truncated (hit output token limit). You may want to ask me to continue."
-                );
-            }
-
-            if !accumulated_text.is_empty() {
-                push_chat_event(&state, &owner, ChatEvent {
-                    event_type: "chunk".into(),
-                    agent: agent_name.clone(),
-                    owner: owner.clone(),
-                    data: json!({ "text": &accumulated_text }),
-                });
-            }
-
-            let final_content = if accumulated_text.is_empty() { "(no response)".to_string() } else { accumulated_text };
-            finish_api_agent(&state, &owner, &agent_name, &final_content);
-
-            // Auto-compaction: check if exchanges exceed window_size
-            if let Ok(conv) = state.chat.load_conversation(&owner, &agent_name) {
-                let exchanges = count_exchanges(&conv.messages);
-                if exchanges >= conv.window_size {
-                    eprintln!("[agent] Auto-compacting {agent_name}: {exchanges} exchanges >= window {}", conv.window_size);
-                    let _ = do_exchange_compact(&state, agent.endpoint_id.as_deref(), &owner, &agent_name, false).await;
-                }
-            }
-
-            // Manager turn: if manage mode is on, run the manager
-            match run_manager_turn(&state, &owner, &agent_name).await {
-                Some(ManagerAction::Continue(guidance)) => {
-                    if let Ok(mgr_msg) = state.chat.append_message(
-                        &owner, &agent_name, ChatRole::User, format!("[manager] {guidance}"),
-                    ) {
-                        push_chat_event(&state, &owner, ChatEvent {
-                            event_type: "message".into(),
-                            agent: agent_name.clone(),
-                            owner: owner.clone(),
-                            data: json!({ "id": mgr_msg.id, "role": "user", "content": mgr_msg.content }),
-                        });
-                        continue 'outer;
-                    }
-                }
-                Some(ManagerAction::Stop(display)) => {
-                    if let Ok(stop_msg) = state.chat.append_message(
-                        &owner, &agent_name, ChatRole::User, format!("[manager] {display}"),
-                    ) {
-                        push_chat_event(&state, &owner, ChatEvent {
-                            event_type: "message".into(),
-                            agent: agent_name.clone(),
-                            owner: owner.clone(),
-                            data: json!({ "id": stop_msg.id, "role": "user", "content": stop_msg.content }),
-                        });
-                    }
-                    return;
-                }
-                None => {}
-            }
-
-            // Auto-repeat: if set, queue the auto_message as a user message
-            if let Ok(conv) = state.chat.load_conversation(&owner, &agent_name) {
-                if let Some(auto_msg) = &conv.auto_message {
-                    if let Ok(auto_stored) = state.chat.append_message(
-                        &owner, &agent_name, ChatRole::User, auto_msg.clone(),
-                    ) {
-                        state.chat_audit.log(&agent_name, &owner, "auto", auto_msg);
-                        push_chat_event(&state, &owner, ChatEvent {
-                            event_type: "auto_message".into(),
-                            agent: agent_name.clone(),
-                            owner: owner.clone(),
-                            data: json!({ "id": auto_stored.id, "content": auto_stored.content }),
-                        });
-                        continue 'outer;
-                    }
-                }
-            }
-            return;
-        }
-
-        let cutoff = format!("{accumulated_text}\n\n\u{26a0}\u{fe0f} Hard cutoff: reached maximum of {API_AGENT_MAX_TURNS} tool-calling turns. Work may be incomplete. Send another message to continue where I left off.");
-        finish_api_agent(&state, &owner, &agent_name, cutoff.trim());
-        return;
-    }
 }
 
 fn finish_api_agent(state: &AppState, owner: &str, agent_name: &str, content: &str) {
@@ -9700,14 +10719,23 @@ fn build_api_agent_system_prompt(
     conv: &crate::auth::ChatConversation,
 ) -> String {
     let mut parts = Vec::new();
-    parts.push("You are a Lore knowledge base agent with tools to read and write content in Lore projects.\n\n\
+    parts.push("You are a Lore knowledge base agent with tools to navigate projects, manage documents, and read/write block content.\n\n\
+        Lore organizes knowledge into projects (management containers) and documents (content containers with typed blocks).\n\
+        Projects have reserved blocks: _agent-context, _overview, and _map. Documents contain regular content blocks.\n\n\
         Guidelines:\n\
         - Be concise and direct. Provide clear answers.\n\
         - Use tools to fulfill user requests. Read before writing. Grep to find content.\n\
+        - Use list_documents to see the document tree, list_blocks to see block structure, then read_block for content.\n\
+        - Use edit_block for targeted changes within a block, update_block for full rewrites.\n\
+        - For large blocks, use read_block with offset/limit to read chunks.\n\
         - When a tool result is truncated, use more targeted queries rather than re-reading the same large result.\n\
         - If you encounter an error, explain it clearly and suggest alternatives.\n\
         - Do not make up content. If you can't find something, say so.\n\
-        - For multi-step tasks, plan before acting. Use fewer tool calls per turn when possible.".to_string());
+        - For multi-step tasks, plan before acting. Use fewer tool calls per turn when possible.\n\n\
+        File Map maintenance:\n\
+        - You have access to a file map (_map) on each project that lists key project files.\n\
+        - Keep this map current: add files you discover are important to the work, remove files that are deleted or no longer relevant.\n\
+        - Only list files that are actionable for development. Do not list generated files, build artifacts, or files unlikely to need attention.".to_string());
 
     let project_context = collect_project_context(state, &agent.grants);
     if !project_context.is_empty() {
@@ -9760,37 +10788,30 @@ fn format_api_tool_display(name: &str, args: &Value) -> String {
     let get_str = |key: &str| -> &str {
         args_map.and_then(|m| m.get(key)).and_then(|v| v.as_str()).unwrap_or("")
     };
+    let short_id = |key: &str| -> String {
+        let id = get_str(key);
+        if id.starts_with('_') {
+            id.to_string()
+        } else if id.len() > 8 {
+            id[..8].to_string()
+        } else {
+            id.to_string()
+        }
+    };
     match name {
         "list_projects" => "\u{1f4cb} list_projects".into(),
-        "list_blocks" => format!("\u{1f4cb} list_blocks {}", get_str("project")),
-        "read_block" => {
-            let bid = get_str("block_id");
-            let short = if bid.len() > 8 { &bid[..8] } else { bid };
-            format!("\u{1f4d6} read_block {short}")
-        }
-        "read_blocks_around" => {
-            let bid = get_str("block_id");
-            let short = if bid.len() > 8 { &bid[..8] } else { bid };
-            format!("\u{1f4d6} read_blocks_around {short}")
-        }
+        "list_documents" => format!("\u{1f4c1} list_documents {}", get_str("project")),
+        "create_document" => format!("\u{1f4c4} create_document \"{}\"", get_str("name")),
+        "rename_document" => format!("\u{1f4c4} rename_document \"{}\"", get_str("name")),
+        "delete_document" => format!("\u{1f5d1}\u{fe0f} delete_document {}", short_id("document_id")),
+        "list_blocks" => format!("\u{1f4cb} list_blocks {}", short_id("document_id")),
+        "read_block" => format!("\u{1f4d6} read_block {}", short_id("block_id")),
+        "update_block" => format!("\u{270f}\u{fe0f} update_block {}", short_id("block_id")),
+        "edit_block" => format!("\u{270f}\u{fe0f} edit_block {}", short_id("block_id")),
+        "create_block" => format!("\u{270f}\u{fe0f} create_block {}", short_id("document_id")),
+        "delete_block" => format!("\u{1f5d1}\u{fe0f} delete_block {}", short_id("block_id")),
+        "move_block" => format!("\u{1f4e6} move_block {}", short_id("block_id")),
         "grep_blocks" => format!("\u{1f50d} grep_blocks \"{}\"", get_str("query")),
-        "create_block" => format!("\u{270f}\u{fe0f} create_block {}", get_str("project")),
-        "update_block" => {
-            let bid = get_str("block_id");
-            let short = if bid.len() > 8 { &bid[..8] } else { bid };
-            format!("\u{270f}\u{fe0f} update_block {short}")
-        }
-        "move_block" => {
-            let bid = get_str("block_id");
-            let short = if bid.len() > 8 { &bid[..8] } else { bid };
-            format!("\u{1f4e6} move_block {short}")
-        }
-        "delete_block" => {
-            let bid = get_str("block_id");
-            let short = if bid.len() > 8 { &bid[..8] } else { bid };
-            format!("\u{1f5d1}\u{fe0f} delete_block {short}")
-        }
-        "get_context" => "\u{1f4d6} get_context".into(),
         _ => format!("\u{1f527} {name}"),
     }
 }
@@ -10211,6 +11232,7 @@ async fn chat_get_manage(
     }).collect();
 
     Ok(Json(json!({
+        "backend": mc.backend,
         "endpoint_id": mc.endpoint_id,
         "goals": mc.goals,
         "stopping_point": mc.stopping_point,
@@ -10225,6 +11247,8 @@ async fn chat_get_manage(
 #[derive(Deserialize)]
 struct ManageSaveForm {
     csrf_token: String,
+    #[serde(default)]
+    backend: Option<String>,
     #[serde(default)]
     endpoint_id: Option<String>,
     #[serde(default)]
@@ -10255,6 +11279,7 @@ async fn chat_save_manage(
     let mut mc = state.chat.get_manage_config(owner, &agent_name)?
         .unwrap_or_default();
 
+    if let Some(b) = &form.backend { mc.backend = b.clone(); }
     if let Some(eid) = &form.endpoint_id { mc.endpoint_id = eid.clone(); }
     if let Some(g) = &form.goals { mc.goals = g.clone(); }
     if let Some(sp) = &form.stopping_point { mc.stopping_point = sp.clone(); }
@@ -11641,37 +12666,64 @@ mod tests {
         let agent_token =
             issue_agent_token(&app, dir.path(), "agent-render", ProjectPermission::ReadWrite).await;
 
+        // Create a document under the project
+        let create_doc = Request::builder()
+            .method("POST")
+            .uri("/v1/projects/alpha.docs/documents")
+            .header("content-type", "application/json")
+            .header("x-lore-key", &agent_token)
+            .body(Body::from("{\"name\":\"Test Doc\"}"))
+            .unwrap();
+        let response = app.clone().oneshot(create_doc).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let doc_json: Value = serde_json::from_slice(&body).unwrap();
+        let doc_id = doc_json["id"].as_str().unwrap().to_string();
+
+        // Create a block in the document
         let create = Request::builder()
             .method("POST")
-            .uri("/v1/blocks")
+            .uri(format!("/v1/projects/alpha.docs/documents/{doc_id}/blocks"))
             .header("content-type", "application/json")
             .header("x-lore-key", &agent_token)
             .body(Body::from(
-                "{\"project\":\"alpha.docs\",\"block_type\":\"markdown\",\"content\":\"# Hello\"}",
+                "{\"block_type\":\"markdown\",\"content\":\"# Hello\"}",
             ))
             .unwrap();
-
         let response = app.clone().oneshot(create).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
+        // Check the project page shows reserved blocks and doc listing
         let request = Request::builder()
             .method("GET")
             .uri("/ui/alpha.docs")
             .header("cookie", &session_cookie)
             .body(Body::empty())
             .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("alpha.docs"));
-        assert!(html.contains("editline-plus"));
-        assert!(html.contains("<h1>Hello</h1>"));
-        assert!(html.contains("width=device-width, initial-scale=1"));
+        assert!(html.contains("Agent Context"));
+        assert!(html.contains("Overview"));
+        assert!(html.contains("File Map"));
+        assert!(html.contains("Test Doc"));
         assert!(html.contains(">admin</span>"));
+
+        // Check the document page shows the block
+        let doc_page = Request::builder()
+            .method("GET")
+            .uri(format!("/ui/alpha.docs/doc/{doc_id}"))
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(doc_page).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<h1>Hello</h1>"));
+        assert!(html.contains("editline-plus"));
         assert!(html.contains("id=\"document\""));
         assert!(html.contains("title=\"Save\""));
         assert!(html.contains("class=\"block-header-btn danger\""));
@@ -11846,9 +12898,22 @@ mod tests {
         let agent_token =
             issue_agent_token(&app, dir.path(), "agent-image", ProjectPermission::ReadWrite).await;
 
+        // Create a document first
+        let create_doc = Request::builder()
+            .method("POST")
+            .uri("/v1/projects/alpha.docs/documents")
+            .header("content-type", "application/json")
+            .header("x-lore-key", &agent_token)
+            .body(Body::from("{\"name\":\"Image Doc\"}"))
+            .unwrap();
+        let response = app.clone().oneshot(create_doc).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let doc_json: Value = serde_json::from_slice(&body).unwrap();
+        let doc_id = doc_json["id"].as_str().unwrap().to_string();
+
         let request = Request::builder()
             .method("POST")
-            .uri("/ui/alpha.docs/blocks")
+            .uri(format!("/ui/alpha.docs/doc/{doc_id}/blocks"))
             .header(
                 "content-type",
                 format!("multipart/form-data; boundary={boundary}"),
@@ -11870,7 +12935,7 @@ mod tests {
 
         let list = Request::builder()
             .method("GET")
-            .uri("/v1/blocks?project=alpha.docs")
+            .uri(format!("/v1/projects/alpha.docs/documents/{doc_id}/blocks"))
             .header("x-lore-key", &agent_token)
             .body(Body::empty())
             .unwrap();
@@ -11887,7 +12952,7 @@ mod tests {
 
         let media = Request::builder()
             .method("GET")
-            .uri(format!("/ui/alpha.docs/blocks/{id}/media"))
+            .uri(format!("/ui/alpha.docs/doc/{doc_id}/blocks/{id}/media"))
             .header("cookie", &session_cookie)
             .body(Body::empty())
             .unwrap();
@@ -11902,7 +12967,7 @@ mod tests {
 
         let page = Request::builder()
             .method("GET")
-            .uri("/ui/alpha.docs")
+            .uri(format!("/ui/alpha.docs/doc/{doc_id}"))
             .header("cookie", &session_cookie)
             .body(Body::empty())
             .unwrap();
@@ -12537,18 +13602,24 @@ mod tests {
                 "csrf_token={csrf_token}&question=Summarise+this+project"
             )))
             .unwrap();
-        let response = app.oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let history = Request::builder()
+            .method("GET")
+            .uri("/ui/chat/librarian/history?project=alpha.docs")
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(history).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Librarian"));
-        assert!(html.contains("Summary from librarian"));
-        assert!(html.contains("Grounded with these blocks"));
-        assert!(html.contains("UI context block"));
-        assert!(html.contains("Recent history"));
-        assert!(html.contains("Ask again"));
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert!(messages.len() >= 2);
+        assert!(messages.iter().any(|m| m["content"].as_str().unwrap_or("").contains("Summary from librarian")));
     }
 
     #[tokio::test]
@@ -12574,24 +13645,23 @@ mod tests {
             .unwrap();
         assert_eq!(
             app.clone().oneshot(ask).await.unwrap().status(),
-            StatusCode::OK
+            StatusCode::SEE_OTHER
         );
 
-        let view = Request::builder()
+        let history = Request::builder()
             .method("GET")
-            .uri("/ui/alpha.docs")
+            .uri("/ui/chat/librarian/history?project=alpha.docs")
             .header("cookie", &session_cookie)
             .body(Body::empty())
             .unwrap();
-        let response = app.oneshot(view).await.unwrap();
+        let response = app.oneshot(history).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Persisted librarian answer"));
-        assert!(html.contains("history source block"));
-        assert!(html.contains("Ask again"));
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|m| m["content"].as_str().unwrap_or("").contains("Persisted librarian answer")));
     }
 
     #[tokio::test]

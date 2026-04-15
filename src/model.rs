@@ -120,9 +120,30 @@ impl BlockId {
     }
 
     pub fn from_string(value: String) -> Result<Self> {
+        if value.starts_with('_') {
+            let rest = &value[1..];
+            if rest.is_empty()
+                || !rest
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch == '-')
+            {
+                return Err(LoreError::Validation(
+                    "reserved block id must be _[a-z-]+".into(),
+                ));
+            }
+            return Ok(Self(value));
+        }
         Uuid::parse_str(&value)
             .map_err(|_| LoreError::Validation("block id must be a valid uuid".into()))?;
         Ok(Self(value))
+    }
+
+    pub fn reserved(name: &str) -> Self {
+        Self(name.to_string())
+    }
+
+    pub fn is_reserved(&self) -> bool {
+        self.0.starts_with('_')
     }
 
     pub fn as_str(&self) -> &str {
@@ -131,6 +152,37 @@ impl BlockId {
 }
 
 impl Display for BlockId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub const RESERVED_AGENT_CONTEXT: &str = "_agent-context";
+pub const RESERVED_OVERVIEW: &str = "_overview";
+pub const RESERVED_MAP: &str = "_map";
+pub const RESERVED_BLOCK_IDS: &[&str] = &[RESERVED_AGENT_CONTEXT, RESERVED_OVERVIEW, RESERVED_MAP];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct DocumentId(String);
+
+impl DocumentId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    pub fn from_string(value: String) -> Result<Self> {
+        Uuid::parse_str(&value)
+            .map_err(|_| LoreError::Validation("document id must be a valid uuid".into()))?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for DocumentId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }

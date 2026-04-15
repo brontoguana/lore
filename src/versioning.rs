@@ -64,6 +64,8 @@ pub struct StoredProjectVersionOperation {
     pub block_id: BlockId,
     pub before: Option<StoredBlockSnapshot>,
     pub after: Option<StoredBlockSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

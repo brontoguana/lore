@@ -6,8 +6,8 @@ use crate::librarian::{
     LibrarianRunStatus, ProjectLibrarianOperationType, ProviderCheckResult,
     StoredLibrarianOperation,
 };
-use crate::model::{Block, BlockId, BlockType, ProjectName};
-use crate::store::{FileBlockStore, ProjectInfo};
+use crate::model::{Block, BlockId, BlockType, ProjectName, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW};
+use crate::store::{DocumentInfo, FileBlockStore, ProjectInfo};
 use crate::updater::{AutoUpdateConfig, AutoUpdateStatus, ReleaseStream};
 use crate::versioning::{
     GitExportConfig, GitExportStatus, ProjectVersionActor, ProjectVersionActorKind,
@@ -36,17 +36,15 @@ pub struct PageShell<'a> {
 
 pub fn render_shell(shell: PageShell, content: String) -> String {
     let flash_html = flash_message(shell.flash);
+    let csrf_hidden = shell.csrf_token
+        .map(|t| format!(r#"<input type="hidden" name="csrf_token" value="{}">"#, t))
+        .unwrap_or_default();
     let nav_html = if let Some(username) = shell.username {
         let admin_link = if shell.is_admin {
             r#"<a href="/ui/admin">Admin</a>"#.to_string()
         } else {
             String::new()
         };
-        let csrf_input = shell
-            .csrf_token
-            .map(|t| format!(r#"<input type="hidden" name="csrf_token" value="{}">"#, t))
-            .unwrap_or_default();
-
         format!(
             r#"<nav class="top-nav">
   <div class="top-nav-inner">
@@ -59,20 +57,15 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     </button>
     <div class="top-nav-links" id="top-nav-links">
       <a href="/ui">Projects</a>
-      <a href="/ui/agents">Agents</a>
       <a href="/ui/chat">Chat</a>
+      <a href="/ui/agents">Agents</a>
       {admin_link}
       <a href="/ui/settings">Settings</a>
-      <form method="post" action="/logout">
-        {csrf_input}
-        <button type="submit">Sign out</button>
-      </form>
     </div>
   </div>
 </nav>"#,
             username = escape_text(username),
             admin_link = admin_link,
-            csrf_input = csrf_input,
         )
     } else {
         String::new()
@@ -89,6 +82,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
 </head>
 <body>
   {nav_html}
+  {csrf_hidden}
   <main class="shell">
     {flash_html}
     {content}
@@ -153,6 +147,26 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     var editPanel = document.getElementById('agent-context-edit');
     var band = document.querySelector('.agent-context-band');
     var block = document.querySelector('.agent-context-block');
+    if (!editPanel) return;
+    if (editPanel.style.display === 'none') {{
+      if (body) body.style.display = 'none';
+      editPanel.style.display = '';
+      if (band) band.classList.add('editline-band-active');
+      if (block) block.classList.add('editing');
+      var ta = editPanel.querySelector('textarea');
+      if (ta) {{ ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }}
+    }} else {{
+      if (body) body.style.display = '';
+      editPanel.style.display = 'none';
+      if (band) band.classList.remove('editline-band-active');
+      if (block) block.classList.remove('editing');
+    }}
+  }}
+  function toggleReservedEdit(safeId) {{
+    var body = document.getElementById('reserved-' + safeId + '-body');
+    var editPanel = document.getElementById('reserved-' + safeId + '-edit');
+    var band = document.querySelector('.reserved-band-' + safeId);
+    var block = document.querySelector('.reserved-block-' + safeId);
     if (!editPanel) return;
     if (editPanel.style.display === 'none') {{
       if (body) body.style.display = 'none';
@@ -523,13 +537,14 @@ pub fn render_projects_page(
     username: &str,
     is_admin: bool,
     projects: &[ProjectListEntry],
+    project_docs: &std::collections::HashMap<String, Vec<DocumentInfo>>,
     csrf_token: &str,
     flash: Option<&str>,
 ) -> String {
     let tree_html = if projects.is_empty() {
         r#"<div class="empty-state"><p>No projects yet.</p></div>"#.to_string()
     } else {
-        render_project_tree(projects, is_admin, csrf_token)
+        render_project_tree(projects, project_docs, is_admin, csrf_token)
     };
 
     let root_create = if is_admin {
@@ -578,6 +593,20 @@ pub fn render_projects_page(
       }}
       childList.appendChild(li);
       li.querySelector('input[name="project_name"]').focus();
+    }}
+    function toggleProjectDocs(btn) {{
+      var node = btn.closest('.tree-node');
+      var docList = node.querySelector(':scope > .tree-doc-list');
+      if (!docList) return;
+      if (docList.style.display === 'none') {{
+        docList.style.display = '';
+        btn.innerHTML = '&#9660;';
+        btn.classList.add('tree-expand-open');
+      }} else {{
+        docList.style.display = 'none';
+        btn.innerHTML = '&#9654;';
+        btn.classList.remove('tree-expand-open');
+      }}
     }}
     function addSiblingRow(btn, parentSlug) {{
       document.querySelectorAll('.tree-inline-create').forEach(function(el) {{ el.remove(); }});
@@ -694,12 +723,45 @@ pub fn render_projects_page(
     )
 }
 
-fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token: &str) -> String {
-    // Build tree structure: root nodes have parent == None
-    // Children have parent == Some(slug)
+fn render_project_tree(
+    projects: &[ProjectListEntry],
+    project_docs: &std::collections::HashMap<String, Vec<DocumentInfo>>,
+    is_admin: bool,
+    csrf_token: &str,
+) -> String {
+    fn render_doc_subtree(
+        project_slug: &str,
+        docs: &[DocumentInfo],
+        depth: usize,
+    ) -> String {
+        docs.iter()
+            .map(|doc| {
+                let doc_id = escape_attribute(doc.id.as_str());
+                let name = escape_text(&doc.display_name);
+                let indent = format!("padding-left:{}px", (depth + 1) * 20);
+                let children = render_doc_subtree(project_slug, &doc.children, depth + 1);
+                format!(
+                    r#"<li class="tree-doc-node" style="{indent}">
+  <a href="/ui/{project_slug}/doc/{doc_id}" class="tree-doc-link">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+    <span>{name}</span>
+  </a>
+</li>{children}"#,
+                    indent = indent,
+                    project_slug = escape_attribute(project_slug),
+                    doc_id = doc_id,
+                    name = name,
+                    children = children,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn render_children(
         parent: Option<&str>,
         projects: &[ProjectListEntry],
+        project_docs: &std::collections::HashMap<String, Vec<DocumentInfo>>,
         is_admin: bool,
         csrf_token: &str,
         depth: usize,
@@ -723,10 +785,32 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
                 let sub = render_children(
                     Some(slug),
                     projects,
+                    project_docs,
                     is_admin,
                     csrf_token,
                     depth + 1,
                 );
+
+                let docs = project_docs.get(slug);
+                let has_docs = docs.map_or(false, |d| !d.is_empty());
+                let expand_btn = if has_docs {
+                    r#"<button type="button" class="tree-expand-btn" onclick="event.stopPropagation(); toggleProjectDocs(this)" title="Show documents">&#9654;</button>"#.to_string()
+                } else {
+                    String::new()
+                };
+
+                let doc_tree_html = if let Some(docs) = docs {
+                    if !docs.is_empty() {
+                        let doc_items = render_doc_subtree(slug, docs, 0);
+                        format!(
+                            r#"<ul class="tree-doc-list" style="display:none;">{doc_items}</ul>"#,
+                        )
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
 
                 let admin_btns = if is_admin {
                     format!(
@@ -750,20 +834,24 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
                 format!(
                     r#"<li class="tree-node" data-slug="{slug}" data-parent="{parent_attr}">
   <div class="tree-node-row" ondragover="onNodeDragOver(event)" ondragleave="onNodeDragLeave(event)" ondrop="onNodeDrop(event)">
+    {expand_btn}
     <a href="/ui/{slug}" class="tree-link">{display}</a>
     <div class="tree-row-right">
       <span class="tree-perm">{perm}</span>
       {admin_btns}
     </div>
   </div>
+  {doc_tree_html}
   {sub}
   {drop_zone}
 </li>"#,
                     slug = escape_attribute(slug),
                     parent_attr = escape_attribute(parent_attr),
+                    expand_btn = expand_btn,
                     display = display,
                     perm = perm,
                     admin_btns = admin_btns,
+                    doc_tree_html = doc_tree_html,
                     sub = sub,
                     drop_zone = drop_zone,
                 )
@@ -787,7 +875,7 @@ fn render_project_tree(projects: &[ProjectListEntry], is_admin: bool, csrf_token
         )
     }
 
-    render_children(None, projects, is_admin, csrf_token, 0)
+    render_children(None, projects, project_docs, is_admin, csrf_token, 0)
 }
 
 pub fn render_admin_page(
@@ -2076,7 +2164,7 @@ pub fn render_agents_page(
                                 <option value="gemini">Gemini</option>
                                 <option value="codex">Codex</option>
                               </select>
-                              <button type="button" onclick="toggleMkdir('{name_attr}')" title="Create folder" aria-label="Create folder" style="display:inline-flex; align-items:center; justify-content:center; aspect-ratio:1; padding:0; flex:0 0 auto;">
+                              <button type="button" style="width:auto; min-height:0; padding:0; aspect-ratio:1; display:inline-flex; align-items:center; justify-content:center;" onclick="toggleMkdir('{name_attr}')" title="Create folder" aria-label="Create folder">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
                                   <path d="M12 11v6"/>
@@ -2754,6 +2842,17 @@ pub fn render_settings_page(
         </div>
       </section>
     </div>
+    <section class="panel" style="margin-top:var(--s-6);">
+      <div class="panel-header">
+        <h2>Account</h2>
+      </div>
+      <div class="padded">
+        <form method="post" action="/logout">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <button type="submit" class="btn-lg" style="background:var(--danger, #c53030); color:#fff;">Sign out</button>
+        </form>
+      </div>
+    </section>
     <script>
     (function() {{
       var cards = document.querySelectorAll('.theme-card[data-theme]');
@@ -2958,7 +3057,22 @@ pub fn render_chat_page(
     selected_agent: Option<&str>,
     messages_json: &str,
     flash: Option<&str>,
+    projects: &[(String, String)],
 ) -> String {
+    let is_librarian = selected_agent == Some("librarian");
+
+    let librarian_active_class = if is_librarian { " chat-agent-active" } else { "" };
+    let librarian_entry = format!(
+        r#"<div class="chat-agent-item{active_class}" data-agent="librarian" onclick="selectAgent('librarian')">
+  <div class="chat-agent-header">
+    <div class="chat-avatar-sm-wrap"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></div>
+    <span class="chat-agent-name">Librarian</span>
+  </div>
+  <div class="chat-agent-snippet">Ask questions about your projects</div>
+</div>"#,
+        active_class = librarian_active_class,
+    );
+
     let agent_list_html: String = agents
         .iter()
         .map(|agent| {
@@ -3015,8 +3129,73 @@ pub fn render_chat_page(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let agent_list_html = format!("{}\n{}", librarian_entry, agent_list_html);
 
-    let chat_area_html = if let Some(agent_name) = selected_agent {
+    let chat_area_html = if is_librarian {
+        let project_options: String = projects
+            .iter()
+            .map(|(slug, display_name)| {
+                format!(
+                    r#"<option value="{}">{}</option>"#,
+                    escape_attribute(slug),
+                    escape_text(display_name),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            r#"<div class="chat-header">
+  <button class="chat-back-btn" onclick="showAgentList()">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
+  </button>
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin-right:var(--s-2);flex-shrink:0;"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>
+  <span class="chat-header-name">Librarian</span>
+  <select id="lib-project" class="chat-config-select" style="margin-left:var(--s-3);max-width:200px;" onchange="onLibProjectChange()">
+    <option value="">Select project...</option>
+    {project_options}
+  </select>
+  <button type="button" class="btn-sm button-link" id="chat-config-btn" style="margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
+</div>
+<div class="chat-messages" id="chat-messages"></div>
+<div class="chat-config-panel" id="chat-config-panel" style="display:none;">
+  <div class="chat-config-inner">
+    <div class="chat-config-field">
+      <label class="chat-config-label">Endpoint</label>
+      <select id="lib-endpoint" class="chat-config-select" onchange="onLibConfigChange()"></select>
+    </div>
+    <div class="chat-config-field">
+      <label class="chat-config-label">Timeout (seconds)</label>
+      <input type="number" id="lib-timeout" class="chat-config-select" min="1" max="120" onchange="onLibConfigChange()">
+    </div>
+    <div class="chat-config-field">
+      <label class="chat-config-label">Max concurrent runs</label>
+      <input type="number" id="lib-concurrent" class="chat-config-select" min="1" max="32" onchange="onLibConfigChange()">
+    </div>
+    <div class="chat-config-field">
+      <label class="toggle"><input type="checkbox" id="lib-approval" onchange="onLibConfigChange()"> <span>Require approval for edits</span></label>
+    </div>
+    <div class="chat-config-field">
+      <label class="toggle"><input type="checkbox" id="lib-include-history" value="1"> <span>Search document history</span></label>
+    </div>
+    <div class="chat-config-field">
+      <label class="toggle"><input type="checkbox" id="lib-allow-edits" value="1"> <span>Allow edits</span></label>
+    </div>
+    <div id="lib-status" class="chat-config-field" style="font-size:0.85em;color:var(--fg-muted);"></div>
+    <div id="lib-pending-actions"></div>
+  </div>
+</div>
+<form class="chat-input-form" id="chat-input-form" onsubmit="return sendLibrarianMessage(event)">
+  <input type="hidden" name="csrf_token" value="{csrf_token}">
+  <textarea class="chat-input" id="chat-input" placeholder="Ask the librarian..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
+  <button type="submit" class="chat-send-btn">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+  </button>
+</form>"#,
+            settings_icon = ICON_SETTINGS,
+            csrf_token = escape_attribute(csrf_token),
+            project_options = project_options,
+        )
+    } else if let Some(agent_name) = selected_agent {
         let selected_agent_data = agents
             .iter()
             .find(|a| a.name == agent_name);
@@ -3102,8 +3281,8 @@ pub fn render_chat_page(
 <div class="chat-config-panel" id="chat-manage-panel" style="display:none;">
   <div class="chat-config-inner">
     <div class="chat-config-field">
-      <label class="chat-config-label">Manager Endpoint</label>
-      <select id="mgr-endpoint" class="chat-config-select" onchange="onManageChange()"></select>
+      <label class="chat-config-label">Manager Backend</label>
+      <select id="mgr-backend" class="chat-config-select" onchange="onManageChange()"></select>
     </div>
     <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
       <label class="chat-config-label">Goals</label>
@@ -3186,6 +3365,8 @@ var eventSource = null;
 var streamingContent = '';
 var agentConfig = {{ backend: '', model: '', effort: '' }};
 var agentStatus = '';
+var isLibrarian = currentAgent === 'librarian';
+var libProject = '';
 
 if (currentAgent) {{
   localStorage.setItem('lastChatAgent', currentAgent);
@@ -3438,17 +3619,11 @@ function expandSvg(container) {{
   close.innerHTML = '&#x2715;';
   close.onclick = function(e) {{ e.stopPropagation(); overlay.remove(); }};
   overlay.appendChild(close);
-  var wrapper = document.createElement('div');
-  wrapper.innerHTML = svg.outerHTML;
-  wrapper.onclick = function(e) {{ e.stopPropagation(); }};
-  var bigSvg = wrapper.querySelector('svg');
-  if (bigSvg) {{
-    bigSvg.removeAttribute('width');
-    bigSvg.removeAttribute('height');
-    bigSvg.style.maxWidth = '90vw';
-    bigSvg.style.maxHeight = '90vh';
-  }}
-  overlay.appendChild(wrapper);
+  var bigSvg = svg.cloneNode(true);
+  bigSvg.removeAttribute('width');
+  bigSvg.removeAttribute('height');
+  bigSvg.onclick = function(e) {{ e.stopPropagation(); }};
+  overlay.appendChild(bigSvg);
   document.body.appendChild(overlay);
 }}
 
@@ -3679,7 +3854,7 @@ function toggleChatConfig() {{
   cfg.style.display = '';
   if (form) form.style.display = 'none';
   if (btn) btn.classList.add('active');
-  loadChatConfig();
+  if (isLibrarian) {{ loadLibrarianConfig(); }} else {{ loadChatConfig(); }}
 }}
 
 function toggleManagePanel() {{
@@ -3744,17 +3919,37 @@ function loadManageConfig() {{
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
       manageConfigData = data;
-      var epSel = document.getElementById('mgr-endpoint');
-      if (epSel) {{
-        epSel.innerHTML = '<option value="">Select endpoint...</option>';
-        var eps = data.endpoints || [];
-        for (var i = 0; i < eps.length; i++) {{
+      var bSel = document.getElementById('mgr-backend');
+      if (bSel) {{
+        bSel.innerHTML = '';
+        var cliBackends = ['claude', 'gemini', 'codex'];
+        var hasEndpoints = data.endpoints && data.endpoints.length > 0;
+        var selectedBackend = data.backend || '';
+        var selectedEndpoint = data.endpoint_id || '';
+        var cliGroup = document.createElement('optgroup');
+        cliGroup.label = 'CLI';
+        for (var i = 0; i < cliBackends.length; i++) {{
           var opt = document.createElement('option');
-          opt.value = eps[i].id;
-          opt.textContent = eps[i].name + ' (' + eps[i].model + ')';
-          if (eps[i].id === data.endpoint_id) opt.selected = true;
-          epSel.appendChild(opt);
+          opt.value = 'cli:' + cliBackends[i];
+          opt.textContent = cliBackends[i].charAt(0).toUpperCase() + cliBackends[i].slice(1);
+          if (!selectedEndpoint && selectedBackend === cliBackends[i]) opt.selected = true;
+          cliGroup.appendChild(opt);
         }}
+        bSel.appendChild(cliGroup);
+        if (hasEndpoints) {{
+          var epGroup = document.createElement('optgroup');
+          epGroup.label = 'Endpoints';
+          var eps = data.endpoints;
+          for (var j = 0; j < eps.length; j++) {{
+            var eopt = document.createElement('option');
+            eopt.value = 'ep:' + eps[j].id;
+            eopt.textContent = eps[j].name + ' (' + eps[j].model + ')';
+            if (selectedEndpoint === eps[j].id) eopt.selected = true;
+            epGroup.appendChild(eopt);
+          }}
+          bSel.appendChild(epGroup);
+        }}
+        if (!selectedBackend && !selectedEndpoint) bSel.selectedIndex = 0;
       }}
       var goals = document.getElementById('mgr-goals');
       var stopping = document.getElementById('mgr-stopping');
@@ -3796,13 +3991,22 @@ function onManageFieldChange() {{
 }}
 
 function saveManageConfig() {{
-  var epSel = document.getElementById('mgr-endpoint');
+  var bSel = document.getElementById('mgr-backend');
   var goals = document.getElementById('mgr-goals');
   var stopping = document.getElementById('mgr-stopping');
   var checks = document.getElementById('mgr-checks');
   var redflags = document.getElementById('mgr-redflags');
+  var val = bSel ? bSel.value : '';
+  var backend = '';
+  var endpointId = '';
+  if (val.startsWith('cli:')) {{
+    backend = val.substring(4);
+  }} else if (val.startsWith('ep:')) {{
+    endpointId = val.substring(3);
+  }}
   var body = 'csrf_token=' + encodeURIComponent(csrfToken)
-    + '&endpoint_id=' + encodeURIComponent(epSel ? epSel.value : '')
+    + '&backend=' + encodeURIComponent(backend)
+    + '&endpoint_id=' + encodeURIComponent(endpointId)
     + '&goals=' + encodeURIComponent(goals ? goals.value : '')
     + '&stopping_point=' + encodeURIComponent(stopping ? stopping.value : '')
     + '&periodic_checks=' + encodeURIComponent(checks ? checks.value : '')
@@ -3982,7 +4186,159 @@ function saveConfig() {{
   }});
 }}
 
-if (currentAgent) {{
+function sendLibrarianMessage(e) {{
+  e.preventDefault();
+  var input = document.getElementById('chat-input');
+  var text = input.value.trim();
+  if (!text || !libProject) return false;
+  input.value = '';
+  chatMessages.push({{ role: 'user', content: text }});
+  renderMessages();
+  var inclHistory = document.getElementById('lib-include-history');
+  var allowEdits = document.getElementById('lib-allow-edits');
+  var body = 'csrf_token=' + encodeURIComponent(csrfToken)
+    + '&project=' + encodeURIComponent(libProject)
+    + '&question=' + encodeURIComponent(text)
+    + '&include_history=' + (inclHistory && inclHistory.checked ? '1' : '0')
+    + '&allow_edits=' + (allowEdits && allowEdits.checked ? '1' : '0');
+  fetch('/ui/chat/librarian/ask', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: body
+  }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    if (data.ok) {{
+      var content = data.answer || data.error || 'No response.';
+      if (data.pending) content = '[Pending approval] ' + content;
+      chatMessages.push({{ role: 'assistant', content: content }});
+    }} else {{
+      chatMessages.push({{ role: 'system', content: 'Error: ' + (data.error || 'request failed') }});
+    }}
+    renderMessages();
+    if (chatConfigOpen) loadLibrarianConfig();
+  }}).catch(function() {{
+    chatMessages.push({{ role: 'system', content: 'Failed to send (network error)' }});
+    renderMessages();
+  }});
+  return false;
+}}
+
+function onLibProjectChange() {{
+  var sel = document.getElementById('lib-project');
+  libProject = sel ? sel.value : '';
+  localStorage.setItem('libProject', libProject);
+  loadLibrarianHistory();
+}}
+
+function loadLibrarianHistory() {{
+  if (!libProject) {{
+    chatMessages = [];
+    renderMessages();
+    return;
+  }}
+  fetch('/ui/chat/librarian/history?project=' + encodeURIComponent(libProject), {{ cache: 'no-store' }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      chatMessages = data.messages || [];
+      renderMessages();
+      renderPendingActions(data.pending_actions || []);
+    }});
+}}
+
+function renderPendingActions(actions) {{
+  var el = document.getElementById('lib-pending-actions');
+  if (!el) return;
+  if (!actions.length) {{ el.innerHTML = ''; return; }}
+  var html = '<div class="chat-config-label" style="margin-bottom:var(--s-2);">Pending Actions</div>';
+  for (var i = 0; i < actions.length; i++) {{
+    var a = actions[i];
+    html += '<div style="display:flex;align-items:center;gap:var(--s-2);margin-bottom:var(--s-2);padding:var(--s-2);border:1px solid var(--line);border-radius:var(--radius);">';
+    html += '<span style="flex:1;font-size:0.85em;">' + escapeHtml(a.summary) + ' (' + a.operation_count + ' ops)</span>';
+    html += '<button class="btn-sm" onclick="libApproveAction(\'' + a.id + '\')" title="Approve"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg></button>';
+    html += '<button class="btn-sm" onclick="libRejectAction(\'' + a.id + '\')" title="Reject"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg></button>';
+    html += '</div>';
+  }}
+  el.innerHTML = html;
+}}
+
+function libApproveAction(id) {{
+  fetch('/ui/chat/librarian/action/' + encodeURIComponent(id) + '/approve', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: 'csrf_token=' + encodeURIComponent(csrfToken)
+  }}).then(function() {{ loadLibrarianHistory(); if (chatConfigOpen) loadLibrarianConfig(); }});
+}}
+
+function libRejectAction(id) {{
+  fetch('/ui/chat/librarian/action/' + encodeURIComponent(id) + '/reject', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: 'csrf_token=' + encodeURIComponent(csrfToken)
+  }}).then(function() {{ loadLibrarianHistory(); if (chatConfigOpen) loadLibrarianConfig(); }});
+}}
+
+function loadLibrarianConfig() {{
+  fetch('/ui/chat/librarian/config', {{ cache: 'no-store' }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      var epSel = document.getElementById('lib-endpoint');
+      if (epSel) {{
+        epSel.innerHTML = '<option value="">Not configured</option>';
+        var eps = data.endpoints || [];
+        for (var i = 0; i < eps.length; i++) {{
+          var opt = document.createElement('option');
+          opt.value = eps[i].id;
+          opt.textContent = eps[i].name + ' (' + eps[i].model + ')';
+          if (data.endpoint_id === eps[i].id) opt.selected = true;
+          epSel.appendChild(opt);
+        }}
+        epSel.disabled = !data.is_admin;
+      }}
+      var timeout = document.getElementById('lib-timeout');
+      if (timeout) {{ timeout.value = data.request_timeout_secs || 30; timeout.disabled = !data.is_admin; }}
+      var concurrent = document.getElementById('lib-concurrent');
+      if (concurrent) {{ concurrent.value = data.max_concurrent_runs || 4; concurrent.disabled = !data.is_admin; }}
+      var approval = document.getElementById('lib-approval');
+      if (approval) {{ approval.checked = !!data.action_requires_approval; approval.disabled = !data.is_admin; }}
+      var statusEl = document.getElementById('lib-status');
+      if (statusEl) {{
+        statusEl.textContent = data.is_configured ? 'Status: configured' : 'Status: not configured (select an endpoint)';
+        if (data.status) statusEl.textContent += ' — ' + data.status;
+      }}
+    }});
+}}
+
+function onLibConfigChange() {{
+  var epSel = document.getElementById('lib-endpoint');
+  var timeout = document.getElementById('lib-timeout');
+  var concurrent = document.getElementById('lib-concurrent');
+  var approval = document.getElementById('lib-approval');
+  var body = 'csrf_token=' + encodeURIComponent(csrfToken)
+    + '&endpoint_id=' + encodeURIComponent(epSel ? epSel.value : '')
+    + '&request_timeout_secs=' + encodeURIComponent(timeout ? timeout.value : '')
+    + '&max_concurrent_runs=' + encodeURIComponent(concurrent ? concurrent.value : '')
+    + '&action_requires_approval=' + (approval && approval.checked ? '1' : '0');
+  fetch('/ui/chat/librarian/config', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: body
+  }});
+}}
+
+if (isLibrarian) {{
+  var params = new URLSearchParams(window.location.search);
+  var qProject = params.get('project');
+  var saved = localStorage.getItem('libProject');
+  var projSel = document.getElementById('lib-project');
+  if (qProject && projSel) {{
+    projSel.value = qProject;
+    libProject = qProject;
+  }} else if (saved && projSel) {{
+    projSel.value = saved;
+    libProject = saved;
+    if (!projSel.value) {{ libProject = ''; }}
+  }}
+  if (libProject) loadLibrarianHistory();
+}} else if (currentAgent) {{
   renderMessages();
   connectSSE();
   fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{ cache: 'no-store' }})
@@ -4246,82 +4602,26 @@ pub fn render_project_page(
     project: &ProjectName,
     display_name: &str,
     project_uuid: &str,
-    agent_context: Option<&str>,
-    blocks: &[Block],
+    reserved_blocks: &[Block],
+    documents: &[DocumentInfo],
     flash: Option<&str>,
-    search: Option<&str>,
-    search_block_type: Option<&str>,
-    search_author: Option<&str>,
-    search_include_history: bool,
     username: &str,
     can_write: bool,
     is_admin: bool,
     csrf_token: &str,
-    librarian_answer: Option<&UiLibrarianAnswer>,
-    librarian_history: &[UiLibrarianAnswer],
-    pending_actions: &[UiPendingLibrarianAction],
-    store: &FileBlockStore,
 ) -> String {
-    let project_infos = store.list_project_infos().unwrap_or_default();
-    let search_value = search.unwrap_or_default();
-    let results_label = if !search_value.is_empty() {
-        format!(
-            "<p>{} result{} for \"{}\". </p>",
-            blocks.len(),
-            if blocks.len() == 1 { "" } else { "s" },
-            escape_text(search_value)
-        )
-    } else {
-        String::new()
-    };
-    let blocks_html = if blocks.is_empty() && can_write {
-        format!(
-            r#"<section class="empty-state"><h2>No blocks yet</h2><p>Click the button below to add the first block.</p></section>{}"#,
-            render_block_inserter(project, None, csrf_token, &project_infos),
-        )
-    } else if blocks.is_empty() {
-        r#"<section class="empty-state"><h2>No blocks yet</h2></section>"#.to_string()
-    } else {
-        let mut html = String::new();
-        if can_write {
-            html.push_str(&render_block_inserter(project, None, csrf_token, &project_infos));
-        }
-        for (i, block) in blocks.iter().enumerate() {
-            html.push_str(&render_block(
-                project, block, can_write, &project_infos, csrf_token, i,
-            ));
-            if can_write {
-                html.push_str(&render_block_inserter(project, Some(&block.id), csrf_token, &project_infos));
-            }
-        }
-        html
-    };
-    let blocks_html = resolve_lore_links_in_html(&blocks_html, store);
-    let librarian_panel = render_librarian_panel(
-        project,
-        csrf_token,
-        can_write,
-        librarian_answer,
-        librarian_history,
-        pending_actions,
-    );
-    let read_only_notice = if !can_write {
-        r#"<section class="panel composer"><div class="panel-header"><h2>Read-only access</h2><p>Viewing only.</p></div></section>"#
-    } else {
-        ""
-    };
+    let project_slug = escape_attribute(project.as_str());
+    let csrf = escape_attribute(csrf_token);
 
     let delete_project_html = if is_admin {
         format!(
             r#"<div class="delete-project-section">
               <form method="post" action="/ui/{project_slug}/delete"
                     onsubmit="return confirm('Are you sure you want to delete this project? This cannot be undone.');">
-                <input type="hidden" name="csrf_token" value="{csrf_token}">
+                <input type="hidden" name="csrf_token" value="{csrf}">
                 <button type="submit" class="delete-project-btn">Delete project</button>
               </form>
             </div>"#,
-            project_slug = escape_attribute(project.as_str()),
-            csrf_token = escape_attribute(csrf_token),
         )
     } else {
         String::new()
@@ -4342,7 +4642,7 @@ pub fn render_project_page(
             >{display_name}</h1>{copy_project_link_btn}</div>
             <form id="rename-form" method="post" action="/ui/{project_slug}/rename"
                   style="display:none; align-items:center; gap:var(--s-3); margin:0;">
-              <input type="hidden" name="csrf_token" value="{csrf_token}">
+              <input type="hidden" name="csrf_token" value="{csrf}">
               <input type="text" name="display_name" value="{display_name_attr}" class="rename-input"
                      autofocus onfocus="this.select()">
               <button type="submit" class="button-link">Save</button>
@@ -4350,8 +4650,8 @@ pub fn render_project_page(
             </form>"#,
             display_name = escape_text(display_name),
             display_name_attr = escape_attribute(display_name),
-            project_slug = escape_attribute(project.as_str()),
-            csrf_token = escape_attribute(csrf_token),
+            project_slug = project_slug,
+            csrf = csrf,
             copy_project_link_btn = copy_project_link_btn,
         )
     } else {
@@ -4362,129 +4662,37 @@ pub fn render_project_page(
         )
     };
 
-    let search_active = !search_value.is_empty()
-        || search_block_type.is_some()
-        || !search_author.unwrap_or_default().is_empty()
-        || search_include_history;
-    let search_strip_style = if search_active {
-        ""
-    } else {
-        " style=\"display:none\""
-    };
-    let search_btn_class = if search_active { " active" } else { "" };
+    let reserved_html: String = reserved_blocks
+        .iter()
+        .map(|block| {
+            render_reserved_block_panel(project, block, can_write, csrf_token)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    let context_text = agent_context.unwrap_or_default();
-    let agent_context_html = {
-        let edit_form = if can_write {
-            format!(
-                r#"<form id="agent-context-form" method="post" action="/ui/{project_slug}/context">
-    <textarea name="agent_context" class="block-edit-textarea agent-context-textarea">{content_escaped}</textarea>
-    <input type="hidden" name="csrf_token" value="{csrf}">
-    <div style="display:flex; gap:var(--s-3);">
-      <button type="submit" class="button-link">Save</button>
-      <button type="button" class="button-link" onclick="toggleAgentContext()">Cancel</button>
-    </div>
-  </form>"#,
-                project_slug = escape_attribute(project.as_str()),
-                csrf = escape_attribute(csrf_token),
-                content_escaped = escape_text(context_text),
-            )
-        } else {
-            String::new()
-        };
-        let band_html = if can_write {
-            r#"<div class="editline-band editline-band-even agent-context-band" onclick="toggleAgentContext()" title="Click to edit agent context"></div>"#
-        } else {
-            ""
-        };
-        let rendered_body = if context_text.trim().is_empty() {
-            "<span class=\"hint\">No agent context set</span>".to_string()
-        } else {
-            render_markdown(context_text)
-        };
-        format!(
-            r#"<div class="agent-context-section">
-  <div class="section-tag">Agent Context</div>
-  <div class="editline-row">
-    <article class="block agent-context-block">
-      <div class="block-body" id="agent-context-body">{rendered_body}</div>
-      <div class="block-edit-panel" id="agent-context-edit" style="display:none;">{edit_form}</div>
-    </article>{band_html}
-  </div>
-</div>"#,
-            rendered_body = rendered_body,
-            edit_form = edit_form,
-            band_html = band_html,
-        )
+    let doc_list_html = render_doc_list_for_project(project, documents, can_write, csrf_token);
+
+    let read_only_notice = if !can_write {
+        r#"<section class="panel composer"><div class="panel-header"><h2>Read-only access</h2><p>Viewing only.</p></div></section>"#
+    } else {
+        ""
     };
 
     let content = format!(
         r#"<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
       {rename_html}
-      <div style="display:flex; gap:var(--s-3);">
-        <button type="button" class="button-link{search_btn_class}" onclick="var s=document.getElementById('search-strip'); if(s.style.display==='none'){{s.style.display='';this.classList.add('active');}}else{{s.style.display='none';this.classList.remove('active');}}">Search</button>
-        <a class="button-link" href="/ui/{project_slug}/audit">Audit</a>
+      <div style="display:flex; gap:var(--s-3); align-items:center;">
         <a class="button-link" href="/ui/{project_slug}/history">History</a>
       </div>
     </div>
-    <form class="searchbar" id="search-strip" method="get" action="/ui/{project_slug}"{search_strip_style}>
-      <input type="search" name="q" value="{search_value}" placeholder="Search content...">
-      <select name="block_type">
-        <option value=""{search_any_type}>Any type</option>
-        <option value="markdown"{search_markdown}>Markdown</option>
-        <option value="svg"{search_svg}>SVG</option>
-        <option value="html"{search_html}>HTML</option>
-        <option value="image"{search_image}>Image</option>
-      </select>
-      <input type="search" name="author" value="{search_author}" placeholder="Author...">
-      <select name="include_history">
-        <option value=""{search_history_current}>Current</option>
-        <option value="1"{search_history_history}>History</option>
-      </select>
-      <button type="submit">Search</button>
-    </form>
-
-    <div class="layout">
-      <div class="main-column">
-        {agent_context_html}
-        <div class="section-tag">Document</div>
-        <section class="panel" id="document">
-          {results_label}
-          <div class="timeline">{blocks_html}</div>
-        </section>
-      </div>
-      <aside class="stack">{librarian_panel}{read_only_notice}</aside>
-    </div>
+    {reserved_html}
+    {doc_list_html}
+    {read_only_notice}
     {delete_project_html}"#,
         rename_html = rename_html,
-        project_slug = escape_attribute(project.as_str()),
-        search_value = escape_attribute(search_value),
-        search_any_type = if search_block_type.is_none() {
-            " selected"
-        } else {
-            ""
-        },
-        search_markdown = selected(search_block_type, "markdown"),
-        search_svg = selected(search_block_type, "svg"),
-        search_html = selected(search_block_type, "html"),
-        search_image = selected(search_block_type, "image"),
-        search_author = escape_attribute(search_author.unwrap_or_default()),
-        search_strip_style = search_strip_style,
-        search_btn_class = search_btn_class,
-        search_history_current = if !search_include_history {
-            " selected"
-        } else {
-            ""
-        },
-        search_history_history = if search_include_history {
-            " selected"
-        } else {
-            ""
-        },
-        agent_context_html = agent_context_html,
-        results_label = results_label,
-        blocks_html = blocks_html,
-        librarian_panel = librarian_panel,
+        project_slug = project_slug,
+        reserved_html = reserved_html,
+        doc_list_html = doc_list_html,
         read_only_notice = read_only_notice,
         delete_project_html = delete_project_html,
     );
@@ -4503,100 +4711,506 @@ pub fn render_project_page(
     )
 }
 
-fn render_librarian_panel(
+fn reserved_block_label(id: &str) -> &'static str {
+    match id {
+        RESERVED_AGENT_CONTEXT => "Agent Context",
+        RESERVED_OVERVIEW => "Overview",
+        RESERVED_MAP => "File Map",
+        _ => "Reserved",
+    }
+}
+
+fn reserved_block_limit(id: &str) -> Option<(usize, usize)> {
+    match id {
+        RESERVED_OVERVIEW => Some((1600, 2000)),
+        RESERVED_MAP => Some((3200, 4000)),
+        _ => None,
+    }
+}
+
+fn render_reserved_block_panel(
     project: &ProjectName,
-    csrf_token: &str,
+    block: &Block,
     can_write: bool,
-    librarian_answer: Option<&UiLibrarianAnswer>,
-    librarian_history: &[UiLibrarianAnswer],
-    pending_actions: &[UiPendingLibrarianAction],
+    csrf_token: &str,
 ) -> String {
-    let answer_html = librarian_answer
-        .map(render_librarian_answer)
-        .unwrap_or_else(|| {
-            "<p class=\"hint\">Ask for a summary, explanation, or grounded answer about this project.</p>".to_string()
-        });
-    let question_value = librarian_answer
-        .map(|answer| escape_attribute(&answer.question))
-        .unwrap_or_default();
-    let history_html = if librarian_history.is_empty() {
-        "<p class=\"hint\">No previous answers.</p>".to_string()
+    let block_id_str = block.id.as_str();
+    let label = reserved_block_label(block_id_str);
+    let safe_id = block_id_str.replace('-', "_");
+    let project_slug = escape_attribute(project.as_str());
+    let csrf = escape_attribute(csrf_token);
+    let content = &block.content;
+
+    let limit_warning = if let Some((soft, hard)) = reserved_block_limit(block_id_str) {
+        let len = content.len();
+        if len > soft {
+            let pct = (len as f64 / hard as f64 * 100.0).min(100.0);
+            format!(
+                r#"<div class="reserved-limit-warning"><span>{len} / {hard} chars ({pct:.0}%)</span></div>"#,
+            )
+        } else {
+            String::new()
+        }
     } else {
-        librarian_history
-            .iter()
-            .map(|answer| render_librarian_history_item(project, csrf_token, answer))
-            .collect::<Vec<_>>()
-            .join("")
+        String::new()
     };
-    let pending_html = if pending_actions.is_empty() {
-        "<p class=\"hint\">No pending actions.</p>".to_string()
+
+    let over_soft = if let Some((soft, _)) = reserved_block_limit(block_id_str) {
+        content.len() > soft
     } else {
-        pending_actions
-            .iter()
-            .map(|action| {
-                render_pending_librarian_action(action, Some(project), csrf_token, can_write)
-            })
-            .collect::<Vec<_>>()
-            .join("")
+        false
     };
-    let allow_edits_html = if can_write {
-        r#"<label class="toggle"><input type="checkbox" name="allow_edits" value="1"> <span>Allow edits</span></label>"#
+    let panel_class = if over_soft {
+        "panel reserved-block-section reserved-over-soft"
     } else {
-        ""
+        "panel reserved-block-section"
     };
-    let compact_html = if can_write {
+
+    let edit_form = if can_write {
         format!(
-            r#"<div class="stack">
-    <h3 class="panel-subheading">Tools</h3>
-    <form method="post" action="/ui/{project}/compact" onsubmit="return confirm('Merge all consecutive markdown blocks into single blocks?')">
-      <input type="hidden" name="csrf_token" value="{csrf_token}">
-      <button type="submit" class="button-link" title="Merge consecutive markdown blocks into single blocks">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16"/><path d="M4 6h16"/><path d="m7 9-3 3 3 3"/><path d="m17 9 3 3-3 3"/></svg>
-        Compact
-      </button>
-    </form>
-  </div>"#,
-            project = escape_attribute(project.as_str()),
-            csrf_token = escape_attribute(csrf_token),
+            r#"<form id="reserved-{safe_id}-form" method="post" action="/ui/{project_slug}/reserved/{block_id}">
+    <textarea name="content" class="block-edit-textarea reserved-textarea">{escaped}</textarea>
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <div style="display:flex; gap:var(--s-3);">
+      <button type="submit" class="button-link">Save</button>
+      <button type="button" class="button-link" onclick="toggleReservedEdit('{safe_id}')">Cancel</button>
+    </div>
+  </form>"#,
+            safe_id = safe_id,
+            project_slug = project_slug,
+            block_id = escape_attribute(block_id_str),
+            csrf = csrf,
+            escaped = escape_text(content),
+        )
+    } else {
+        String::new()
+    };
+
+    let band_html = if can_write {
+        format!(
+            r#"<div class="editline-band editline-band-even reserved-band-{safe_id}" onclick="toggleReservedEdit('{safe_id}')" title="Click to edit {label}"></div>"#,
+        )
+    } else {
+        String::new()
+    };
+
+    let rendered_body = if content.trim().is_empty() {
+        format!("<span class=\"hint\">No {} set</span>", label.to_lowercase())
+    } else {
+        render_markdown(content)
+    };
+
+    format!(
+        r#"<section class="{panel_class}">
+  <div class="section-tag">{label}</div>
+  {limit_warning}
+  <div class="editline-row">
+    <article class="block reserved-block reserved-block-{safe_id}">
+      <div class="block-body" id="reserved-{safe_id}-body">{rendered_body}</div>
+      <div class="block-edit-panel" id="reserved-{safe_id}-edit" style="display:none;">{edit_form}</div>
+    </article>{band_html}
+  </div>
+</section>"#,
+    )
+}
+
+fn render_doc_tree_items(
+    project: &ProjectName,
+    docs: &[DocumentInfo],
+    depth: usize,
+) -> String {
+    let project_slug = escape_attribute(project.as_str());
+    docs.iter()
+        .map(|doc| {
+            let doc_id = escape_attribute(doc.id.as_str());
+            let name = escape_text(&doc.display_name);
+            let indent = if depth > 0 {
+                format!(" style=\"padding-left:{}px\"", depth * 20)
+            } else {
+                String::new()
+            };
+            let children = render_doc_tree_items(project, &doc.children, depth + 1);
+            format!(
+                r#"<a href="/ui/{project_slug}/doc/{doc_id}" class="doc-tree-item"{indent}>
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+  <span>{name}</span>
+</a>{children}"#,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_doc_list_for_project(
+    project: &ProjectName,
+    docs: &[DocumentInfo],
+    can_write: bool,
+    csrf_token: &str,
+) -> String {
+    let project_slug = escape_attribute(project.as_str());
+    let csrf = escape_attribute(csrf_token);
+
+    let doc_items = if docs.is_empty() {
+        "<p class=\"hint\" style=\"margin:0;\">No documents yet</p>".to_string()
+    } else {
+        render_doc_tree_items(project, docs, 0)
+    };
+
+    let add_doc_html = if can_write {
+        format!(
+            r#"<form class="doc-add-form" method="post" action="/ui/{project_slug}/documents" style="display:none;" id="add-doc-form">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="text" name="name" placeholder="Document name" required class="tree-inline-input" style="flex:1;">
+  <button type="submit" class="button-link">Create</button>
+  <button type="button" class="button-link" onclick="this.closest('form').style.display='none'">Cancel</button>
+</form>
+<button type="button" class="button-link" style="margin-top:var(--s-3);" onclick="var f=document.getElementById('add-doc-form'); f.style.display='flex'; f.querySelector('input[name=name]').focus();">
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+  New document
+</button>"#,
         )
     } else {
         String::new()
     };
 
     format!(
-        r#"<section class="panel composer">
-  <div class="panel-header">
-    <h2>Librarian</h2>
-  </div>
-  <form method="post" action="/ui/{project}/librarian">
-    <input type="hidden" name="csrf_token" value="{csrf_token}">
-    <label>
-      Question
-      <textarea name="question" placeholder="Summarise the current decisions in this project." required>{question_value}</textarea>
-    </label>
-    <label class="toggle"><input type="checkbox" name="include_history" value="1"> <span>Search document history</span></label>
-    {allow_edits_html}
-    <button type="submit">Ask</button>
-  </form>
-  {answer_html}
-  <div class="stack">
-    <h3 class="panel-subheading">Recent history</h3>
-    {history_html}
-  </div>
-  <div class="stack">
-    <h3 class="panel-subheading">Pending actions</h3>
-    {pending_html}
-  </div>
-  {compact_html}
+        r#"<div class="section-tag">Documents</div>
+<section class="panel">
+  <div class="doc-tree">{doc_items}</div>
+  {add_doc_html}
 </section>"#,
-        project = escape_attribute(project.as_str()),
-        csrf_token = escape_attribute(csrf_token),
-        question_value = question_value,
-        allow_edits_html = allow_edits_html,
-        answer_html = answer_html,
-        history_html = history_html,
-        pending_html = pending_html,
-        compact_html = compact_html,
+    )
+}
+
+pub fn render_document_page(
+    theme: UiTheme,
+    color_mode: ColorMode,
+    project: &ProjectName,
+    project_display_name: &str,
+    doc_id: &str,
+    doc_display_name: &str,
+    blocks: &[Block],
+    child_docs: &[DocumentInfo],
+    flash: Option<&str>,
+    username: &str,
+    can_write: bool,
+    is_admin: bool,
+    csrf_token: &str,
+    store: &FileBlockStore,
+) -> String {
+    let project_infos = store.list_project_infos().unwrap_or_default();
+    let project_slug = escape_attribute(project.as_str());
+    let doc_id_attr = escape_attribute(doc_id);
+    let csrf = escape_attribute(csrf_token);
+
+    let blocks_html = if blocks.is_empty() && can_write {
+        format!(
+            r#"<section class="empty-state"><h2>No blocks yet</h2><p>Click the button below to add the first block.</p></section>{}"#,
+            render_doc_block_inserter(project, doc_id, None, csrf_token, &project_infos),
+        )
+    } else if blocks.is_empty() {
+        r#"<section class="empty-state"><h2>No blocks yet</h2></section>"#.to_string()
+    } else {
+        let mut html = String::new();
+        if can_write {
+            html.push_str(&render_doc_block_inserter(project, doc_id, None, csrf_token, &project_infos));
+        }
+        for (i, block) in blocks.iter().enumerate() {
+            html.push_str(&render_doc_block(
+                project, doc_id, block, can_write, &project_infos, csrf_token, i,
+            ));
+            if can_write {
+                html.push_str(&render_doc_block_inserter(project, doc_id, Some(&block.id), csrf_token, &project_infos));
+            }
+        }
+        html
+    };
+    let blocks_html = resolve_lore_links_in_html(&blocks_html, store);
+
+    let rename_html = if can_write {
+        format!(
+            r#"<div style="display:flex; align-items:center;">
+            <h1 class="page-title editable-title" style="margin:0;" id="doc-title"
+                title="Click to rename" onclick="document.getElementById('doc-rename-form').style.display='flex'; this.style.display='none';"
+            >{doc_name}</h1></div>
+            <form id="doc-rename-form" method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/rename"
+                  style="display:none; align-items:center; gap:var(--s-3); margin:0;">
+              <input type="hidden" name="csrf_token" value="{csrf}">
+              <input type="text" name="name" value="{doc_name_attr}" class="rename-input"
+                     autofocus onfocus="this.select()">
+              <button type="submit" class="button-link">Save</button>
+              <button type="button" class="button-link" onclick="this.closest('form').style.display='none'; document.getElementById('doc-title').style.display='';">Cancel</button>
+            </form>"#,
+            doc_name = escape_text(doc_display_name),
+            doc_name_attr = escape_attribute(doc_display_name),
+        )
+    } else {
+        format!(
+            r#"<div style="display:flex; align-items:center;"><h1 class="page-title" style="margin:0;">{}</h1></div>"#,
+            escape_text(doc_display_name),
+        )
+    };
+
+    let child_doc_items = if child_docs.is_empty() {
+        String::new()
+    } else {
+        let items = render_doc_tree_items(project, child_docs, 0);
+        format!(
+            r#"<div class="section-tag">Sub-documents</div>
+<section class="panel">
+  <div class="doc-tree">{items}</div>
+</section>"#,
+        )
+    };
+
+    let add_subdoc_html = if can_write {
+        format!(
+            r#"<form class="doc-add-form" method="post" action="/ui/{project_slug}/documents" style="display:none;" id="add-subdoc-form">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="hidden" name="parent_document_id" value="{doc_id_attr}">
+  <input type="text" name="name" placeholder="Document name" required class="tree-inline-input" style="flex:1;">
+  <button type="submit" class="button-link">Create</button>
+  <button type="button" class="button-link" onclick="this.closest('form').style.display='none'">Cancel</button>
+</form>
+<button type="button" class="button-link" style="margin-top:var(--s-3);" onclick="var f=document.getElementById('add-subdoc-form'); f.style.display='flex'; f.querySelector('input[name=name]').focus();">
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+  New sub-document
+</button>"#,
+        )
+    } else {
+        String::new()
+    };
+
+    let delete_doc_html = if can_write {
+        format!(
+            r#"<div class="delete-project-section">
+              <form method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/delete"
+                    onsubmit="return confirm('Delete this document and all its contents? This cannot be undone.');">
+                <input type="hidden" name="csrf_token" value="{csrf}">
+                <button type="submit" class="delete-project-btn">Delete document</button>
+              </form>
+            </div>"#,
+        )
+    } else {
+        String::new()
+    };
+
+    let read_only_notice = if !can_write {
+        r#"<section class="panel composer"><div class="panel-header"><h2>Read-only access</h2><p>Viewing only.</p></div></section>"#
+    } else {
+        ""
+    };
+
+    let content = format!(
+        r#"<div style="margin-bottom:var(--s-3);">
+      <a href="/ui/{project_slug}" class="breadcrumb-link">{project_name}</a>
+    </div>
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
+      {rename_html}
+    </div>
+    <section class="panel" id="document">
+      <div class="timeline">{blocks_html}</div>
+    </section>
+    {child_doc_items}
+    {add_subdoc_html}
+    {read_only_notice}
+    {delete_doc_html}"#,
+        project_slug = project_slug,
+        project_name = escape_text(project_display_name),
+        rename_html = rename_html,
+        blocks_html = blocks_html,
+        child_doc_items = child_doc_items,
+        add_subdoc_html = add_subdoc_html,
+        read_only_notice = read_only_notice,
+        delete_doc_html = delete_doc_html,
+    );
+
+    render_shell(
+        PageShell {
+            title: &format!("Lore · {} · {}", project_display_name, doc_display_name),
+            username: Some(username),
+            is_admin,
+            theme,
+            color_mode,
+            csrf_token: Some(csrf_token),
+            flash,
+        },
+        content,
+    )
+}
+
+fn render_doc_block_inserter(
+    project: &ProjectName,
+    doc_id: &str,
+    after_block_id: Option<&BlockId>,
+    csrf_token: &str,
+    project_infos: &[ProjectInfo],
+) -> String {
+    let after_value = after_block_id
+        .map(|id| escape_attribute(id.as_str()).to_string())
+        .unwrap_or_default();
+    let project_attr = escape_attribute(project.as_str());
+    let doc_id_attr = escape_attribute(doc_id);
+    let csrf_attr = escape_attribute(csrf_token);
+    format!(
+        r#"<div class="editline-row editline-gap-row">
+  <div class="block-inserter" data-after="{after_value}">
+    <div class="inserter-expand" style="display:none">
+      <div class="inserter-types">
+        <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'md')">Markdown</button>
+        <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'svg')">SVG</button>
+        <button type="button" class="inserter-type-btn" onclick="showInserterForm(this,'image')">Image</button>
+        <button type="button" class="cancel-circle" onclick="toggleEditlineInserter(this.closest('.editline-gap-row').querySelector('.editline-plus'))" title="Cancel"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      </div>
+      <form class="inserter-form inserter-form-md" style="display:none" method="post" action="/ui/{project_attr}/doc/{doc_id_attr}/blocks" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{csrf_attr}">
+        <input type="hidden" name="block_type" value="markdown">
+        <input type="hidden" name="after_block_id" value="{after_value}">
+        <textarea name="content" placeholder="Write markdown..." rows="6"></textarea>
+        {doc_link_picker}
+        <button type="submit">Add markdown</button>
+      </form>
+      <form class="inserter-form inserter-form-svg" style="display:none" method="post" action="/ui/{project_attr}/doc/{doc_id_attr}/blocks" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{csrf_attr}">
+        <input type="hidden" name="block_type" value="svg">
+        <input type="hidden" name="after_block_id" value="{after_value}">
+        <textarea name="content" placeholder="Paste SVG markup or describe what you want..." rows="6"></textarea>
+        <label>Or upload an SVG file
+          <input type="file" name="image_file" accept=".svg,image/svg+xml">
+        </label>
+        <button type="submit">Add SVG</button>
+      </form>
+      <form class="inserter-form inserter-form-image" style="display:none" method="post" action="/ui/{project_attr}/doc/{doc_id_attr}/blocks" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{csrf_attr}">
+        <input type="hidden" name="block_type" value="image">
+        <input type="hidden" name="after_block_id" value="{after_value}">
+        <label>Upload image
+          <input type="file" name="image_file" accept="image/*">
+        </label>
+        <textarea name="content" placeholder="Optional caption or note..." rows="2"></textarea>
+        <button type="submit">Add image</button>
+      </form>
+    </div>
+  </div>
+  <div class="editline-gap" data-after="{after_value}" ondragover="gapDragOver(event)" ondragleave="gapDragLeave(event)" ondrop="gapDrop(event)"><button type="button" class="editline-plus" onclick="toggleEditlineInserter(this)">+</button></div>
+</div>"#,
+        project_attr = project_attr,
+        doc_id_attr = doc_id_attr,
+        csrf_attr = csrf_attr,
+        after_value = after_value,
+        doc_link_picker = render_doc_link_picker(project_infos),
+    )
+}
+
+fn render_doc_block(
+    project: &ProjectName,
+    doc_id: &str,
+    block: &Block,
+    can_write: bool,
+    _project_infos: &[ProjectInfo],
+    csrf_token: &str,
+    block_index: usize,
+) -> String {
+    let block_id = escape_attribute(block.id.as_str());
+    let project_slug = escape_attribute(project.as_str());
+    let doc_id_attr = escape_attribute(doc_id);
+    let csrf = escape_attribute(csrf_token);
+
+    let copy_link_btn = format!(
+        r##"<button type="button" class="block-header-btn" title="Copy link" onclick="copyLoreLink('{block_id}')">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+  </button>"##,
+    );
+
+    let pin_title = if block.pinned { "Unpin (allow agent edits)" } else { "Pin (block agent edits)" };
+    let pin_class = if block.pinned { "block-header-btn pinned" } else { "block-header-btn" };
+
+    let header_actions = if can_write {
+        format!(
+            r##"<div class="block-header-actions">
+  <button type="button" class="block-header-btn danger" title="Delete" onclick="if(confirm('Delete this block? This cannot be undone.')){{document.getElementById('del-{block_id}').submit();}}">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+  </button>
+  {copy_link_btn}
+  <button type="button" class="{pin_class}" title="{pin_title}" onclick="document.getElementById('pin-{block_id}').submit();">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
+  </button>
+  <button type="button" class="block-header-btn" title="Save" onclick="document.querySelector('#edit-{block_id} form').submit();">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+  </button>
+  <button type="button" class="block-header-btn" title="Cancel" onclick="cancelBlockEdit('{block_id}')">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  </button>
+  <form id="del-{block_id}" method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/delete" style="display:none;">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+  </form>
+  <form id="pin-{block_id}" method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/pin" style="display:none;">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+  </form>
+</div>"##,
+        )
+    } else {
+        format!(
+            r##"<div class="block-header-actions">{copy_link_btn}</div>"##,
+        )
+    };
+
+    let block_type_label = format!("{:?}", block.block_type).to_lowercase();
+    let body_html = render_block_body_with_doc(block, Some(doc_id));
+    let edit_panel = if can_write {
+        let block_type_options = render_block_type_options(block.block_type);
+        let content_escaped = escape_text(&block.content);
+        format!(
+            r#"<div class="block-edit-panel" id="edit-{block_id}" style="display:none;">
+  <form method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/edit" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <div class="block-edit-top-row">
+      <select name="block_type" class="block-type-select">{block_type_options}</select>
+    </div>
+    <textarea name="content" class="block-edit-textarea">{content_escaped}</textarea>
+    <label class="image-upload-label">Replace media <input type="file" name="image_file" accept="image/*,.svg"></label>
+    <div class="block-edit-actions">
+      <button type="submit" class="button-link">Save</button>
+      <button type="button" class="button-link" onclick="cancelBlockEdit('{block_id}')">Cancel</button>
+    </div>
+  </form>
+</div>"#,
+        )
+    } else {
+        String::new()
+    };
+
+    let band_class = if block.pinned {
+        "editline-band editline-band-pinned"
+    } else if block_index % 2 == 0 {
+        "editline-band editline-band-even"
+    } else {
+        "editline-band editline-band-odd"
+    };
+
+    let band_html = if can_write {
+        format!(
+            r#"<div class="{band_class}" onclick="toggleBlockEdit('{block_id}')" title="Click to edit" draggable="true" ondragstart="blockDragStart(event, '{block_id}')" ondragend="blockDragEnd(event)"></div>"#,
+        )
+    } else {
+        String::new()
+    };
+
+    let meta_html = format!(
+        r#"<div class="block-meta" id="meta-{block_id}" style="display:none;">
+  <span class="pill">{block_type_label}</span>
+  {header_actions}
+</div>"#,
+    );
+
+    format!(
+        r#"<div class="editline-row">
+  <article class="block" id="block-{block_id}">
+    {meta_html}
+    <div class="block-body" id="body-{block_id}">{body_html}</div>
+    {edit_panel}
+  </article>{band_html}
+</div>"#,
     )
 }
 
@@ -5111,61 +5725,6 @@ fn render_project_version_diff(operation: &UiProjectVersionOperation) -> String 
     )
 }
 
-fn render_librarian_history_item(
-    project: &ProjectName,
-    csrf_token: &str,
-    answer: &UiLibrarianAnswer,
-) -> String {
-    let actor_html = answer
-        .actor
-        .as_ref()
-        .map(|actor| {
-            let label = match actor.kind {
-                LibrarianActorKind::User => "user",
-                LibrarianActorKind::Agent => "agent",
-            };
-            format!(
-                "{} {}",
-                escape_text(label),
-                escape_text(actor.name.as_str())
-            )
-        })
-        .unwrap_or_else(|| "unknown actor".to_string());
-    let allow_edits_field = if matches!(answer.kind, LibrarianRunKind::ProjectAction) {
-        r#"<input type="hidden" name="allow_edits" value="1">"#
-    } else {
-        ""
-    };
-    let retry_form = format!(
-        r#"<form method="post" action="/ui/{project}/librarian">
-  <input type="hidden" name="csrf_token" value="{csrf_token}">
-  <input type="hidden" name="question" value="{question}">
-  {allow_edits_field}
-  <button type="submit">Ask again</button>
-</form>"#,
-        project = escape_attribute(project.as_str()),
-        csrf_token = escape_attribute(csrf_token),
-        question = escape_attribute(&answer.question),
-        allow_edits_field = allow_edits_field,
-    );
-
-    format!(
-        r#"<article class="block">
-  <div class="block-meta">
-    <span class="pill">Librarian</span>
-    <span>{created_at}</span>
-    <span>{actor}</span>
-  </div>
-  {answer_html}
-  {retry_form}
-</article>"#,
-        created_at = escape_text(&format_timestamp(answer.created_at)),
-        actor = actor_html,
-        answer_html = render_librarian_answer(answer),
-        retry_form = retry_form,
-    )
-}
-
 fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectInfo]) -> String {
     let grants = role
         .grants
@@ -5653,6 +6212,10 @@ fn render_block(
 }
 
 pub fn render_block_body(block: &Block) -> String {
+    render_block_body_with_doc(block, None)
+}
+
+fn render_block_body_with_doc(block: &Block, doc_id: Option<&str>) -> String {
     match block.block_type {
         BlockType::Markdown => render_markdown(&block.content),
         BlockType::Html => format!(
@@ -5660,7 +6223,7 @@ pub fn render_block_body(block: &Block) -> String {
             escape_text(&block.content)
         ),
         BlockType::Svg => render_data_image("image/svg+xml", &block.content, "SVG block"),
-        BlockType::Image => render_image_block(block),
+        BlockType::Image => render_image_block(block, doc_id),
     }
 }
 
@@ -5708,13 +6271,22 @@ fn resolve_lore_links_in_html(html: &str, store: &FileBlockStore) -> String {
     .into_owned()
 }
 
-fn render_image_block(block: &Block) -> String {
+fn render_image_block(block: &Block, doc_id: Option<&str>) -> String {
     let src = if block.media_type.is_some() {
-        format!(
-            "/ui/{}/blocks/{}/media",
-            escape_attribute(block.project.as_str()),
-            escape_attribute(block.id.as_str())
-        )
+        if let Some(did) = doc_id {
+            format!(
+                "/ui/{}/doc/{}/blocks/{}/media",
+                escape_attribute(block.project.as_str()),
+                escape_attribute(did),
+                escape_attribute(block.id.as_str()),
+            )
+        } else {
+            format!(
+                "/ui/{}/blocks/{}/media",
+                escape_attribute(block.project.as_str()),
+                escape_attribute(block.id.as_str())
+            )
+        }
     } else {
         let trimmed = block.content.trim();
         if trimmed.starts_with("data:image/")
@@ -6673,6 +7245,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 
     * { box-sizing: border-box; }
 
+    html { scrollbar-gutter: stable; }
+
     body {
       margin: 0;
       font-family: var(--font-sans);
@@ -6735,24 +7309,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: var(--ink);
     }
 
-    .top-nav-links form {
-      padding: 0;
-      margin: 0;
-    }
-
-    .top-nav-links button {
-      background: none;
-      color: var(--muted);
-      padding: 0;
-      font-size: 0.95rem;
-      min-height: auto;
-      width: auto;
-    }
-
-    .top-nav-links button:hover {
-      color: var(--ink);
-    }
-
     .burger-btn {
       display: none;
       background: none;
@@ -6780,6 +7336,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border-radius: var(--radius);
       box-shadow: var(--shadow);
       backdrop-filter: blur(8px);
+      padding: var(--s-5);
     }
 
     .hero {
@@ -6981,7 +7538,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       flex-direction: column;
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      margin: var(--s-5);
+      margin: 0;
       overflow: hidden;
     }
     .sel-item {
@@ -7021,7 +7578,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .sel-detail {
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      margin: 0 var(--s-5) var(--s-5);
+      margin: var(--s-3) 0 0;
       padding: var(--s-4) 0;
     }
 
@@ -7372,7 +7929,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .chat-svg-wrap {
       cursor: pointer;
-      margin: 0.4em 0;
+      margin: 0.4em auto;
+      width: fit-content;
       max-width: 100%;
       border-radius: 4px;
       border: 1px solid var(--line);
@@ -7405,6 +7963,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       max-height: 90vh;
       border-radius: 8px;
       padding: 1rem;
+      background: #fff;
     }
     .svg-overlay-close {
       position: fixed;
@@ -7625,6 +8184,54 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: var(--surface-hover);
     }
 
+    .tree-expand-btn {
+      background: none;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 0.7rem;
+      padding: 2px;
+      min-height: auto;
+      line-height: 1;
+      flex-shrink: 0;
+      transition: color 0.15s;
+    }
+    .tree-expand-btn:hover {
+      color: var(--accent);
+    }
+
+    .tree-doc-list {
+      list-style: none;
+      margin: 0;
+      padding: 0 0 0 var(--s-5);
+      border-left: 1px solid var(--line);
+      margin-left: var(--s-4);
+    }
+
+    .tree-doc-node {
+      margin: var(--s-1) 0;
+    }
+
+    .tree-doc-link {
+      display: flex;
+      align-items: center;
+      gap: var(--s-2);
+      padding: var(--s-1) var(--s-2);
+      border-radius: var(--radius);
+      color: var(--ink);
+      text-decoration: none;
+      font-size: 0.9rem;
+      transition: background 0.15s;
+    }
+    .tree-doc-link:hover {
+      background: var(--surface-hover);
+      color: var(--accent);
+    }
+    .tree-doc-link svg {
+      flex-shrink: 0;
+      color: var(--muted);
+    }
+
     .timeline {
       padding: var(--s-5);
     }
@@ -7660,6 +8267,71 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 
     .agent-context-section {
       margin-bottom: 0;
+    }
+
+    .reserved-block-section {
+      margin-bottom: 0;
+    }
+
+    .reserved-over-soft {
+      border-color: #d4a017;
+      box-shadow: 0 0 0 1px #d4a017;
+    }
+
+    .reserved-limit-warning {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #d4a017;
+      margin-bottom: var(--s-2);
+    }
+
+    .reserved-textarea {
+      min-height: 120px;
+    }
+
+    .doc-tree {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .doc-tree-item {
+      display: flex;
+      align-items: center;
+      gap: var(--s-2);
+      padding: var(--s-2) var(--s-3);
+      border-radius: var(--radius);
+      color: var(--ink);
+      text-decoration: none;
+      font-weight: 500;
+      font-size: 0.95rem;
+      transition: background 0.15s;
+    }
+
+    .doc-tree-item:hover {
+      background: var(--surface-hover);
+      color: var(--accent);
+    }
+
+    .doc-tree-item svg {
+      flex-shrink: 0;
+      color: var(--muted);
+    }
+
+    .doc-add-form {
+      display: flex;
+      align-items: center;
+      gap: var(--s-3);
+    }
+
+    .breadcrumb-link {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+
+    .breadcrumb-link:hover {
+      color: var(--accent);
     }
 
     .agent-context-textarea {
@@ -7870,7 +8542,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
 
     .panel-header {
-      padding: var(--s-5) var(--s-5) 0;
+      padding: 0;
       display: grid;
       gap: var(--s-2);
     }
@@ -8001,21 +8673,19 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: var(--callout-bg);
     }
 
-    .searchbar {
+    .search-inline {
       display: flex;
-      flex-wrap: wrap;
+    }
+    .search-inline input {
+      width: 160px;
+      margin: 0;
+      padding: 6px 10px;
+      font-size: 0.9rem;
+    }
+    .search-scope {
+      display: flex;
       gap: var(--s-2);
-      margin-top: var(--s-4);
-    }
-
-    .searchbar input, .searchbar select {
-      flex: 1;
-      min-width: 120px;
-    }
-
-    .searchbar button {
-      width: auto;
-      padding: 0 var(--s-6);
+      margin-top: var(--s-3);
     }
 
     .block-meta {
@@ -8432,8 +9102,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       }
 
       .layout,
-      .admin-layout,
-      .searchbar {
+      .admin-layout {
         grid-template-columns: 1fr;
       }
 

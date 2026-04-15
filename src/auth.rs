@@ -1505,6 +1505,8 @@ pub enum AgentChatStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManageConfig {
     #[serde(default)]
+    pub backend: String,
+    #[serde(default)]
     pub endpoint_id: String,
     #[serde(default)]
     pub goals: String,
