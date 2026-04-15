@@ -7936,15 +7936,15 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .chat-svg-wrap {
       cursor: pointer;
-      margin: 0.4em auto;
-      width: fit-content;
-      max-width: 100%;
+      margin: 0.4em 0;
+      width: 100%;
       border-radius: 4px;
       border: 1px solid var(--line);
       padding: 0.5em;
       position: relative;
+      box-sizing: border-box;
     }
-    .chat-svg-wrap svg { max-width: 100%; height: auto; display: block; }
+    .chat-svg-wrap svg { width: 100%; height: auto; display: block; }
     .chat-svg-wrap:hover { border-color: var(--accent); }
     .chat-svg-hint {
       font-size: 0.72em;
