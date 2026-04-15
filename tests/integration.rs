@@ -1396,6 +1396,90 @@ async fn librarian_ask_without_endpoint_returns_json_error() {
 }
 
 #[tokio::test]
+async fn librarian_history_persists_after_ask() {
+    let dir = tempdir().unwrap();
+    let (llm_addr, _shutdown) = spawn_mock_llm().await;
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    let endpoint_id = create_endpoint(
+        &client,
+        &addr,
+        "hist-ep",
+        &format!("http://{llm_addr}/v1/chat/completions"),
+        "mock-model",
+    )
+    .await;
+
+    let resp = client
+        .post(url(&addr, "/v1/admin/librarian-config"))
+        .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
+        .json(&json!({
+            "endpoint_id": endpoint_id,
+            "request_timeout_secs": 30,
+            "max_concurrent_runs": 2,
+            "action_requires_approval": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let token = api_create_agent_token(&client, &addr, "hist-agent", &[("hist.proj", "read_write")]).await;
+    let resp = client
+        .post(url(&addr, "/v1/blocks"))
+        .header("x-lore-key", &token)
+        .json(&json!({"project": "hist.proj", "block_type": "markdown", "content": "Testing history persistence."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let (cookie, csrf) = admin_login(&client, &addr).await;
+
+    // Send a librarian question
+    let resp = client
+        .post(url(&addr, "/ui/chat/librarian/ask"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "csrf_token={}&project=hist.proj&question=What+is+being+tested&include_history=0&allow_edits=0",
+            csrf
+        ))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["ok"].as_bool().unwrap_or(false), "ask failed: {body}");
+
+    // Now fetch history -- it must contain the question and answer
+    let resp = client
+        .get(url(&addr, "/ui/chat/librarian/history?project=hist.proj"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let history: Value = resp.json().await.unwrap();
+    let messages = history["messages"].as_array().expect("messages should be an array");
+    assert!(messages.len() >= 2, "history should have at least user + assistant: {history}");
+    assert_eq!(messages[0]["role"].as_str().unwrap(), "user");
+    assert!(messages[0]["content"].as_str().unwrap().contains("What is being tested"));
+    assert_eq!(messages[1]["role"].as_str().unwrap(), "assistant");
+    let answer = messages[1]["content"].as_str().unwrap();
+    assert!(!answer.is_empty(), "assistant answer in history should not be empty");
+
+    // Also check "All Projects" history includes the same run
+    let resp = client
+        .get(url(&addr, "/ui/chat/librarian/history?project="))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let history: Value = resp.json().await.unwrap();
+    let messages = history["messages"].as_array().expect("messages array");
+    assert!(messages.len() >= 2, "all-projects history should include the run: {history}");
+}
+
+#[tokio::test]
 async fn agent_chat_send_poll_respond() {
     let dir = tempdir().unwrap();
     let (llm_addr, _shutdown) = spawn_mock_llm().await;

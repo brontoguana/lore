@@ -3490,6 +3490,7 @@ function renderMessages() {{
   for (var i = 0; i < chatMessages.length; i++) {{
     var msg = chatMessages[i];
     var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : msg.role === 'config' ? 'chat-msg-config' : msg.role === 'tool' ? 'chat-msg-tool' : 'chat-msg-assistant';
+    if (msg._thinking) cls += ' chat-msg-thinking';
     html += '<div class="chat-msg ' + cls + '">';
     if (msg.role === 'assistant') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
@@ -3675,7 +3676,7 @@ document.addEventListener('keydown', function(e) {{
 function handleChatKey(e) {{
   if (e.key === 'Enter' && !e.shiftKey) {{
     e.preventDefault();
-    sendMessage(e);
+    if (isLibrarian) {{ sendLibrarianMessage(e); }} else {{ sendMessage(e); }}
     return false;
   }}
   return true;
@@ -4231,6 +4232,7 @@ function sendLibrarianMessage(e) {{
   if (!text) return false;
   input.value = '';
   chatMessages.push({{ role: 'user', content: text }});
+  chatMessages.push({{ role: 'assistant', content: 'Thinking\u2026', _thinking: true }});
   renderMessages();
   var histBtn = document.getElementById('lib-toggle-history');
   var editsBtn = document.getElementById('lib-toggle-edits');
@@ -4244,6 +4246,7 @@ function sendLibrarianMessage(e) {{
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
     body: body
   }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    chatMessages = chatMessages.filter(function(m) {{ return !m._thinking; }});
     if (data.ok) {{
       var content = data.answer || data.error || 'No response.';
       if (data.pending) content = '[Pending approval] ' + content;
@@ -4253,6 +4256,7 @@ function sendLibrarianMessage(e) {{
     }}
     renderMessages();
   }}).catch(function() {{
+    chatMessages = chatMessages.filter(function(m) {{ return !m._thinking; }});
     chatMessages.push({{ role: 'system', content: 'Failed to send (network error)' }});
     renderMessages();
   }});
@@ -4273,6 +4277,9 @@ function loadLibrarianHistory() {{
       chatMessages = data.messages || [];
       renderMessages();
       renderPendingActions(data.pending_actions || []);
+    }}).catch(function() {{
+      chatMessages = [];
+      renderMessages();
     }});
 }}
 
@@ -7664,6 +7671,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-agent-time {
       font-size: 0.75rem;
       color: var(--fg-muted);
+      min-height: 1em;
     }
     .chat-main {
       flex: 1;
@@ -7823,6 +7831,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-size: 0.85rem;
       max-width: 90%;
       font-family: var(--font-mono);
+    }
+    .chat-msg-thinking {
+      opacity: 0.6;
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.6; }
+      50% { opacity: 0.3; }
     }
     .chat-msg-config {
       align-self: center;

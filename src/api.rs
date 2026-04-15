@@ -10306,6 +10306,13 @@ async fn chat_agent_history(
     let git_ctx = collect_git_context(conv.cwd.as_deref());
     let activity = get_agent_recent_activity(&state, owner_str, &agent.name);
 
+    let accessible: Vec<String> = agent.grants.iter()
+        .map(|g| {
+            let perm = if g.permission.allows_write() { "read-write" } else { "read" };
+            format!("- {} ({})", g.project.as_str(), perm)
+        })
+        .collect();
+
     let mut resp = json!({
         "messages": msgs,
         "summary": conv.summary,
@@ -10313,6 +10320,7 @@ async fn chat_agent_history(
         "pins": conv.pins.iter().map(|p| json!({"id": p.id, "text": p.text})).collect::<Vec<_>>(),
         "pinned_context": conv.pinned_context,
         "project_context": project_context,
+        "accessible_projects": accessible.join("\n"),
         "model": model,
         "effort": effort,
     });
@@ -10905,7 +10913,11 @@ fn build_api_agent_system_prompt(
         File Map maintenance:\n\
         - You have access to a file map (_map) on each project that lists key project files.\n\
         - Keep this map current: add files you discover are important to the work, remove files that are deleted or no longer relevant.\n\
-        - Only list files that are actionable for development. Do not list generated files, build artifacts, or files unlikely to need attention.".to_string());
+        - Only list files that are actionable for development. Do not list generated files, build artifacts, or files unlikely to need attention.\n\n\
+        SVG output:\n\
+        - You can output inline SVG to present quick reports, diagrams, tables, and visual summaries to the user.\n\
+        - Use <svg xmlns=\"http://www.w3.org/2000/svg\" ...>...</svg> with a self-contained design. Keep SVGs simple and readable.\n\
+        - Do NOT use <foreignObject> — use only native SVG elements (<text>, <rect>, <circle>, <line>, <path>, <g>, etc). Use &amp; not & in SVG text.".to_string());
 
     let project_context = collect_project_context(state, &agent.grants);
     if !project_context.is_empty() {

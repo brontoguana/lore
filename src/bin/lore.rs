@@ -1958,6 +1958,9 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     let window_size = history["window_size"].as_u64().unwrap_or(22) as usize;
     let hist_messages = history["messages"].as_array();
     let pins = history["pins"].as_array();
+    let project_context = history["project_context"].as_str().unwrap_or("");
+    let accessible_projects = history["accessible_projects"].as_str().unwrap_or("");
+    let recent_activity = history["recent_activity"].as_str().unwrap_or("");
 
     let mut prompt_parts: Vec<String> = Vec::new();
 
@@ -2102,22 +2105,27 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
 
     prompt_parts.push(format!("\n## New Message\n\n{combined}"));
 
-    let full_prompt = prompt_parts.join("\n\n");
-
-    // Save full prompt + context to .lore for debugging
-    {
-        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
-        let _ = fs::create_dir_all(&lore_dir);
-        let _ = fs::write(lore_dir.join("context.txt"), &full_prompt);
-    }
+    let user_context = prompt_parts.join("\n\n");
 
     let full_response = if has_endpoint {
         // API mode: run local agentic loop, proxy LLM calls through the server
         eprintln!("[agent] Using API endpoint mode");
         let model_override = history["model"].as_str().map(|s| s.to_string());
-        run_api_agent_turn(context, agent_name, &full_prompt, model_override.as_deref()).await?
+        run_api_agent_turn(context, agent_name, &user_context, project_context, accessible_projects, recent_activity, model_override.as_deref()).await?
     } else {
-        // CLI mode: spawn backend process
+        // CLI mode: spawn backend process — prepend system instructions to user context
+        let system_instructions = build_lore_system_instructions(
+            project_context, accessible_projects, recent_activity,
+            &build_cli_tool_section(),
+        );
+        let full_prompt = format!("{system_instructions}\n\n---\n\n{user_context}");
+
+        {
+            let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+            let _ = fs::create_dir_all(&lore_dir);
+            let _ = fs::write(lore_dir.join("prompt.txt"), &full_prompt);
+        }
+
         let model_override = history["model"].as_str().map(|s| s.to_string());
         let effort_override = history["effort"].as_str().map(|s| s.to_string());
         let mut child = spawn_backend(backend, &full_prompt, model_override.as_deref(), effort_override.as_deref()).await?;
@@ -2415,6 +2423,93 @@ async fn run_manager_endpoint(
     Ok(text)
 }
 
+// --- Shared agent system prompt ---
+
+fn build_lore_system_instructions(
+    project_context: &str,
+    accessible_projects: &str,
+    recent_activity: &str,
+    tool_section: &str,
+) -> String {
+    let mut parts = Vec::new();
+
+    parts.push("# Lore Agent Instructions
+
+You are an AI agent connected to the Lore knowledge base. Lore organizes knowledge into projects (management containers) and documents (content containers with typed blocks). Projects have reserved blocks: _agent-context, _overview, and _map. Documents contain regular content blocks.
+
+## Guidelines
+- Be concise and direct. Provide clear answers.
+- Read files before editing them.
+- For Lore content: use list_documents to see the doc tree, list_blocks for block structure, read_block for content, edit_block for targeted edits.
+- For large blocks, use read_block with offset/limit to read chunks.
+- When a tool result is truncated, use more targeted queries rather than re-reading the same large result.
+- If you encounter an error, explain it clearly and suggest alternatives.
+- Do not make up content. If you can't find something, say so.
+- For multi-step tasks, plan before acting. Use fewer tool calls per turn when possible.
+
+## File Map Maintenance
+You have access to a file map (_map) on each project that lists key project files. Keep this map current: add files you discover are important, remove files that are deleted or no longer relevant. Only list files that are actionable for development.
+
+## SVG Output
+You can output inline SVG to present quick reports, diagrams, tables, and visual summaries to the user. Use <svg xmlns=\"http://www.w3.org/2000/svg\" ...>...</svg> with a self-contained design. Keep SVGs simple and readable. Do NOT use <foreignObject> — use only native SVG elements (<text>, <rect>, <circle>, <line>, <path>, <g>, etc). Use &amp; not & in SVG text.".to_string());
+
+    if !project_context.is_empty() {
+        parts.push(format!("## Project Context\n{project_context}"));
+    }
+
+    if !accessible_projects.is_empty() {
+        parts.push(format!("## Accessible Projects\n{accessible_projects}"));
+    }
+
+    if !recent_activity.is_empty() {
+        parts.push(format!("## Recent Activity\n{recent_activity}"));
+    }
+
+    parts.push(format!("## Available Lore Tools\n{tool_section}"));
+
+    parts.join("\n\n")
+}
+
+fn build_cli_tool_section() -> String {
+    "You have access to the `lore` CLI tool in addition to your normal file and shell tools. Use these commands to interact with the Lore knowledge base:
+
+Project navigation:
+  lore projects                          List all accessible projects
+  lore context                           Show the current project's agent context
+
+Reading content:
+  lore blocks list [--limit N]           List blocks in the current project
+  lore blocks read <block-id>            Read a single block by ID
+  lore blocks around <id> [--before N] [--after N]   Read a block with surrounding context
+
+Searching:
+  lore grep <query> [--limit N]          Search blocks by content across projects
+
+Writing content:
+  lore add <content> [--type markdown|code|data] [--after-block-id ID]   Add a new block
+  lore update <id> <content> [--type markdown|code|data]                  Update an existing block
+  lore move <id> [--after-block-id ID]   Move a block to a new position
+  lore delete <id> [--yes]               Delete a block
+
+History:
+  lore history list                      List recent block changes
+  lore history show <version-id>         Show a specific version
+  lore history revert <version-id>       Revert a block to a previous version
+
+Librarian (AI-powered):
+  lore librarian answer <question>       Ask the librarian a question about project content
+  lore librarian action <instruction>    Request the librarian to perform a content action".to_string()
+}
+
+fn build_api_tool_section(lore_tool_names: &[String]) -> String {
+    if lore_tool_names.is_empty() {
+        return "You have file tools (read_file, write_file, edit_file, list_directory, run_command, grep_search) to work with the local filesystem.".to_string();
+    }
+    format!("You have file tools (read_file, write_file, edit_file, list_directory, run_command, grep_search) to work with the local filesystem.
+
+You also have Lore MCP tools to manage knowledge base content: {}. Use list_documents to see the doc tree, list_blocks for block structure, read_block for content, edit_block for targeted changes, update_block for full rewrites.", lore_tool_names.join(", "))
+}
+
 // --- API agent loop (runs on machine, proxies LLM calls through server) ---
 
 const API_AGENT_MAX_TURNS: usize = 500;
@@ -2426,7 +2521,10 @@ const API_AGENT_TRIMMED_STUB: &str = "[Content trimmed \u{2014} re-read if neede
 async fn run_api_agent_turn(
     context: &CliContext,
     agent_name: &str,
-    full_prompt: &str,
+    user_context: &str,
+    project_context: &str,
+    accessible_projects: &str,
+    recent_activity: &str,
     model_override: Option<&str>,
 ) -> CliResult<String> {
     let token = context.token.as_deref().ok_or("no token configured")?;
@@ -2439,12 +2537,19 @@ async fn run_api_agent_turn(
     let lore_names: std::collections::HashSet<String> = lore_tool_names.iter()
         .filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string()))
         .collect();
+    let lore_name_list: Vec<String> = lore_names.iter().cloned().collect();
 
-    let system_content = if lore_names.is_empty() {
-        "You are an AI coding assistant with tools to read, write, and edit files, run shell commands, and search codebases. Use these tools to help the user.\n\nGuidelines:\n- Read files before editing them\n- Use edit_file for targeted changes, write_file for new files or full rewrites\n- The edit_file old_string must match exactly including whitespace\n- Test changes by running relevant commands\n- Be concise in responses".to_string()
-    } else {
-        "You are an AI coding assistant with tools to read, write, and edit files, run shell commands, and search codebases. You also have Lore knowledge base tools to manage structured content: list_projects, list_documents, list_blocks, read_block (with offset/limit), edit_block (find/replace), update_block, create_block, delete_block, grep_blocks, create_document, rename_document, delete_document. Use these tools to help the user.\n\nGuidelines:\n- Read files before editing them\n- Use edit_file for targeted changes, write_file for new files or full rewrites\n- The edit_file old_string must match exactly including whitespace\n- For Lore content: use list_documents to see the doc tree, list_blocks for block structure, read_block for content, edit_block for targeted edits\n- Test changes by running relevant commands\n- Be concise in responses".to_string()
-    };
+    let system_content = build_lore_system_instructions(
+        project_context, accessible_projects, recent_activity,
+        &build_api_tool_section(&lore_name_list),
+    );
+
+    {
+        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let _ = fs::create_dir_all(&lore_dir);
+        let prompt_dump = format!("=== SYSTEM PROMPT ===\n{system_content}\n\n=== USER CONTEXT ===\n{user_context}");
+        let _ = fs::write(lore_dir.join("prompt.txt"), &prompt_dump);
+    }
 
     let mut messages: Vec<serde_json::Value> = vec![
         serde_json::json!({
@@ -2453,7 +2558,7 @@ async fn run_api_agent_turn(
         }),
         serde_json::json!({
             "role": "user",
-            "content": full_prompt
+            "content": user_context
         }),
     ];
 
