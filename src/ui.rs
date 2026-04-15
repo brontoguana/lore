@@ -608,6 +608,38 @@ pub fn render_projects_page(
         btn.classList.remove('tree-expand-open');
       }}
     }}
+    function addDocRow(btn, projectSlug, parentDocId) {{
+      document.querySelectorAll('.tree-doc-inline-create').forEach(function(el) {{ el.remove(); }});
+      var li = document.createElement('li');
+      li.className = 'tree-doc-node tree-doc-inline-create';
+      li.innerHTML = '<form class="tree-doc-row" method="post" action="/ui/' + projectSlug + '/documents">'
+        + '<input type="hidden" name="csrf_token" value="' + csrfToken + '">'
+        + (parentDocId ? '<input type="hidden" name="parent_document_id" value="' + parentDocId + '">' : '')
+        + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>'
+        + '<input type="text" name="name" class="tree-inline-input" placeholder="Document name" required style="font-size:0.9rem;font-weight:normal">'
+        + '<button type="submit" class="tree-add-child">Save</button>'
+        + '<button type="button" class="tree-add-child" onclick="this.closest(\'.tree-doc-inline-create\').remove()">Cancel</button>'
+        + '</form>';
+      var node = btn.closest('.tree-node') || btn.closest('.tree-doc-node');
+      if (parentDocId) {{
+        node.appendChild(li);
+      }} else {{
+        var docList = node.querySelector(':scope > .tree-doc-list');
+        if (!docList) {{
+          docList = document.createElement('ul');
+          docList.className = 'tree-doc-list';
+          node.appendChild(docList);
+          var expandBtn = node.querySelector('.tree-expand-btn');
+          if (expandBtn) {{
+            expandBtn.innerHTML = '&#9660;';
+            expandBtn.classList.add('tree-expand-open');
+          }}
+        }}
+        docList.style.display = '';
+        docList.appendChild(li);
+      }}
+      li.querySelector('input[name="name"]').focus();
+    }}
     function addSiblingRow(btn, parentSlug) {{
       document.querySelectorAll('.tree-inline-create').forEach(function(el) {{ el.remove(); }});
       var li = createRow(parentSlug);
@@ -733,24 +765,38 @@ fn render_project_tree(
         project_slug: &str,
         docs: &[DocumentInfo],
         depth: usize,
+        can_write: bool,
     ) -> String {
         docs.iter()
             .map(|doc| {
                 let doc_id = escape_attribute(doc.id.as_str());
                 let name = escape_text(&doc.display_name);
                 let indent = format!("padding-left:{}px", (depth + 1) * 20);
-                let children = render_doc_subtree(project_slug, &doc.children, depth + 1);
+                let children = render_doc_subtree(project_slug, &doc.children, depth + 1, can_write);
+                let add_child_doc_btn = if can_write {
+                    format!(
+                        r#"<button type="button" class="tree-add-child tree-doc-add" onclick="event.stopPropagation(); event.preventDefault(); addDocRow(this, '{project_slug}', '{doc_id}')" title="New sub-document"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg></button>"#,
+                        project_slug = escape_attribute(project_slug),
+                        doc_id = doc_id,
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
-                    r#"<li class="tree-doc-node" style="{indent}">
-  <a href="/ui/{project_slug}/doc/{doc_id}" class="tree-doc-link">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-    <span>{name}</span>
-  </a>
+                    r#"<li class="tree-doc-node">
+  <div class="tree-doc-row" style="{indent}">
+    <a href="/ui/{project_slug}/doc/{doc_id}" class="tree-doc-link">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+      <span>{name}</span>
+    </a>
+    {add_child_doc_btn}
+  </div>
 </li>{children}"#,
                     indent = indent,
                     project_slug = escape_attribute(project_slug),
                     doc_id = doc_id,
                     name = name,
+                    add_child_doc_btn = add_child_doc_btn,
                     children = children,
                 )
             })
@@ -801,13 +847,22 @@ fn render_project_tree(
 
                 let doc_tree_html = if let Some(docs) = docs {
                     if !docs.is_empty() {
-                        let doc_items = render_doc_subtree(slug, docs, 0);
+                        let doc_items = render_doc_subtree(slug, docs, 0, entry.can_write);
                         format!(
                             r#"<ul class="tree-doc-list" style="display:none;">{doc_items}</ul>"#,
                         )
                     } else {
                         String::new()
                     }
+                } else {
+                    String::new()
+                };
+
+                let add_doc_btn = if entry.can_write {
+                    format!(
+                        r#"<button type="button" class="tree-add-child" onclick="event.stopPropagation(); addDocRow(this, '{slug_attr}', '')" title="New document"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg></button>"#,
+                        slug_attr = escape_attribute(slug),
+                    )
                 } else {
                     String::new()
                 };
@@ -838,6 +893,7 @@ fn render_project_tree(
     <a href="/ui/{slug}" class="tree-link">{display}</a>
     <div class="tree-row-right">
       <span class="tree-perm">{perm}</span>
+      {add_doc_btn}
       {admin_btns}
     </div>
   </div>
@@ -850,6 +906,7 @@ fn render_project_tree(
                     expand_btn = expand_btn,
                     display = display,
                     perm = perm,
+                    add_doc_btn = add_doc_btn,
                     admin_btns = admin_btns,
                     doc_tree_html = doc_tree_html,
                     sub = sub,
@@ -8041,6 +8098,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 
     .project-tree-panel {
       padding: var(--s-5);
+      overflow-x: hidden;
     }
 
     .tree-list {
@@ -8057,6 +8115,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 
     .tree-node {
       margin: var(--s-2) 0;
+      min-width: 0;
     }
 
     .tree-node-row {
@@ -8066,6 +8125,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       padding: var(--s-2) var(--s-3);
       border-radius: var(--radius);
       transition: background 0.15s;
+      min-width: 0;
     }
 
     .tree-node-row:hover {
@@ -8079,6 +8139,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       text-decoration: none;
       flex: 1;
       min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .tree-link:hover {
@@ -8109,6 +8172,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       cursor: pointer;
       font-size: 0.85rem;
       padding: 2px 8px;
+      width: auto;
       min-height: auto;
       display: inline-flex;
       align-items: center;
@@ -8191,6 +8255,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       cursor: pointer;
       font-size: 0.7rem;
       padding: 2px;
+      width: auto;
       min-height: auto;
       line-height: 1;
       flex-shrink: 0;
@@ -8212,19 +8277,37 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       margin: var(--s-1) 0;
     }
 
-    .tree-doc-link {
+    .tree-doc-row {
       display: flex;
       align-items: center;
       gap: var(--s-2);
       padding: var(--s-1) var(--s-2);
       border-radius: var(--radius);
+      transition: background 0.15s;
+    }
+    .tree-doc-row:hover {
+      background: var(--surface-hover);
+    }
+    .tree-doc-add {
+      opacity: 0;
+      flex-shrink: 0;
+      margin-left: auto;
+    }
+    .tree-doc-row:hover .tree-doc-add {
+      opacity: 1;
+    }
+
+    .tree-doc-link {
+      display: flex;
+      align-items: center;
+      gap: var(--s-2);
+      flex: 1;
+      min-width: 0;
       color: var(--ink);
       text-decoration: none;
       font-size: 0.9rem;
-      transition: background 0.15s;
     }
     .tree-doc-link:hover {
-      background: var(--surface-hover);
       color: var(--accent);
     }
     .tree-doc-link svg {
@@ -9171,6 +9254,28 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-sidebar-show .chat-main { display: none !important; }
       .chat-back-btn { display: flex; }
       .chat-msg { max-width: 90%; }
+
+      .tree-perm { display: none; }
+      .tree-doc-add { opacity: 1; }
+
+      .project-tree-panel { padding: var(--s-3); }
+      .tree-list .tree-list {
+        padding-left: var(--s-3);
+        margin-left: var(--s-2);
+      }
+      .tree-doc-list {
+        padding-left: var(--s-3);
+        margin-left: var(--s-2);
+      }
+      .tree-row-right {
+        gap: var(--s-2);
+        flex-shrink: 1;
+        min-width: 0;
+      }
+      .tree-node-row {
+        gap: var(--s-2);
+        padding: var(--s-2);
+      }
 
     }
     "#;
