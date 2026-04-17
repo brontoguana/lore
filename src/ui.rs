@@ -3427,13 +3427,23 @@ function showAgentList() {{
   window.location.href = '/ui/chat';
 }}
 
-/* Fix mobile keyboard dismiss: browser sometimes leaves page scrolled
-   so chat-header hides behind the sticky top-nav. Reset on viewport grow. */
+/* Fix mobile keyboard: on dismiss, browser sometimes leaves page scrolled
+   so chat-header hides behind the sticky top-nav. Reset on viewport grow.
+   On first keyboard open, iOS doesn't recalculate fixed layout — nudge input into view. */
 if (window.visualViewport) {{
   var _lastVVH = window.visualViewport.height;
+  var _firstKb = true;
   window.visualViewport.addEventListener('resize', function() {{
     var h = window.visualViewport.height;
-    if (h > _lastVVH) window.scrollTo(0, 0);
+    if (h > _lastVVH) {{
+      window.scrollTo(0, 0);
+    }} else if (_firstKb) {{
+      _firstKb = false;
+      var ci = document.getElementById('chat-input');
+      if (ci && ci === document.activeElement) {{
+        setTimeout(function() {{ ci.scrollIntoView({{ block: 'nearest' }}); }}, 50);
+      }}
+    }}
     _lastVVH = h;
   }});
 }}
