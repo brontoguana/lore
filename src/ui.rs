@@ -3423,6 +3423,7 @@ function selectAgent(name) {{
 }}
 
 function showAgentList() {{
+  localStorage.removeItem('lastChatAgent');
   window.location.href = '/ui/chat';
 }}
 
@@ -7769,32 +7770,30 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .agent-status-badge.stopped { color: var(--fg-muted); }
     }
 
-    /* Chat pages: fixed page header, chat pane owns the remaining viewport. */
+    /* Chat pages: page header fixed at top, shell fixed below it to bottom. */
     body:has(.chat-layout) {
+      margin: 0;
       overflow: hidden;
-      position: fixed;
-      inset: 0;
-      display: flex;
-      flex-direction: column;
-      padding-top: 0;
     }
     .top-nav:has(~ .shell .chat-layout) {
-      margin-bottom: 0;
       position: fixed;
       top: 0;
       left: 0;
       right: 0;
-      width: 100%;
-      flex-shrink: 0;
+      z-index: 100;
+      margin-bottom: 0;
     }
     .shell:has(.chat-layout) {
+      position: fixed;
+      top: 64px;
+      left: 0;
+      right: 0;
+      bottom: 0;
       width: 100%;
       max-width: 100%;
-      padding: 64px 0 0;
+      padding: 0;
       margin: 0;
       overflow: hidden;
-      flex: 1;
-      min-height: 0;
     }
     .chat-layout {
       display: flex;
@@ -9540,10 +9539,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         position: relative;
       }
 
-      /* Chat mobile: same stacked layout, with header offset preserved */
+      /* Chat mobile: adjust shell top for safe area */
       .shell:has(.chat-layout) {
-        padding-top: calc(64px + env(safe-area-inset-top));
-        padding-bottom: 0;
+        top: calc(64px + env(safe-area-inset-top));
       }
       .chat-layout {
         flex-direction: column;
