@@ -3428,15 +3428,34 @@ function showAgentList() {{
 }}
 
 /* Fix mobile keyboard dismiss: browser sometimes leaves page scrolled
-   so chat-header hides behind the sticky top-nav. Reset on viewport grow. */
+   so chat-header hides behind the sticky top-nav. Reset on viewport grow.
+   Also fix first-focus: iOS doesn't recalc fixed layout on first keyboard
+   open, so scroll the input into view after a short delay. */
 if (window.visualViewport) {{
   var _lastVVH = window.visualViewport.height;
   window.visualViewport.addEventListener('resize', function() {{
     var h = window.visualViewport.height;
     if (h > _lastVVH) window.scrollTo(0, 0);
+    if (h < _lastVVH) {{
+      var ci = document.getElementById('chat-input');
+      if (ci && document.activeElement === ci) {{
+        ci.scrollIntoView({{ block: 'nearest' }});
+      }}
+    }}
     _lastVVH = h;
   }});
 }}
+(function() {{
+  var ci = document.getElementById('chat-input');
+  if (ci) {{
+    ci.addEventListener('focus', function() {{
+      setTimeout(function() {{
+        ci.scrollIntoView({{ block: 'nearest' }});
+        window.scrollTo(0, 0);
+      }}, 300);
+    }});
+  }}
+}})()
 
 function openProfilePic(el) {{
   var agent = el.getAttribute('data-agent');
@@ -9572,7 +9591,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-main { display: none; }
       .chat-has-agent .chat-sidebar { display: none; }
       .chat-has-agent .chat-main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
-      .chat-back-btn { display: flex; margin: 0; }
+      .chat-back-btn { display: flex; margin: 0 4px 0 6px; }
       .chat-header { gap: 4px; padding: 8px 8px 8px 0; }
       .chat-header .chat-avatar-sm-wrap { margin-right: 0; margin-left: 0; }
       .chat-header .chat-avatar-header { margin: 0; }
