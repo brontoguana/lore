@@ -9563,6 +9563,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-header .chat-avatar-sm-wrap { margin-right: 0; margin-left: 0; }
       .chat-header .chat-avatar-header { margin: 0; }
       .chat-header-cwd { display: none; }
+      .chat-header-status { display: none; }
       .chat-msg { max-width: 90%; }
 
       .tree-perm { display: none; }
