@@ -52,12 +52,17 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
       <a href="/ui" class="logo">Lore</a>
       <span class="eyebrow" style="margin-top:2px;">{username}</span>
     </div>
-    <button class="burger-btn" onclick="toggleBurger()" aria-label="Menu">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-    </button>
+    <div class="nav-right-btns">
+      <a href="/ui/chat" class="nav-chat-btn" aria-label="Chat">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </a>
+      <button class="burger-btn" onclick="toggleBurger()" aria-label="Menu">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+    </div>
     <div class="top-nav-links" id="top-nav-links">
       <a href="/ui">Projects</a>
-      <a href="/ui/chat">Chat</a>
+      <a href="/ui/chat" class="nav-link-chat">Chat</a>
       <a href="/ui/agents">Agents</a>
       {admin_link}
       <a href="/ui/settings">Settings</a>
@@ -7491,6 +7496,19 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: var(--ink);
     }
 
+    .nav-right-btns {
+      display: contents;
+    }
+
+    .nav-chat-btn {
+      display: none;
+      color: var(--muted);
+      padding: var(--s-2);
+    }
+    .nav-chat-btn:hover {
+      color: var(--ink);
+    }
+
     .burger-btn {
       display: none;
       background: none;
@@ -9525,6 +9543,22 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       }
 
       /* Burger menu */
+      .nav-right-btns {
+        display: flex;
+        align-items: center;
+        gap: var(--s-1);
+      }
+
+      .nav-chat-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .nav-link-chat {
+        display: none;
+      }
+
       .burger-btn {
         display: block;
       }
