@@ -17,24 +17,37 @@ TAG="v${VERSION}"
 echo "Quick deploy: ${TAG}"
 
 # --- Stage uncommitted changes ---
-DIRTY=$(git diff --name-only HEAD)
+DIRTY=$(git status --porcelain)
 if [ -n "$DIRTY" ]; then
     echo ""
     echo "Uncommitted changes:"
     echo "$DIRTY"
     echo ""
-    read -p "Include in release? [y/N] " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    if [ -t 0 ]; then
+        read -p "Include in release? [y/N] " -n 1 -r
+        echo
+        [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    else
+        echo "Non-interactive mode: auto-including changes"
+    fi
     git add -u
 fi
 
 # --- Build and test ---
 sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
 echo "Building..."
-cargo build --release 2>&1 | tail -1
+if ! cargo build --release 2>&1 | tee /dev/stderr | tail -1; then
+    echo "BUILD FAILED"
+    exit 1
+fi
 echo "Testing..."
-cargo test 2>&1 | tail -3
+TEST_OUTPUT=$(cargo test 2>&1)
+TEST_EXIT=$?
+echo "$TEST_OUTPUT" | tail -5
+if [ $TEST_EXIT -ne 0 ]; then
+    echo "TESTS FAILED"
+    exit 1
+fi
 echo ""
 
 # --- Commit and tag (local only) ---
