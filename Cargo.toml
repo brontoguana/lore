@@ -33,7 +33,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tar = "0.4"
-tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "sync", "process", "io-util"] }
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "signal"] }
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde", "serde-well-known"] }
 urlencoding = "2.1"

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 use tokio::io::AsyncBufReadExt;
 
-type CliResult<T> = Result<T, Box<dyn Error>>;
+type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const CLI_SELF_UPDATE_SKIP_ENV: &str = "LORE_SKIP_CLI_SELF_UPDATE";
 const CLI_AUTO_UPDATE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
@@ -1685,6 +1685,33 @@ fn get_hostname() -> String {
 
 const LORE_DAEMON_ENV: &str = "LORE_DAEMON";
 
+tokio::task_local! {
+    static AGENT_CWD: PathBuf;
+}
+
+/// Returns the agent's working directory. Inside an agent task this is the
+/// task-local folder; outside (standalone CLI commands) falls back to process cwd.
+fn agent_cwd() -> PathBuf {
+    AGENT_CWD
+        .try_with(|p| p.clone())
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Resolve a path that may be relative against the agent's working directory.
+fn resolve_agent_path(path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        agent_cwd().join(p)
+    }
+}
+
+/// Convenience: the .lore/<agent_name> directory under the agent's cwd.
+fn agent_lore_dir(agent_name: &str) -> PathBuf {
+    agent_cwd().join(format!(".lore/{}", agent_name))
+}
+
 async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
     let is_daemon = env::var(LORE_DAEMON_ENV).unwrap_or_default() == "1";
 
@@ -1792,9 +1819,11 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
         return Ok(());
     }
 
+    let folder = std::env::current_dir()?;
+
     // If daemon child, write PID file
     if is_daemon {
-        let lore_dir = PathBuf::from(format!(".lore/{}", args.name));
+        let lore_dir = folder.join(format!(".lore/{}", args.name));
         fs::create_dir_all(&lore_dir)?;
         fs::write(lore_dir.join("lore.pid"), std::process::id().to_string())?;
     }
@@ -1805,41 +1834,76 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
         cli_backend_override.map(|b: AgentBackend| b.to_string()).as_deref().unwrap_or("server config"));
 
     // Main agent loop: poll for messages, process them
-    loop {
-        match agent_poll_and_process(&agent_context, &args.name, cli_backend_override).await {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("[agent] Error: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    AGENT_CWD.scope(folder, async move {
+        let mut consecutive_errors: u32 = 0;
+        loop {
+            match agent_poll_and_process(&agent_context, &args.name, cli_backend_override).await {
+                Ok(AgentPollAction::Continue) => { consecutive_errors = 0; }
+                Ok(AgentPollAction::Stop | AgentPollAction::UpdateAvailable) => break,
+                Ok(AgentPollAction::Restart) => {
+                    eprintln!("[agent] Restarting...");
+                    break;
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    let delay = std::cmp::min(5 * (1u64 << consecutive_errors.saturating_sub(1)), 60);
+                    eprintln!("[agent] Error (#{consecutive_errors}, retry in {delay}s): {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
             }
         }
-    }
+    }).await;
+    Ok(())
 }
 
-async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_backend_override: Option<AgentBackend>) -> CliResult<()> {
+/// What the agent poll loop should do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentPollAction {
+    /// Keep polling for the next message.
+    Continue,
+    /// Stop this agent — do not auto-restart.
+    Stop,
+    /// Restart this agent (e.g. /restart chat command).
+    Restart,
+    /// Server says an update is available — the *service* handles the actual
+    /// update; standalone agents just stop.
+    UpdateAvailable,
+}
+
+async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_backend_override: Option<AgentBackend>) -> CliResult<AgentPollAction> {
     let token = context.token.as_deref().ok_or("no token configured")?;
 
     // Long-poll for messages
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    // Detect git branch if in a git repo
-    let git_branch = std::process::Command::new("git")
+    let cwd = agent_cwd();
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    // Detect git branch if in a git repo (async to avoid blocking tokio threads)
+    let git_branch = tokio::process::Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .output()
+        .await
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if s.is_empty() { None } else { Some(s) }
         });
+    // Read machine name once (blocking file read, but off the async thread)
+    let machine_name = {
+        let mn = tokio::task::spawn_blocking(|| {
+            load_cli_config().ok().and_then(|c| c.machine_name)
+        }).await;
+        mn.ok().flatten()
+    };
     let mut req = context
         .client
         .get(format!("{}/v1/chat/poll", context.url))
         .header("x-lore-key", token)
-        .header("x-lore-cwd", &cwd)
+        .header("x-lore-cwd", &cwd_str)
         .header("x-lore-version", env!("CARGO_PKG_VERSION"));
-    if let Some(ref machine) = load_cli_config().ok().and_then(|c| c.machine_name) {
+    if let Some(ref machine) = machine_name {
         req = req.header("x-lore-machine", machine);
     }
     if let Some(ref branch) = git_branch {
@@ -1852,27 +1916,21 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
 
     let resp = match resp {
         Ok(r) => r,
-        Err(e) if e.is_timeout() => return Ok(()), // Normal long-poll timeout
+        Err(e) if e.is_timeout() => return Ok(AgentPollAction::Continue), // Normal long-poll timeout
         Err(e) => return Err(e.into()),
     };
 
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(format!("server rejected agent token ({status}) — agent may need re-provisioning").into());
+    }
     let body: serde_json::Value = resp.error_for_status()?.json().await?;
 
-    // Check if server is requesting a CLI update
-    if let Some(update_version) = body["update_to"].as_str() {
-        eprintln!("[agent] Server requested update to v{update_version}, updating...");
-        let mut cfg = load_cli_config()?;
-        let repo = body["update_repo"]
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| cfg.update_repo.clone());
-        match apply_cli_update_to_target(&mut cfg, update_version, &repo).await {
-            Ok(()) => {
-                eprintln!("[agent] Updated CLI, restarting...");
-                std::process::exit(0);
-            }
-            Err(e) => eprintln!("[agent] Update failed: {e}"),
-        }
+    // Server says a CLI update is available.  The *service* handles the actual
+    // binary swap; standalone agents just exit so the user can restart manually.
+    if body["update_to"].as_str().is_some() {
+        eprintln!("[agent] Server signalled update available");
+        return Ok(AgentPollAction::UpdateAvailable);
     }
 
     let has_endpoint = body["endpoint_id"].as_str().is_some();
@@ -1886,7 +1944,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     let messages = body["messages"].as_array();
 
     if messages.is_none() || messages.unwrap().is_empty() {
-        return Ok(());
+        return Ok(AgentPollAction::Continue);
     }
 
     let messages = messages.unwrap();
@@ -1900,13 +1958,13 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
                 eprintln!("[agent] Received /compact command");
                 let cb = if has_endpoint { AgentBackend::OpenAi } else { backend };
                 do_compact(context, agent_name, true, cb).await?;
-                return Ok(());
+                return Ok(AgentPollAction::Continue);
             } else if trimmed == "/stop" {
                 eprintln!("[agent] Received /stop command");
-                return Ok(());
+                return Ok(AgentPollAction::Stop);
             } else if trimmed == "/restart" {
-                eprintln!("[agent] Received /restart — exiting for restart");
-                std::process::exit(0);
+                eprintln!("[agent] Received /restart — restarting");
+                return Ok(AgentPollAction::Restart);
             } else {
                 regular_messages.push(content);
             }
@@ -1916,14 +1974,14 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     let combined = regular_messages.join("\n\n");
 
     if combined.trim().is_empty() {
-        return Ok(());
+        return Ok(AgentPollAction::Continue);
     }
 
     eprintln!("[agent] Received message: {}...", &combined.chars().take(80).collect::<String>());
 
     // Log user message to .lore chat log
     {
-        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
         let ts = time::OffsetDateTime::now_utc();
         let timestamp = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -1943,15 +2001,35 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         .send()
         .await;
 
-    // Get conversation history for context
-    let history_resp = context
+    // Get conversation history for context — if this fails, respond with an error
+    // so the user sees something (their message was already consumed from the poll).
+    let history: serde_json::Value = match context
         .client
         .get(format!("{}/v1/chat/history", context.url))
         .header("x-lore-key", token)
         .send()
-        .await?
-        .error_for_status()?;
-    let history: serde_json::Value = history_resp.json().await?;
+        .await
+    {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(resp) => resp.json().await.unwrap_or(serde_json::Value::Null),
+            Err(e) => {
+                let err_msg = format!("[Agent error: failed to fetch history: {e}]");
+                let _ = context.client.post(format!("{}/v1/chat/respond", context.url))
+                    .header("x-lore-key", token)
+                    .json(&serde_json::json!({ "text": err_msg, "done": true }))
+                    .send().await;
+                return Ok(AgentPollAction::Continue);
+            }
+        },
+        Err(e) => {
+            let err_msg = format!("[Agent error: failed to fetch history: {e}]");
+            let _ = context.client.post(format!("{}/v1/chat/respond", context.url))
+                .header("x-lore-key", token)
+                .json(&serde_json::json!({ "text": err_msg, "done": true }))
+                .send().await;
+            return Ok(AgentPollAction::Continue);
+        }
+    };
 
     // Build rich prompt with system context, git info, conversation history
     let summary = history["summary"].as_str().unwrap_or("");
@@ -1995,11 +2073,16 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     ));
 
     // Git repository context (gathered locally from the agent's working directory)
+    // All git commands use async process to avoid blocking tokio threads.
     let mut git_section = String::new();
     // Get the repo root directory name
-    let repo_name = std::process::Command::new("git")
+    let repo_name = tokio::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .output()
+        .await
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| {
@@ -2011,9 +2094,13 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         git_section.push_str(&format!("## Git Repository\n\n{repo}/ (branch: {branch_display})\n"));
 
         // Last commit
-        if let Some(last_commit) = std::process::Command::new("git")
+        if let Some(last_commit) = tokio::process::Command::new("git")
             .args(["log", "-1", "--format=%h %s"])
+            .current_dir(&cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .output()
+            .await
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -2023,9 +2110,13 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         }
 
         // Git status (modified/untracked files)
-        if let Some(status_output) = std::process::Command::new("git")
+        if let Some(status_output) = tokio::process::Command::new("git")
             .args(["status", "--porcelain"])
+            .current_dir(&cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .output()
+            .await
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -2042,9 +2133,13 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         }
 
         // Recent commits (last 3)
-        if let Some(log_output) = std::process::Command::new("git")
+        if let Some(log_output) = tokio::process::Command::new("git")
             .args(["log", "--oneline", "-3"])
+            .current_dir(&cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .output()
+            .await
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -2061,7 +2156,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     }
 
     // Working directory
-    prompt_parts.push(format!("## Working Directory\n\n{cwd}"));
+    prompt_parts.push(format!("## Working Directory\n\n{cwd_str}"));
 
     // Pinned context
     if let Some(pins) = pins {
@@ -2122,7 +2217,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         let full_prompt = format!("{system_instructions}\n\n---\n\n{user_context}");
 
         {
-            let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+            let lore_dir = agent_lore_dir(agent_name);
             let _ = fs::create_dir_all(&lore_dir);
             let _ = fs::write(lore_dir.join("prompt.txt"), &full_prompt);
         }
@@ -2196,7 +2291,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
 
     // Log agent response to .lore chat log
     {
-        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let lore_dir = agent_lore_dir(agent_name);
         let ts = time::OffsetDateTime::now_utc();
         let timestamp = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             ts.year(), ts.month() as u8, ts.day(), ts.hour(), ts.minute(), ts.second());
@@ -2217,7 +2312,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         eprintln!("[manager] Error: {e}");
     }
 
-    Ok(())
+    Ok(AgentPollAction::Continue)
 }
 
 async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<()> {
@@ -2300,7 +2395,7 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
 
     // Log manager response
     {
-        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
         let ts = time::OffsetDateTime::now_utc();
         let timestamp = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -2341,7 +2436,7 @@ async fn run_manager_cli(
 
     // Save manager context for debugging
     {
-        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
         let _ = fs::write(lore_dir.join("manager_context.txt"), &full_prompt);
     }
@@ -2646,31 +2741,33 @@ fn prune_old_error_files(dir: &Path) {
     }
 }
 
-fn write_agent_error_locally(agent_name: &str, record: &AgentErrorRecord) {
-    let dir = PathBuf::from(format!(".lore/{}", agent_name));
-    if fs::create_dir_all(&dir).is_err() { return; }
-    prune_old_error_files(&dir);
-    let path = dir.join(format!("error-{}.jsonl", today_utc_date()));
-    if let Ok(meta) = fs::metadata(&path) {
-        if meta.len() >= ERROR_FILE_MAX_BYTES { return; }
-    }
-    let Ok(mut line) = serde_json::to_string(record) else { return };
-    if line.len() > ERROR_ENTRY_MAX_BYTES {
-        // Progressively shrink preview fields (still keeping head+tail) until it fits.
-        let mut trimmed = record.clone();
-        trimmed.preview_response = trimmed.preview_response.map(|s| truncate_head_tail(&s, 350, 150));
-        trimmed.preview_request = trimmed.preview_request.map(|s| truncate_head_tail(&s, 350, 150));
-        line = serde_json::to_string(&trimmed).unwrap_or(line);
-        if line.len() > ERROR_ENTRY_MAX_BYTES {
-            trimmed.preview_response = None;
-            trimmed.preview_request = None;
-            line = serde_json::to_string(&trimmed).unwrap_or(line);
+async fn write_agent_error_locally(agent_name: &str, record: &AgentErrorRecord) {
+    let dir = agent_lore_dir(agent_name);
+    let record = record.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if fs::create_dir_all(&dir).is_err() { return; }
+        prune_old_error_files(&dir);
+        let path = dir.join(format!("error-{}.jsonl", today_utc_date()));
+        if let Ok(meta) = fs::metadata(&path) {
+            if meta.len() >= ERROR_FILE_MAX_BYTES { return; }
         }
-    }
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        use std::io::Write;
-        let _ = writeln!(f, "{line}");
-    }
+        let Ok(mut line) = serde_json::to_string(&record) else { return };
+        if line.len() > ERROR_ENTRY_MAX_BYTES {
+            let mut trimmed = record.clone();
+            trimmed.preview_response = trimmed.preview_response.map(|s| truncate_head_tail(&s, 350, 150));
+            trimmed.preview_request = trimmed.preview_request.map(|s| truncate_head_tail(&s, 350, 150));
+            line = serde_json::to_string(&trimmed).unwrap_or(line);
+            if line.len() > ERROR_ENTRY_MAX_BYTES {
+                trimmed.preview_response = None;
+                trimmed.preview_request = None;
+                line = serde_json::to_string(&trimmed).unwrap_or(line);
+            }
+        }
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{line}");
+        }
+    }).await;
 }
 
 async fn report_agent_error_to_server(context: &CliContext, record: &AgentErrorRecord) {
@@ -2696,7 +2793,7 @@ async fn report_agent_error_to_server(context: &CliContext, record: &AgentErrorR
 }
 
 async fn record_agent_error(context: &CliContext, agent_name: &str, record: AgentErrorRecord) {
-    write_agent_error_locally(agent_name, &record);
+    write_agent_error_locally(agent_name, &record).await;
     report_agent_error_to_server(context, &record).await;
 }
 
@@ -2737,7 +2834,7 @@ async fn run_api_agent_turn(
     );
 
     {
-        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
         let prompt_dump = format!("=== SYSTEM PROMPT ===\n{system_content}\n\n=== USER CONTEXT ===\n{user_context}");
         let _ = fs::write(lore_dir.join("prompt.txt"), &prompt_dump);
@@ -2951,7 +3048,7 @@ async fn run_api_agent_turn(
 
     // Save API agent context for debugging
     {
-        let lore_dir = PathBuf::from(format!(".lore/{}", agent_name));
+        let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
         let debug: String = messages.iter().map(|m| {
             let role = m["role"].as_str().unwrap_or("?");
@@ -3228,86 +3325,96 @@ fn build_local_tools() -> Vec<serde_json::Value> {
 async fn execute_local_tool(name: &str, args: &serde_json::Value) -> String {
     match name {
         "read_file" => execute_read_file(args).await,
-        "write_file" => execute_write_file(args),
-        "edit_file" => execute_edit_file(args),
+        "write_file" => execute_write_file(args).await,
+        "edit_file" => execute_edit_file(args).await,
         "bash" => execute_bash(args).await,
         "grep" => execute_grep(args).await,
         "glob" => execute_glob(args).await,
-        "list_directory" => execute_list_directory(args),
+        "list_directory" => execute_list_directory(args).await,
         _ => format!("Unknown tool: {name}"),
     }
 }
 
 async fn execute_read_file(args: &serde_json::Value) -> String {
     let path = match args["path"].as_str() {
-        Some(p) => p,
+        Some(p) => p.to_string(),
         None => return "Error: path is required".to_string(),
     };
+    let resolved = resolve_agent_path(&path);
     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
     let limit = args["limit"].as_u64().map(|l| l as usize);
 
-    match fs::read_to_string(path) {
-        Ok(content) => {
-            let lines: Vec<&str> = content.lines().collect();
-            let start = if offset > 0 { offset.saturating_sub(1) } else { 0 };
-            let end = match limit {
-                Some(l) => (start + l).min(lines.len()),
-                None => lines.len(),
-            };
-            if start >= lines.len() {
-                return format!("Error: offset {offset} beyond end of file ({} lines)", lines.len());
+    // Run blocking file read off the async runtime
+    tokio::task::spawn_blocking(move || {
+        match fs::read_to_string(&resolved) {
+            Ok(content) => {
+                let lines: Vec<&str> = content.lines().collect();
+                let start = if offset > 0 { offset.saturating_sub(1) } else { 0 };
+                let end = match limit {
+                    Some(l) => (start + l).min(lines.len()),
+                    None => lines.len(),
+                };
+                if start >= lines.len() {
+                    return format!("Error: offset {offset} beyond end of file ({} lines)", lines.len());
+                }
+                let mut result = String::new();
+                for (i, line) in lines[start..end].iter().enumerate() {
+                    result.push_str(&format!("{:>6}\t{}\n", start + i + 1, line));
+                }
+                if result.is_empty() { "(empty file)".to_string() } else { result }
             }
-            let mut result = String::new();
-            for (i, line) in lines[start..end].iter().enumerate() {
-                result.push_str(&format!("{:>6}\t{}\n", start + i + 1, line));
-            }
-            if result.is_empty() { "(empty file)".to_string() } else { result }
+            Err(e) => format!("Error reading {}: {e}", path),
         }
-        Err(e) => format!("Error reading {path}: {e}"),
-    }
+    }).await.unwrap_or_else(|e| format!("Error: task failed: {e}"))
 }
 
-fn execute_write_file(args: &serde_json::Value) -> String {
+async fn execute_write_file(args: &serde_json::Value) -> String {
     let path = match args["path"].as_str() {
-        Some(p) => p,
+        Some(p) => p.to_string(),
         None => return "Error: path is required".to_string(),
     };
-    let content = args["content"].as_str().unwrap_or("");
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    match fs::write(path, content) {
-        Ok(()) => format!("Wrote {} bytes to {path}", content.len()),
-        Err(e) => format!("Error writing {path}: {e}"),
-    }
+    let resolved = resolve_agent_path(&path);
+    let content = args["content"].as_str().unwrap_or("").to_string();
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = resolved.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::write(&resolved, &content) {
+            Ok(()) => format!("Wrote {} bytes to {}", content.len(), path),
+            Err(e) => format!("Error writing {}: {e}", path),
+        }
+    }).await.unwrap_or_else(|e| format!("Error: task failed: {e}"))
 }
 
-fn execute_edit_file(args: &serde_json::Value) -> String {
+async fn execute_edit_file(args: &serde_json::Value) -> String {
     let path = match args["path"].as_str() {
-        Some(p) => p,
+        Some(p) => p.to_string(),
         None => return "Error: path is required".to_string(),
     };
+    let resolved = resolve_agent_path(&path);
     let old_string = match args["old_string"].as_str() {
-        Some(s) => s,
+        Some(s) => s.to_string(),
         None => return "Error: old_string is required".to_string(),
     };
-    let new_string = args["new_string"].as_str().unwrap_or("");
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => return format!("Error reading {path}: {e}"),
-    };
-    let count = content.matches(old_string).count();
-    if count == 0 {
-        return format!("Error: old_string not found in {path}");
-    }
-    if count > 1 {
-        return format!("Error: old_string found {count} times in {path} \u{2014} must be unique. Provide more surrounding context.");
-    }
-    let new_content = content.replacen(old_string, new_string, 1);
-    match fs::write(path, new_content) {
-        Ok(()) => format!("Edited {path}: replaced 1 occurrence"),
-        Err(e) => format!("Error writing {path}: {e}"),
-    }
+    let new_string = args["new_string"].as_str().unwrap_or("").to_string();
+    tokio::task::spawn_blocking(move || {
+        let content = match fs::read_to_string(&resolved) {
+            Ok(c) => c,
+            Err(e) => return format!("Error reading {}: {e}", path),
+        };
+        let count = content.matches(old_string.as_str()).count();
+        if count == 0 {
+            return format!("Error: old_string not found in {}", path);
+        }
+        if count > 1 {
+            return format!("Error: old_string found {count} times in {} \u{2014} must be unique. Provide more surrounding context.", path);
+        }
+        let new_content = content.replacen(&old_string, &new_string, 1);
+        match fs::write(&resolved, new_content) {
+            Ok(()) => format!("Edited {}: replaced 1 occurrence", path),
+            Err(e) => format!("Error writing {}: {e}", path),
+        }
+    }).await.unwrap_or_else(|e| format!("Error: task failed: {e}"))
 }
 
 async fn execute_bash(args: &serde_json::Value) -> String {
@@ -3319,6 +3426,7 @@ async fn execute_bash(args: &serde_json::Value) -> String {
         std::time::Duration::from_secs(120),
         tokio::process::Command::new("bash")
             .args(["-lc", command])
+            .current_dir(&agent_cwd())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -3348,11 +3456,13 @@ async fn execute_grep(args: &serde_json::Value) -> String {
         None => return "Error: pattern is required".to_string(),
     };
     let path = args["path"].as_str().unwrap_or(".");
+    let resolved = resolve_agent_path(path);
     let include = args["include"].as_str();
     let mut cmd = tokio::process::Command::new("grep");
     cmd.args(["-rn", "--color=never"]);
     if let Some(inc) = include { cmd.args(["--include", inc]); }
-    cmd.arg("--").arg(pattern).arg(path);
+    cmd.arg("--").arg(pattern).arg(&resolved);
+    cmd.current_dir(&agent_cwd());
     cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
         Ok(Ok(output)) => {
@@ -3370,8 +3480,10 @@ async fn execute_glob(args: &serde_json::Value) -> String {
         None => return "Error: pattern is required".to_string(),
     };
     let path = args["path"].as_str().unwrap_or(".");
+    let resolved = resolve_agent_path(path);
     let mut cmd = tokio::process::Command::new("find");
-    cmd.arg(path).args(["-name", pattern, "-type", "f"]);
+    cmd.arg(&resolved).args(["-name", pattern, "-type", "f"]);
+    cmd.current_dir(&agent_cwd());
     cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     match tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await {
         Ok(Ok(output)) => {
@@ -3383,21 +3495,24 @@ async fn execute_glob(args: &serde_json::Value) -> String {
     }
 }
 
-fn execute_list_directory(args: &serde_json::Value) -> String {
-    let path = args["path"].as_str().unwrap_or(".");
-    match fs::read_dir(path) {
-        Ok(entries) => {
-            let mut items: Vec<String> = Vec::new();
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                items.push(if is_dir { format!("{name}/") } else { name });
+async fn execute_list_directory(args: &serde_json::Value) -> String {
+    let path = args["path"].as_str().unwrap_or(".").to_string();
+    let resolved = resolve_agent_path(&path);
+    tokio::task::spawn_blocking(move || {
+        match fs::read_dir(&resolved) {
+            Ok(entries) => {
+                let mut items: Vec<String> = Vec::new();
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    items.push(if is_dir { format!("{name}/") } else { name });
+                }
+                items.sort();
+                if items.is_empty() { "(empty directory)".to_string() } else { items.join("\n") }
             }
-            items.sort();
-            if items.is_empty() { "(empty directory)".to_string() } else { items.join("\n") }
+            Err(e) => format!("Error listing {}: {e}", path),
         }
-        Err(e) => format!("Error listing {path}: {e}"),
-    }
+    }).await.unwrap_or_else(|e| format!("Error: task failed: {e}"))
 }
 
 // --- API-based compaction (for API agents without CLI) ---
@@ -3653,6 +3768,7 @@ async fn spawn_backend(
 ) -> CliResult<tokio::process::Child> {
     use tokio::io::AsyncWriteExt;
 
+    let cwd = agent_cwd();
     let mut child = match backend {
         AgentBackend::Claude => {
             let mut args = vec![
@@ -3672,6 +3788,7 @@ async fn spawn_backend(
             }
             tokio::process::Command::new("claude")
                 .args(&args)
+                .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -3691,6 +3808,7 @@ async fn spawn_backend(
             args.push(String::new());
             tokio::process::Command::new("gemini")
                 .args(&args)
+                .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -3708,6 +3826,7 @@ async fn spawn_backend(
             }
             tokio::process::Command::new("codex")
                 .args(&args)
+                .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -3819,6 +3938,7 @@ async fn run_compaction(context: &CliContext, backend: AgentBackend, prompt: &st
             use tokio::io::AsyncWriteExt;
             let mut child = tokio::process::Command::new("claude")
                 .args(["-p", "--model", "sonnet", "--no-session-persistence"])
+                .current_dir(&agent_cwd())
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -3885,6 +4005,12 @@ struct ManagedAgent {
 struct ServiceState {
     agents: Vec<ManagedAgent>,
     state_dir: PathBuf,
+    /// Runtime task handles for each agent, keyed by agent name.
+    tasks: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    /// Agents explicitly stopped (via command or /stop chat message) — skip auto-restart.
+    stopped: std::collections::HashSet<String>,
+    /// Shared with agent tasks: they insert their name here when they receive /stop.
+    self_stops: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ServiceState {
@@ -3898,7 +4024,13 @@ impl ServiceState {
         } else {
             Vec::new()
         };
-        Self { agents, state_dir: state_dir.to_path_buf() }
+        Self {
+            agents,
+            state_dir: state_dir.to_path_buf(),
+            tasks: std::collections::HashMap::new(),
+            stopped: std::collections::HashSet::new(),
+            self_stops: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
     }
 
     fn save(&self) {
@@ -3910,37 +4042,57 @@ impl ServiceState {
     }
 
     fn check_agents(&mut self) {
-        for agent in &mut self.agents {
-            if agent.pid != 0 && !is_process_running(agent.pid) {
-                eprintln!("[service] Agent '{}' (pid {}) is no longer running", agent.name, agent.pid);
-                agent.pid = 0;
+        // Drain any self-stop requests from agent tasks.
+        if let Ok(mut stops) = self.self_stops.lock() {
+            for name in stops.drain() {
+                eprintln!("[service] Agent '{}' self-stopped via chat command", name);
+                self.stopped.insert(name);
             }
+        }
+
+        let mut dead: Vec<String> = Vec::new();
+        for (name, handle) in &self.tasks {
+            if handle.is_finished() {
+                if self.stopped.contains(name) {
+                    eprintln!("[service] Agent '{}' task finished (stopped)", name);
+                } else {
+                    eprintln!("[service] Agent '{}' task finished, will restart", name);
+                }
+                dead.push(name.clone());
+            }
+        }
+        for name in &dead {
+            self.tasks.remove(name);
         }
     }
 
-    fn restart_crashed_agents(&mut self, context: &CliContext) {
-        for agent in &mut self.agents {
-            if agent.pid == 0 {
-                match spawn_agent_process(context, agent) {
-                    Ok(pid) => {
-                        eprintln!("[service] Restarted agent '{}' (pid {})", agent.name, pid);
-                        agent.pid = pid;
-                    }
-                    Err(e) => {
-                        eprintln!("[service] Failed to restart agent '{}': {e}", agent.name);
-                    }
-                }
+    fn start_agent_tasks(&mut self, context: &CliContext) {
+        for agent in &self.agents {
+            if self.tasks.contains_key(&agent.name) {
+                continue; // already running
             }
+            if self.stopped.contains(&agent.name) {
+                continue; // explicitly stopped — don't auto-restart
+            }
+            let handle = spawn_agent_task(context, agent, self.self_stops.clone());
+            eprintln!("[service] Started agent '{}' as task", agent.name);
+            self.tasks.insert(agent.name.clone(), handle);
         }
-        self.save();
     }
 
     fn agent_statuses(&self) -> Vec<serde_json::Value> {
         self.agents.iter().map(|a| {
-            let status = if a.pid != 0 && is_process_running(a.pid) { "running" } else { "stopped" };
+            let running = self.tasks.get(&a.name).map(|h| !h.is_finished()).unwrap_or(false);
+            let status = if running {
+                "running"
+            } else if self.stopped.contains(&a.name) {
+                "stopped"
+            } else {
+                "restarting"
+            };
             serde_json::json!({
                 "name": a.name,
-                "pid": a.pid,
+                "pid": std::process::id(),
                 "status": status,
                 "folder": a.folder,
             })
@@ -3948,16 +4100,13 @@ impl ServiceState {
     }
 
     fn stop_agent(&mut self, name: &str) -> serde_json::Value {
-        if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
-            if agent.pid != 0 && is_process_running(agent.pid) {
-                eprintln!("[service] Stopping agent '{}' (pid {})", name, agent.pid);
-                kill_process(agent.pid);
-                agent.pid = 0;
-                self.save();
+        if self.agents.iter().any(|a| a.name == name) {
+            self.stopped.insert(name.to_string());
+            if let Some(handle) = self.tasks.remove(name) {
+                eprintln!("[service] Stopping agent '{}'", name);
+                handle.abort();
                 serde_json::json!({ "ok": true, "agent_name": name })
             } else {
-                agent.pid = 0;
-                self.save();
                 serde_json::json!({ "ok": true, "agent_name": name, "note": "agent was not running" })
             }
         } else {
@@ -3967,14 +4116,14 @@ impl ServiceState {
 
     fn remove_agent(&mut self, name: &str) -> serde_json::Value {
         if let Some(index) = self.agents.iter().position(|a| a.name == name) {
-            let agent = self.agents[index].clone();
-            if agent.pid != 0 && is_process_running(agent.pid) {
-                eprintln!("[service] Removing agent '{}' (pid {})", name, agent.pid);
-                kill_process(agent.pid);
-                std::thread::sleep(std::time::Duration::from_millis(300));
+            // Stop the task if running
+            if let Some(handle) = self.tasks.remove(name) {
+                eprintln!("[service] Removing agent '{}'", name);
+                handle.abort();
             } else {
                 eprintln!("[service] Removing agent '{}'", name);
             }
+            self.stopped.remove(name);
 
             self.agents.remove(index);
             self.save();
@@ -3991,71 +4140,110 @@ impl ServiceState {
     }
 
     fn restart_agent(&mut self, context: &CliContext, name: &str) -> serde_json::Value {
-        if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
+        if let Some(agent) = self.agents.iter().find(|a| a.name == name).cloned() {
+            // Clear stopped flag so it can run
+            self.stopped.remove(name);
             // Stop if running
-            if agent.pid != 0 && is_process_running(agent.pid) {
-                kill_process(agent.pid);
-                // Brief wait for process to exit
-                std::thread::sleep(std::time::Duration::from_millis(300));
+            if let Some(handle) = self.tasks.remove(name) {
+                handle.abort();
             }
-            // Restart
-            match spawn_agent_process(context, agent) {
-                Ok(pid) => {
-                    eprintln!("[service] Restarted agent '{}' (pid {})", name, pid);
-                    agent.pid = pid;
-                    self.save();
-                    serde_json::json!({ "ok": true, "agent_name": name, "pid": pid })
-                }
-                Err(e) => {
-                    agent.pid = 0;
-                    self.save();
-                    serde_json::json!({ "error": format!("restart failed: {e}") })
-                }
-            }
+            // Restart as new task
+            let handle = spawn_agent_task(context, &agent, self.self_stops.clone());
+            eprintln!("[service] Restarted agent '{}' as task", name);
+            self.tasks.insert(name.to_string(), handle);
+            self.save();
+            serde_json::json!({ "ok": true, "agent_name": name, "pid": std::process::id() })
         } else {
             serde_json::json!({ "error": format!("agent '{}' not managed by this service", name) })
         }
     }
 
     fn stop_all_agents(&mut self) {
-        for agent in &mut self.agents {
-            if agent.pid != 0 && is_process_running(agent.pid) {
-                eprintln!("[service] Stopping agent '{}' (pid {})", agent.name, agent.pid);
-                kill_process(agent.pid);
-                agent.pid = 0;
-            }
+        for (name, handle) in self.tasks.drain() {
+            eprintln!("[service] Stopping agent '{}'", name);
+            self.stopped.insert(name);
+            handle.abort();
         }
-        self.save();
+    }
+
+    fn restart_all_agents(&mut self) {
+        self.stopped.clear();
     }
 }
 
-fn spawn_agent_process(context: &CliContext, agent: &ManagedAgent) -> CliResult<u32> {
-    let exe = resolved_current_exe()?;
-    let lore_dir = PathBuf::from(&agent.folder).join(format!(".lore/{}", agent.name));
-    fs::create_dir_all(&lore_dir)?;
+/// Spawn an agent as a tokio task within this process.
+fn spawn_agent_task(
+    context: &CliContext,
+    agent: &ManagedAgent,
+    self_stops: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+) -> tokio::task::JoinHandle<()> {
+    let folder = PathBuf::from(&agent.folder);
+    let name = agent.name.clone();
+    let ctx = CliContext {
+        client: context.client.clone(),
+        url: context.url.clone(),
+        token: Some(agent.token.clone()),
+        project: None,
+    };
 
-    let log_path = lore_dir.join("lore.log");
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    // Ensure .lore dir exists
+    let lore_dir = folder.join(format!(".lore/{}", name));
+    let _ = fs::create_dir_all(&lore_dir);
 
-    let child = std::process::Command::new(&exe)
-        .current_dir(&agent.folder)
-        .args([
-            "--url", &context.url,
-            "--token", &agent.token,
-            "agent", &agent.name,
-        ])
-        .env(LORE_DAEMON_ENV, "1")
-        .stdout(log_file.try_clone()?)
-        .stderr(log_file)
-        .stdin(std::process::Stdio::null())
-        .spawn()?;
+    tokio::spawn(AGENT_CWD.scope(folder, async move {
+        eprintln!("[agent] Task started for '{}'", name);
+        let mut consecutive_errors: u32 = 0;
+        loop {
+            let outcome = agent_poll_and_process(&ctx, &name, None).await;
+            match outcome {
+                Ok(AgentPollAction::Continue) => { consecutive_errors = 0; }
+                Ok(AgentPollAction::Stop) => {
+                    eprintln!("[agent] Task for '{}' stopped via /stop", name);
+                    if let Ok(mut stops) = self_stops.lock() {
+                        stops.insert(name.clone());
+                    }
+                    break;
+                }
+                Ok(AgentPollAction::Restart) => {
+                    eprintln!("[agent] Task for '{}' restarting", name);
+                    // Don't add to self_stops — service will auto-restart
+                    break;
+                }
+                Ok(AgentPollAction::UpdateAvailable) => {
+                    // Service handles updates centrally — just keep polling.
+                    eprintln!("[agent] '{}' ignoring update_to (service handles updates)", name);
+                    consecutive_errors = 0;
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    // Exponential backoff: 5s, 10s, 20s, 40s, capped at 60s
+                    let delay = std::cmp::min(5 * (1u64 << consecutive_errors.saturating_sub(1)), 60);
+                    eprintln!("[agent] '{}' error (#{consecutive_errors}, retry in {delay}s): {e}", name);
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
+            }
+        }
+    }))
+}
 
-    let pid = child.id();
-    fs::write(lore_dir.join("lore.pid"), pid.to_string())?;
-    Ok(pid)
+/// Rotate log file if it exceeds 2MB. Keeps one `.1` backup.
+fn rotate_log_if_needed(log_path: &Path) {
+    const MAX_LOG_SIZE: u64 = 2 * 1024 * 1024; // 2MB
+    if let Ok(meta) = fs::metadata(log_path) {
+        if meta.len() > MAX_LOG_SIZE {
+            let backup = log_path.with_extension("log.1");
+            let _ = fs::rename(log_path, &backup);
+            // Service's stderr is still pointing at the old inode, which is now
+            // the backup file. The next write will go there, but the file won't
+            // grow because we'll re-open on the next daemon spawn/restart.
+            // For the running process, just truncate and carry on.
+            let _ = fs::write(log_path, format!(
+                "[service] Log rotated at {}\n",
+                time::OffsetDateTime::now_utc()
+            ));
+            eprintln!("[service] Log rotated ({} -> .log.1)", log_path.display());
+        }
+    }
 }
 
 /// Migrate old-style standalone `lore agent` processes into the service's managed agents.
@@ -4261,18 +4449,59 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
 
     eprintln!("[service] Loaded {} managed agent(s)", svc_state.agents.len());
 
-    // Check and restart any crashed agents on startup
+    // Start all agents as tasks within this process
     svc_state.check_agents();
-    svc_state.restart_crashed_agents(context);
+    svc_state.start_agent_tasks(context);
+
+    // Rotate service log if it's grown large (>2MB)
+    let service_log_path = lore_dir.join("service.log");
+    rotate_log_if_needed(&service_log_path);
+
+    // Graceful shutdown on SIGTERM/SIGINT
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_flag = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("[service] Shutdown signal received");
+    });
+
+    let mut consecutive_service_errors: u32 = 0;
 
     loop {
-        // Check agent health before each poll
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("[service] Shutting down gracefully...");
+            svc_state.stop_all_agents();
+            svc_state.save();
+            let pid_path = lore_dir.join("service.pid");
+            let _ = fs::remove_file(&pid_path);
+            eprintln!("[service] Shutdown complete");
+            return Ok(());
+        }
+        // Check agent health and restart dead tasks
         svc_state.check_agents();
-        svc_state.restart_crashed_agents(context);
+        svc_state.start_agent_tasks(context);
+
+        // Periodic log rotation check (cheap stat call)
+        rotate_log_if_needed(&service_log_path);
 
         let poll_start = std::time::Instant::now();
         match service_poll_and_execute(context, machine_token, &mut svc_state).await {
             Ok(update_info) => {
+                consecutive_service_errors = 0;
                 if let Some((target_version, repo)) = update_info {
                     eprintln!("[service] Self-update to v{target_version} requested, stopping all agents...");
                     svc_state.stop_all_agents();
@@ -4318,19 +4547,23 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                                 }
                             }
                             // If spawn failed, restart agents on old binary and keep running
-                            svc_state.restart_crashed_agents(context);
+                            svc_state.restart_all_agents();
+                            svc_state.start_agent_tasks(context);
                         }
                         Err(e) => {
                             eprintln!("[service] Update failed: {e}");
-                            // Restart agents that were stopped
-                            svc_state.restart_crashed_agents(context);
+                            // Restart agents that were stopped for the update
+                            svc_state.restart_all_agents();
+                            svc_state.start_agent_tasks(context);
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[service] Error: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                consecutive_service_errors += 1;
+                let delay = std::cmp::min(5 * (1u64 << consecutive_service_errors.saturating_sub(1)), 120);
+                eprintln!("[service] Error (#{consecutive_service_errors}, retry in {delay}s): {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
         }
@@ -4368,6 +4601,10 @@ async fn service_poll_and_execute(
         Err(e) => return Err(e.into()),
     };
 
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(format!("server rejected machine token ({status}) — check token config").into());
+    }
     let body: serde_json::Value = resp.error_for_status()?.json().await?;
 
     // Check for self-update request
@@ -4592,7 +4829,7 @@ async fn service_handle_create_agent(
     save_cli_config(&config)?;
 
     // Create managed agent entry
-    let mut managed = ManagedAgent {
+    let managed = ManagedAgent {
         name: agent_slug.to_string(),
         pid: 0,
         folder: folder_path.to_string_lossy().into_owned(),
@@ -4600,28 +4837,19 @@ async fn service_handle_create_agent(
         token: agent_token.to_string(),
     };
 
-    // Start the agent process
-    match spawn_agent_process(context, &managed) {
-        Ok(pid) => {
-            managed.pid = pid;
-            eprintln!(
-                "[service] Agent '{}' started in {} (pid {})",
-                agent_slug,
-                managed.folder,
-                pid
-            );
-        }
-        Err(e) => {
-            eprintln!("[service] Failed to start agent '{}': {e}", agent_slug);
-        }
-    }
-
+    // Start the agent as a task within this process
+    let handle = spawn_agent_task(context, &managed, svc_state.self_stops.clone());
+    eprintln!(
+        "[service] Agent '{}' started in {} as task",
+        agent_slug, managed.folder,
+    );
+    svc_state.tasks.insert(agent_slug.to_string(), handle);
     svc_state.agents.push(managed.clone());
 
     Ok(serde_json::json!({
         "ok": true,
         "agent_name": agent_slug,
         "folder": managed.folder,
-        "pid": managed.pid,
+        "pid": std::process::id(),
     }))
 }
