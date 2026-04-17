@@ -3428,34 +3428,15 @@ function showAgentList() {{
 }}
 
 /* Fix mobile keyboard dismiss: browser sometimes leaves page scrolled
-   so chat-header hides behind the sticky top-nav. Reset on viewport grow.
-   Also fix first-focus: iOS doesn't recalc fixed layout on first keyboard
-   open, so scroll the input into view after a short delay. */
+   so chat-header hides behind the sticky top-nav. Reset on viewport grow. */
 if (window.visualViewport) {{
   var _lastVVH = window.visualViewport.height;
   window.visualViewport.addEventListener('resize', function() {{
     var h = window.visualViewport.height;
     if (h > _lastVVH) window.scrollTo(0, 0);
-    if (h < _lastVVH) {{
-      var ci = document.getElementById('chat-input');
-      if (ci && document.activeElement === ci) {{
-        ci.scrollIntoView({{ block: 'nearest' }});
-      }}
-    }}
     _lastVVH = h;
   }});
 }}
-(function() {{
-  var ci = document.getElementById('chat-input');
-  if (ci) {{
-    ci.addEventListener('focus', function() {{
-      setTimeout(function() {{
-        ci.scrollIntoView({{ block: 'nearest' }});
-        window.scrollTo(0, 0);
-      }}, 300);
-    }});
-  }}
-}})()
 
 function openProfilePic(el) {{
   var agent = el.getAttribute('data-agent');
