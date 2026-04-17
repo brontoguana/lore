@@ -9043,6 +9043,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-weight: 700;
       cursor: pointer;
       min-height: 48px;
+      border-radius: 5px;
     }
 
     button:hover {
