@@ -7769,24 +7769,28 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .agent-status-badge.stopped { color: var(--fg-muted); }
     }
 
-    /* Chat — flex column: nav on top, chat fills the rest. No overlap. */
+    /* Chat pages: fixed page header, chat pane owns the remaining viewport. */
     body:has(.chat-layout) {
       overflow: hidden;
       position: fixed;
       inset: 0;
       display: flex;
       flex-direction: column;
-      padding-top: env(safe-area-inset-top, 0px);
+      padding-top: 0;
     }
     .top-nav:has(~ .shell .chat-layout) {
       margin-bottom: 0;
-      position: static;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      width: 100%;
       flex-shrink: 0;
     }
     .shell:has(.chat-layout) {
       width: 100%;
       max-width: 100%;
-      padding: 0;
+      padding: 64px 0 0;
       margin: 0;
       overflow: hidden;
       flex: 1;
@@ -7866,6 +7870,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       flex-direction: column;
       min-width: 0;
+      min-height: 0;
+      overflow: hidden;
     }
     .chat-header {
       padding: var(--s-3) var(--s-4);
@@ -7873,6 +7879,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       align-items: center;
       gap: var(--s-3);
+      flex-shrink: 0;
+      background: var(--panel);
     }
     .chat-header-name {
       font-weight: 600;
@@ -7935,6 +7943,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .chat-config-panel {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
       overscroll-behavior: none;
       padding: var(--s-5);
@@ -7985,6 +7994,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .chat-messages {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
       overscroll-behavior: none;
       padding: var(--s-4);
@@ -8314,6 +8324,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       padding: var(--s-3) var(--s-4) calc(var(--s-3) + env(safe-area-inset-bottom));
       border-top: 1px solid var(--line);
       align-items: flex-end;
+      flex-shrink: 0;
+      background: var(--panel);
     }
     .chat-input {
       flex: 1;
@@ -9528,8 +9540,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         position: relative;
       }
 
-      /* Chat mobile — flex column handles layout, no manual height calc needed */
-      .shell:has(.chat-layout) { padding: 0; }
+      /* Chat mobile: same stacked layout, with header offset preserved */
+      .shell:has(.chat-layout) {
+        padding-top: calc(64px + env(safe-area-inset-top));
+        padding-bottom: 0;
+      }
       .chat-layout {
         flex-direction: column;
         height: 100%;
