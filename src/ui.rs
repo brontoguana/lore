@@ -3213,7 +3213,7 @@ pub fn render_chat_page(
   <button class="chat-back-btn" onclick="showAgentList()">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
   </button>
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin-right:var(--s-2);flex-shrink:0;"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>
+  <span class="chat-header-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></span>
   <span class="chat-header-name">Librarian</span>
   <select id="lib-project" class="chat-config-select" style="margin-left:var(--s-3);max-width:200px;" onchange="onLibProjectChange()">
     <option value="">All Projects</option>
@@ -7934,7 +7934,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: none;
       align-items: center;
       justify-content: center;
-      background: none;
+      background: rgba(0,0,0,0.12);
       border: none;
       color: var(--fg);
       cursor: pointer;
@@ -7943,6 +7943,17 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       padding: 0;
       min-height: auto;
       border-radius: 5px;
+      flex-shrink: 0;
+    }
+    .chat-header-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 5px;
+      background: rgba(0,0,0,0.12);
+      flex-shrink: 0;
     }
     .chat-config-panel {
       flex: 1;
