@@ -1547,7 +1547,7 @@ pub fn render_admin_page(
       <section class="panel" data-panel="audit"{audit_display}>
         <div class="panel-header">
           <h2>Audit</h2>
-          <p>Recent runs and events. <a href="/ui/admin/audit">Open full audit</a>.</p>
+          <p>Recent runs and events. <a href="/ui/admin/audit">Open full audit</a> &middot; <a href="/ui/admin/errors">Open error log</a>.</p>
         </div>
         <div class="timeline">{pending_actions_html}</div>
         <div class="timeline">{audit_html}</div>
@@ -3314,6 +3314,10 @@ pub fn render_chat_page(
       <label class="chat-config-label">Project Context</label>
       <textarea id="cfg-project-context" class="chat-config-textarea" readonly placeholder="No project context set."></textarea>
     </div>
+    <div class="chat-config-field" id="cfg-errors-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Error Log <span id="cfg-errors-count" style="color:var(--fg-muted);font-weight:normal;"></span></label>
+      <div id="cfg-errors-list" class="chat-errors-list"></div>
+    </div>
   </div>
 </div>
 <div class="chat-config-panel" id="chat-manage-panel" style="display:none;">
@@ -3489,11 +3493,13 @@ function renderMessages() {{
   var html = '';
   for (var i = 0; i < chatMessages.length; i++) {{
     var msg = chatMessages[i];
-    var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : msg.role === 'config' ? 'chat-msg-config' : msg.role === 'tool' ? 'chat-msg-tool' : 'chat-msg-assistant';
+    var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : msg.role === 'config' ? 'chat-msg-config' : msg.role === 'tool' ? 'chat-msg-tool' : msg.role === 'error' ? 'chat-msg-error' : 'chat-msg-assistant';
     if (msg._thinking) cls += ' chat-msg-thinking';
     html += '<div class="chat-msg ' + cls + '">';
     if (msg.role === 'assistant') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
+    }} else if (msg.role === 'error') {{
+      html += '<div class="chat-msg-content"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:var(--s-1);"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>' + escapeHtmlRaw(msg.content.replace(/\n.*$/s, '')) + '</div>';
     }} else if (msg.role === 'tool') {{
       html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
     }} else {{
@@ -3750,7 +3756,11 @@ function connectSSE() {{
     try {{
       var evt = JSON.parse(e.data);
       if (evt.agent !== currentAgent) return;
-      if (evt.event_type === 'tool_use') {{
+      if (evt.event_type === 'message' && evt.data && evt.data.role === 'error') {{
+        chatMessages.push({{ role: 'error', content: evt.data.content, _id: evt.data.id }});
+        renderMessages();
+        if (typeof refreshErrorsPanel === 'function') refreshErrorsPanel();
+      }} else if (evt.event_type === 'tool_use') {{
         var detail = '\u{{1F527}} ' + evt.data.detail;
         var lastMsg = chatMessages[chatMessages.length - 1];
         if (lastMsg && lastMsg.role === 'tool') {{
@@ -3932,6 +3942,49 @@ function loadChatConfig() {{
           pta.value = '';
         }}
       }}
+    }});
+  refreshErrorsPanel();
+}}
+
+function refreshErrorsPanel() {{
+  if (!currentAgent || isLibrarian) return;
+  var list = document.getElementById('cfg-errors-list');
+  var countEl = document.getElementById('cfg-errors-count');
+  if (!list) return;
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/errors', {{ cache: 'no-store' }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      var records = (data && data.records) || [];
+      if (countEl) countEl.textContent = records.length ? '(' + records.length + ')' : '';
+      if (records.length === 0) {{
+        list.innerHTML = '<div class="chat-errors-empty">No errors in the last 3 days.</div>';
+        return;
+      }}
+      var html = '';
+      for (var i = 0; i < records.length; i++) {{
+        var r = records[i];
+        var ts = r.ts || '';
+        var cat = r.category || 'error';
+        var detail = r.detail || '';
+        var status = r.status_code ? ('HTTP ' + r.status_code) : '';
+        var endpoint = r.endpoint_id ? ('endpoint ' + r.endpoint_id) : '';
+        var meta = [ts, cat, status, endpoint].filter(function(s){{ return s && s.length; }}).join(' \u2022 ');
+        html += '<div class="chat-errors-row">';
+        html += '<div class="chat-errors-meta">' + escapeHtmlRaw(meta) + '</div>';
+        html += '<div class="chat-errors-detail">' + escapeHtmlRaw(detail) + '</div>';
+        if (r.preview_request || r.preview_response) {{
+          html += '<details class="chat-errors-preview"><summary>details</summary>';
+          if (r.preview_request) html += '<pre><code>request: ' + escapeHtmlRaw(r.preview_request) + '</code></pre>';
+          if (r.preview_response) html += '<pre><code>response: ' + escapeHtmlRaw(r.preview_response) + '</code></pre>';
+          html += '</details>';
+        }}
+        html += '</div>';
+      }}
+      list.innerHTML = html;
+    }})
+    .catch(function() {{
+      if (countEl) countEl.textContent = '';
+      list.innerHTML = '<div class="chat-errors-empty">Failed to load errors.</div>';
     }});
 }}
 
@@ -4454,6 +4507,138 @@ pub fn render_admin_audit_page(
     render_shell(
         PageShell {
             title: "Lore admin audit",
+            username: Some(username),
+            is_admin: true,
+            theme,
+            color_mode,
+            csrf_token: Some(csrf_token),
+            flash: None,
+        },
+        content,
+    )
+}
+
+pub fn render_admin_errors_page(
+    theme: UiTheme,
+    color_mode: ColorMode,
+    username: &str,
+    csrf_token: &str,
+    reporting_enabled: bool,
+) -> String {
+    let reporting_checked = if reporting_enabled { " checked" } else { "" };
+    let toggle_panel = format!(
+        r#"<section class="panel">
+        <div class="panel-header">
+          <h2>Server-side reporting</h2>
+          <p>When enabled, agent machines forward LLM/CLI errors here for the last 3 days. Agents always keep a local log in <code>.lore/&lt;agent&gt;/error-*.jsonl</code> regardless.</p>
+        </div>
+        <label class="toggle" style="padding:var(--s-5);">
+          <input type="checkbox" id="errors-reporting-toggle" data-csrf="{csrf_token}"{reporting_checked}>
+          <span>Accept and persist errors reported by agents</span>
+        </label>
+      </section>"#
+    );
+    let content = r#"<h1 class="page-title">Errors</h1>
+    <div class="layout admin-layout">
+      {TOGGLE_PANEL}
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Recent errors</h2>
+          <p>All agent and server LLM errors from the last 3 days. Newest first.</p>
+        </div>
+        <div class="errors-toolbar">
+          <input type="text" id="errors-filter-input" placeholder="Filter by owner, agent, or text"/>
+          <select id="errors-filter-category">
+            <option value="">All categories</option>
+            <option value="llm_api">LLM API</option>
+            <option value="cli">CLI</option>
+            <option value="tool">Tool</option>
+            <option value="parse">Parse</option>
+            <option value="manager">Manager</option>
+          </select>
+          <button class="btn-sm" id="errors-refresh" type="button" title="Refresh"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg></button>
+        </div>
+        <div class="errors-count" id="errors-count"></div>
+        <div class="errors-list" id="errors-list"><p class="hint padded">Loading errors...</p></div>
+      </section>
+    </div>
+<script>
+(function(){
+  var all = [];
+  function categoryLabel(c){
+    return ({llm_api:'LLM API',cli:'CLI',tool:'Tool',parse:'Parse',manager:'Manager'})[c] || c;
+  }
+  function escapeHtml(s){
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function render(){
+    var list = document.getElementById('errors-list');
+    var filter = (document.getElementById('errors-filter-input').value || '').toLowerCase();
+    var category = document.getElementById('errors-filter-category').value;
+    var rows = all.filter(function(r){
+      if (category && r.category !== category) return false;
+      if (!filter) return true;
+      var hay = [r.owner, r.agent, r.detail, r.category, r.endpoint_id].filter(Boolean).join(' ').toLowerCase();
+      return hay.indexOf(filter) >= 0;
+    });
+    document.getElementById('errors-count').textContent = rows.length + ' error' + (rows.length===1?'':'s');
+    if (!rows.length){
+      list.innerHTML = '<p class="hint padded">No errors match.</p>';
+      return;
+    }
+    list.innerHTML = rows.map(function(r){
+      var tag = r.agent ? (r.owner + ' / ' + r.agent) : (r.owner === '_server' ? 'server' : r.owner);
+      var status = r.status_code ? (' (HTTP ' + r.status_code + ')') : '';
+      var details = '';
+      if (r.preview_request || r.preview_response){
+        details = '<details class="errors-preview"><summary>Preview</summary>' +
+          (r.preview_request ? '<pre>REQUEST\n' + escapeHtml(r.preview_request) + '</pre>' : '') +
+          (r.preview_response ? '<pre>RESPONSE\n' + escapeHtml(r.preview_response) + '</pre>' : '') +
+          '</details>';
+      }
+      var endpoint = r.endpoint_id ? ' <span class="errors-endpoint">ep:' + escapeHtml(r.endpoint_id) + '</span>' : '';
+      return '<div class="errors-card">' +
+        '<div class="errors-card-head">' +
+          '<span class="errors-card-ts">' + escapeHtml(r.ts||'') + '</span>' +
+          '<span class="errors-card-scope">' + escapeHtml(tag) + '</span>' +
+          '<span class="errors-card-cat">' + escapeHtml(categoryLabel(r.category||'')) + status + '</span>' +
+          endpoint +
+        '</div>' +
+        '<div class="errors-card-detail">' + escapeHtml(r.detail||'') + '</div>' +
+        details +
+        '</div>';
+    }).join('');
+  }
+  function load(){
+    fetch('/v1/admin/errors').then(function(r){return r.json();}).then(function(data){
+      all = data.records || [];
+      render();
+    }).catch(function(){
+      document.getElementById('errors-list').innerHTML = '<p class="hint padded">Failed to load errors.</p>';
+    });
+  }
+  document.getElementById('errors-refresh').addEventListener('click', load);
+  document.getElementById('errors-filter-input').addEventListener('input', render);
+  document.getElementById('errors-filter-category').addEventListener('change', render);
+  var reportCb = document.getElementById('errors-reporting-toggle');
+  if (reportCb) {
+    reportCb.addEventListener('change', function(){
+      var csrf = reportCb.getAttribute('data-csrf');
+      fetch('/ui/admin/errors/reporting-toggle-json', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'csrf_token=' + encodeURIComponent(csrf) + '&enabled=' + reportCb.checked
+      });
+    });
+  }
+  load();
+})();
+</script>"#;
+
+    let content = content.replace("{TOGGLE_PANEL}", &toggle_panel);
+    render_shell(
+        PageShell {
+            title: "Lore admin errors",
             username: Some(username),
             is_admin: true,
             theme,
@@ -7856,6 +8041,136 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       padding: var(--s-1) var(--s-3);
       font-family: var(--font-mono);
       max-width: 100%;
+    }
+    .chat-msg-error {
+      align-self: stretch;
+      background: rgba(220, 38, 38, 0.08);
+      color: #dc2626;
+      border: 1px solid rgba(220, 38, 38, 0.35);
+      border-radius: var(--radius-sm);
+      font-size: 0.82rem;
+      padding: var(--s-1) var(--s-3);
+      font-family: var(--font-mono);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+    }
+    .chat-msg-error .chat-msg-content {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .chat-errors-list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-2);
+      overflow-y: auto;
+      max-height: 100%;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      padding: var(--s-2);
+      background: var(--bg-subtle, transparent);
+    }
+    .chat-errors-empty {
+      color: var(--fg-muted);
+      font-size: 0.85rem;
+      padding: var(--s-2);
+      text-align: center;
+    }
+    .chat-errors-row {
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-1);
+      padding: var(--s-2);
+      border-left: 3px solid #dc2626;
+      background: rgba(220, 38, 38, 0.04);
+      border-radius: var(--radius-sm);
+    }
+    .chat-errors-meta {
+      font-size: 0.75rem;
+      color: var(--fg-muted);
+      font-family: var(--font-mono);
+    }
+    .chat-errors-detail {
+      font-size: 0.85rem;
+      color: var(--fg);
+      word-break: break-word;
+    }
+    .chat-errors-preview {
+      font-size: 0.75rem;
+    }
+    .chat-errors-preview summary {
+      cursor: pointer;
+      color: var(--fg-muted);
+    }
+    .chat-errors-preview pre {
+      margin: var(--s-1) 0 0;
+      padding: var(--s-2);
+      background: var(--bg-subtle, #f5f5f5);
+      border-radius: var(--radius-sm);
+      max-height: 200px;
+      overflow: auto;
+    }
+    .errors-toolbar {
+      display: flex;
+      gap: var(--s-2);
+      align-items: center;
+      padding: var(--s-2) var(--s-3);
+      border-bottom: 1px solid var(--line);
+    }
+    .errors-toolbar input[type=text] {
+      flex: 1;
+    }
+    .errors-count {
+      padding: var(--s-2) var(--s-3);
+      color: var(--fg-muted);
+      font-size: 0.85rem;
+    }
+    .errors-list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-2);
+      padding: var(--s-3);
+    }
+    .errors-card {
+      padding: var(--s-2) var(--s-3);
+      border-left: 3px solid #dc2626;
+      background: rgba(220, 38, 38, 0.04);
+      border-radius: var(--radius-sm);
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-1);
+    }
+    .errors-card-head {
+      display: flex;
+      gap: var(--s-2);
+      flex-wrap: wrap;
+      font-size: 0.78rem;
+      color: var(--fg-muted);
+      font-family: var(--font-mono);
+    }
+    .errors-card-scope { color: var(--fg); font-weight: 600; }
+    .errors-card-cat { color: #dc2626; }
+    .errors-endpoint { color: var(--fg-muted); }
+    .errors-card-detail {
+      font-size: 0.9rem;
+      color: var(--fg);
+      word-break: break-word;
+    }
+    .errors-preview summary {
+      cursor: pointer;
+      color: var(--fg-muted);
+      font-size: 0.78rem;
+    }
+    .errors-preview pre {
+      margin: var(--s-1) 0 0;
+      padding: var(--s-2);
+      background: var(--bg-subtle, #f5f5f5);
+      border-radius: var(--radius-sm);
+      max-height: 240px;
+      overflow: auto;
+      font-size: 0.78rem;
     }
     .chat-msg-user .chat-msg-content,
     .chat-msg-system .chat-msg-content { white-space: pre-wrap; }

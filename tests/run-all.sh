@@ -20,42 +20,63 @@ cd ../..
 echo ""
 echo "=== Starting test server for UI tests ==="
 TEST_DIR=$(mktemp -d)
+PID_FILE="$TEST_DIR/.server.pid"
+SERVER_LOG="$TEST_DIR/.server.log"
 trap "rm -rf $TEST_DIR; pkill -f 'lore-server.*$TEST_DIR' 2>/dev/null || true" EXIT
 
 printf 'admin\ncorrect-horse-battery\ncorrect-horse-battery\n' | \
     script -qec "./target/release/lore-server --data-dir $TEST_DIR create-admin" /dev/null >/dev/null 2>&1
 
-LORE_SKIP_SELF_UPDATE=1 ./target/release/lore-server --data-dir "$TEST_DIR" --bind "127.0.0.1:0" start &
-SERVER_PID=$!
+# Pre-allocate a free port so restart-test-server.sh can reuse it.
+PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+BIND_ADDR="127.0.0.1:$PORT"
 
-for i in $(seq 1 30); do
-    PORT=$(ss -tlnp 2>/dev/null | grep "$SERVER_PID" | grep -oP '127\.0\.0\.1:\K\d+' | head -1 || true)
-    if [ -n "${PORT:-}" ]; then break; fi
+LORE_SKIP_SELF_UPDATE=1 ./target/release/lore-server --data-dir "$TEST_DIR" --bind "$BIND_ADDR" start > "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+echo "$SERVER_PID" > "$PID_FILE"
+
+for i in $(seq 1 60); do
+    if curl -s -o /dev/null -m 1 "http://127.0.0.1:$PORT/v1/health" 2>/dev/null; then
+        break
+    fi
     sleep 0.2
 done
 
-if [ -z "${PORT:-}" ]; then
-    echo "ERROR: Server failed to start"
+if ! curl -s -o /dev/null -m 1 "http://127.0.0.1:$PORT/v1/health"; then
+    echo "ERROR: Server failed to start on $BIND_ADDR"
     kill $SERVER_PID 2>/dev/null || true
     exit 1
 fi
 
 echo "Server on port $PORT (PID $SERVER_PID)"
 
+SERVER_BIN="$PWD/target/release/lore-server"
+RESTART_SCRIPT="$PWD/tests/scripts/restart-test-server.sh"
+
 echo ""
-echo "=== Playwright UI tests (18 tests) ==="
+echo "=== Playwright UI tests ==="
 cd tests/playwright
-LORE_URL="http://127.0.0.1:$PORT" npx playwright test 2>&1
+LORE_URL="http://127.0.0.1:$PORT" \
+  LORE_DATA_DIR="$TEST_DIR" \
+  LORE_BIND_ADDR="$BIND_ADDR" \
+  LORE_PID_FILE="$PID_FILE" \
+  LORE_SERVER_BIN="$SERVER_BIN" \
+  LORE_SERVER_LOG="$SERVER_LOG" \
+  LORE_RESTART_CMD="$RESTART_SCRIPT" \
+  npx playwright test 2>&1
 PW_EXIT=$?
 cd ../..
 
-kill $SERVER_PID 2>/dev/null || true
+# Server PID may have changed if tests restarted it; re-read.
+if [ -f "$PID_FILE" ]; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+fi
 
 echo ""
 echo "=== Summary ==="
 echo "Unit tests:        110 (cargo test --lib)"
-echo "Integration tests: 22  (cargo test --test integration)  $([ $RUST_EXIT -eq 0 ] && echo PASS || echo FAIL)"
-echo "Playwright tests:  18  (npx playwright test)            $([ $PW_EXIT -eq 0 ] && echo PASS || echo FAIL)"
-echo "Total:             150"
+echo "Integration tests: 26  (cargo test --test integration)  $([ $RUST_EXIT -eq 0 ] && echo PASS || echo FAIL)"
+echo "Playwright tests:  26  (npx playwright test)            $([ $PW_EXIT -eq 0 ] && echo PASS || echo FAIL)"
+echo "Total:             162"
 
 exit $(( RUST_EXIT + PW_EXIT ))

@@ -30,7 +30,7 @@ use crate::ui::{
     AgentTokenSummary, ChatAgentSummary, ProjectListEntry, UiAuditEvent, UiDiffLine,
     UiDiffLineKind, UiLibrarianAnswer, UiPendingLibrarianAction, UiProjectVersion,
     UiProjectVersionOperation, UiUserSummary, UserProjectAccess, render_admin_audit_page,
-    render_admin_page, render_agent_guide_page, render_chat_page, render_document_page,
+    render_admin_errors_page, render_admin_page, render_agent_guide_page, render_chat_page, render_document_page,
     render_login_page, render_project_audit_page, render_project_history_page,
     render_project_page, render_agents_page, render_projects_page, render_settings_page,
     render_setup_page,
@@ -374,7 +374,7 @@ fn build_app_with_librarian(
     store: FileBlockStore,
     librarian_client: Arc<dyn AnswerLibrarianClient>,
 ) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(root_redirect))
         .route("/login", get(login_page).post(login_submit))
         .route("/login/oidc", get(oidc_login_start))
@@ -467,6 +467,7 @@ fn build_app_with_librarian(
         .route("/v1/chat/respond", post(chat_agent_respond))
         .route("/v1/chat/status", post(chat_agent_update_status))
         .route("/v1/chat/history", get(chat_agent_history))
+        .route("/v1/chat/errors/report", post(chat_agent_errors_report))
         .route("/v1/chat/compact", post(chat_agent_compact))
         .route("/v1/chat/config", get(chat_agent_config))
         .route("/v1/chat/manage", get(chat_agent_get_manage))
@@ -584,10 +585,17 @@ fn build_app_with_librarian(
         .route("/ui/chat/{agent}/command", post(chat_slash_command))
         .route("/ui/chat/{agent}/config", post(chat_save_config).get(chat_get_config))
         .route("/ui/chat/{agent}/manage", post(chat_save_manage).get(chat_get_manage))
+        .route("/ui/chat/{agent}/errors", get(chat_errors_list))
         .route("/ui/settings", get(settings_page))
         .route("/ui/settings/theme", post(update_theme_from_ui))
         .route("/ui/admin", get(admin_page))
         .route("/ui/admin/audit", get(admin_audit_page))
+        .route("/ui/admin/errors", get(admin_errors_page))
+        .route("/v1/admin/errors", get(admin_errors_list))
+        .route(
+            "/ui/admin/errors/reporting-toggle-json",
+            post(toggle_agent_error_reporting_json),
+        )
         .route("/ui/admin/roles", post(create_role_from_ui))
         .route("/ui/admin/roles/{name}", post(update_role_from_ui))
         .route("/ui/admin/users", post(create_user_from_ui))
@@ -754,8 +762,23 @@ fn build_app_with_librarian(
             post(toggle_block_pin_from_form),
         )
         .route("/ui/{project}/compact", post(compact_blocks_from_form))
-        .layer(axum::middleware::map_response(add_security_headers))
-        .with_state(AppState::with_librarian(store, librarian_client))
+        .layer(axum::middleware::map_response(add_security_headers));
+
+    let state = AppState::with_librarian(store, librarian_client);
+    spawn_error_file_sweeper(state.clone());
+    router.with_state(state)
+}
+
+fn spawn_error_file_sweeper(state: AppState) {
+    tokio::spawn(async move {
+        sweep_agent_error_files(&state);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        interval.tick().await; // consume the initial immediate tick
+        loop {
+            interval.tick().await;
+            sweep_agent_error_files(&state);
+        }
+    });
 }
 
 async fn add_security_headers(mut response: Response) -> Response {
@@ -5191,12 +5214,17 @@ async fn answer_librarian(
     let project = ProjectName::new(project)?;
     let actor = authorize_project_read(&state, &headers, &project)?;
     let options = librarian_options_from_request(&payload)?;
+    let user_scope = match &actor {
+        RequestActor::User(u) => Some(u.clone()),
+        _ => None,
+    };
     let answer = answer_librarian_for_project(
         &state,
         &project,
         payload.question,
         options,
         librarian_actor_for_request_actor(&actor),
+        user_scope.as_ref(),
     )
     .await?;
     Ok(Json(answer))
@@ -5230,6 +5258,7 @@ async fn answer_librarian_from_ui(
             form.question,
             options,
             librarian_actor_for_user(&session.user),
+            Some(&session.user),
         )
         .await?;
     };
@@ -6632,6 +6661,7 @@ async fn answer_librarian_for_project(
     question: String,
     options: LibrarianOptions,
     actor: LibrarianActor,
+    user_scope: Option<&crate::auth::AuthenticatedUser>,
 ) -> Result<LibrarianAnswerBody, LoreError> {
     let created_at = OffsetDateTime::now_utc();
     let mut source_blocks = Vec::new();
@@ -6640,7 +6670,14 @@ async fn answer_librarian_for_project(
     let result = async {
         enforce_librarian_rate_limit(state, &actor, project)?;
         enforce_global_librarian_rate_limit(state)?;
-        let request = build_librarian_request(&state.store, project, &question, &options)?;
+        let mut request = build_librarian_request(&state.store, project, &question, &options)?;
+        if let Some(user) = user_scope {
+            let errors = collect_errors_for_librarian(state, user, 40);
+            let block = format_errors_block_for_prompt(&errors, 4000);
+            if !block.is_empty() {
+                request.context_errors = Some(block);
+            }
+        }
         source_blocks = request.context_blocks.clone();
         let LibrarianAnswer { answer } = state
             .librarian_client
@@ -6659,6 +6696,17 @@ async fn answer_librarian_for_project(
     }
     .await;
 
+    if let Err(ref e) = result {
+        record_server_error(
+            state,
+            "llm_api",
+            format!("librarian answer for project {project} failed: {e}"),
+            None,
+            Some(endpoint.id.clone()),
+            None,
+            None,
+        );
+    }
     let audit = librarian_audit_entry(
         project,
         actor,
@@ -6984,6 +7032,7 @@ fn build_librarian_request(
         project: project.clone(),
         question,
         context_blocks,
+        context_errors: None,
     };
     request.validate()?;
     let prompt = build_prompt(&request);
@@ -7148,6 +7197,7 @@ fn trim_context_to_prompt_limit(project: &ProjectName, question: &str, context: 
             project: project.clone(),
             question: question.to_string(),
             context_blocks: context.clone(),
+            context_errors: None,
         };
         if build_prompt(&request).chars().count() <= MAX_PROMPT_CHARS {
             break;
@@ -9500,7 +9550,7 @@ async fn chat_page(
                 .iter()
                 .map(|m| {
                     json!({
-                        "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant" },
+                        "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
                         "content": m.content,
                     })
                 })
@@ -9715,8 +9765,11 @@ async fn librarian_chat_ask_inner(
         if projects_context.is_empty() {
             return Ok(json!({ "ok": true, "answer": "No relevant content found across projects." }));
         }
-        let system = "You are Lore Answer Librarian. You are read-only. You have access to multiple Lore projects and only the project context provided in this request. Answer from that context, referencing project names where relevant. If the context is insufficient, say so plainly. Do not claim to run commands, browse the web, inspect anything outside the provided Lore blocks, or take actions.";
-        let user_msg = build_prompt_multi_project(&projects_context, &form.question);
+        let system = "You are Lore Answer Librarian. You are read-only. You have access to multiple Lore projects and only the project context provided in this request. Answer from that context, referencing project names where relevant. If the context is insufficient, say so plainly. Do not claim to run commands, browse the web, inspect anything outside the provided Lore blocks, or take actions. If a 'Recent agent/server errors' section is provided, you may reference it when the user asks about errors, agent failures, or reliability.";
+        let errors_records = collect_errors_for_librarian(state, &session.user, 40);
+        let errors_block = format_errors_block_for_prompt(&errors_records, 4000);
+        let errors_opt = if errors_block.is_empty() { None } else { Some(errors_block.as_str()) };
+        let user_msg = build_prompt_multi_project(&projects_context, &form.question, errors_opt);
         if user_msg.chars().count() > MAX_PROMPT_CHARS {
             return Ok(json!({ "ok": false, "error": "Combined context exceeds maximum prompt size." }));
         }
@@ -9728,6 +9781,18 @@ async fn librarian_chat_ask_inner(
             .librarian_client
             .answer_raw(&endpoint, config.request_timeout_secs, system, &user_msg)
             .await;
+        if let Err(ref e) = result {
+            let req_preview = format!("SYSTEM:\n{system}\n\nUSER:\n{user_msg}");
+            record_server_error(
+                state,
+                "llm_api",
+                format!("librarian multi-project answer failed: {e}"),
+                None,
+                Some(endpoint.id.clone()),
+                Some(req_preview),
+                None,
+            );
+        }
         let first_project = projects_context[0].0.clone();
         let audit = librarian_audit_entry(
             &first_project,
@@ -9779,6 +9844,7 @@ async fn librarian_chat_ask_inner(
             form.question.clone(),
             options,
             librarian_actor_for_user(&session.user),
+            Some(&session.user),
         )
         .await?;
         json!({
@@ -10193,6 +10259,8 @@ async fn chat_agent_respond(
     let owner_str = owner.as_str();
 
     if let Some(detail) = &body.tool_use {
+        let _ = state.chat.append_or_extend_tool(owner_str, &agent.name, detail);
+        state.chat_audit.log(&agent.name, owner_str, "tool", detail);
         push_chat_event(&state, owner_str, ChatEvent {
             event_type: "tool_use".into(),
             agent: agent.name.clone(),
@@ -10315,6 +10383,474 @@ async fn chat_agent_update_status(
     Ok(StatusCode::OK)
 }
 
+// --- Agent error reporting ---
+//
+// Machine-side errors (LLM API failures, CLI spawn/timeout, tool errors, parse errors)
+// are reported here fire-and-forget. Persisted under:
+//   <store_root>/errors/<owner>/<agent>/YYYY-MM-DD.jsonl
+// Retention: 3 days (swept hourly).
+// Caps: 8KB per entry, 10MB per daily file.
+
+const SERVER_ERROR_ENTRY_MAX_BYTES: usize = 8 * 1024;
+const SERVER_ERROR_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const SERVER_ERROR_RETENTION_DAYS: i64 = 3;
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct AgentErrorReport {
+    ts: String,
+    category: String,
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_request: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_response: Option<String>,
+}
+
+fn errors_dir_for(state: &AppState) -> std::path::PathBuf {
+    state.store.root().join("errors")
+}
+
+fn agent_error_reporting_config_path(state: &AppState) -> std::path::PathBuf {
+    state.store.root().join("config").join("agent-error-reporting.json")
+}
+
+/// Whether agent-reported errors are accepted and persisted server-side.
+/// Defaults to true (enabled) if the config file is absent or unreadable.
+fn agent_error_reporting_enabled(state: &AppState) -> bool {
+    let path = agent_error_reporting_config_path(state);
+    let Ok(bytes) = std::fs::read(&path) else { return true };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(v) => v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+fn set_agent_error_reporting_enabled(state: &AppState, enabled: bool) -> Result<(), LoreError> {
+    let path = agent_error_reporting_config_path(state);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(LoreError::Io)?;
+    }
+    let body = serde_json::json!({ "enabled": enabled });
+    std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap_or_default())
+        .map_err(LoreError::Io)?;
+    Ok(())
+}
+
+fn truncate_error_preview(s: &str) -> String {
+    truncate_head_tail_chars(s, 2730, 1366)
+}
+
+fn truncate_head_tail_chars(s: &str, head: usize, tail: usize) -> String {
+    let total: usize = s.chars().count();
+    if total <= head + tail {
+        return s.to_string();
+    }
+    let head_part: String = s.chars().take(head).collect();
+    let tail_part: String = s.chars().skip(total - tail).collect();
+    let omitted = total - head - tail;
+    format!("{head_part}\n\u{2026}[truncated {omitted} chars]\u{2026}\n{tail_part}")
+}
+
+fn today_utc_date_str() -> String {
+    let now = OffsetDateTime::now_utc();
+    format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day())
+}
+
+fn write_error_report_to_disk(
+    root: &std::path::Path,
+    owner: &str,
+    agent: Option<&str>,
+    report: &AgentErrorReport,
+) {
+    let mut dir = root.to_path_buf();
+    dir.push(owner);
+    if let Some(a) = agent { dir.push(a); }
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let path = dir.join(format!("{}.jsonl", today_utc_date_str()));
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() >= SERVER_ERROR_FILE_MAX_BYTES { return; }
+    }
+    let mut line = match serde_json::to_string(report) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if line.len() > SERVER_ERROR_ENTRY_MAX_BYTES {
+        let mut trimmed = report.clone();
+        trimmed.preview_response = trimmed.preview_response.map(|s| truncate_head_tail_chars(&s, 350, 150));
+        trimmed.preview_request = trimmed.preview_request.map(|s| truncate_head_tail_chars(&s, 350, 150));
+        line = serde_json::to_string(&trimmed).unwrap_or(line);
+        if line.len() > SERVER_ERROR_ENTRY_MAX_BYTES {
+            trimmed.preview_response = None;
+            trimmed.preview_request = None;
+            line = serde_json::to_string(&trimmed).unwrap_or(line);
+        }
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+pub fn sweep_agent_error_files(state: &AppState) {
+    let root = errors_dir_for(state);
+    let Ok(entries) = std::fs::read_dir(&root) else { return };
+    let today = OffsetDateTime::now_utc().date();
+    // Walk three levels: <owner>/<agent>/<date>.jsonl and <_server>/<date>.jsonl
+    for owner_entry in entries.flatten() {
+        let owner_path = owner_entry.path();
+        if !owner_path.is_dir() { continue; }
+        let Ok(subs) = std::fs::read_dir(&owner_path) else { continue };
+        for sub in subs.flatten() {
+            let p = sub.path();
+            if p.is_dir() {
+                if let Ok(files) = std::fs::read_dir(&p) {
+                    for f in files.flatten() {
+                        remove_if_expired(&f.path(), today);
+                    }
+                }
+            } else {
+                remove_if_expired(&p, today);
+            }
+        }
+    }
+}
+
+fn remove_if_expired(path: &std::path::Path, today: time::Date) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return };
+    let Some(date_part) = name.strip_suffix(".jsonl") else { return };
+    let parts: Vec<&str> = date_part.split('-').collect();
+    if parts.len() != 3 { return; }
+    let (Ok(y), Ok(m), Ok(d)) = (
+        parts[0].parse::<i32>(),
+        parts[1].parse::<u8>(),
+        parts[2].parse::<u8>(),
+    ) else { return };
+    let Some(month) = time::Month::try_from(m).ok() else { return };
+    let Ok(file_date) = time::Date::from_calendar_date(y, month, d) else { return };
+    if (today - file_date).whole_days() > SERVER_ERROR_RETENTION_DAYS {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+async fn chat_agent_errors_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<AgentErrorReport>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?
+        .ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    // Admin can turn off server-side persistence of agent errors. When disabled
+    // the agent still keeps a local copy in .lore/<agent>/error-YYYY-MM-DD.jsonl;
+    // we just don't store or surface it here.
+    if !agent_error_reporting_enabled(&state) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Backfill ts if missing.
+    if body.ts.is_empty() {
+        let now = OffsetDateTime::now_utc();
+        body.ts = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            now.year(), now.month() as u8, now.day(),
+            now.hour(), now.minute(), now.second()
+        );
+    }
+
+    let root = errors_dir_for(&state);
+    write_error_report_to_disk(&root, owner_str, Some(&agent.name), &body);
+
+    // Persist a compact human-readable line as a chat message (role=error)
+    // and notify live clients. Single line, truncated, prefixed by category.
+    let display = format_error_chat_line(&body);
+    state.chat_audit.log(&agent.name, owner_str, "error", &display);
+    if let Ok(msg) = state.chat.append_message(owner_str, &agent.name, ChatRole::Error, display) {
+        push_chat_event(&state, owner_str, ChatEvent {
+            event_type: "message".into(),
+            agent: agent.name.clone(),
+            owner: owner_str.to_string(),
+            data: json!({ "id": msg.id, "role": "error", "content": msg.content }),
+        });
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn record_server_error(
+    state: &AppState,
+    category: &str,
+    detail: impl Into<String>,
+    status_code: Option<u16>,
+    endpoint_id: Option<String>,
+    preview_request: Option<String>,
+    preview_response: Option<String>,
+) {
+    let now = OffsetDateTime::now_utc();
+    let ts = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        now.year(), now.month() as u8, now.day(),
+        now.hour(), now.minute(), now.second()
+    );
+    let report = AgentErrorReport {
+        ts,
+        category: category.to_string(),
+        detail: detail.into(),
+        endpoint_id,
+        status_code,
+        duration_ms: None,
+        preview_request: preview_request.map(|s| truncate_error_preview(&s)),
+        preview_response: preview_response.map(|s| truncate_error_preview(&s)),
+    };
+    let root = errors_dir_for(state);
+    write_error_report_to_disk(&root, "_server", None, &report);
+    eprintln!("[server-error] {} {}: {}", report.category,
+        report.status_code.map(|c| c.to_string()).unwrap_or_default(),
+        report.detail);
+}
+
+fn format_error_chat_line(r: &AgentErrorReport) -> String {
+    let category_label = match r.category.as_str() {
+        "llm_api" => "LLM API",
+        "cli" => "CLI",
+        "tool" => "Tool",
+        "parse" => "Parse",
+        "manager" => "Manager",
+        other => other,
+    };
+    let status = r.status_code.map(|s| format!(" (HTTP {s})")).unwrap_or_default();
+    // Collapse whitespace, cap to ~200 chars.
+    let detail = r.detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let detail_short: String = if detail.chars().count() > 200 {
+        let mut out: String = detail.chars().take(200).collect();
+        out.push('\u{2026}');
+        out
+    } else {
+        detail
+    };
+    format!("{category_label}{status}: {detail_short}")
+}
+
+async fn chat_errors_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent_name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_ui_session(&state, &headers)?;
+    let owner_name = &session.user.username;
+    let agents = state.auth.list_agent_tokens_for_user(owner_name)?;
+    if !agents.iter().any(|a| a.name == agent_name) {
+        return Err(ApiError::from(LoreError::PermissionDenied));
+    }
+
+    let root = errors_dir_for(&state);
+    let records = read_recent_error_records(&root, owner_name.as_str(), Some(&agent_name), 200);
+    Ok(Json(json!({ "records": records })))
+}
+
+fn read_recent_error_records(
+    root: &std::path::Path,
+    owner: &str,
+    agent: Option<&str>,
+    limit: usize,
+) -> Vec<Value> {
+    let mut dir = root.to_path_buf();
+    dir.push(owner);
+    if let Some(a) = agent { dir.push(a); }
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut files: Vec<std::path::PathBuf> = entries.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    files.sort();
+    files.reverse();
+    let mut out: Vec<Value> = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.reverse();
+        for line in lines {
+            if line.trim().is_empty() { continue; }
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                out.push(v);
+                if out.len() >= limit { return out; }
+            }
+        }
+    }
+    out
+}
+
+fn collect_errors_for_librarian(
+    state: &AppState,
+    user: &crate::auth::AuthenticatedUser,
+    limit: usize,
+) -> Vec<Value> {
+    let root = errors_dir_for(state);
+    if user.is_admin {
+        return read_all_error_records(&root, limit);
+    }
+    let owner = user.username.as_str();
+    let owner_path = root.join(owner);
+    let Ok(entries) = std::fs::read_dir(&owner_path) else { return Vec::new() };
+    let mut all: Vec<(String, String, Option<String>, Value)> = Vec::new();
+    for sub in entries.flatten() {
+        let sub_path = sub.path();
+        if sub_path.is_dir() {
+            let agent_name = sub_path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let Ok(files) = std::fs::read_dir(&sub_path) else { continue };
+            for f in files.flatten() {
+                collect_file_records(&f.path(), owner, Some(&agent_name), &mut all);
+            }
+        } else {
+            collect_file_records(&sub_path, owner, None, &mut all);
+        }
+    }
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.into_iter()
+        .take(limit)
+        .map(|(ts, owner, agent, v)| {
+            let mut obj = v.as_object().cloned().unwrap_or_default();
+            obj.insert("owner".to_string(), json!(owner));
+            if let Some(a) = agent { obj.insert("agent".to_string(), json!(a)); }
+            if !obj.contains_key("ts") { obj.insert("ts".to_string(), json!(ts)); }
+            Value::Object(obj)
+        })
+        .collect()
+}
+
+fn format_errors_block_for_prompt(records: &[Value], max_chars: usize) -> String {
+    if records.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for r in records {
+        let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+        let owner = r.get("owner").and_then(|v| v.as_str()).unwrap_or("");
+        let agent = r.get("agent").and_then(|v| v.as_str()).unwrap_or("_server");
+        let category = r.get("category").and_then(|v| v.as_str()).unwrap_or("");
+        let status = r.get("status_code").and_then(|v| v.as_u64()).map(|s| format!(" HTTP {s}")).unwrap_or_default();
+        let detail = r.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+        let detail_short: String = detail
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(240)
+            .collect();
+        let owner_label = if owner.is_empty() { String::new() } else { format!("{owner}/") };
+        let line = format!("- [{ts}] {owner_label}{agent} [{category}{status}]: {detail_short}\n");
+        if out.len() + line.len() > max_chars { break; }
+        out.push_str(&line);
+    }
+    out
+}
+
+fn read_all_error_records(root: &std::path::Path, limit: usize) -> Vec<Value> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut all: Vec<(String, String, Option<String>, Value)> = Vec::new();
+    for owner_entry in entries.flatten() {
+        let owner_path = owner_entry.path();
+        let owner_name = owner_path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        if owner_name.is_empty() { continue; }
+        if !owner_path.is_dir() { continue; }
+        let Ok(subs) = std::fs::read_dir(&owner_path) else { continue };
+        for sub in subs.flatten() {
+            let sub_path = sub.path();
+            if sub_path.is_dir() {
+                let agent_name = sub_path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                let Ok(files) = std::fs::read_dir(&sub_path) else { continue };
+                for f in files.flatten() {
+                    collect_file_records(&f.path(), &owner_name, Some(&agent_name), &mut all);
+                }
+            } else {
+                collect_file_records(&sub_path, &owner_name, None, &mut all);
+            }
+        }
+    }
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.into_iter()
+        .take(limit)
+        .map(|(ts, owner, agent, v)| {
+            let mut obj = v.as_object().cloned().unwrap_or_default();
+            obj.insert("owner".to_string(), json!(owner));
+            if let Some(a) = agent { obj.insert("agent".to_string(), json!(a)); }
+            if !obj.contains_key("ts") { obj.insert("ts".to_string(), json!(ts)); }
+            Value::Object(obj)
+        })
+        .collect()
+}
+
+fn collect_file_records(
+    path: &std::path::Path,
+    owner: &str,
+    agent: Option<&str>,
+    out: &mut Vec<(String, String, Option<String>, Value)>,
+) {
+    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { return; }
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    for line in text.lines() {
+        if line.trim().is_empty() { continue; }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        out.push((ts, owner.to_string(), agent.map(|s| s.to_string()), v));
+    }
+}
+
+async fn admin_errors_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let _session = require_ui_admin(&state, &headers)?;
+    let root = errors_dir_for(&state);
+    let records = read_all_error_records(&root, 500);
+    Ok(Json(json!({ "records": records })))
+}
+
+async fn admin_errors_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> UiResult<Html<String>> {
+    let session = require_ui_admin(&state, &headers)?;
+    let reporting_enabled = agent_error_reporting_enabled(&state);
+    Ok(Html(render_admin_errors_page(
+        resolved_theme(&session.user, &state.config.load()?),
+        resolved_color_mode(&session.user),
+        session.user.username.as_str(),
+        &session.csrf_token,
+        reporting_enabled,
+    )))
+}
+
+async fn toggle_agent_error_reporting_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    let session = require_ui_admin(&state, &headers)?;
+    let csrf = form.get("csrf_token").map(|s| s.as_str()).unwrap_or("");
+    verify_csrf(&session, csrf)?;
+    let enabled = form.get("enabled").map(|s| s == "true").unwrap_or(true);
+    set_agent_error_reporting_enabled(&state, enabled)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        if enabled { "enable agent error reporting" } else { "disable agent error reporting" },
+        None,
+        None,
+    )?;
+    Ok(axum::Json(serde_json::json!({ "ok": true, "enabled": enabled })))
+}
+
 async fn chat_agent_history(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -10331,7 +10867,7 @@ async fn chat_agent_history(
         .map(|m| {
             json!({
                 "id": m.id,
-                "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant" },
+                "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
                 "content": m.content,
                 "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
             })
@@ -10502,7 +11038,7 @@ async fn chat_agent_get_manage(
     };
     let recent_msgs: Vec<Value> = conv.messages[last_10_start..].iter().map(|m| {
         json!({
-            "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant" },
+            "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
             "content": m.content,
         })
     }).collect();
@@ -10587,13 +11123,34 @@ async fn chat_manager_proxy_completions(
         &state.librarian_client_http, &endpoint, &url, &body, 60,
     ).await;
 
+    let body_preview = serde_json::to_string(&body).ok();
     match result {
         Ok((status, response)) if status.is_success() => Ok(Json(response)),
-        Ok((_, response)) => {
+        Ok((status, response)) => {
             let err = crate::librarian::extract_provider_error(&response);
+            record_server_error(
+                &state,
+                "llm_api",
+                format!("manager proxy non-success: {err}"),
+                Some(status.as_u16()),
+                Some(endpoint.id.clone()),
+                body_preview.clone(),
+                Some(response.to_string()),
+            );
             Err(ApiError(LoreError::Validation(format!("Manager endpoint error: {err}"))))
         }
-        Err(e) => Err(ApiError(LoreError::Validation(format!("Manager request failed: {e}")))),
+        Err(e) => {
+            record_server_error(
+                &state,
+                "llm_api",
+                format!("manager proxy transport error: {e}"),
+                None,
+                Some(endpoint.id.clone()),
+                body_preview,
+                None,
+            );
+            Err(ApiError(LoreError::Validation(format!("Manager request failed: {e}"))))
+        }
     }
 }
 
@@ -10681,6 +11238,8 @@ async fn do_exchange_compact(
         let role = match msg.role {
             ChatRole::User => "User",
             ChatRole::Assistant => "Assistant",
+            ChatRole::Tool => "Tool",
+            ChatRole::Error => "Error",
         };
         let content: String = msg.content.chars().take(2000).collect();
         let content = if content.len() < msg.content.len() {
@@ -10764,9 +11323,20 @@ fn build_manager_prompt(mc: &ManageConfig, turn_in_cycle: u32) -> String {
         mc.goals, mc.stopping_point, mc.red_flags
     );
 
-    let sentinel = "\n\nIMPORTANT: If the stopping point criteria are met, respond with STOPPING_POINT in your message. \
-                     If any red flags are triggered, respond with RED_FLAG_POINT in your message. \
-                     Otherwise, do NOT include these tokens.";
+    let sentinel = "\n\nCRITICAL SIGNAL TOKENS:\n\
+                     The tokens STOPPING_POINT and RED_FLAG_POINT are control signals that halt the agent. \
+                     They are NOT words to discuss, quote, explain, echo, or demonstrate. \
+                     Any appearance of either token anywhere in your response is treated as a live signal and will stop the agent immediately.\n\n\
+                     You MUST NOT write STOPPING_POINT or RED_FLAG_POINT under ANY of the following circumstances:\n\
+                     - As examples, demonstrations, or illustrations of what the tokens look like\n\
+                     - When summarizing, paraphrasing, or restating these instructions\n\
+                     - Inside quotes, code blocks, backticks, or markdown\n\
+                     - When describing the stopping point or red flag criteria in prose\n\
+                     - In hypotheticals (\"if STOPPING_POINT were triggered...\")\n\
+                     - In any other context whatsoever\n\n\
+                     Write STOPPING_POINT ONLY when the stopping point criteria above are actually met right now and the agent should halt.\n\
+                     Write RED_FLAG_POINT ONLY when a red flag above has actually triggered right now and the agent should halt.\n\
+                     When referring to these concepts in guidance, use plain English (\"the stopping criteria\", \"a red flag\") \u{2014} never the literal token.";
 
     match turn_in_cycle {
         0 | 1 | 2 => format!(
@@ -11193,11 +11763,14 @@ async fn run_api_btw(
                     let tool_args: Value = serde_json::from_str(raw_args).unwrap_or(json!({}));
 
                     let detail = format_api_tool_display(tool_name, &tool_args);
+                    let labeled_detail = format!("[btw] {detail}");
+                    let _ = state.chat.append_or_extend_tool(&owner, &agent_name, &labeled_detail);
+                    state.chat_audit.log(&agent_name, &owner, "tool", &labeled_detail);
                     push_chat_event(&state, &owner, ChatEvent {
                         event_type: "tool_use".into(),
                         agent: agent_name.clone(),
                         owner: owner.clone(),
-                        data: json!({"detail": format!("[btw] {detail}")}),
+                        data: json!({"detail": labeled_detail}),
                     });
                     record_api_tool_activity(&state, &owner, &agent_name, tool_name, &tool_args);
 
@@ -11298,6 +11871,8 @@ async fn chat_proxy_completions(
         let model_clone = model.clone();
         let cid = completion_id.clone();
         let state_clone = state.clone();
+        let endpoint_id_for_stream = endpoint.id.clone();
+        let body_preview = serde_json::to_string(&body).ok();
         let stream = async_stream::stream! {
             while let Some(chunk) = rx.recv().await {
                 // Forward tool_calls to chat UI
@@ -11306,6 +11881,8 @@ async fn chat_proxy_completions(
                         for tc in tcs {
                             if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
                                 if !name.is_empty() {
+                                    let _ = state_clone.chat.append_or_extend_tool(&owner_str, &agent_name, name);
+                                    state_clone.chat_audit.log(&agent_name, &owner_str, "tool", name);
                                     push_chat_event(&state_clone, &owner_str, ChatEvent {
                                         event_type: "tool_use".into(),
                                         agent: agent_name.clone(),
@@ -11316,6 +11893,17 @@ async fn chat_proxy_completions(
                             }
                         }
                     }
+                }
+                if let crate::librarian::ProxyStreamChunk::Error(ref msg) = chunk {
+                    record_server_error(
+                        &state_clone,
+                        "llm_api",
+                        format!("chat proxy stream error: {msg}"),
+                        None,
+                        Some(endpoint_id_for_stream.clone()),
+                        body_preview.clone(),
+                        Some(msg.clone()),
+                    );
                 }
                 if let Some(formatted) = crate::librarian::format_openai_stream_chunk(&chunk, &model_clone, &cid) {
                     yield Ok::<_, std::convert::Infallible>(formatted);
@@ -11334,8 +11922,22 @@ async fn chat_proxy_completions(
             .unwrap())
     } else {
         let client = state.librarian_client_http.clone();
-        let result = crate::librarian::proxy_non_streaming(&client, &endpoint, &url, &body, 300).await?;
-        Ok(Json(result).into_response())
+        let body_preview = serde_json::to_string(&body).ok();
+        match crate::librarian::proxy_non_streaming(&client, &endpoint, &url, &body, 300).await {
+            Ok(result) => Ok(Json(result).into_response()),
+            Err(e) => {
+                record_server_error(
+                    &state,
+                    "llm_api",
+                    format!("chat proxy non-streaming error: {e}"),
+                    None,
+                    Some(endpoint.id.clone()),
+                    body_preview,
+                    None,
+                );
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -12712,6 +13314,7 @@ mod tests {
                 project: request.project.clone(),
                 question: request.instruction.clone(),
                 context_blocks: request.context_blocks.clone(),
+                context_errors: None,
             });
             Ok(ProjectLibrarianPlan {
                 summary: self.answer.clone(),

@@ -4,7 +4,7 @@ use crate::model::ProjectName;
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rand_core::OsRng;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
@@ -437,6 +437,20 @@ fn fmt_dt(dt: &OffsetDateTime) -> String {
 fn parse_dt(s: &str) -> OffsetDateTime {
     OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+/// Parse a tool-use line into (base, repeat_count). A trailing " (xN)" is
+/// treated as a repeat marker. Mirrors the UI aggregation in chat_stream.
+fn parse_tool_repeat(line: &str) -> (&str, Option<u32>) {
+    if let Some(open) = line.rfind(" (x") {
+        if line.ends_with(')') {
+            let inner = &line[open + 3..line.len() - 1];
+            if let Ok(n) = inner.parse::<u32>() {
+                return (&line[..open], Some(n));
+            }
+        }
+    }
+    (line, None)
 }
 
 impl LocalAuthStore {
@@ -1449,6 +1463,8 @@ pub fn hash_agent_token(token: &str) -> String {
 pub enum ChatRole {
     User,
     Assistant,
+    Tool,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1713,6 +1729,8 @@ impl ChatStore {
                 id: row.get::<_, i64>(0)? as u64,
                 role: match row.get::<_, String>(1)?.as_str() {
                     "assistant" => ChatRole::Assistant,
+                    "tool" => ChatRole::Tool,
+                    "error" => ChatRole::Error,
                     // fallback to User for unknown roles
                     _ => ChatRole::User,
                 },
@@ -1769,6 +1787,8 @@ impl ChatStore {
             let role_str = match msg.role {
                 ChatRole::User => "user",
                 ChatRole::Assistant => "assistant",
+                ChatRole::Tool => "tool",
+                ChatRole::Error => "error",
             };
             conn.execute(
                 "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1799,6 +1819,8 @@ impl ChatStore {
         let role_str = match role {
             ChatRole::User => "user",
             ChatRole::Assistant => "assistant",
+            ChatRole::Tool => "tool",
+            ChatRole::Error => "error",
         };
         conn.execute(
             "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1809,6 +1831,69 @@ impl ChatStore {
             params![next_id + 1, owner, agent],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(ChatMessage { id: next_id as u64, role, content, timestamp: now })
+    }
+
+    /// Append a tool-use detail. If the most recent message for this (owner,agent)
+    /// is already a Tool message, extend it with a new line (with x-count dedup on
+    /// consecutive duplicates, mirroring the live UI aggregation). Otherwise insert
+    /// a new Tool message. Returns the resulting stored message.
+    pub fn append_or_extend_tool(&self, owner: &str, agent: &str, detail: &str) -> Result<ChatMessage> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::ensure_conversation(&conn, owner, agent)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+
+        let last: Option<(i64, String, String, String)> = conn.query_row(
+            "SELECT id, role, content, timestamp FROM messages WHERE owner = ?1 AND agent = ?2 ORDER BY id DESC LIMIT 1",
+            params![owner, agent],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+
+        if let Some((last_id, last_role, last_content, last_ts)) = last {
+            if last_role == "tool" {
+                let mut lines: Vec<String> = last_content.split('\n').map(|s| s.to_string()).collect();
+                let prev = lines.last().cloned().unwrap_or_default();
+                let (prev_base, prev_count) = parse_tool_repeat(&prev);
+                if prev_base == detail {
+                    let new_count = prev_count.unwrap_or(1) + 1;
+                    let new_line = format!("{detail} (x{new_count})");
+                    let last_idx = lines.len() - 1;
+                    lines[last_idx] = new_line;
+                } else {
+                    lines.push(detail.to_string());
+                }
+                let new_content = lines.join("\n");
+                conn.execute(
+                    "UPDATE messages SET content = ?1 WHERE owner = ?2 AND agent = ?3 AND id = ?4",
+                    params![new_content, owner, agent, last_id],
+                ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+                return Ok(ChatMessage {
+                    id: last_id as u64,
+                    role: ChatRole::Tool,
+                    content: new_content,
+                    timestamp: parse_dt(&last_ts),
+                });
+            }
+        }
+
+        let next_id: i64 = conn.query_row(
+            "SELECT next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+            params![owner, agent], |row| row.get(0),
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let now = OffsetDateTime::now_utc();
+        conn.execute(
+            "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, 'tool', ?4, ?5)",
+            params![owner, agent, next_id, detail, fmt_dt(&now)],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "UPDATE conversations SET next_id = ?1 WHERE owner = ?2 AND agent = ?3",
+            params![next_id + 1, owner, agent],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(ChatMessage {
+            id: next_id as u64,
+            role: ChatRole::Tool,
+            content: detail.to_string(),
+            timestamp: now,
+        })
     }
 
     pub fn update_agent_status(&self, owner: &str, agent: &str, status: AgentChatStatus) -> Result<()> {
@@ -1884,6 +1969,8 @@ impl ChatStore {
             let role_str = match msg.role {
                 ChatRole::User => "user",
                 ChatRole::Assistant => "assistant",
+                ChatRole::Tool => "tool",
+                ChatRole::Error => "error",
             };
             conn.execute(
                 "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",

@@ -2111,7 +2111,8 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         // API mode: run local agentic loop, proxy LLM calls through the server
         eprintln!("[agent] Using API endpoint mode");
         let model_override = history["model"].as_str().map(|s| s.to_string());
-        run_api_agent_turn(context, agent_name, &user_context, project_context, accessible_projects, recent_activity, model_override.as_deref()).await?
+        let endpoint_id = body["endpoint_id"].as_str().map(|s| s.to_string());
+        run_api_agent_turn(context, agent_name, &user_context, project_context, accessible_projects, recent_activity, model_override.as_deref(), endpoint_id.as_deref()).await?
     } else {
         // CLI mode: spawn backend process — prepend system instructions to user context
         let system_instructions = build_lore_system_instructions(
@@ -2128,7 +2129,14 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
 
         let model_override = history["model"].as_str().map(|s| s.to_string());
         let effort_override = history["effort"].as_str().map(|s| s.to_string());
-        let mut child = spawn_backend(backend, &full_prompt, model_override.as_deref(), effort_override.as_deref()).await?;
+        let mut child = match spawn_backend(backend, &full_prompt, model_override.as_deref(), effort_override.as_deref()).await {
+            Ok(c) => c,
+            Err(e) => {
+                let rec = AgentErrorRecord::new("cli", format!("spawn {} failed: {e}", backend));
+                record_agent_error(context, agent_name, rec).await;
+                return Err(e);
+            }
+        };
 
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let reader = tokio::io::BufReader::new(stdout);
@@ -2240,10 +2248,24 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
 
     let has_endpoint = manage["has_endpoint"].as_bool().unwrap_or(false);
     let manager_response = if has_endpoint {
-        run_manager_endpoint(context, &system_prompt, messages).await?
+        match run_manager_endpoint(context, &system_prompt, messages).await {
+            Ok(s) => s,
+            Err(e) => {
+                let rec = AgentErrorRecord::new("manager", format!("endpoint call failed: {e}"));
+                record_agent_error(context, agent_name, rec).await;
+                return Err(e);
+            }
+        }
     } else {
         let backend: AgentBackend = backend_str.parse().unwrap_or(AgentBackend::Claude);
-        run_manager_cli(agent_name, backend, &system_prompt, messages).await?
+        match run_manager_cli(context, agent_name, backend, &system_prompt, messages).await {
+            Ok(s) => s,
+            Err(e) => {
+                let rec = AgentErrorRecord::new("manager", format!("cli run failed: {e}"));
+                record_agent_error(context, agent_name, rec).await;
+                return Err(e);
+            }
+        }
     };
 
     if manager_response.is_empty() {
@@ -2293,6 +2315,7 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
 }
 
 async fn run_manager_cli(
+    context: &CliContext,
     agent_name: &str,
     backend: AgentBackend,
     system_prompt: &str,
@@ -2323,7 +2346,14 @@ async fn run_manager_cli(
         let _ = fs::write(lore_dir.join("manager_context.txt"), &full_prompt);
     }
 
-    let mut child = spawn_backend(backend, &full_prompt, None, None).await?;
+    let mut child = match spawn_backend(backend, &full_prompt, None, None).await {
+        Ok(c) => c,
+        Err(e) => {
+            let rec = AgentErrorRecord::new("manager", format!("spawn {} failed: {e}", backend));
+            record_agent_error(context, agent_name, rec).await;
+            return Err(e);
+        }
+    };
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let reader = tokio::io::BufReader::new(stdout);
@@ -2355,10 +2385,16 @@ async fn run_manager_cli(
 
     match tokio::time::timeout(std::time::Duration::from_secs(300), read_output).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("[manager] CLI read error: {e}"),
+        Ok(Err(e)) => {
+            eprintln!("[manager] CLI read error: {e}");
+            let rec = AgentErrorRecord::new("manager", format!("cli stdout read error: {e}"));
+            record_agent_error(context, agent_name, rec).await;
+        }
         Err(_) => {
             eprintln!("[manager] CLI timed out after 5 minutes, killing process");
             let _ = child.kill().await;
+            let rec = AgentErrorRecord::new("manager", format!("{} cli timed out after 300s", backend));
+            record_agent_error(context, agent_name, rec).await;
             if full_response.is_empty() {
                 full_response = "[Manager timed out after 5 minutes]".to_string();
             }
@@ -2510,6 +2546,160 @@ fn build_api_tool_section(lore_tool_names: &[String]) -> String {
 You also have Lore MCP tools to manage knowledge base content: {}. Use list_documents to see the doc tree, list_blocks for block structure, read_block for content, edit_block for targeted changes, update_block for full rewrites.", lore_tool_names.join(", "))
 }
 
+// --- Agent error logging ---
+//
+// Each error is written as one JSON line to .lore/<agent>/error-YYYY-MM-DD.jsonl
+// and fire-and-forget reported to the server via POST /v1/chat/errors/report.
+// Local retention: 3 days (files older than 3 days by filename date are deleted on every write).
+// Per-entry cap: 8KB (preview_request/preview_response truncated to fit).
+// Per-file cap: 10MB (further writes skipped once exceeded).
+
+const ERROR_ENTRY_MAX_BYTES: usize = 8 * 1024;
+const ERROR_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const ERROR_RETENTION_DAYS: i64 = 3;
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentErrorRecord {
+    ts: String,
+    category: String,          // llm_api | cli | tool | parse | manager
+    detail: String,            // short human-readable message
+    endpoint_id: Option<String>,
+    status_code: Option<u16>,
+    duration_ms: Option<u64>,
+    preview_request: Option<String>,
+    preview_response: Option<String>,
+}
+
+impl AgentErrorRecord {
+    fn new(category: &str, detail: impl Into<String>) -> Self {
+        let now = time::OffsetDateTime::now_utc();
+        let ts = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            now.year(), now.month() as u8, now.day(),
+            now.hour(), now.minute(), now.second()
+        );
+        Self {
+            ts,
+            category: category.to_string(),
+            detail: detail.into(),
+            endpoint_id: None,
+            status_code: None,
+            duration_ms: None,
+            preview_request: None,
+            preview_response: None,
+        }
+    }
+    fn with_status(mut self, s: u16) -> Self { self.status_code = Some(s); self }
+    fn with_endpoint(mut self, e: Option<String>) -> Self { self.endpoint_id = e; self }
+    fn with_preview_request(mut self, s: impl Into<String>) -> Self {
+        self.preview_request = Some(truncate_preview(&s.into()));
+        self
+    }
+    fn with_preview_response(mut self, s: impl Into<String>) -> Self {
+        self.preview_response = Some(truncate_preview(&s.into()));
+        self
+    }
+}
+
+fn truncate_preview(s: &str) -> String {
+    // Keep the head and the tail so we can see the system prompt / opening request
+    // shape AND the trailing part (often where the failing tool call or the last
+    // user turn lives). Total budget: ~4KB chars, split ~2/3 head, 1/3 tail.
+    truncate_head_tail(s, 2730, 1366)
+}
+
+fn truncate_head_tail(s: &str, head: usize, tail: usize) -> String {
+    let total: usize = s.chars().count();
+    if total <= head + tail {
+        return s.to_string();
+    }
+    let head_part: String = s.chars().take(head).collect();
+    let tail_part: String = s.chars().skip(total - tail).collect();
+    let omitted = total - head - tail;
+    format!("{head_part}\n\u{2026}[truncated {omitted} chars]\u{2026}\n{tail_part}")
+}
+
+fn today_utc_date() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day())
+}
+
+fn prune_old_error_files(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let today = time::OffsetDateTime::now_utc().date();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(date_part) = name.strip_prefix("error-").and_then(|s| s.strip_suffix(".jsonl")) else { continue };
+        let parts: Vec<&str> = date_part.split('-').collect();
+        if parts.len() != 3 { continue; }
+        let (Ok(y), Ok(m), Ok(d)) = (
+            parts[0].parse::<i32>(),
+            parts[1].parse::<u8>(),
+            parts[2].parse::<u8>(),
+        ) else { continue };
+        let Some(month) = time::Month::try_from(m).ok() else { continue };
+        let Ok(file_date) = time::Date::from_calendar_date(y, month, d) else { continue };
+        if (today - file_date).whole_days() > ERROR_RETENTION_DAYS {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn write_agent_error_locally(agent_name: &str, record: &AgentErrorRecord) {
+    let dir = PathBuf::from(format!(".lore/{}", agent_name));
+    if fs::create_dir_all(&dir).is_err() { return; }
+    prune_old_error_files(&dir);
+    let path = dir.join(format!("error-{}.jsonl", today_utc_date()));
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() >= ERROR_FILE_MAX_BYTES { return; }
+    }
+    let Ok(mut line) = serde_json::to_string(record) else { return };
+    if line.len() > ERROR_ENTRY_MAX_BYTES {
+        // Progressively shrink preview fields (still keeping head+tail) until it fits.
+        let mut trimmed = record.clone();
+        trimmed.preview_response = trimmed.preview_response.map(|s| truncate_head_tail(&s, 350, 150));
+        trimmed.preview_request = trimmed.preview_request.map(|s| truncate_head_tail(&s, 350, 150));
+        line = serde_json::to_string(&trimmed).unwrap_or(line);
+        if line.len() > ERROR_ENTRY_MAX_BYTES {
+            trimmed.preview_response = None;
+            trimmed.preview_request = None;
+            line = serde_json::to_string(&trimmed).unwrap_or(line);
+        }
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+async fn report_agent_error_to_server(context: &CliContext, record: &AgentErrorRecord) {
+    let Some(token) = context.token.as_deref() else { return };
+    let url = format!("{}/v1/chat/errors/report", context.url);
+    let body = serde_json::to_value(record).unwrap_or(serde_json::json!({}));
+    let send = || async {
+        context.client
+            .post(&url)
+            .header("x-lore-key", token)
+            .timeout(std::time::Duration::from_secs(5))
+            .json(&body)
+            .send()
+            .await
+    };
+    match send().await {
+        Ok(r) if r.status().is_success() => {}
+        _ => {
+            // Single retry, then drop.
+            let _ = send().await;
+        }
+    }
+}
+
+async fn record_agent_error(context: &CliContext, agent_name: &str, record: AgentErrorRecord) {
+    write_agent_error_locally(agent_name, &record);
+    report_agent_error_to_server(context, &record).await;
+}
+
 // --- API agent loop (runs on machine, proxies LLM calls through server) ---
 
 const API_AGENT_MAX_TURNS: usize = 500;
@@ -2526,7 +2716,9 @@ async fn run_api_agent_turn(
     accessible_projects: &str,
     recent_activity: &str,
     model_override: Option<&str>,
+    endpoint_id: Option<&str>,
 ) -> CliResult<String> {
+    let endpoint_id_owned = endpoint_id.map(|s| s.to_string());
     let token = context.token.as_deref().ok_or("no token configured")?;
     let mut tools = build_local_tools();
 
@@ -2600,18 +2792,23 @@ async fn run_api_agent_turn(
                     continue;
                 }
                 let err_text = format!("API request error: {e}");
+                let rec = AgentErrorRecord::new("llm_api", &err_text)
+                    .with_endpoint(endpoint_id_owned.clone())
+                    .with_preview_request(serde_json::to_string(&body).unwrap_or_default());
+                record_agent_error(context, agent_name, rec).await;
                 accumulated_text.push_str(&format!("\n\n[{err_text}]"));
                 break;
             }
         };
 
         let status = resp.status();
-        let resp_body: serde_json::Value = resp.json().await?;
+        let resp_text = resp.text().await.unwrap_or_default();
+        let resp_body: serde_json::Value = serde_json::from_str(&resp_text).unwrap_or(serde_json::Value::Null);
 
         if !status.is_success() {
             let err = resp_body["error"]["message"].as_str()
                 .or_else(|| resp_body["error"].as_str())
-                .unwrap_or("unknown error");
+                .unwrap_or_else(|| if resp_text.is_empty() { "unknown error" } else { resp_text.as_str() });
 
             if status.as_u16() == 429 && !rate_limit_retried {
                 rate_limit_retried = true;
@@ -2640,7 +2837,14 @@ async fn run_api_agent_turn(
                 }
             }
 
-            accumulated_text.push_str(&format!("\n\n[API error ({status}): {err}]"));
+            let detail = format!("API error ({status}): {err}");
+            let rec = AgentErrorRecord::new("llm_api", &detail)
+                .with_status(status.as_u16())
+                .with_endpoint(endpoint_id_owned.clone())
+                .with_preview_request(serde_json::to_string(&body).unwrap_or_default())
+                .with_preview_response(resp_text.clone());
+            record_agent_error(context, agent_name, rec).await;
+            accumulated_text.push_str(&format!("\n\n[{detail}]"));
             break;
         }
 
@@ -2677,7 +2881,13 @@ async fn run_api_agent_turn(
 
                     let (tool_args, parse_error) = match serde_json::from_str::<serde_json::Value>(raw_args) {
                         Ok(v) => (v, false),
-                        Err(_) => (serde_json::json!({}), true),
+                        Err(e) => {
+                            let rec = AgentErrorRecord::new("parse", format!("tool arg JSON parse failed: {e}"))
+                                .with_endpoint(endpoint_id_owned.clone())
+                                .with_preview_request(format!("tool={tool_name} args={raw_args}"));
+                            record_agent_error(context, agent_name, rec).await;
+                            (serde_json::json!({}), true)
+                        }
                     };
 
                     let is_lore_tool = lore_names.contains(tool_name);

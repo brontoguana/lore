@@ -361,6 +361,7 @@ pub struct LibrarianRequest {
     pub project: ProjectName,
     pub question: String,
     pub context_blocks: Vec<Block>,
+    pub context_errors: Option<String>,
 }
 
 impl LibrarianRequest {
@@ -912,7 +913,7 @@ impl AnswerLibrarianClient for HttpLibrarianClient {
         request: &LibrarianRequest,
     ) -> Result<LibrarianAnswer> {
         request.validate()?;
-        let system = "You are Lore Answer Librarian. You are read-only. You have access to exactly one Lore project and only the project context provided in this request. Answer only from that context. If the context is insufficient, say so plainly. Do not claim to run commands, browse the web, inspect anything outside the provided Lore blocks, or take actions.";
+        let system = "You are Lore Answer Librarian. You are read-only. You have access to exactly one Lore project and only the project context provided in this request. Answer only from that context. If the context is insufficient, say so plainly. Do not claim to run commands, browse the web, inspect anything outside the provided Lore blocks, or take actions. If a 'Recent agent/server errors' section is provided, you may reference it when the user asks about errors, agent failures, or reliability.";
         let user_msg = build_prompt(request);
         send_librarian_llm_request(&self.client, endpoint, timeout_secs, system, &user_msg).await
     }
@@ -1262,6 +1263,13 @@ pub fn build_prompt(request: &LibrarianRequest) -> String {
         request.project.as_str(),
         request.question.trim()
     );
+    if let Some(errors) = &request.context_errors {
+        if !errors.trim().is_empty() {
+            prompt.push_str("\nRecent agent/server errors (scoped to asker):\n");
+            prompt.push_str(errors);
+            prompt.push('\n');
+        }
+    }
     if request.context_blocks.is_empty() {
         prompt.push_str("\nNo blocks were available for this project.\n");
         return prompt;
@@ -1294,6 +1302,7 @@ pub fn build_prompt(request: &LibrarianRequest) -> String {
 pub fn build_prompt_multi_project(
     projects_context: &[(ProjectName, Vec<Block>)],
     question: &str,
+    context_errors: Option<&str>,
 ) -> String {
     let project_names: Vec<&str> = projects_context.iter().map(|(p, _)| p.as_str()).collect();
     let mut prompt = format!(
@@ -1301,6 +1310,13 @@ pub fn build_prompt_multi_project(
         project_names.join(", "),
         question.trim(),
     );
+    if let Some(errors) = context_errors {
+        if !errors.trim().is_empty() {
+            prompt.push_str("\nRecent agent/server errors (scoped to asker):\n");
+            prompt.push_str(errors);
+            prompt.push('\n');
+        }
+    }
     let total_blocks: usize = projects_context.iter().map(|(_, blocks)| blocks.len()).sum();
     if total_blocks == 0 {
         prompt.push_str("\nNo blocks were available.\n");
