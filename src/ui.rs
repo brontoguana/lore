@@ -8960,7 +8960,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       cursor: pointer;
     }
 
-    input:not([type="checkbox"]), select, textarea, button {
+    input:not([type="checkbox"]), select, textarea {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: var(--s-3);
