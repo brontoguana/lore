@@ -7975,7 +7975,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       height: 28px;
       padding: 0;
       min-height: auto;
-      border-radius: 5px;
+      border-radius: 6px;
       flex-shrink: 0;
     }
     .chat-header-icon {
@@ -7984,7 +7984,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       justify-content: center;
       width: 28px;
       height: 28px;
-      border-radius: 5px;
+      border-radius: 6px;
       background: rgba(0,0,0,0.12);
       flex-shrink: 0;
     }
@@ -9043,7 +9043,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-weight: 700;
       cursor: pointer;
       min-height: 48px;
-      border-radius: 5px;
+      border-radius: 8px;
     }
 
     button:hover {
@@ -9064,7 +9064,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       height: 28px;
       min-height: auto;
       padding: 0;
-      border-radius: 5px;
+      border-radius: 6px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -9081,7 +9081,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       min-height: 48px;
       padding: var(--s-3) var(--s-4);
       font-size: 16px;
-      border-radius: 5px;
+      border-radius: 8px;
     }
 
     .create-agent-panel select,
