@@ -53,6 +53,9 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
       <span class="eyebrow" style="margin-top:2px;">{username}</span>
     </div>
     <div class="nav-right-btns">
+      <a href="/ui" class="nav-projects-btn" aria-label="Projects">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></svg>
+      </a>
       <a href="/ui/chat" class="nav-chat-btn" aria-label="Chat">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
       </a>
@@ -61,7 +64,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
       </button>
     </div>
     <div class="top-nav-links" id="top-nav-links">
-      <a href="/ui">Projects</a>
+      <a href="/ui" class="nav-link-projects">Projects</a>
       <a href="/ui/chat" class="nav-link-chat">Chat</a>
       <a href="/ui/agents">Agents</a>
       {admin_link}
@@ -7500,11 +7503,13 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: contents;
     }
 
+    .nav-projects-btn,
     .nav-chat-btn {
       display: none;
       color: var(--muted);
       padding: var(--s-2);
     }
+    .nav-projects-btn:hover,
     .nav-chat-btn:hover {
       color: var(--ink);
     }
@@ -9549,12 +9554,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         gap: var(--s-1);
       }
 
+      .nav-projects-btn,
       .nav-chat-btn {
         display: flex;
         align-items: center;
         justify-content: center;
       }
 
+      .nav-link-projects,
       .nav-link-chat {
         display: none;
       }
