@@ -4276,32 +4276,49 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                 if let Some((target_version, repo)) = update_info {
                     eprintln!("[service] Self-update to v{target_version} requested, stopping all agents...");
                     svc_state.stop_all_agents();
+                    // Resolve exe path BEFORE update — after update /proc/self/exe
+                    // points to the deleted old binary which can cause exec issues.
+                    let exe = resolved_current_exe()?;
                     let mut cfg = load_cli_config()?;
                     match apply_cli_update_to_target(&mut cfg, &target_version, &repo).await {
                         Ok(()) => {
-                            eprintln!("[service] Updated CLI binary, re-launching service...");
-                            let exe = resolved_current_exe()?;
-                            let args_vec: Vec<String> = env::args().skip(1).collect();
-                            let mut cmd = std::process::Command::new(&exe);
-                            cmd.args(&args_vec);
-                            cmd.env(LORE_SERVICE_DAEMON_ENV, "1");
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::process::CommandExt;
-                                let err = cmd.exec();
-                                eprintln!("[service] Failed to re-exec: {err}");
-                                std::process::exit(1);
-                            }
-                            #[cfg(not(unix))]
-                            {
-                                match cmd.spawn() {
-                                    Ok(_) => std::process::exit(0),
-                                    Err(e) => {
-                                        eprintln!("[service] Failed to re-exec: {e}");
-                                        std::process::exit(1);
+                            eprintln!("[service] Updated CLI binary, re-launching as {}", exe.display());
+                            let lore_dir = env::var("HOME").map(PathBuf::from)
+                                .unwrap_or_else(|_| PathBuf::from("."))
+                                .join("lore-service");
+                            let log_path = lore_dir.join("service.log");
+                            let pid_path = lore_dir.join("service.pid");
+                            let log_file = fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&log_path);
+                            match log_file {
+                                Ok(log_file) => {
+                                    match std::process::Command::new(&exe)
+                                        .args(["--url", &context.url, "--token", machine_token, "service", "--fg"])
+                                        .env(LORE_SERVICE_DAEMON_ENV, "1")
+                                        .stdout(log_file.try_clone().unwrap_or_else(|_| log_file.try_clone().expect("log clone")))
+                                        .stderr(log_file)
+                                        .stdin(std::process::Stdio::null())
+                                        .spawn()
+                                    {
+                                        Ok(child) => {
+                                            let _ = fs::write(&pid_path, child.id().to_string());
+                                            eprintln!("[service] New service started (pid {}), exiting old.", child.id());
+                                            std::process::exit(0);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[service] Failed to spawn new service: {e}");
+                                            // Fall through to restart agents on old binary
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    eprintln!("[service] Failed to open log file: {e}");
+                                }
                             }
+                            // If spawn failed, restart agents on old binary and keep running
+                            svc_state.restart_crashed_agents(context);
                         }
                         Err(e) => {
                             eprintln!("[service] Update failed: {e}");

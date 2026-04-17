@@ -542,13 +542,19 @@ fn hex_sha256(bytes: &[u8]) -> String {
     output
 }
 
-fn copy_permissions(source: &Path, target: &Path) -> Result<()> {
-    let permissions = fs::metadata(source)?.permissions();
-    fs::set_permissions(target, permissions)?;
+fn copy_permissions(_source: &Path, target: &Path) -> Result<()> {
     #[cfg(unix)]
     {
+        // On Unix we always set 0o755 regardless of source permissions,
+        // so skip reading source metadata (which fails if the running
+        // binary was already deleted by a prior update).
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let permissions = fs::metadata(source)?.permissions();
+        fs::set_permissions(target, permissions)?;
     }
     Ok(())
 }

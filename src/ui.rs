@@ -3423,8 +3423,7 @@ function selectAgent(name) {{
 }}
 
 function showAgentList() {{
-  var layout = document.querySelector('.chat-layout');
-  if (layout) layout.classList.add('chat-sidebar-show');
+  window.location.href = '/ui/chat';
 }}
 
 /* Fix mobile keyboard dismiss: browser sometimes leaves page scrolled
@@ -3839,29 +3838,7 @@ function connectSSE() {{
   }};
 }}
 
-// Mobile swipe: right to show agent list, left to show chat
-(function() {{
-  var touchStartX = 0;
-  var touchStartY = 0;
-  document.addEventListener('touchstart', function(e) {{
-    touchStartX = e.touches[0].clientX;
-    touchStartY = e.touches[0].clientY;
-  }}, {{ passive: true }});
-  document.addEventListener('touchend', function(e) {{
-    var dx = e.changedTouches[0].clientX - touchStartX;
-    var dy = e.changedTouches[0].clientY - touchStartY;
-    if (Math.abs(dx) < 60 || Math.abs(dy) > Math.abs(dx)) return;
-    var layout = document.querySelector('.chat-layout');
-    if (!layout) return;
-    if (dx > 0) {{
-      // Swipe right: show agent list
-      layout.classList.add('chat-sidebar-show');
-    }} else {{
-      // Swipe left: show chat
-      layout.classList.remove('chat-sidebar-show');
-    }}
-  }}, {{ passive: true }});
-}})();
+// No custom swipe handler on mobile — let the OS/browser handle back navigation
 
 var chatConfigOpen = false;
 var chatManageOpen = false;
@@ -9539,8 +9516,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-main { display: none; }
       .chat-has-agent .chat-sidebar { display: none; }
       .chat-has-agent .chat-main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
-      .chat-sidebar-show .chat-sidebar { display: flex !important; }
-      .chat-sidebar-show .chat-main { display: none !important; }
       .chat-back-btn { display: flex; }
       .chat-msg { max-width: 90%; }
 
