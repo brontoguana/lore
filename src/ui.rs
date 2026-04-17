@@ -7770,7 +7770,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
 
     /* Chat — full-viewport layout, no page scroll */
-    body:has(.chat-layout) { overflow: hidden; }
+    body:has(.chat-layout) { overflow: hidden; position: fixed; inset: 0; }
     .shell:has(.chat-layout) {
       width: 100%;
       max-width: 100%;
@@ -7792,6 +7792,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       flex-direction: column;
       overflow-y: auto;
+      overscroll-behavior: none;
     }
     .chat-sidebar-header {
       padding: var(--s-3) var(--s-4);
@@ -7803,6 +7804,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-agent-list {
       flex: 1;
       overflow-y: auto;
+      overscroll-behavior: none;
     }
     .chat-agent-item {
       padding: var(--s-3) var(--s-4);
@@ -7922,6 +7924,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-config-panel {
       flex: 1;
       overflow-y: auto;
+      overscroll-behavior: none;
       padding: var(--s-5);
     }
     .chat-config-inner {
@@ -7971,6 +7974,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-messages {
       flex: 1;
       overflow-y: auto;
+      overscroll-behavior: none;
       padding: var(--s-4);
       display: flex;
       flex-direction: column;
@@ -9444,9 +9448,16 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
 
     @media (max-width: 860px) {
+      .top-nav {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        width: 100%;
+      }
       .shell {
         width: min(100vw - 16px, 1080px);
-        padding-top: max(8px, env(safe-area-inset-top));
+        padding-top: calc(64px + max(8px, env(safe-area-inset-top)));
         padding-bottom: calc(28px + env(safe-area-inset-bottom));
       }
 
@@ -9505,7 +9516,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         position: relative;
       }
 
-      /* Chat mobile */
+      /* Chat mobile — shell padding reset (fixed header accounted for in chat-layout height) */
+      .shell:has(.chat-layout) { padding-top: 0; }
       .chat-layout { flex-direction: column; }
       .chat-sidebar {
         width: 100%;
