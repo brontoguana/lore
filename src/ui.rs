@@ -9556,7 +9556,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-main { display: none; }
       .chat-has-agent .chat-sidebar { display: none; }
       .chat-has-agent .chat-main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
-      .chat-back-btn { display: flex; }
+      .chat-back-btn { display: flex; padding-left: 0; margin-left: calc(-1 * var(--s-1)); }
+      .chat-header { gap: var(--s-2); padding-left: var(--s-2); }
+      .chat-header-cwd { display: none; }
       .chat-msg { max-width: 90%; }
 
       .tree-perm { display: none; }
