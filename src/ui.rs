@@ -9516,9 +9516,12 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         position: relative;
       }
 
-      /* Chat mobile — shell padding reset (fixed header accounted for in chat-layout height) */
-      .shell:has(.chat-layout) { padding-top: 0; }
-      .chat-layout { flex-direction: column; }
+      /* Chat mobile — keep shell padding-top (pushes below fixed header), kill bottom padding */
+      .shell:has(.chat-layout) { padding-bottom: 0; }
+      .chat-layout {
+        flex-direction: column;
+        height: calc(100dvh - 64px - max(8px, env(safe-area-inset-top)));
+      }
       .chat-sidebar {
         width: 100%;
         min-width: 100%;
