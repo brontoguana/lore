@@ -7940,6 +7940,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       cursor: pointer;
       padding: var(--s-2);
       min-height: auto;
+      width: auto;
     }
     .chat-config-panel {
       flex: 1;
