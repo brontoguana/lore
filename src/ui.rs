@@ -7938,9 +7938,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border: none;
       color: var(--fg);
       cursor: pointer;
-      padding: var(--s-2);
+      width: 28px;
+      height: 28px;
+      padding: 0;
       min-height: auto;
-      width: auto;
+      border-radius: 5px;
     }
     .chat-config-panel {
       flex: 1;
@@ -8287,7 +8289,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       position: fixed;
       top: 0; left: 0;
       width: 100%; height: 100%;
-      background: rgba(0,0,0,0.85);
+      background: color-mix(in srgb, var(--bg) 90%, transparent);
+      backdrop-filter: blur(4px);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -8301,14 +8304,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       max-height: 90vh;
       border-radius: 8px;
       padding: 1rem;
-      background: #fff;
+      background: var(--panel);
     }
     .svg-overlay-close {
       position: fixed;
       top: 1rem; right: 1rem;
-      background: rgba(255,255,255,0.15);
+      background: var(--surface-hover);
       border: none;
-      color: #fff;
+      color: var(--ink);
       font-size: 1.5rem;
       cursor: pointer;
       z-index: 10000;
@@ -8318,7 +8321,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       justify-content: center;
       border-radius: 50%;
     }
-    .svg-overlay-close:hover { background: rgba(255,255,255,0.3); }
+    .svg-overlay-close:hover { background: var(--line); }
     .chat-input-form {
       display: flex;
       gap: var(--s-2);
@@ -9558,7 +9561,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-main { display: none; }
       .chat-has-agent .chat-sidebar { display: none; }
       .chat-has-agent .chat-main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
-      .chat-back-btn { display: flex; padding: 4px; margin: 0; }
+      .chat-back-btn { display: flex; margin: 0; }
       .chat-header { gap: 4px; padding: 8px 8px 8px 0; }
       .chat-header .chat-avatar-sm-wrap { margin-right: 0; margin-left: 0; }
       .chat-header .chat-avatar-header { margin: 0; }
