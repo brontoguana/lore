@@ -7769,20 +7769,32 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .agent-status-badge.stopped { color: var(--fg-muted); }
     }
 
-    /* Chat — full-viewport layout, no page scroll */
-    body:has(.chat-layout) { overflow: hidden; position: fixed; inset: 0; }
+    /* Chat — flex column: nav on top, chat fills the rest. No overlap. */
+    body:has(.chat-layout) {
+      overflow: hidden;
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      padding-top: env(safe-area-inset-top, 0px);
+    }
+    .top-nav:has(~ .shell .chat-layout) {
+      margin-bottom: 0;
+      position: static;
+      flex-shrink: 0;
+    }
     .shell:has(.chat-layout) {
       width: 100%;
       max-width: 100%;
       padding: 0;
       margin: 0;
       overflow: hidden;
+      flex: 1;
+      min-height: 0;
     }
-    .top-nav:has(~ .shell .chat-layout) { margin-bottom: 0; }
     .chat-layout {
       display: flex;
-      height: calc(100vh - 65px);
-      height: calc(100dvh - 65px);
+      height: 100%;
       overflow: hidden;
     }
     .chat-sidebar {
@@ -9516,11 +9528,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         position: relative;
       }
 
-      /* Chat mobile — keep shell padding-top (pushes below fixed header), kill bottom padding */
-      .shell:has(.chat-layout) { padding-bottom: 0; }
+      /* Chat mobile — flex column handles layout, no manual height calc needed */
+      .shell:has(.chat-layout) { padding: 0; }
       .chat-layout {
         flex-direction: column;
-        height: calc(100dvh - 64px - max(8px, env(safe-area-inset-top)));
+        height: 100%;
       }
       .chat-sidebar {
         width: 100%;
