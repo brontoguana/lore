@@ -3427,6 +3427,17 @@ function showAgentList() {{
   if (layout) layout.classList.add('chat-sidebar-show');
 }}
 
+/* Fix mobile keyboard dismiss: browser sometimes leaves page scrolled
+   so chat-header hides behind the sticky top-nav. Reset on viewport grow. */
+if (window.visualViewport) {{
+  var _lastVVH = window.visualViewport.height;
+  window.visualViewport.addEventListener('resize', function() {{
+    var h = window.visualViewport.height;
+    if (h > _lastVVH) window.scrollTo(0, 0);
+    _lastVVH = h;
+  }});
+}}
+
 function openProfilePic(el) {{
   var agent = el.getAttribute('data-agent');
   var inp = document.createElement('input');
@@ -7436,6 +7447,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: var(--body-bg);
       min-height: 100vh;
       line-height: 1.5;
+      touch-action: manipulation;
     }
 "#;
     let rest = r#"
