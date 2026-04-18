@@ -22,8 +22,9 @@ use crate::librarian::{
     build_prompt, build_prompt_multi_project,
 };
 use crate::model::{
-    Block, BlockId, BlockType, DocumentId, ImageUpload, NewBlock, OrderKey, ProjectName,
-    UpdateBlock, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW,
+    Block, BlockId, BlockType, DocumentId, ImageUpload, KeyFingerprint, NewBlock, OrderKey,
+    ProjectName, UpdateBlock, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW,
+    reserved_block_display_name,
 };
 use crate::store::FileBlockStore;
 use crate::ui::{
@@ -255,12 +256,48 @@ fn record_api_tool_activity(state: &AppState, owner: &str, agent: &str, tool_nam
             let mut map = state.agent_recent_activity.lock().unwrap();
             map.entry(key).or_default().record_file(path, "edit".into());
         }
-        "move_block" | "delete_block" => {
+        "move_block" | "delete_block" | "split_block" => {
             let block = get_str("block_id");
             let short = if block.len() > 8 { &block[..8] } else { block };
             let key = format!("{owner}_{agent}");
             let mut map = state.agent_recent_activity.lock().unwrap();
-            map.entry(key).or_default().record_file(short.to_string(), tool_name.strip_prefix("move_").or(tool_name.strip_prefix("delete_")).unwrap_or(tool_name).into());
+            map.entry(key).or_default().record_file(short.to_string(), tool_name.strip_suffix("_block").unwrap_or(tool_name).into());
+        }
+        "combine_blocks" => {
+            let project = get_str("project");
+            let key = format!("{owner}_{agent}");
+            let mut map = state.agent_recent_activity.lock().unwrap();
+            map.entry(key).or_default().record_file(project.to_string(), "combine".into());
+        }
+        "read_document" => {
+            let project = get_str("project");
+            let doc = get_str("document_id");
+            let short = if doc.len() > 8 { &doc[..8] } else { doc };
+            let path = if project.is_empty() { short.to_string() } else { format!("{project}/{short}") };
+            let key = format!("{owner}_{agent}");
+            let mut map = state.agent_recent_activity.lock().unwrap();
+            map.entry(key).or_default().record_file(path, "read".into());
+        }
+        "write_document" => {
+            let project = get_str("project");
+            let doc = get_str("document_id");
+            let short = if doc.len() > 8 { &doc[..8] } else { doc };
+            let path = if project.is_empty() { short.to_string() } else { format!("{project}/{short}") };
+            let key = format!("{owner}_{agent}");
+            let mut map = state.agent_recent_activity.lock().unwrap();
+            map.entry(key).or_default().record_file(path, "write".into());
+        }
+        "get_project_overview" | "get_file_map" | "get_agent_context" => {
+            let project = get_str("project");
+            let key = format!("{owner}_{agent}");
+            let mut map = state.agent_recent_activity.lock().unwrap();
+            map.entry(key).or_default().record_file(project.to_string(), "read".into());
+        }
+        "update_file_map" | "edit_file_map" => {
+            let project = get_str("project");
+            let key = format!("{owner}_{agent}");
+            let mut map = state.agent_recent_activity.lock().unwrap();
+            map.entry(key).or_default().record_file(format!("{project}/file-map"), "edit".into());
         }
         _ => {}
     }
@@ -520,8 +557,20 @@ fn build_app_with_librarian(
             post(api_edit_doc_block),
         )
         .route(
+            "/v1/projects/{project}/documents/{doc_id}/blocks/{block_id}/split",
+            post(api_split_doc_block),
+        )
+        .route(
+            "/v1/projects/{project}/documents/{doc_id}/blocks/combine",
+            post(api_combine_doc_blocks),
+        )
+        .route(
             "/v1/projects/{project}/documents/{doc_id}/grep",
             get(api_grep_doc_blocks),
+        )
+        .route(
+            "/v1/projects/{project}/documents/{doc_id}/text",
+            get(api_read_document_text).put(api_write_document_text),
         )
         .route(
             "/v1/projects/{project}/reserved/{block_id}",
@@ -944,6 +993,27 @@ struct DocBlockUpdateRequest {
 struct DocBlockEditRequest {
     old_string: String,
     new_string: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocBlockSplitRequest {
+    position: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocBlockCombineRequest {
+    block_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadDocumentTextQuery {
+    start_block_id: Option<String>,
+    end_block_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WriteDocumentTextRequest {
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2430,6 +2500,211 @@ async fn api_edit_doc_block(
         vec![version_op],
     )?;
     Ok(Json(block))
+}
+
+async fn api_split_doc_block(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id, block_id)): Path<(String, String, String)>,
+    Json(body): Json<DocBlockSplitRequest>,
+) -> ApiResult<Json<Value>> {
+    let project = ProjectName::new(project)?;
+    let actor = authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let block_id = BlockId::from_string(block_id)?;
+    let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+    let author = match &actor {
+        RequestActor::Agent(agent) => KeyFingerprint::from_api_key(&agent.token)?,
+        RequestActor::User(user) => KeyFingerprint::from_user_name(user.username.as_str())?,
+    };
+    let (updated, new_block) = state.store.split_doc_block(
+        &project, &doc_id, &block_id, body.position, author,
+    )?;
+    let ops = vec![
+        update_doc_version_operation(
+            &state, &project, &doc_id, &updated.id, before,
+            ProjectVersionOperationType::UpdateBlock,
+        )?,
+        create_doc_version_operation(&state, &project, &doc_id, &new_block.id)?,
+    ];
+    record_project_version(
+        &state,
+        &project_version_actor_for_request_actor(&actor),
+        &project,
+        "split document block",
+        ops,
+    )?;
+    Ok(Json(json!({ "original": updated, "new_block": new_block })))
+}
+
+async fn api_combine_doc_blocks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    Json(body): Json<DocBlockCombineRequest>,
+) -> ApiResult<Json<Block>> {
+    let project = ProjectName::new(project)?;
+    let actor = authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let block_ids: Vec<BlockId> = body.block_ids.into_iter()
+        .map(BlockId::from_string)
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    // Snapshot all blocks before combining
+    let befores: Vec<_> = block_ids.iter()
+        .map(|bid| state.store.snapshot_doc_block(&project, &doc_id, bid))
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    let author = match &actor {
+        RequestActor::Agent(agent) => KeyFingerprint::from_api_key(&agent.token)?,
+        RequestActor::User(user) => KeyFingerprint::from_user_name(user.username.as_str())?,
+    };
+    let merged = state.store.combine_doc_blocks(&project, &doc_id, &block_ids, author)?;
+    let mut ops = Vec::new();
+    // First block was updated
+    ops.push(update_doc_version_operation(
+        &state, &project, &doc_id, &merged.id, befores[0].clone(),
+        ProjectVersionOperationType::UpdateBlock,
+    )?);
+    // Remaining blocks were deleted
+    for (i, bid) in block_ids[1..].iter().enumerate() {
+        ops.push(StoredProjectVersionOperation {
+            operation_type: ProjectVersionOperationType::DeleteBlock,
+            block_id: bid.clone(),
+            before: Some(befores[i + 1].clone()),
+            after: None,
+            document_id: Some(doc_id.as_str().to_string()),
+        });
+    }
+    record_project_version(
+        &state,
+        &project_version_actor_for_request_actor(&actor),
+        &project,
+        "combine document blocks",
+        ops,
+    )?;
+    Ok(Json(merged))
+}
+
+async fn api_read_document_text(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    Query(query): Query<ReadDocumentTextQuery>,
+) -> ApiResult<Json<Value>> {
+    let project = ProjectName::new(project)?;
+    authorize_project_read(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let start = query
+        .start_block_id
+        .map(BlockId::from_string)
+        .transpose()?;
+    let end = query
+        .end_block_id
+        .map(BlockId::from_string)
+        .transpose()?;
+    let text = state.store.read_document_text(
+        &project,
+        &doc_id,
+        start.as_ref(),
+        end.as_ref(),
+    )?;
+    Ok(Json(json!({ "content": text })))
+}
+
+async fn api_write_document_text(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+    Json(body): Json<WriteDocumentTextRequest>,
+) -> ApiResult<Json<Value>> {
+    let project = ProjectName::new(project)?;
+    let actor = authorize_project_write(&state, &headers, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+
+    let entries = crate::store::parse_document_text(&body.content)?;
+
+    // Snapshot current blocks before write (for version tracking)
+    let current_blocks = state.store.list_doc_blocks(&project, &doc_id)?;
+    let mut before_snapshots: HashMap<String, StoredBlockSnapshot> = HashMap::new();
+    for block in &current_blocks {
+        if let Ok(snap) = state.store.snapshot_doc_block(&project, &doc_id, &block.id) {
+            before_snapshots.insert(block.id.as_str().to_string(), snap);
+        }
+    }
+
+    let author = match &actor {
+        RequestActor::Agent(agent) => KeyFingerprint::from_api_key(&agent.token)?,
+        RequestActor::User(user) => KeyFingerprint::from_user_name(user.username.as_str())?,
+    };
+    let result = state.store.write_document_text(
+        &project, &doc_id, entries, author,
+    )?;
+
+    // Build version operations
+    let mut ops = Vec::new();
+    for block in &result.updated {
+        if let Some(before) = before_snapshots.get(block.id.as_str()) {
+            if let Ok(after) = state.store.snapshot_doc_block(&project, &doc_id, &block.id) {
+                ops.push(StoredProjectVersionOperation {
+                    operation_type: ProjectVersionOperationType::UpdateBlock,
+                    block_id: block.id.clone(),
+                    before: Some(before.clone()),
+                    after: Some(after),
+                    document_id: Some(doc_id.as_str().to_string()),
+                });
+            }
+        }
+    }
+    for (_, block) in &result.created {
+        if let Ok(after) = state.store.snapshot_doc_block(&project, &doc_id, &block.id) {
+            ops.push(StoredProjectVersionOperation {
+                operation_type: ProjectVersionOperationType::CreateBlock,
+                block_id: block.id.clone(),
+                before: None,
+                after: Some(after),
+                document_id: Some(doc_id.as_str().to_string()),
+            });
+        }
+    }
+    for deleted_id in &result.deleted {
+        if let Some(before) = before_snapshots.get(deleted_id.as_str()) {
+            ops.push(StoredProjectVersionOperation {
+                operation_type: ProjectVersionOperationType::DeleteBlock,
+                block_id: deleted_id.clone(),
+                before: Some(before.clone()),
+                after: None,
+                document_id: Some(doc_id.as_str().to_string()),
+            });
+        }
+    }
+    if !ops.is_empty() {
+        record_project_version(
+            &state,
+            &project_version_actor_for_request_actor(&actor),
+            &project,
+            "write document text",
+            ops,
+        )?;
+    }
+
+    // Build response
+    let created_map: Vec<Value> = result
+        .created
+        .iter()
+        .map(|(placeholder, block)| {
+            json!({
+                "placeholder_id": placeholder,
+                "block_id": block.id.as_str(),
+            })
+        })
+        .collect();
+    let updated_ids: Vec<&str> = result.updated.iter().map(|b| b.id.as_str()).collect();
+    let deleted_ids: Vec<&str> = result.deleted.iter().map(|b| b.as_str()).collect();
+
+    Ok(Json(json!({
+        "created": created_map,
+        "updated": updated_ids,
+        "deleted": deleted_ids,
+    })))
 }
 
 async fn api_grep_doc_blocks(
@@ -8565,6 +8840,50 @@ fn call_mcp_tool(
             let docs = state.store.list_documents(&project)?;
             json!({ "documents": serialize_doc_tree(&docs) })
         }
+        "get_project_overview" => {
+            let project = required_project(&args, "project", &state.store)?;
+            authorize_agent_read(agent, &project)?;
+            let block = state.store.get_reserved_block(&project, RESERVED_OVERVIEW)?;
+            json!({ "project": project.as_str(), "overview": block.content })
+        }
+        "get_file_map" => {
+            let project = required_project(&args, "project", &state.store)?;
+            authorize_agent_read(agent, &project)?;
+            let block = state.store.get_reserved_block(&project, RESERVED_MAP)?;
+            json!({ "project": project.as_str(), "file_map": block.content })
+        }
+        "update_file_map" => {
+            let project = required_project(&args, "project", &state.store)?;
+            authorize_agent_write(agent, &project)?;
+            let content = required_string(&args, "content")?;
+            let block = state.store.update_reserved_block(&project, RESERVED_MAP, &content, true)?;
+            json!({ "project": project.as_str(), "file_map": block.content })
+        }
+        "edit_file_map" => {
+            let project = required_project(&args, "project", &state.store)?;
+            authorize_agent_write(agent, &project)?;
+            let old_string = required_string(&args, "old_string")?;
+            let new_string = required_string(&args, "new_string")?;
+            let existing = state.store.get_reserved_block(&project, RESERVED_MAP)?;
+            let count = existing.content.matches(&old_string).count();
+            if count == 0 {
+                return Err(LoreError::Validation("old_string not found in file map".into()));
+            }
+            if count > 1 {
+                return Err(LoreError::Validation(format!(
+                    "old_string found {count} times — must be unique"
+                )));
+            }
+            let new_content = existing.content.replacen(&old_string, &new_string, 1);
+            let block = state.store.update_reserved_block(&project, RESERVED_MAP, &new_content, true)?;
+            json!({ "edited": true, "project": project.as_str(), "file_map": block.content })
+        }
+        "get_agent_context" => {
+            let project = required_project(&args, "project", &state.store)?;
+            authorize_agent_read(agent, &project)?;
+            let block = state.store.get_reserved_block(&project, RESERVED_AGENT_CONTEXT)?;
+            json!({ "project": project.as_str(), "agent_context": block.content })
+        }
         "create_document" => {
             let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
@@ -8614,13 +8933,9 @@ fn call_mcp_tool(
         "read_block" => {
             let project = required_project(&args, "project", &state.store)?;
             authorize_agent_read(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
             let block_id = required_block_id(&args, "block_id")?;
-            let block = if block_id.is_reserved() {
-                state.store.get_reserved_block(&project, block_id.as_str())?
-            } else {
-                let doc_id = required_document_id(&args, "document_id")?;
-                state.store.get_doc_block(&project, &doc_id, &block_id)?
-            };
+            let block = state.store.get_doc_block(&project, &doc_id, &block_id)?;
             let offset = optional_usize(&args, "offset");
             let limit = optional_usize(&args, "limit");
             if offset.is_some() || limit.is_some() {
@@ -8652,104 +8967,79 @@ fn call_mcp_tool(
         "update_block" => {
             let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
             let block_id = required_block_id(&args, "block_id")?;
             let content = required_string(&args, "content")?;
-            if block_id.is_reserved() {
-                let block = state
-                    .store
-                    .update_reserved_block(&project, block_id.as_str(), &content, true)?;
-                json!({ "block": block })
-            } else {
-                let doc_id = required_document_id(&args, "document_id")?;
-                let existing = state.store.get_doc_block(&project, &doc_id, &block_id)?;
-                let block_type = optional_block_type(&args, "block_type")?
-                    .unwrap_or(existing.block_type);
-                let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
-                let block = state.store.update_doc_block(
-                    &doc_id,
-                    UpdateBlock {
-                        project: project.clone(),
-                        block_id: block_id.clone(),
-                        block_type,
-                        content,
-                        author_key: agent.token.clone(),
-                        left: None,
-                        right: None,
-                        image_upload: None,
-                    },
-                )?;
-                let version_op = update_doc_version_operation(
-                    state, &project, &doc_id, &block_id, before,
-                    ProjectVersionOperationType::UpdateBlock,
-                )?;
-                let actor = ProjectVersionActor {
-                    kind: ProjectVersionActorKind::Agent,
-                    name: agent.name.clone(),
-                };
-                record_project_version(state, &actor, &project, "update document block (MCP)", vec![version_op])?;
-                json!({ "block": block })
-            }
+            let existing = state.store.get_doc_block(&project, &doc_id, &block_id)?;
+            let block_type = optional_block_type(&args, "block_type")?
+                .unwrap_or(existing.block_type);
+            let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+            let block = state.store.update_doc_block(
+                &doc_id,
+                UpdateBlock {
+                    project: project.clone(),
+                    block_id: block_id.clone(),
+                    block_type,
+                    content,
+                    author_key: agent.token.clone(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )?;
+            let version_op = update_doc_version_operation(
+                state, &project, &doc_id, &block_id, before,
+                ProjectVersionOperationType::UpdateBlock,
+            )?;
+            let actor = ProjectVersionActor {
+                kind: ProjectVersionActorKind::Agent,
+                name: agent.name.clone(),
+            };
+            record_project_version(state, &actor, &project, "update document block (MCP)", vec![version_op])?;
+            json!({ "block": block })
         }
         "edit_block" => {
             let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
             let block_id = required_block_id(&args, "block_id")?;
             let old_string = required_string(&args, "old_string")?;
             let new_string = required_string(&args, "new_string")?;
-            if block_id.is_reserved() {
-                let existing = state.store.get_reserved_block(&project, block_id.as_str())?;
-                let count = existing.content.matches(&old_string).count();
-                if count == 0 {
-                    return Err(LoreError::Validation("old_string not found in block".into()));
-                }
-                if count > 1 {
-                    return Err(LoreError::Validation(format!(
-                        "old_string found {count} times — must be unique"
-                    )));
-                }
-                let new_content = existing.content.replacen(&old_string, &new_string, 1);
-                let block = state
-                    .store
-                    .update_reserved_block(&project, block_id.as_str(), &new_content, true)?;
-                json!({ "edited": true, "block": block })
-            } else {
-                let doc_id = required_document_id(&args, "document_id")?;
-                let existing = state.store.get_doc_block(&project, &doc_id, &block_id)?;
-                let count = existing.content.matches(&old_string).count();
-                if count == 0 {
-                    return Err(LoreError::Validation("old_string not found in block".into()));
-                }
-                if count > 1 {
-                    return Err(LoreError::Validation(format!(
-                        "old_string found {count} times — must be unique"
-                    )));
-                }
-                let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
-                let new_content = existing.content.replacen(&old_string, &new_string, 1);
-                let block = state.store.update_doc_block(
-                    &doc_id,
-                    UpdateBlock {
-                        project: project.clone(),
-                        block_id: block_id.clone(),
-                        block_type: existing.block_type,
-                        content: new_content,
-                        author_key: agent.token.clone(),
-                        left: None,
-                        right: None,
-                        image_upload: None,
-                    },
-                )?;
-                let version_op = update_doc_version_operation(
-                    state, &project, &doc_id, &block_id, before,
-                    ProjectVersionOperationType::UpdateBlock,
-                )?;
-                let actor = ProjectVersionActor {
-                    kind: ProjectVersionActorKind::Agent,
-                    name: agent.name.clone(),
-                };
-                record_project_version(state, &actor, &project, "edit document block (MCP)", vec![version_op])?;
-                json!({ "edited": true, "block": block })
+            let existing = state.store.get_doc_block(&project, &doc_id, &block_id)?;
+            let count = existing.content.matches(&old_string).count();
+            if count == 0 {
+                return Err(LoreError::Validation("old_string not found in block".into()));
             }
+            if count > 1 {
+                return Err(LoreError::Validation(format!(
+                    "old_string found {count} times — must be unique"
+                )));
+            }
+            let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+            let new_content = existing.content.replacen(&old_string, &new_string, 1);
+            let block = state.store.update_doc_block(
+                &doc_id,
+                UpdateBlock {
+                    project: project.clone(),
+                    block_id: block_id.clone(),
+                    block_type: existing.block_type,
+                    content: new_content,
+                    author_key: agent.token.clone(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )?;
+            let version_op = update_doc_version_operation(
+                state, &project, &doc_id, &block_id, before,
+                ProjectVersionOperationType::UpdateBlock,
+            )?;
+            let actor = ProjectVersionActor {
+                kind: ProjectVersionActorKind::Agent,
+                name: agent.name.clone(),
+            };
+            record_project_version(state, &actor, &project, "edit document block (MCP)", vec![version_op])?;
+            json!({ "edited": true, "block": block })
         }
         "create_block" => {
             let project = required_project(&args, "project", &state.store)?;
@@ -8832,6 +9122,66 @@ fn call_mcp_tool(
             record_project_version(state, &actor, &project, "delete document block (MCP)", vec![version_op])?;
             json!({ "deleted": true, "block_id": block_id.as_str() })
         }
+        "split_block" => {
+            let project = required_project(&args, "project", &state.store)?;
+            authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
+            let block_id = required_block_id(&args, "block_id")?;
+            let position = required_usize(&args, "position")?;
+            let before = state.store.snapshot_doc_block(&project, &doc_id, &block_id)?;
+            let author = KeyFingerprint::from_api_key(&agent.token)?;
+            let (updated, new_block) = state.store.split_doc_block(
+                &project, &doc_id, &block_id, position, author,
+            )?;
+            let ops = vec![
+                update_doc_version_operation(
+                    state, &project, &doc_id, &updated.id, before,
+                    ProjectVersionOperationType::UpdateBlock,
+                )?,
+                create_doc_version_operation(state, &project, &doc_id, &new_block.id)?,
+            ];
+            let actor = ProjectVersionActor {
+                kind: ProjectVersionActorKind::Agent,
+                name: agent.name.clone(),
+            };
+            record_project_version(state, &actor, &project, "split document block (MCP)", ops)?;
+            json!({ "original": updated, "new_block": new_block })
+        }
+        "combine_blocks" => {
+            let project = required_project(&args, "project", &state.store)?;
+            authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
+            let block_ids: Vec<BlockId> = required_string_array(&args, "block_ids")?
+                .into_iter()
+                .map(|s| BlockId::from_string(s))
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let befores: Vec<_> = block_ids.iter()
+                .map(|bid| state.store.snapshot_doc_block(&project, &doc_id, bid))
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let author = KeyFingerprint::from_api_key(&agent.token)?;
+            let merged = state.store.combine_doc_blocks(&project, &doc_id, &block_ids, author)?;
+            let mut ops = vec![
+                update_doc_version_operation(
+                    state, &project, &doc_id, &merged.id, befores[0].clone(),
+                    ProjectVersionOperationType::UpdateBlock,
+                )?,
+            ];
+            for (i, bid) in block_ids[1..].iter().enumerate() {
+                ops.push(StoredProjectVersionOperation {
+                    operation_type: ProjectVersionOperationType::DeleteBlock,
+                    block_id: bid.clone(),
+                    before: Some(befores[i + 1].clone()),
+                    after: None,
+                    document_id: Some(doc_id.as_str().to_string()),
+                });
+            }
+            let actor = ProjectVersionActor {
+                kind: ProjectVersionActorKind::Agent,
+                name: agent.name.clone(),
+            };
+            record_project_version(state, &actor, &project, "combine document blocks (MCP)", ops)?;
+            json!({ "merged": true, "block": merged })
+        }
         "grep_blocks" => {
             let project = required_project(&args, "project", &state.store)?;
             authorize_agent_read(agent, &project)?;
@@ -8853,6 +9203,106 @@ fn call_mcp_tool(
                     json!({ "matches": matches })
                 }
             }
+        }
+        "read_document" => {
+            let project = required_project(&args, "project", &state.store)?;
+            authorize_agent_read(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
+            let start = optional_string(&args, "start_block_id")
+                .map(BlockId::from_string)
+                .transpose()?;
+            let end = optional_string(&args, "end_block_id")
+                .map(BlockId::from_string)
+                .transpose()?;
+            let text = state.store.read_document_text(
+                &project,
+                &doc_id,
+                start.as_ref(),
+                end.as_ref(),
+            )?;
+            json!({ "content": text })
+        }
+        "write_document" => {
+            let project = required_project(&args, "project", &state.store)?;
+            authorize_agent_write(agent, &project)?;
+            let doc_id = required_document_id(&args, "document_id")?;
+            let content = required_string(&args, "content")?;
+
+            let entries = crate::store::parse_document_text(&content)?;
+
+            // Snapshot current blocks before write
+            let current_blocks = state.store.list_doc_blocks(&project, &doc_id)?;
+            let mut before_snapshots: HashMap<String, StoredBlockSnapshot> = HashMap::new();
+            for block in &current_blocks {
+                if let Ok(snap) = state.store.snapshot_doc_block(&project, &doc_id, &block.id) {
+                    before_snapshots.insert(block.id.as_str().to_string(), snap);
+                }
+            }
+
+            let author = KeyFingerprint::from_api_key(&agent.token)?;
+            let result = state.store.write_document_text(
+                &project, &doc_id, entries, author,
+            )?;
+
+            // Build version operations
+            let mut ops = Vec::new();
+            for block in &result.updated {
+                if let Some(before) = before_snapshots.get(block.id.as_str()) {
+                    if let Ok(after) = state.store.snapshot_doc_block(&project, &doc_id, &block.id) {
+                        ops.push(StoredProjectVersionOperation {
+                            operation_type: ProjectVersionOperationType::UpdateBlock,
+                            block_id: block.id.clone(),
+                            before: Some(before.clone()),
+                            after: Some(after),
+                            document_id: Some(doc_id.as_str().to_string()),
+                        });
+                    }
+                }
+            }
+            for (_, block) in &result.created {
+                if let Ok(after) = state.store.snapshot_doc_block(&project, &doc_id, &block.id) {
+                    ops.push(StoredProjectVersionOperation {
+                        operation_type: ProjectVersionOperationType::CreateBlock,
+                        block_id: block.id.clone(),
+                        before: None,
+                        after: Some(after),
+                        document_id: Some(doc_id.as_str().to_string()),
+                    });
+                }
+            }
+            for deleted_id in &result.deleted {
+                if let Some(before) = before_snapshots.get(deleted_id.as_str()) {
+                    ops.push(StoredProjectVersionOperation {
+                        operation_type: ProjectVersionOperationType::DeleteBlock,
+                        block_id: deleted_id.clone(),
+                        before: Some(before.clone()),
+                        after: None,
+                        document_id: Some(doc_id.as_str().to_string()),
+                    });
+                }
+            }
+            if !ops.is_empty() {
+                let actor = ProjectVersionActor {
+                    kind: ProjectVersionActorKind::Agent,
+                    name: agent.name.clone(),
+                };
+                record_project_version(state, &actor, &project, "write document (MCP)", ops)?;
+            }
+
+            let created_map: Vec<Value> = result.created.iter()
+                .map(|(placeholder, block)| json!({
+                    "placeholder_id": placeholder,
+                    "block_id": block.id.as_str(),
+                }))
+                .collect();
+            let updated_ids: Vec<&str> = result.updated.iter().map(|b| b.id.as_str()).collect();
+            let deleted_ids: Vec<&str> = result.deleted.iter().map(|b| b.as_str()).collect();
+
+            json!({
+                "created": created_map,
+                "updated": updated_ids,
+                "deleted": deleted_ids,
+            })
         }
         other => {
             return Err(LoreError::Validation(format!("unknown tool: {other}")));
@@ -9018,6 +9468,25 @@ fn optional_usize(args: &serde_json::Map<String, Value>, key: &str) -> Option<us
         .and_then(|value| usize::try_from(value).ok())
 }
 
+fn required_usize(args: &serde_json::Map<String, Value>, key: &str) -> Result<usize, LoreError> {
+    optional_usize(args, key)
+        .ok_or_else(|| LoreError::Validation(format!("{key} is required (integer)")))
+}
+
+fn required_string_array(
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Vec<String>, LoreError> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .ok_or_else(|| LoreError::Validation(format!("{key} is required (array of strings)")))
+}
 
 fn optional_block_type(
     args: &serde_json::Map<String, Value>,
@@ -9088,6 +9557,43 @@ fn mcp_tools() -> Vec<Value> {
             "inputSchema": schema_with_required_property("project", "string", "Lore project name")
         }),
         json!({
+            "name": "get_project_overview",
+            "title": "Get Project Overview",
+            "description": "Read the project overview — a short summary of what the project is about.",
+            "inputSchema": schema_with_required_property("project", "string", "Lore project name")
+        }),
+        json!({
+            "name": "get_file_map",
+            "title": "Get File Map",
+            "description": "Read the project file map — a listing of key project files.",
+            "inputSchema": schema_with_required_property("project", "string", "Lore project name")
+        }),
+        json!({
+            "name": "update_file_map",
+            "title": "Update File Map",
+            "description": "Replace the entire file map content for a project.",
+            "inputSchema": schema_with_required_properties(&[
+                ("project", "string", "Lore project name"),
+                ("content", "string", "New file map content")
+            ])
+        }),
+        json!({
+            "name": "edit_file_map",
+            "title": "Edit File Map",
+            "description": "Apply a targeted find-and-replace within the project file map. The old_string must match exactly once.",
+            "inputSchema": schema_with_required_properties(&[
+                ("project", "string", "Lore project name"),
+                ("old_string", "string", "Exact text to find (must be unique)"),
+                ("new_string", "string", "Replacement text")
+            ])
+        }),
+        json!({
+            "name": "get_agent_context",
+            "title": "Get Agent Context",
+            "description": "Read the agent context for a project — instructions and context set by the project owner for agents.",
+            "inputSchema": schema_with_required_property("project", "string", "Lore project name")
+        }),
+        json!({
             "name": "create_document",
             "title": "Create Document",
             "description": "Create a new document under a project or parent document.",
@@ -9132,49 +9638,49 @@ fn mcp_tools() -> Vec<Value> {
         json!({
             "name": "read_block",
             "title": "Read Block",
-            "description": "Read a block's content or a line range within it. Use offset/limit for large blocks.",
+            "description": "Read a document block's content or a line range within it. Use offset/limit for large blocks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Lore project name" },
                     "document_id": { "type": "string", "description": "Document UUID" },
-                    "block_id": { "type": "string", "description": "Block UUID or reserved ID (_agent-context, _overview, _map)" },
+                    "block_id": { "type": "string", "description": "Block UUID" },
                     "offset": { "type": "integer", "description": "Starting line (0-based). Omit to read from beginning.", "minimum": 0 },
                     "limit": { "type": "integer", "description": "Max lines to read. Omit to read all.", "minimum": 1 }
                 },
-                "required": ["project", "block_id"]
+                "required": ["project", "document_id", "block_id"]
             }
         }),
         json!({
             "name": "update_block",
             "title": "Update Block",
-            "description": "Replace the entire content of a block. Use for small blocks or full rewrites.",
+            "description": "Replace the entire content of a document block. Use for small blocks or full rewrites.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Lore project name" },
                     "document_id": { "type": "string", "description": "Document UUID" },
-                    "block_id": { "type": "string", "description": "Block UUID or _map" },
+                    "block_id": { "type": "string", "description": "Block UUID" },
                     "content": { "type": "string", "description": "New content" },
                     "block_type": { "type": ["string", "null"], "enum": ["markdown", "html", "svg", "image", null] }
                 },
-                "required": ["project", "block_id", "content"]
+                "required": ["project", "document_id", "block_id", "content"]
             }
         }),
         json!({
             "name": "edit_block",
             "title": "Edit Block",
-            "description": "Apply a targeted find-and-replace within a block. The old_string must match exactly once.",
+            "description": "Apply a targeted find-and-replace within a document block. The old_string must match exactly once.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Lore project name" },
                     "document_id": { "type": "string", "description": "Document UUID" },
-                    "block_id": { "type": "string", "description": "Block UUID or _map" },
+                    "block_id": { "type": "string", "description": "Block UUID" },
                     "old_string": { "type": "string", "description": "Exact text to find (must be unique)" },
                     "new_string": { "type": "string", "description": "Replacement text" }
                 },
-                "required": ["project", "block_id", "old_string", "new_string"]
+                "required": ["project", "document_id", "block_id", "old_string", "new_string"]
             }
         }),
         json!({
@@ -9219,6 +9725,40 @@ fn mcp_tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "split_block",
+            "title": "Split Block",
+            "description": "Split a markdown block at a character position. The original block keeps content before the position; a new block is created after it with the remaining content. Useful for inserting images or SVGs between text.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": "string", "description": "Document UUID" },
+                    "block_id": { "type": "string", "description": "Block UUID to split" },
+                    "position": { "type": "integer", "description": "Character offset at which to split (1 to len-1)", "minimum": 1 }
+                },
+                "required": ["project", "document_id", "block_id", "position"]
+            }
+        }),
+        json!({
+            "name": "combine_blocks",
+            "title": "Combine Blocks",
+            "description": "Merge consecutive markdown blocks into one. Content is joined with newlines. The first block is kept; the rest are deleted. Blocks must be consecutive, non-pinned, and all markdown.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": "string", "description": "Document UUID" },
+                    "block_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ordered list of block UUIDs to combine (minimum 2)",
+                        "minItems": 2
+                    }
+                },
+                "required": ["project", "document_id", "block_ids"]
+            }
+        }),
+        json!({
             "name": "grep_blocks",
             "title": "Grep Blocks",
             "description": "Search across block content in a document or all documents in a project. Returns block IDs, line numbers, and context.",
@@ -9231,6 +9771,35 @@ fn mcp_tools() -> Vec<Value> {
                     "context_lines": { "type": "integer", "description": "Lines of context before/after each match (default: 2)", "minimum": 0 }
                 },
                 "required": ["project", "query"]
+            }
+        }),
+        json!({
+            "name": "read_document",
+            "title": "Read Document",
+            "description": "Read all blocks in a document (or a range) as a single text with block boundary markers. Each block is wrapped in <<<< block:ID type:TYPE >>>> ... <<<< end:ID >>>>. Use for reading an entire document like a file. For surgical reads, prefer read_block.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": "string", "description": "Document UUID" },
+                    "start_block_id": { "type": ["string", "null"], "description": "First block to include (null = from start)" },
+                    "end_block_id": { "type": ["string", "null"], "description": "Last block to include (null = to end)" }
+                },
+                "required": ["project", "document_id"]
+            }
+        }),
+        json!({
+            "name": "write_document",
+            "title": "Write Document",
+            "description": "Write back a document using the same marker format from read_document. Lore diffs against current state: changed content is updated, missing blocks are deleted, new blocks are created. Image blocks are validated but never modified. SVG and markdown blocks can be edited. For new blocks, use any non-UUID string as the ID (e.g. 'new_heading', 'intro') — Lore replaces it with a real UUID. Existing blocks must use their real UUID. Returns a summary of changes made.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Lore project name" },
+                    "document_id": { "type": "string", "description": "Document UUID" },
+                    "content": { "type": "string", "description": "Full document in marker format (<<<< block:ID type:TYPE >>>> ... <<<< end:ID >>>>)" }
+                },
+                "required": ["project", "document_id", "content"]
             }
         }),
     ]
@@ -11442,7 +12011,7 @@ fn truncate_tool_result(tool_name: &str, text: &str) -> String {
     let total_lines = text.matches('\n').count() + 1;
     let shown_lines = text[..cut_at].matches('\n').count() + 1;
     let hint = match tool_name {
-        "read_block" | "read_blocks_around" => "Use smaller reads or targeted grep.",
+        "read_block" | "read_blocks_around" | "read_document" => "Use smaller reads or targeted grep.",
         "grep_blocks" => "Narrow your search query.",
         "list_blocks" | "list_projects" => "Results are large; consider targeted queries.",
         _ => "Consider a more targeted query to reduce output size.",
@@ -11525,13 +12094,14 @@ fn build_api_agent_system_prompt(
     conv: &crate::auth::ChatConversation,
 ) -> String {
     let mut parts = Vec::new();
-    parts.push("You are a Lore knowledge base agent with tools to navigate projects, manage documents, and read/write block content.\n\n\
-        Lore organizes knowledge into projects (management containers) and documents (content containers with typed blocks).\n\
-        Projects have reserved blocks: _agent-context, _overview, and _map. Documents contain regular content blocks.\n\n\
+    parts.push("You are a Lore knowledge base agent with tools to navigate projects, manage documents, and read/write content.\n\n\
+        Lore organizes knowledge into projects and documents. Each project has an Overview, File Map, and Agent Context accessible via dedicated tools. Documents contain typed blocks (the content itself).\n\n\
         Guidelines:\n\
         - Be concise and direct. Provide clear answers.\n\
         - Use tools to fulfill user requests. Read before writing. Grep to find content.\n\
-        - Use list_documents to see the document tree, list_blocks to see block structure, then read_block for content.\n\
+        - Use get_project_overview, get_file_map, get_agent_context for project-level info.\n\
+        - Use list_documents to see the document tree, read_document to read the entire document as text, list_blocks for block structure, read_block for individual blocks.\n\
+        - For broad document changes, use read_document then write_document. For surgical edits, use edit_block.\n\
         - Use edit_block for targeted changes within a block, update_block for full rewrites.\n\
         - For large blocks, use read_block with offset/limit to read chunks.\n\
         - When a tool result is truncated, use more targeted queries rather than re-reading the same large result.\n\
@@ -11539,7 +12109,7 @@ fn build_api_agent_system_prompt(
         - Do not make up content. If you can't find something, say so.\n\
         - For multi-step tasks, plan before acting. Use fewer tool calls per turn when possible.\n\n\
         File Map maintenance:\n\
-        - You have access to a file map (_map) on each project that lists key project files.\n\
+        - Each project has a File Map listing key project files. Use get_file_map to read it, update_file_map or edit_file_map to modify it.\n\
         - Keep this map current: add files you discover are important to the work, remove files that are deleted or no longer relevant.\n\
         - Only list files that are actionable for development. Do not list generated files, build artifacts, or files unlikely to need attention.\n\n\
         SVG output:\n\
@@ -11559,7 +12129,8 @@ fn build_api_agent_system_prompt(
     let readable: Vec<String> = agent.grants.iter()
         .map(|g| {
             let perm = if g.permission.allows_write() { "read-write" } else { "read" };
-            format!("- {} ({})", g.project.as_str(), perm)
+            let name = state.store.read_project_meta(&g.project).display_name;
+            format!("- {} ({})", name, perm)
         })
         .collect();
     if !readable.is_empty() {
@@ -11614,6 +12185,11 @@ fn format_api_tool_display(name: &str, args: &Value) -> String {
         "create_document" => format!("\u{1f4c4} create_document \"{}\"", get_str("name")),
         "rename_document" => format!("\u{1f4c4} rename_document \"{}\"", get_str("name")),
         "delete_document" => format!("\u{1f5d1}\u{fe0f} delete_document {}", short_id("document_id")),
+        "get_project_overview" => format!("\u{1f4d6} get_project_overview {}", get_str("project")),
+        "get_file_map" => format!("\u{1f5fa}\u{fe0f} get_file_map {}", get_str("project")),
+        "update_file_map" => format!("\u{270f}\u{fe0f} update_file_map {}", get_str("project")),
+        "edit_file_map" => format!("\u{270f}\u{fe0f} edit_file_map {}", get_str("project")),
+        "get_agent_context" => format!("\u{1f4d6} get_agent_context {}", get_str("project")),
         "list_blocks" => format!("\u{1f4cb} list_blocks {}", short_id("document_id")),
         "read_block" => format!("\u{1f4d6} read_block {}", short_id("block_id")),
         "update_block" => format!("\u{270f}\u{fe0f} update_block {}", short_id("block_id")),
@@ -11621,6 +12197,10 @@ fn format_api_tool_display(name: &str, args: &Value) -> String {
         "create_block" => format!("\u{270f}\u{fe0f} create_block {}", short_id("document_id")),
         "delete_block" => format!("\u{1f5d1}\u{fe0f} delete_block {}", short_id("block_id")),
         "move_block" => format!("\u{1f4e6} move_block {}", short_id("block_id")),
+        "split_block" => format!("\u{2702}\u{fe0f} split_block {}", short_id("block_id")),
+        "combine_blocks" => format!("\u{1f517} combine_blocks"),
+        "read_document" => format!("\u{1f4d6} read_document {}", short_id("document_id")),
+        "write_document" => format!("\u{270f}\u{fe0f} write_document {}", short_id("document_id")),
         "grep_blocks" => format!("\u{1f50d} grep_blocks \"{}\"", get_str("query")),
         _ => format!("\u{1f527} {name}"),
     }

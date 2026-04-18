@@ -2850,7 +2850,7 @@ Add this to your MCP client config (Claude Desktop, Cursor, etc.):
   }}
 }}
 
-Available MCP tools: list_projects, list_blocks, read_block, read_blocks_around, grep_blocks, create_block, update_block, move_block, delete_block.
+Available MCP tools: list_projects, list_documents, list_blocks, read_block, read_blocks_around, grep_blocks, create_block, update_block, edit_block, move_block, delete_block, create_document, rename_document, delete_document.
 
 ## Add to your persistent config
 

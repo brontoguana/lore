@@ -1,7 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use lore_core::{
     AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, ReleaseStream,
-    SelfUpdateOutcome, apply_update_to_version, check_for_update, maybe_apply_self_update, slugify,
+    SelfUpdateOutcome, apply_update_to_version, check_for_update, maybe_apply_self_update,
+    slugify,
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -45,21 +46,27 @@ enum Command {
     },
     /// List all projects
     Projects,
-    /// Read and list blocks
+    /// Read the project overview
+    Overview,
+    /// Read or update the project file map
+    FileMap {
+        #[command(subcommand)]
+        command: FileMapCommand,
+    },
+    /// Show the current project's agent context
+    Context,
+    /// List and manage documents
+    Docs {
+        #[command(subcommand)]
+        command: DocsCommand,
+    },
+    /// Read, create, edit, and manage blocks within documents
     Blocks {
         #[command(subcommand)]
         command: BlocksCommand,
     },
     /// Search blocks by content
     Grep(GrepArgs),
-    /// Add a new block to the current project
-    Add(WriteBlockArgs),
-    /// Update an existing block
-    Update(UpdateBlockArgs),
-    /// Move a block to a new position
-    Move(MoveBlockArgs),
-    /// Delete a block
-    Delete(DeleteBlockArgs),
     /// Ask the librarian a question or request an action
     Librarian {
         #[command(subcommand)]
@@ -75,8 +82,6 @@ enum Command {
         #[command(subcommand)]
         command: UpdateCommand,
     },
-    /// Show the current project's agent context
-    Context,
     /// Connect to a Lore server (interactive setup)
     Setup(SetupArgs),
     /// Run an agent daemon
@@ -116,33 +121,240 @@ struct ConfigClearArgs {
 }
 
 #[derive(Subcommand)]
-enum BlocksCommand {
-    /// List blocks in the current project
-    List(ListBlocksArgs),
-    /// Read a single block by ID
-    Read(ReadBlockArgs),
-    /// Read a block with surrounding context
-    Around(AroundArgs),
+enum FileMapCommand {
+    /// Read the file map
+    #[command(name = "read")]
+    Read,
+    /// Replace the entire file map content
+    #[command(name = "update")]
+    Update(FileMapUpdateArgs),
+    /// Apply a find-and-replace within the file map
+    #[command(name = "edit")]
+    Edit(FileMapEditArgs),
 }
 
 #[derive(Args)]
-struct ListBlocksArgs {
-    #[arg(long, default_value_t = 20)]
+struct FileMapUpdateArgs {
+    /// New file map content
+    content: String,
+}
+
+#[derive(Args)]
+struct FileMapEditArgs {
+    /// Exact text to find (must be unique)
+    #[arg(long)]
+    old: String,
+    /// Replacement text
+    #[arg(long)]
+    new: String,
+}
+
+#[derive(Subcommand)]
+enum DocsCommand {
+    /// List documents in the current project (shows doc tree with IDs)
+    List,
+    /// Read a document as a single text with block markers
+    Read(DocReadArgs),
+    /// Write a document from marker-format text (reads from stdin)
+    Write(DocWriteArgs),
+    /// Create a new document
+    Create(DocCreateArgs),
+    /// Rename a document
+    Rename(DocRenameArgs),
+    /// Delete a document and all its contents
+    Delete(DocDeleteArgs),
+}
+
+#[derive(Args)]
+struct DocReadArgs {
+    /// Document ID (UUID)
+    doc_id: String,
+    /// First block to include (omit for start of document)
+    #[arg(long)]
+    from: Option<String>,
+    /// Last block to include (omit for end of document)
+    #[arg(long)]
+    to: Option<String>,
+}
+
+#[derive(Args)]
+struct DocWriteArgs {
+    /// Document ID (UUID)
+    doc_id: String,
+    /// Read content from this file instead of stdin
+    #[arg(long)]
+    file: Option<String>,
+}
+
+#[derive(Args)]
+struct DocCreateArgs {
+    /// Document display name
+    name: String,
+    /// Parent document ID for nesting (omit for top-level)
+    #[arg(long)]
+    parent: Option<String>,
+}
+
+#[derive(Args)]
+struct DocRenameArgs {
+    /// Document ID (UUID)
+    doc_id: String,
+    /// New display name
+    name: String,
+}
+
+#[derive(Args)]
+struct DocDeleteArgs {
+    /// Document ID (UUID)
+    doc_id: String,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Subcommand)]
+enum BlocksCommand {
+    /// List blocks in a document
+    List(BlockListArgs),
+    /// Read a block's content
+    Read(BlockReadArgs),
+    /// Read a block with surrounding context
+    Around(AroundArgs),
+    /// Create a new block in a document
+    Create(BlockCreateArgs),
+    /// Replace a block's entire content
+    Update(BlockUpdateArgs),
+    /// Apply a find-and-replace within a block
+    Edit(BlockEditArgs),
+    /// Move a block to a new position within a document
+    Move(BlockMoveArgs),
+    /// Delete a block from a document
+    Delete(BlockDeleteArgs),
+    /// Split a markdown block at a character position
+    Split(BlockSplitArgs),
+    /// Combine consecutive markdown blocks into one
+    Combine(BlockCombineArgs),
+}
+
+#[derive(Args)]
+struct BlockListArgs {
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
+    #[arg(long, default_value_t = 50)]
     limit: usize,
 }
 
 #[derive(Args)]
-struct ReadBlockArgs {
+struct BlockReadArgs {
+    /// Block ID (UUID)
     id: String,
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
+    /// Starting line (0-based)
+    #[arg(long)]
+    offset: Option<usize>,
+    /// Max lines to read
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Args)]
 struct AroundArgs {
+    /// Block ID (UUID)
     id: String,
     #[arg(long, default_value_t = 2)]
     before: usize,
     #[arg(long, default_value_t = 2)]
     after: usize,
+}
+
+#[derive(Args)]
+struct BlockCreateArgs {
+    /// Block content
+    content: String,
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
+    /// Block type
+    #[arg(long = "type", value_enum, default_value_t = CliBlockType::Markdown)]
+    block_type: CliBlockType,
+    /// Place after this block ID (omit for start of document)
+    #[arg(long)]
+    after: Option<String>,
+}
+
+#[derive(Args)]
+struct BlockUpdateArgs {
+    /// Block ID (UUID)
+    id: String,
+    /// New content
+    content: String,
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
+    /// Block type (only if changing)
+    #[arg(long = "type", value_enum)]
+    block_type: Option<CliBlockType>,
+}
+
+#[derive(Args)]
+struct BlockEditArgs {
+    /// Block ID (UUID)
+    id: String,
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
+    /// Exact text to find (must be unique within the block)
+    #[arg(long)]
+    old: String,
+    /// Replacement text
+    #[arg(long)]
+    new: String,
+}
+
+#[derive(Args)]
+struct BlockMoveArgs {
+    /// Block ID (UUID)
+    id: String,
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
+    /// Place after this block ID (omit to move to start)
+    #[arg(long)]
+    after: Option<String>,
+}
+
+#[derive(Args)]
+struct BlockDeleteArgs {
+    /// Block ID (UUID)
+    id: String,
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct BlockSplitArgs {
+    /// Block ID (UUID)
+    id: String,
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
+    /// Character position at which to split
+    #[arg(long)]
+    position: usize,
+}
+
+#[derive(Args)]
+struct BlockCombineArgs {
+    /// Block IDs to combine (minimum 2, in order)
+    ids: Vec<String>,
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
 }
 
 #[derive(Args)]
@@ -154,38 +366,6 @@ struct GrepArgs {
     limit: usize,
 }
 
-#[derive(Args)]
-struct WriteBlockArgs {
-    content: String,
-    #[arg(long = "type", value_enum, default_value_t = CliBlockType::Markdown)]
-    block_type: CliBlockType,
-    #[arg(long)]
-    after_block_id: Option<String>,
-}
-
-#[derive(Args)]
-struct UpdateBlockArgs {
-    id: String,
-    content: String,
-    #[arg(long = "type", value_enum, default_value_t = CliBlockType::Markdown)]
-    block_type: CliBlockType,
-    #[arg(long)]
-    after_block_id: Option<String>,
-}
-
-#[derive(Args)]
-struct MoveBlockArgs {
-    id: String,
-    #[arg(long)]
-    after_block_id: Option<String>,
-}
-
-#[derive(Args)]
-struct DeleteBlockArgs {
-    id: String,
-    #[arg(long)]
-    yes: bool,
-}
 
 #[derive(Args)]
 struct SetupArgs {
@@ -469,25 +649,6 @@ struct ErrorBody {
 }
 
 #[derive(Debug, Serialize)]
-struct CreateProjectBlockRequest {
-    block_type: BlockType,
-    content: String,
-    after_block_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct UpdateProjectBlockRequest {
-    block_type: BlockType,
-    content: String,
-    after_block_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct MoveBlockRequest {
-    after_block_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 struct AskLibrarianRequest {
     question: String,
     block_type: Option<String>,
@@ -629,13 +790,12 @@ async fn run() -> CliResult<()> {
     let context = build_context(&cli, &config)?;
     match cli.command {
         Command::Projects => projects_command(&context).await?,
+        Command::Overview => overview_command(&context).await?,
+        Command::FileMap { command } => file_map_command(&context, command).await?,
         Command::Context => context_command(&context).await?,
+        Command::Docs { command } => docs_command(&context, command).await?,
         Command::Blocks { command } => blocks_command(&context, command).await?,
         Command::Grep(args) => grep_command(&context, args).await?,
-        Command::Add(args) => add_command(&context, args).await?,
-        Command::Update(args) => update_command(&context, args).await?,
-        Command::Move(args) => move_command(&context, args).await?,
-        Command::Delete(args) => delete_command(&context, args).await?,
         Command::Librarian { command } => librarian_command(&context, command).await?,
         Command::History { command } => history_command(&context, command).await?,
         Command::Agent(args) => agent_command(&context, args).await?,
@@ -718,6 +878,63 @@ async fn projects_command(context: &CliContext) -> CliResult<()> {
     Ok(())
 }
 
+async fn overview_command(context: &CliContext) -> CliResult<()> {
+    let project = context.require_project(None)?;
+    let path = format!("/v1/projects/{}/reserved/_overview", project.as_str());
+    let block: Block = context.get_json(&path).await?;
+    if block.content.trim().is_empty() {
+        println!("No overview set for {}.", project);
+    } else {
+        println!("{}", block.content);
+    }
+    Ok(())
+}
+
+async fn file_map_command(context: &CliContext, command: FileMapCommand) -> CliResult<()> {
+    let project = context.require_project(None)?;
+    let path = format!("/v1/projects/{}/reserved/_map", project.as_str());
+    match command {
+        FileMapCommand::Read => {
+            let block: Block = context.get_json(&path).await?;
+            if block.content.trim().is_empty() {
+                println!("No file map set for {}.", project);
+            } else {
+                println!("{}", block.content);
+            }
+        }
+        FileMapCommand::Update(args) => {
+            let _block: Block = context
+                .send_json(
+                    Method::PATCH,
+                    &path,
+                    &serde_json::json!({ "content": args.content }),
+                )
+                .await?;
+            println!("File map updated for {}.", project);
+        }
+        FileMapCommand::Edit(args) => {
+            let existing: Block = context.get_json(&path).await?;
+            let count = existing.content.matches(&args.old).count();
+            if count == 0 {
+                return Err("old string not found in file map".into());
+            }
+            if count > 1 {
+                return Err(format!("old string found {count} times -- must be unique").into());
+            }
+            let new_content = existing.content.replacen(&args.old, &args.new, 1);
+            let _block: Block = context
+                .send_json(
+                    Method::PATCH,
+                    &path,
+                    &serde_json::json!({ "content": new_content }),
+                )
+                .await?;
+            println!("File map edited for {}.", project);
+        }
+    }
+    Ok(())
+}
+
 async fn context_command(context: &CliContext) -> CliResult<()> {
     let text = context.get_text("/v1/context").await?;
     if text.trim().is_empty() {
@@ -774,18 +991,143 @@ async fn run_update(command: UpdateCommand, config: &mut CliConfig) -> CliResult
     Ok(())
 }
 
+async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<()> {
+    let project = context.require_project(None)?;
+    match command {
+        DocsCommand::List => {
+            let path = format!("/v1/projects/{}/documents", project.as_str());
+            let resp: serde_json::Value = context.get_json(&path).await?;
+            let docs = resp["documents"].as_array();
+            match docs {
+                Some(docs) if !docs.is_empty() => {
+                    print_doc_tree(docs, 0);
+                }
+                _ => println!("No documents in {}.", project),
+            }
+        }
+        DocsCommand::Read(args) => {
+            let mut path = format!(
+                "/v1/projects/{}/documents/{}/text",
+                project.as_str(),
+                args.doc_id
+            );
+            let mut sep = '?';
+            if let Some(from) = &args.from {
+                path.push_str(&format!("{}start_block_id={}", sep, from));
+                sep = '&';
+            }
+            if let Some(to) = &args.to {
+                path.push_str(&format!("{}end_block_id={}", sep, to));
+            }
+            let resp: serde_json::Value = context.get_json(&path).await?;
+            let text = resp["content"].as_str().unwrap_or("");
+            println!("{}", text);
+        }
+        DocsCommand::Write(args) => {
+            let content = match &args.file {
+                Some(file_path) => std::fs::read_to_string(file_path)
+                    .map_err(|e| io::Error::other(format!("reading {}: {}", file_path, e)))?,
+                None => {
+                    let mut buf = String::new();
+                    io::Read::read_to_string(&mut io::stdin(), &mut buf)?;
+                    buf
+                }
+            };
+            let path = format!(
+                "/v1/projects/{}/documents/{}/text",
+                project.as_str(),
+                args.doc_id
+            );
+            let resp: serde_json::Value = context
+                .send_json(
+                    Method::PUT,
+                    &path,
+                    &serde_json::json!({ "content": content }),
+                )
+                .await?;
+            let created = resp["created"].as_array().map(|a| a.len()).unwrap_or(0);
+            let updated = resp["updated"].as_array().map(|a| a.len()).unwrap_or(0);
+            let deleted = resp["deleted"].as_array().map(|a| a.len()).unwrap_or(0);
+            println!(
+                "Document updated: {} created, {} updated, {} deleted.",
+                created, updated, deleted
+            );
+        }
+        DocsCommand::Create(args) => {
+            let path = format!("/v1/projects/{}/documents", project.as_str());
+            let resp: serde_json::Value = context
+                .send_json(
+                    Method::POST,
+                    &path,
+                    &serde_json::json!({
+                        "name": args.name,
+                        "parent_document_id": args.parent
+                    }),
+                )
+                .await?;
+            let id = resp["id"].as_str().unwrap_or("?");
+            let name = resp["name"].as_str().unwrap_or("?");
+            println!("Created document \"{}\" ({}).", name, id);
+        }
+        DocsCommand::Rename(args) => {
+            let path = format!(
+                "/v1/projects/{}/documents/{}",
+                project.as_str(),
+                args.doc_id
+            );
+            let _resp: serde_json::Value = context
+                .send_json(
+                    Method::PUT,
+                    &path,
+                    &serde_json::json!({ "name": args.name }),
+                )
+                .await?;
+            println!("Renamed document {} to \"{}\".", args.doc_id, args.name);
+        }
+        DocsCommand::Delete(args) => {
+            if !args.yes {
+                return Err(io::Error::other("delete requires --yes").into());
+            }
+            let path = format!(
+                "/v1/projects/{}/documents/{}",
+                project.as_str(),
+                args.doc_id
+            );
+            context.send_no_content(Method::DELETE, &path).await?;
+            println!("Deleted document {}.", args.doc_id);
+        }
+    }
+    Ok(())
+}
+
+fn print_doc_tree(docs: &[serde_json::Value], depth: usize) {
+    for doc in docs {
+        let id = doc["id"].as_str().unwrap_or("?");
+        let name = doc["name"].as_str().unwrap_or("?");
+        let indent = "  ".repeat(depth);
+        println!("{}{} ({})", indent, name, id);
+        if let Some(children) = doc["children"].as_array() {
+            print_doc_tree(children, depth + 1);
+        }
+    }
+}
+
 async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResult<()> {
+    let project = context.require_project(None)?;
     match command {
         BlocksCommand::List(args) => {
-            let project = context.require_project(None)?;
-            let path = format!("/v1/projects/{}/blocks", project.as_str());
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks",
+                project.as_str(),
+                args.doc
+            );
             let mut blocks: Vec<Block> = context.get_json(&path).await?;
             blocks.truncate(args.limit.max(1));
             if blocks.is_empty() {
-                println!("No blocks in {}.", project);
+                println!("No blocks in document {}.", args.doc);
                 return Ok(());
             }
-            for block in blocks {
+            for block in &blocks {
                 println!(
                     "{}  {:<8}  {}",
                     block.id,
@@ -795,13 +1137,28 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             }
         }
         BlocksCommand::Read(args) => {
-            let project = context.require_project(None)?;
-            let path = format!("/v1/projects/{}/blocks/{}", project.as_str(), args.id);
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks/{}",
+                project.as_str(),
+                args.doc,
+                args.id
+            );
             let block: Block = context.get_json(&path).await?;
-            print_block(&block, false);
+            let content = match (args.offset, args.limit) {
+                (Some(off), Some(lim)) => {
+                    block.content.lines().skip(off).take(lim).collect::<Vec<_>>().join("\n")
+                }
+                (Some(off), None) => {
+                    block.content.lines().skip(off).collect::<Vec<_>>().join("\n")
+                }
+                (None, Some(lim)) => {
+                    block.content.lines().take(lim).collect::<Vec<_>>().join("\n")
+                }
+                (None, None) => block.content.clone(),
+            };
+            println!("{}", content);
         }
         BlocksCommand::Around(args) => {
-            let project = context.require_project(None)?;
             let path = format!(
                 "/v1/projects/{}/blocks/{}/around?before={}&after={}",
                 project.as_str(),
@@ -824,6 +1181,123 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                     one_line_preview(&block.content, 72)
                 );
             }
+        }
+        BlocksCommand::Create(args) => {
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks",
+                project.as_str(),
+                args.doc
+            );
+            let block: Block = context
+                .send_json(
+                    Method::POST,
+                    &path,
+                    &serde_json::json!({
+                        "block_type": block_type_api_label(args.block_type),
+                        "content": args.content,
+                        "after_block_id": args.after
+                    }),
+                )
+                .await?;
+            println!("Created block {}.", block.id);
+        }
+        BlocksCommand::Update(args) => {
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks/{}",
+                project.as_str(),
+                args.doc,
+                args.id
+            );
+            let mut body = serde_json::json!({ "content": args.content });
+            if let Some(bt) = args.block_type {
+                body["block_type"] = serde_json::json!(block_type_api_label(bt));
+            }
+            let block: Block = context.send_json(Method::PATCH, &path, &body).await?;
+            println!("Updated block {}.", block.id);
+        }
+        BlocksCommand::Edit(args) => {
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks/{}/edit",
+                project.as_str(),
+                args.doc,
+                args.id
+            );
+            let block: Block = context
+                .send_json(
+                    Method::POST,
+                    &path,
+                    &serde_json::json!({
+                        "old_string": args.old,
+                        "new_string": args.new
+                    }),
+                )
+                .await?;
+            println!("Edited block {}.", block.id);
+        }
+        BlocksCommand::Move(args) => {
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks/{}/move",
+                project.as_str(),
+                args.doc,
+                args.id
+            );
+            let block: Block = context
+                .send_json(
+                    Method::POST,
+                    &path,
+                    &serde_json::json!({ "after_block_id": args.after }),
+                )
+                .await?;
+            println!("Moved block {} to order {}.", block.id, block.order);
+        }
+        BlocksCommand::Delete(args) => {
+            if !args.yes {
+                return Err(io::Error::other("delete requires --yes").into());
+            }
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks/{}",
+                project.as_str(),
+                args.doc,
+                args.id
+            );
+            context.send_no_content(Method::DELETE, &path).await?;
+            println!("Deleted block {}.", args.id);
+        }
+        BlocksCommand::Split(args) => {
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks/{}/split",
+                project.as_str(),
+                args.doc,
+                args.id
+            );
+            let resp: serde_json::Value = context
+                .send_json(
+                    Method::POST,
+                    &path,
+                    &serde_json::json!({ "position": args.position }),
+                )
+                .await?;
+            let original = resp["original"]["id"].as_str().unwrap_or("?");
+            let new_block = resp["new_block"]["id"].as_str().unwrap_or("?");
+            println!("Split block {} -> {} + {}.", args.id, original, new_block);
+        }
+        BlocksCommand::Combine(args) => {
+            if args.ids.len() < 2 {
+                return Err(io::Error::other("combine requires at least 2 block IDs").into());
+            }
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks/combine",
+                project.as_str(),
+                args.doc
+            );
+            let block: Block = context
+                .send_json(
+                    Method::POST,
+                    &path,
+                    &serde_json::json!({ "block_ids": args.ids }),
+                )
+                .await?;
+            println!("Combined into block {}.", block.id);
         }
     }
     Ok(())
@@ -851,69 +1325,6 @@ async fn grep_command(context: &CliContext, args: GrepArgs) -> CliResult<()> {
             entry.preview
         );
     }
-    Ok(())
-}
-
-async fn add_command(context: &CliContext, args: WriteBlockArgs) -> CliResult<()> {
-    let project = context.require_project(None)?;
-    let path = format!("/v1/projects/{}/blocks", project.as_str());
-    let block: Block = context
-        .send_json(
-            Method::POST,
-            &path,
-            &CreateProjectBlockRequest {
-                block_type: args.block_type.into(),
-                content: args.content,
-                after_block_id: args.after_block_id,
-            },
-        )
-        .await?;
-    println!("Created block {} in {}.", block.id, block.project);
-    Ok(())
-}
-
-async fn update_command(context: &CliContext, args: UpdateBlockArgs) -> CliResult<()> {
-    let project = context.require_project(None)?;
-    let path = format!("/v1/projects/{}/blocks/{}", project.as_str(), args.id);
-    let block: Block = context
-        .send_json(
-            Method::PATCH,
-            &path,
-            &UpdateProjectBlockRequest {
-                block_type: args.block_type.into(),
-                content: args.content,
-                after_block_id: args.after_block_id,
-            },
-        )
-        .await?;
-    println!("Updated block {}.", block.id);
-    Ok(())
-}
-
-async fn move_command(context: &CliContext, args: MoveBlockArgs) -> CliResult<()> {
-    let project = context.require_project(None)?;
-    let path = format!("/v1/projects/{}/blocks/{}/move", project.as_str(), args.id);
-    let block: Block = context
-        .send_json(
-            Method::POST,
-            &path,
-            &MoveBlockRequest {
-                after_block_id: args.after_block_id,
-            },
-        )
-        .await?;
-    println!("Moved block {} to order {}.", block.id, block.order);
-    Ok(())
-}
-
-async fn delete_command(context: &CliContext, args: DeleteBlockArgs) -> CliResult<()> {
-    if !args.yes {
-        return Err(io::Error::other("delete requires --yes").into());
-    }
-    let project = context.require_project(None)?;
-    let path = format!("/v1/projects/{}/blocks/{}", project.as_str(), args.id);
-    context.send_no_content(Method::DELETE, &path).await?;
-    println!("Deleted block {}.", args.id);
     Ok(())
 }
 
@@ -1619,6 +2030,15 @@ fn block_type_label(value: BlockType) -> &'static str {
         BlockType::Html => "html",
         BlockType::Svg => "svg",
         BlockType::Image => "image",
+    }
+}
+
+fn block_type_api_label(value: CliBlockType) -> &'static str {
+    match value {
+        CliBlockType::Markdown => "markdown",
+        CliBlockType::Html => "html",
+        CliBlockType::Svg => "svg",
+        CliBlockType::Image => "image",
     }
 }
 
@@ -2634,12 +3054,14 @@ fn build_lore_system_instructions(
 
     parts.push("# Lore Agent Instructions
 
-You are an AI agent connected to the Lore knowledge base. Lore organizes knowledge into projects (management containers) and documents (content containers with typed blocks). Projects have reserved blocks: _agent-context, _overview, and _map. Documents contain regular content blocks.
+You are an AI agent connected to the Lore knowledge base. Lore organizes knowledge into projects and documents. Each project has an Overview, File Map, and Agent Context accessible via dedicated tools. Documents contain typed blocks (the content itself).
 
 ## Guidelines
 - Be concise and direct. Provide clear answers.
 - Read files before editing them.
-- For Lore content: use list_documents to see the doc tree, list_blocks for block structure, read_block for content, edit_block for targeted edits.
+- For project info: use get_project_overview, get_file_map, get_agent_context.
+- For documents: use list_documents to see the doc tree, read_document to read the entire document as text, list_blocks for block structure, read_block for content, edit_block for targeted edits.
+- For broad document changes, use read_document then write_document. For surgical edits, use edit_block.
 - For large blocks, use read_block with offset/limit to read chunks.
 - When a tool result is truncated, use more targeted queries rather than re-reading the same large result.
 - If you encounter an error, explain it clearly and suggest alternatives.
@@ -2647,7 +3069,7 @@ You are an AI agent connected to the Lore knowledge base. Lore organizes knowled
 - For multi-step tasks, plan before acting. Use fewer tool calls per turn when possible.
 
 ## File Map Maintenance
-You have access to a file map (_map) on each project that lists key project files. Keep this map current: add files you discover are important, remove files that are deleted or no longer relevant. Only list files that are actionable for development.
+Each project has a File Map listing key project files. Use get_file_map to read it, update_file_map or edit_file_map to modify it. Keep this map current: add files you discover are important, remove files that are deleted or no longer relevant. Only list files that are actionable for development.
 
 ## SVG Output
 You can output inline SVG to present quick reports, diagrams, tables, and visual summaries to the user. Use <svg xmlns=\"http://www.w3.org/2000/svg\" ...>...</svg> with a self-contained design. Keep SVGs simple and readable. Do NOT use <foreignObject> — use only native SVG elements (<text>, <rect>, <circle>, <line>, <path>, <g>, etc). Use &amp; not & in SVG text.".to_string());
@@ -2672,23 +3094,38 @@ You can output inline SVG to present quick reports, diagrams, tables, and visual
 fn build_cli_tool_section() -> String {
     "You have access to the `lore` CLI tool in addition to your normal file and shell tools. Use these commands to interact with the Lore knowledge base:
 
-Project navigation:
+Project info:
   lore projects                          List all accessible projects
-  lore context                           Show the current project's agent context
+  lore overview                          Read the project overview
+  lore file-map read                     Read the project file map
+  lore file-map update <content>         Replace the entire file map
+  lore file-map edit --old <text> --new <text>   Find-and-replace within the file map
+  lore context                           Show the project's agent context
 
-Reading content:
-  lore blocks list [--limit N]           List blocks in the current project
-  lore blocks read <block-id>            Read a single block by ID
+Documents:
+  lore docs list                         List documents (shows doc tree with IDs)
+  lore docs read <doc-id> [--from <block-id>] [--to <block-id>]   Read entire document as text with block markers
+  lore docs write <doc-id> [--file <path>]   Write document from marker-format text (reads stdin if no --file)
+  lore docs create <name> [--parent <doc-id>]   Create a new document
+  lore docs rename <doc-id> <new-name>   Rename a document
+  lore docs delete <doc-id> --yes        Delete a document and all its contents
+
+Blocks (reading):
+  lore blocks list --doc <doc-id>        List blocks in a document
+  lore blocks read <id> --doc <doc-id> [--offset N] [--limit N]   Read a block's content
   lore blocks around <id> [--before N] [--after N]   Read a block with surrounding context
 
-Searching:
-  lore grep <query> [--limit N]          Search blocks by content across projects
+Blocks (writing):
+  lore blocks create --doc <doc-id> <content> [--type markdown|html|svg|image] [--after <id>]
+  lore blocks update <id> --doc <doc-id> <content> [--type markdown|html|svg|image]
+  lore blocks edit <id> --doc <doc-id> --old <text> --new <text>
+  lore blocks move <id> --doc <doc-id> [--after <id>]
+  lore blocks delete <id> --doc <doc-id> --yes
+  lore blocks split <id> --doc <doc-id> --position N
+  lore blocks combine --doc <doc-id> <id1> <id2> [id3...]
 
-Writing content:
-  lore add <content> [--type markdown|code|data] [--after-block-id ID]   Add a new block
-  lore update <id> <content> [--type markdown|code|data]                  Update an existing block
-  lore move <id> [--after-block-id ID]   Move a block to a new position
-  lore delete <id> [--yes]               Delete a block
+Searching:
+  lore grep <query> [--limit N]          Search blocks by content
 
 History:
   lore history list                      List recent block changes
@@ -2696,8 +3133,10 @@ History:
   lore history revert <version-id>       Revert a block to a previous version
 
 Librarian (AI-powered):
-  lore librarian answer <question>       Ask the librarian a question about project content
-  lore librarian action <instruction>    Request the librarian to perform a content action".to_string()
+  lore librarian answer <question>       Ask the librarian about project content
+  lore librarian action <instruction>    Request a content action
+
+Start by listing documents (lore docs list) to see the content structure, then use lore docs read <doc-id> to read entire documents, or lore blocks list --doc <doc-id> for block-level detail.".to_string()
 }
 
 fn build_api_tool_section(lore_tool_names: &[String]) -> String {

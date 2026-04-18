@@ -1275,6 +1275,344 @@ impl FileBlockStore {
         self.delete_block_in_doc_dir(&doc_dir, project, block_id, None)
     }
 
+    /// Split a document block at a character offset. Updates the original block
+    /// with content before the split point and creates a new block immediately
+    /// after it with the remaining content. Returns (updated_original, new_block).
+    pub fn split_doc_block(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_id: &BlockId,
+        position: usize,
+        author: KeyFingerprint,
+    ) -> Result<(Block, Block)> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        let existing = {
+            let path = doc_dir.join("blocks").join(format!("{}.json", block_id.as_str()));
+            if !path.exists() {
+                return Err(LoreError::BlockNotFound(block_id.as_str().to_string()));
+            }
+            let stored: StoredBlock = serde_json::from_slice(&fs::read(&path)?)?;
+            self.inflate_block(stored)?
+        };
+        if existing.block_type != BlockType::Markdown {
+            return Err(LoreError::Validation("only markdown blocks can be split".into()));
+        }
+        if position == 0 || position >= existing.content.len() {
+            return Err(LoreError::Validation(
+                "split position must be between 1 and content length - 1".into(),
+            ));
+        }
+        let before_content = existing.content[..position].to_string();
+        let after_content = existing.content[position..].to_string();
+
+        // Find the next block's order key for insertion
+        let blocks = self.list_doc_blocks_in_dir(&doc_dir)?;
+        let idx = blocks.iter().position(|b| &b.id == block_id)
+            .ok_or_else(|| LoreError::BlockNotFound(block_id.as_str().to_string()))?;
+        let right_order = blocks.get(idx + 1).map(|b| b.order.clone());
+
+        // Update original block with first half
+        let updated = self.update_block_in_doc_dir(
+            &doc_dir,
+            UpdateBlock {
+                project: project.clone(),
+                block_id: block_id.clone(),
+                block_type: BlockType::Markdown,
+                content: before_content,
+                author_key: "internal".into(),
+                left: None,
+                right: None,
+                image_upload: None,
+            },
+            UpdateMode::ProjectWriter(author.clone()),
+        )?;
+
+        // Create new block after the original with second half
+        let new_order = generate_order_key(Some(&existing.order), right_order.as_ref())?;
+        let new_id = BlockId::new();
+        let project_dir = self.project_dir(project);
+        let content_ref = self.persist_text_content_in(
+            &doc_dir, &project_dir, &new_id, BlockType::Markdown, &after_content,
+        )?;
+        let stored = StoredBlock {
+            id: new_id.clone(),
+            project: project.clone(),
+            block_type: BlockType::Markdown,
+            order: new_order,
+            author,
+            content: content_ref,
+            media: None,
+            created_at: OffsetDateTime::now_utc(),
+            pinned: false,
+        };
+        let path = doc_dir.join("blocks").join(format!("{}.json", new_id.as_str()));
+        fs::write(path, serde_json::to_vec_pretty(&stored)?)?;
+        let new_block = self.inflate_block(stored)?;
+
+        Ok((updated, new_block))
+    }
+
+    /// Combine consecutive markdown blocks in a document into a single block.
+    /// All block_ids must be markdown, consecutive in order, and non-pinned.
+    /// Content is joined with newlines. The first block is kept; the rest are deleted.
+    /// Returns the merged block.
+    pub fn combine_doc_blocks(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        block_ids: &[BlockId],
+        author: KeyFingerprint,
+    ) -> Result<Block> {
+        if block_ids.len() < 2 {
+            return Err(LoreError::Validation(
+                "combine requires at least 2 block IDs".into(),
+            ));
+        }
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        let all_blocks = self.list_doc_blocks_in_dir(&doc_dir)?;
+
+        // Find the indices of the requested blocks and verify they are consecutive markdown
+        let mut indices = Vec::with_capacity(block_ids.len());
+        for bid in block_ids {
+            let idx = all_blocks.iter().position(|b| &b.id == bid)
+                .ok_or_else(|| LoreError::BlockNotFound(bid.as_str().to_string()))?;
+            indices.push(idx);
+        }
+        indices.sort();
+        for i in 1..indices.len() {
+            if indices[i] != indices[i - 1] + 1 {
+                return Err(LoreError::Validation(
+                    "blocks must be consecutive in document order".into(),
+                ));
+            }
+        }
+        for &idx in &indices {
+            let b = &all_blocks[idx];
+            if b.block_type != BlockType::Markdown {
+                return Err(LoreError::Validation(format!(
+                    "block {} is not markdown — only markdown blocks can be combined",
+                    b.id
+                )));
+            }
+            if b.pinned {
+                return Err(LoreError::Validation(format!(
+                    "block {} is pinned — unpin before combining",
+                    b.id
+                )));
+            }
+        }
+
+        // Merge content in order
+        let merged_content: String = indices.iter()
+            .map(|&idx| all_blocks[idx].content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Update first block with merged content
+        let first_id = &all_blocks[indices[0]].id;
+        let updated = self.update_block_in_doc_dir(
+            &doc_dir,
+            UpdateBlock {
+                project: project.clone(),
+                block_id: first_id.clone(),
+                block_type: BlockType::Markdown,
+                content: merged_content,
+                author_key: "internal".into(),
+                left: None,
+                right: None,
+                image_upload: None,
+            },
+            UpdateMode::ProjectWriter(author),
+        )?;
+
+        // Delete the remaining blocks
+        for &idx in &indices[1..] {
+            let bid = &all_blocks[idx].id;
+            self.delete_block_in_doc_dir(&doc_dir, project, bid, None)?;
+        }
+
+        Ok(updated)
+    }
+
+    /// Read a document (or a range of blocks within it) as a single text with
+    /// block boundary markers.  The marker format is:
+    ///
+    /// ```text
+    /// <<<< block:<ID> type:<TYPE> >>>>
+    /// content
+    /// <<<< end:<ID> >>>>
+    /// ```
+    ///
+    /// Image blocks have empty content between the markers.
+    pub fn read_document_text(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        start_block_id: Option<&BlockId>,
+        end_block_id: Option<&BlockId>,
+    ) -> Result<String> {
+        let blocks = self.list_doc_blocks(project, doc_id)?;
+        let range = filter_block_range(&blocks, start_block_id, end_block_id)?;
+        Ok(serialize_blocks_to_text(range))
+    }
+
+    /// Apply a full document write expressed in the marker text format.
+    ///
+    /// The caller supplies parsed `DocumentWriteEntry` items (use
+    /// `parse_document_text` to obtain them).  The method diffs against the
+    /// current blocks and applies creates, updates, deletes and reordering
+    /// under a single project lock.
+    ///
+    /// * Existing blocks are matched by UUID.
+    /// * Image blocks are validated but their content is never changed.
+    /// * Non-UUID ids are treated as new-block placeholders and replaced with
+    ///   real UUIDs.
+    /// * Any current block **not** present in `entries` is deleted.
+    /// * Block order is set to match the input sequence.
+    pub fn write_document_text(
+        &self,
+        project: &ProjectName,
+        doc_id: &DocumentId,
+        entries: Vec<DocumentWriteEntry>,
+        author: KeyFingerprint,
+    ) -> Result<DocumentWriteResult> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
+        let doc_dir = self.find_doc_dir(project, doc_id)?;
+        let current_blocks = self.list_doc_blocks_in_dir(&doc_dir)?;
+
+        let mut existing_map: HashMap<String, &Block> = HashMap::new();
+        for block in &current_blocks {
+            existing_map.insert(block.id.as_str().to_string(), block);
+        }
+
+        let mut result = DocumentWriteResult {
+            created: Vec::new(),
+            updated: Vec::new(),
+            deleted: Vec::new(),
+        };
+
+        let mut referenced_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut final_block_ids: Vec<BlockId> = Vec::new();
+
+        for entry in &entries {
+            let is_existing_uuid = Uuid::parse_str(&entry.id).is_ok()
+                && existing_map.contains_key(&entry.id);
+            let is_unknown_uuid = Uuid::parse_str(&entry.id).is_ok()
+                && !existing_map.contains_key(&entry.id);
+
+            if is_unknown_uuid {
+                return Err(LoreError::Validation(format!(
+                    "block {} not found in document",
+                    entry.id
+                )));
+            }
+
+            if is_existing_uuid {
+                let existing = existing_map[&entry.id];
+                referenced_ids.insert(entry.id.clone());
+
+                if existing.block_type == BlockType::Image {
+                    // Image: validate only, never modify content
+                    final_block_ids.push(existing.id.clone());
+                    continue;
+                }
+
+                if existing.content != entry.content
+                    || existing.block_type != entry.block_type
+                {
+                    let updated = self.update_block_in_doc_dir(
+                        &doc_dir,
+                        UpdateBlock {
+                            project: project.clone(),
+                            block_id: existing.id.clone(),
+                            block_type: entry.block_type,
+                            content: entry.content.clone(),
+                            author_key: "internal".into(),
+                            left: None,
+                            right: None,
+                            image_upload: None,
+                        },
+                        UpdateMode::ProjectWriter(author.clone()),
+                    )?;
+                    result.updated.push(updated);
+                }
+                final_block_ids.push(BlockId::from_string(entry.id.clone())?);
+            } else {
+                // Non-UUID id → new block placeholder
+                let new_block = self.create_block_in_doc_dir(
+                    &doc_dir,
+                    NewBlock {
+                        project: project.clone(),
+                        block_type: entry.block_type,
+                        content: entry.content.clone(),
+                        author_key: "internal".into(),
+                        left: None,
+                        right: None,
+                        image_upload: None,
+                    },
+                    author.clone(),
+                )?;
+                final_block_ids.push(new_block.id.clone());
+                result.created.push((entry.id.clone(), new_block));
+            }
+        }
+
+        // Delete blocks not referenced in the input
+        for block in &current_blocks {
+            if !referenced_ids.contains(block.id.as_str()) {
+                self.delete_block_in_doc_dir(&doc_dir, project, &block.id, None)?;
+                result.deleted.push(block.id.clone());
+            }
+        }
+
+        // Reorder blocks to match input sequence
+        let mut prev_order: Option<OrderKey> = None;
+        for block_id in &final_block_ids {
+            let new_order = generate_order_key(prev_order.as_ref(), None)?;
+            let path = doc_dir
+                .join("blocks")
+                .join(format!("{}.json", block_id.as_str()));
+            if path.exists() {
+                let mut stored: StoredBlock =
+                    serde_json::from_slice(&fs::read(&path)?)?;
+                if stored.order != new_order {
+                    stored.order = new_order.clone();
+                    fs::write(&path, serde_json::to_vec_pretty(&stored)?)?;
+                }
+            }
+            prev_order = Some(new_order);
+        }
+
+        Ok(result)
+    }
+
+    fn list_doc_blocks_in_dir(&self, doc_dir: &std::path::Path) -> Result<Vec<Block>> {
+        let blocks_dir = doc_dir.join("blocks");
+        if !blocks_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut blocks = Vec::new();
+        for entry in fs::read_dir(blocks_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let stored: StoredBlock = serde_json::from_slice(&fs::read(&path)?)?;
+            blocks.push(self.inflate_block(stored)?);
+        }
+        blocks.sort_by(|a, b| {
+            a.order.cmp(&b.order).then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        Ok(blocks)
+    }
+
     pub fn resolve_after_doc_block(
         &self,
         project: &ProjectName,
@@ -2057,11 +2395,233 @@ fn media_extension(media_type: &str) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Document text format: serialize / parse / types
+// ---------------------------------------------------------------------------
+
+/// A single entry parsed from the document text write format.
+#[derive(Debug, Clone)]
+pub struct DocumentWriteEntry {
+    pub id: String,
+    pub block_type: BlockType,
+    pub content: String,
+}
+
+/// Result returned by `write_document_text`.
+#[derive(Debug)]
+pub struct DocumentWriteResult {
+    /// `(placeholder_id, created_block)` for every new block.
+    pub created: Vec<(String, Block)>,
+    /// Blocks whose content or type was changed.
+    pub updated: Vec<Block>,
+    /// Block IDs that were removed because they were absent from the input.
+    pub deleted: Vec<BlockId>,
+}
+
+/// Serialize a slice of blocks into the marker text format.
+pub fn serialize_blocks_to_text(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let type_label = match block.block_type {
+            BlockType::Markdown => "markdown",
+            BlockType::Html => "html",
+            BlockType::Svg => "svg",
+            BlockType::Image => "image",
+        };
+        out.push_str(&format!(
+            "<<<< block:{} type:{} >>>>\n",
+            block.id, type_label
+        ));
+        if block.block_type != BlockType::Image {
+            if !block.content.is_empty() {
+                out.push_str(&block.content);
+                if !block.content.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+        }
+        out.push_str(&format!("<<<< end:{} >>>>", block.id));
+        if i + 1 < blocks.len() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Parse the marker text format into a vec of write entries.
+///
+/// Returns an error on malformed markers (mismatched start/end, nested blocks,
+/// unrecognised block type, content outside markers, etc).
+pub fn parse_document_text(text: &str) -> crate::error::Result<Vec<DocumentWriteEntry>> {
+    use crate::error::LoreError;
+
+    let mut entries = Vec::new();
+    let mut current_id: Option<String> = None;
+    let mut current_type: Option<BlockType> = None;
+    let mut content_lines: Vec<&str> = Vec::new();
+
+    for (line_num, line) in text.lines().enumerate() {
+        if let Some(rest) = line.strip_prefix("<<<< block:") {
+            if current_id.is_some() {
+                return Err(LoreError::Validation(format!(
+                    "line {}: nested block marker (previous block not closed)",
+                    line_num + 1
+                )));
+            }
+            let rest = rest
+                .strip_suffix(" >>>>")
+                .ok_or_else(|| {
+                    LoreError::Validation(format!(
+                        "line {}: malformed block start marker",
+                        line_num + 1
+                    ))
+                })?;
+            let mut parts = rest.splitn(2, " type:");
+            let id = parts
+                .next()
+                .ok_or_else(|| {
+                    LoreError::Validation(format!(
+                        "line {}: missing block id",
+                        line_num + 1
+                    ))
+                })?
+                .to_string();
+            let type_str = parts.next().ok_or_else(|| {
+                LoreError::Validation(format!(
+                    "line {}: missing type in block marker",
+                    line_num + 1
+                ))
+            })?;
+            let block_type = match type_str {
+                "markdown" => BlockType::Markdown,
+                "html" => BlockType::Html,
+                "svg" => BlockType::Svg,
+                "image" => BlockType::Image,
+                other => {
+                    return Err(LoreError::Validation(format!(
+                        "line {}: unknown block type '{}'",
+                        line_num + 1,
+                        other
+                    )));
+                }
+            };
+            current_id = Some(id);
+            current_type = Some(block_type);
+            content_lines.clear();
+        } else if let Some(rest) = line.strip_prefix("<<<< end:") {
+            let end_id = rest
+                .strip_suffix(" >>>>")
+                .ok_or_else(|| {
+                    LoreError::Validation(format!(
+                        "line {}: malformed end marker",
+                        line_num + 1
+                    ))
+                })?;
+            match &current_id {
+                Some(id) if id == end_id => {
+                    let content = if content_lines.is_empty() {
+                        String::new()
+                    } else {
+                        let joined = content_lines.join("\n");
+                        // Strip single trailing newline that serialization added
+                        if joined.ends_with('\n') {
+                            joined[..joined.len() - 1].to_string()
+                        } else {
+                            joined
+                        }
+                    };
+                    entries.push(DocumentWriteEntry {
+                        id: id.clone(),
+                        block_type: current_type.unwrap(),
+                        content,
+                    });
+                    current_id = None;
+                    current_type = None;
+                    content_lines.clear();
+                }
+                Some(id) => {
+                    return Err(LoreError::Validation(format!(
+                        "line {}: end marker id '{}' does not match open block '{}'",
+                        line_num + 1,
+                        end_id,
+                        id
+                    )));
+                }
+                None => {
+                    return Err(LoreError::Validation(format!(
+                        "line {}: end marker without matching block start",
+                        line_num + 1
+                    )));
+                }
+            }
+        } else if current_id.is_some() {
+            content_lines.push(line);
+        } else if !line.trim().is_empty() {
+            return Err(LoreError::Validation(format!(
+                "line {}: content outside of block markers",
+                line_num + 1
+            )));
+        }
+    }
+
+    if current_id.is_some() {
+        return Err(LoreError::Validation(
+            "unexpected end of input: block not closed".into(),
+        ));
+    }
+
+    Ok(entries)
+}
+
+/// Filter a block slice to a start..=end range (both inclusive, both optional).
+fn filter_block_range<'a>(
+    blocks: &'a [Block],
+    start: Option<&BlockId>,
+    end: Option<&BlockId>,
+) -> crate::error::Result<&'a [Block]> {
+    use crate::error::LoreError;
+
+    let start_idx = match start {
+        Some(id) => blocks
+            .iter()
+            .position(|b| &b.id == id)
+            .ok_or_else(|| {
+                LoreError::BlockNotFound(id.as_str().to_string())
+            })?,
+        None => 0,
+    };
+    let end_idx = match end {
+        Some(id) => blocks
+            .iter()
+            .position(|b| &b.id == id)
+            .ok_or_else(|| {
+                LoreError::BlockNotFound(id.as_str().to_string())
+            })?,
+        None => {
+            if blocks.is_empty() {
+                return Ok(&[]);
+            }
+            blocks.len() - 1
+        }
+    };
+    if start_idx > end_idx {
+        return Err(LoreError::Validation(
+            "start_block_id must come before end_block_id".into(),
+        ));
+    }
+    Ok(&blocks[start_idx..=end_idx])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::FileBlockStore;
+    use super::{FileBlockStore, parse_document_text, serialize_blocks_to_text};
     use crate::error::LoreError;
-    use crate::model::{BlockType, NewBlock, OrderKey, ProjectName, UpdateBlock};
+    use crate::model::{
+        BlockType, KeyFingerprint, NewBlock, OrderKey, ProjectName, UpdateBlock,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -2944,5 +3504,1183 @@ mod tests {
             .get_doc_block(&project.slug, &doc.id, &block.id)
             .unwrap();
         assert_eq!(fetched.content, big_content);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for document text tests
+    // -----------------------------------------------------------------------
+
+    /// Create a project + doc + N markdown blocks, return (project_slug, doc_id, block_ids)
+    fn setup_doc_with_blocks(
+        store: &FileBlockStore,
+        contents: &[&str],
+    ) -> (ProjectName, super::DocumentId, Vec<crate::model::BlockId>) {
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "My Doc")
+            .unwrap();
+        let mut ids = Vec::new();
+        let mut prev_order: Option<OrderKey> = None;
+        for &text in contents {
+            let block = store
+                .create_doc_block_as_project_writer(
+                    &doc.id,
+                    NewBlock {
+                        project: project.slug.clone(),
+                        block_type: BlockType::Markdown,
+                        content: text.into(),
+                        author_key: "testuser".into(),
+                        left: prev_order.clone(),
+                        right: None,
+                        image_upload: None,
+                    },
+                )
+                .unwrap();
+            prev_order = Some(block.order.clone());
+            ids.push(block.id);
+        }
+        (project.slug, doc.id, ids)
+    }
+
+    fn author() -> KeyFingerprint {
+        KeyFingerprint::from_user_name("testuser").unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // serialize_blocks_to_text / parse_document_text round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serialize_parse_roundtrip_single_block() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, _ids) = setup_doc_with_blocks(&store, &["Hello world"]);
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        let text = serialize_blocks_to_text(&blocks);
+        let parsed = parse_document_text(&text).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, blocks[0].id.as_str());
+        assert_eq!(parsed[0].block_type, BlockType::Markdown);
+        assert_eq!(parsed[0].content, "Hello world");
+    }
+
+    #[test]
+    fn serialize_parse_roundtrip_multiple_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, _ids) =
+            setup_doc_with_blocks(&store, &["First", "Second", "Third"]);
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        let text = serialize_blocks_to_text(&blocks);
+        let parsed = parse_document_text(&text).unwrap();
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].content, "First");
+        assert_eq!(parsed[1].content, "Second");
+        assert_eq!(parsed[2].content, "Third");
+    }
+
+    #[test]
+    fn serialize_parse_roundtrip_multiline_content() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let content = "Line one\nLine two\nLine three";
+        let (project, doc_id, _ids) = setup_doc_with_blocks(&store, &[content]);
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        let text = serialize_blocks_to_text(&blocks);
+        let parsed = parse_document_text(&text).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].content, content);
+    }
+
+    #[test]
+    fn serialize_parse_roundtrip_empty_content() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, _ids) = setup_doc_with_blocks(&store, &[""]);
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        let text = serialize_blocks_to_text(&blocks);
+        let parsed = parse_document_text(&text).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].content, "");
+    }
+
+    #[test]
+    fn serialize_parse_roundtrip_svg_block() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "SVG Doc")
+            .unwrap();
+        let svg = "<svg><circle r=\"10\"/></svg>";
+        store
+            .create_doc_block_as_project_writer(
+                &doc.id,
+                NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Svg,
+                    content: svg.into(),
+                    author_key: "testuser".into(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+
+        let blocks = store.list_doc_blocks(&project.slug, &doc.id).unwrap();
+        let text = serialize_blocks_to_text(&blocks);
+        assert!(text.contains("type:svg"));
+        let parsed = parse_document_text(&text).unwrap();
+        assert_eq!(parsed[0].block_type, BlockType::Svg);
+        assert_eq!(parsed[0].content, svg);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_document_text error cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_rejects_nested_block_markers() {
+        let text = "<<<< block:abc type:markdown >>>>\n<<<< block:def type:markdown >>>>\ncontent\n<<<< end:def >>>>\n<<<< end:abc >>>>";
+        let err = parse_document_text(text).unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn parse_rejects_mismatched_end_id() {
+        let text = "<<<< block:abc type:markdown >>>>\ncontent\n<<<< end:xyz >>>>";
+        let err = parse_document_text(text).unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn parse_rejects_unclosed_block() {
+        let text = "<<<< block:abc type:markdown >>>>\ncontent";
+        let err = parse_document_text(text).unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn parse_rejects_content_outside_markers() {
+        let text = "stray content\n<<<< block:abc type:markdown >>>>\ncontent\n<<<< end:abc >>>>";
+        let err = parse_document_text(text).unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_block_type() {
+        let text = "<<<< block:abc type:javascript >>>>\ncontent\n<<<< end:abc >>>>";
+        let err = parse_document_text(text).unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn parse_rejects_end_without_start() {
+        let text = "<<<< end:abc >>>>";
+        let err = parse_document_text(text).unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn parse_allows_blank_lines_between_blocks() {
+        let text = "<<<< block:a type:markdown >>>>\nfirst\n<<<< end:a >>>>\n\n<<<< block:b type:markdown >>>>\nsecond\n<<<< end:b >>>>";
+        let parsed = parse_document_text(text).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].content, "first");
+        assert_eq!(parsed[1].content, "second");
+    }
+
+    // -----------------------------------------------------------------------
+    // read_document_text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_document_text_full() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Alpha", "Beta", "Gamma"]);
+
+        let text = store
+            .read_document_text(&project, &doc_id, None, None)
+            .unwrap();
+        let parsed = parse_document_text(&text).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].id, ids[0].as_str());
+        assert_eq!(parsed[1].id, ids[1].as_str());
+        assert_eq!(parsed[2].id, ids[2].as_str());
+        assert_eq!(parsed[0].content, "Alpha");
+        assert_eq!(parsed[1].content, "Beta");
+        assert_eq!(parsed[2].content, "Gamma");
+    }
+
+    #[test]
+    fn read_document_text_partial_range() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["A", "B", "C", "D", "E"]);
+
+        // Read blocks B..D (indices 1..3 inclusive)
+        let text = store
+            .read_document_text(&project, &doc_id, Some(&ids[1]), Some(&ids[3]))
+            .unwrap();
+        let parsed = parse_document_text(&text).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].content, "B");
+        assert_eq!(parsed[1].content, "C");
+        assert_eq!(parsed[2].content, "D");
+    }
+
+    #[test]
+    fn read_document_text_start_only() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["A", "B", "C"]);
+
+        // From B to end
+        let text = store
+            .read_document_text(&project, &doc_id, Some(&ids[1]), None)
+            .unwrap();
+        let parsed = parse_document_text(&text).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].content, "B");
+        assert_eq!(parsed[1].content, "C");
+    }
+
+    #[test]
+    fn read_document_text_end_only() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["A", "B", "C"]);
+
+        // From start to B
+        let text = store
+            .read_document_text(&project, &doc_id, None, Some(&ids[1]))
+            .unwrap();
+        let parsed = parse_document_text(&text).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].content, "A");
+        assert_eq!(parsed[1].content, "B");
+    }
+
+    #[test]
+    fn read_document_text_single_block_range() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["A", "B", "C"]);
+
+        // Just block B
+        let text = store
+            .read_document_text(&project, &doc_id, Some(&ids[1]), Some(&ids[1]))
+            .unwrap();
+        let parsed = parse_document_text(&text).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].content, "B");
+    }
+
+    #[test]
+    fn read_document_text_reversed_range_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["A", "B", "C"]);
+
+        // Start after end
+        let err = store
+            .read_document_text(&project, &doc_id, Some(&ids[2]), Some(&ids[0]))
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn read_document_text_nonexistent_block_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, _ids) =
+            setup_doc_with_blocks(&store, &["A"]);
+
+        let fake_id = crate::model::BlockId::new();
+        let err = store
+            .read_document_text(&project, &doc_id, Some(&fake_id), None)
+            .unwrap_err();
+        assert!(matches!(err, LoreError::BlockNotFound(_)));
+    }
+
+    #[test]
+    fn read_document_text_empty_doc() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Empty")
+            .unwrap();
+
+        let text = store
+            .read_document_text(&project.slug, &doc.id, None, None)
+            .unwrap();
+        assert_eq!(text, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // write_document_text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_document_text_updates_content() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Original A", "Original B"]);
+
+        // Read, modify, write back
+        let mut text = store
+            .read_document_text(&project, &doc_id, None, None)
+            .unwrap();
+        text = text.replace("Original A", "Modified A");
+        text = text.replace("Original B", "Modified B");
+
+        let entries = parse_document_text(&text).unwrap();
+        let result = store
+            .write_document_text(&project, &doc_id, entries, author())
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 2);
+        assert!(result.created.is_empty());
+        assert!(result.deleted.is_empty());
+
+        // Verify
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].content, "Modified A");
+        assert_eq!(blocks[1].content, "Modified B");
+        assert_eq!(blocks[0].id, ids[0]);
+        assert_eq!(blocks[1].id, ids[1]);
+    }
+
+    #[test]
+    fn write_document_text_deletes_missing_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Keep", "Delete me", "Also keep"]);
+
+        // Read and remove the middle block from the text
+        let text = store
+            .read_document_text(&project, &doc_id, None, None)
+            .unwrap();
+        let entries = parse_document_text(&text).unwrap();
+        let filtered: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.id != ids[1].as_str())
+            .collect();
+
+        let result = store
+            .write_document_text(&project, &doc_id, filtered, author())
+            .unwrap();
+
+        assert_eq!(result.deleted.len(), 1);
+        assert_eq!(result.deleted[0], ids[1]);
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].content, "Keep");
+        assert_eq!(blocks[1].content, "Also keep");
+    }
+
+    #[test]
+    fn write_document_text_creates_new_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Existing"]);
+
+        // Build text with existing block + a new placeholder block
+        let text = format!(
+            "<<<< block:{} type:markdown >>>>\nExisting\n<<<< end:{} >>>>\n\n<<<< block:new_block_1 type:markdown >>>>\nBrand new content\n<<<< end:new_block_1 >>>>",
+            ids[0], ids[0]
+        );
+        let entries = parse_document_text(&text).unwrap();
+        let result = store
+            .write_document_text(&project, &doc_id, entries, author())
+            .unwrap();
+
+        assert_eq!(result.created.len(), 1);
+        assert_eq!(result.created[0].0, "new_block_1");
+        assert_eq!(result.created[0].1.content, "Brand new content");
+        assert!(result.updated.is_empty());
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].content, "Existing");
+        assert_eq!(blocks[1].content, "Brand new content");
+    }
+
+    #[test]
+    fn write_document_text_reorders_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["First", "Second", "Third"]);
+
+        // Reverse the order
+        let text = format!(
+            "<<<< block:{id2} type:markdown >>>>\nThird\n<<<< end:{id2} >>>>\n\n<<<< block:{id1} type:markdown >>>>\nSecond\n<<<< end:{id1} >>>>\n\n<<<< block:{id0} type:markdown >>>>\nFirst\n<<<< end:{id0} >>>>",
+            id0 = ids[0], id1 = ids[1], id2 = ids[2]
+        );
+        let entries = parse_document_text(&text).unwrap();
+        store
+            .write_document_text(&project, &doc_id, entries, author())
+            .unwrap();
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks[0].content, "Third");
+        assert_eq!(blocks[1].content, "Second");
+        assert_eq!(blocks[2].content, "First");
+    }
+
+    #[test]
+    fn write_document_text_rejects_unknown_uuid() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, _ids) =
+            setup_doc_with_blocks(&store, &["A"]);
+
+        let fake_uuid = uuid::Uuid::new_v4().to_string();
+        let text = format!(
+            "<<<< block:{fake_uuid} type:markdown >>>>\ncontent\n<<<< end:{fake_uuid} >>>>"
+        );
+        let entries = parse_document_text(&text).unwrap();
+        let err = store
+            .write_document_text(&project, &doc_id, entries, author())
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn write_document_text_image_block_not_modified() {
+        use crate::model::{BlockId, ContentRef, StoredBlock};
+        use time::OffsetDateTime;
+
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Doc")
+            .unwrap();
+
+        // Create image block directly on disk (bypasses validate which rejects
+        // empty content for non-markdown blocks — in production, images always
+        // come with an upload)
+        let img_id = BlockId::new();
+        let doc_dir = store.find_doc_dir(&project.slug, &doc.id).unwrap();
+        let img_order = OrderKey::new("40000000".into()).unwrap();
+        let img_stored = StoredBlock {
+            id: img_id.clone(),
+            project: project.slug.clone(),
+            block_type: BlockType::Image,
+            order: img_order.clone(),
+            author: author(),
+            content: ContentRef::Inline(String::new()),
+            media: None,
+            created_at: OffsetDateTime::now_utc(),
+            pinned: false,
+        };
+        std::fs::write(
+            doc_dir.join("blocks").join(format!("{}.json", img_id.as_str())),
+            serde_json::to_vec_pretty(&img_stored).unwrap(),
+        )
+        .unwrap();
+
+        // Create a markdown block after
+        let md_block = store
+            .create_doc_block_as_project_writer(
+                &doc.id,
+                NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Markdown,
+                    content: "text".into(),
+                    author_key: "testuser".into(),
+                    left: Some(img_order),
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+
+        // Write back with image block present and markdown updated
+        let text = format!(
+            "<<<< block:{img} type:image >>>>\n<<<< end:{img} >>>>\n\n<<<< block:{md} type:markdown >>>>\nupdated text\n<<<< end:{md} >>>>",
+            img = img_id, md = md_block.id
+        );
+        let entries = parse_document_text(&text).unwrap();
+        let result = store
+            .write_document_text(&project.slug, &doc.id, entries, author())
+            .unwrap();
+
+        // Image should not appear in updated list
+        assert!(!result.updated.iter().any(|b| b.id == img_id));
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].content, "updated text");
+
+        let blocks = store.list_doc_blocks(&project.slug, &doc.id).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].block_type, BlockType::Image);
+        assert_eq!(blocks[1].content, "updated text");
+    }
+
+    #[test]
+    fn write_document_text_combined_create_update_delete_reorder() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["A", "B", "C", "D"]);
+
+        // Keep C (unchanged), update A, delete B and D, add new block
+        // Order: new_block, C, A-updated
+        let text = format!(
+            "<<<< block:new1 type:markdown >>>>\nFresh\n<<<< end:new1 >>>>\n\n<<<< block:{c} type:markdown >>>>\nC\n<<<< end:{c} >>>>\n\n<<<< block:{a} type:markdown >>>>\nA-updated\n<<<< end:{a} >>>>",
+            a = ids[0], c = ids[2]
+        );
+        let entries = parse_document_text(&text).unwrap();
+        let result = store
+            .write_document_text(&project, &doc_id, entries, author())
+            .unwrap();
+
+        assert_eq!(result.created.len(), 1);
+        assert_eq!(result.created[0].0, "new1");
+        assert_eq!(result.updated.len(), 1); // A content changed
+        assert_eq!(result.deleted.len(), 2); // B and D
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].content, "Fresh");
+        assert_eq!(blocks[1].content, "C");
+        assert_eq!(blocks[2].content, "A-updated");
+    }
+
+    #[test]
+    fn write_document_text_no_changes() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, _ids) =
+            setup_doc_with_blocks(&store, &["Unchanged"]);
+
+        let text = store
+            .read_document_text(&project, &doc_id, None, None)
+            .unwrap();
+        let entries = parse_document_text(&text).unwrap();
+        let result = store
+            .write_document_text(&project, &doc_id, entries, author())
+            .unwrap();
+
+        assert!(result.created.is_empty());
+        assert!(result.updated.is_empty());
+        assert!(result.deleted.is_empty());
+    }
+
+    #[test]
+    fn write_document_text_delete_all_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["A", "B"]);
+
+        // Empty entries = delete everything
+        let result = store
+            .write_document_text(&project, &doc_id, Vec::new(), author())
+            .unwrap();
+
+        assert_eq!(result.deleted.len(), 2);
+        assert!(result.deleted.contains(&ids[0]));
+        assert!(result.deleted.contains(&ids[1]));
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn write_document_text_multiple_new_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Doc")
+            .unwrap();
+
+        let text = "<<<< block:a type:markdown >>>>\nFirst\n<<<< end:a >>>>\n\n<<<< block:b type:markdown >>>>\nSecond\n<<<< end:b >>>>\n\n<<<< block:c type:svg >>>>\n<svg/>\n<<<< end:c >>>>";
+        let entries = parse_document_text(text).unwrap();
+        let result = store
+            .write_document_text(&project.slug, &doc.id, entries, author())
+            .unwrap();
+
+        assert_eq!(result.created.len(), 3);
+        let blocks = store.list_doc_blocks(&project.slug, &doc.id).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].content, "First");
+        assert_eq!(blocks[0].block_type, BlockType::Markdown);
+        assert_eq!(blocks[1].content, "Second");
+        assert_eq!(blocks[2].content, "<svg/>");
+        assert_eq!(blocks[2].block_type, BlockType::Svg);
+    }
+
+    // -----------------------------------------------------------------------
+    // split_doc_block
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_doc_block_at_midpoint() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["HelloWorld"]);
+
+        let (left, right) = store
+            .split_doc_block(&project, &doc_id, &ids[0], 5, author())
+            .unwrap();
+
+        assert_eq!(left.content, "Hello");
+        assert_eq!(right.content, "World");
+        assert_eq!(left.id, ids[0]); // original keeps its ID
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].content, "Hello");
+        assert_eq!(blocks[1].content, "World");
+    }
+
+    #[test]
+    fn split_doc_block_at_position_1() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["ABCDE"]);
+
+        let (left, right) = store
+            .split_doc_block(&project, &doc_id, &ids[0], 1, author())
+            .unwrap();
+
+        assert_eq!(left.content, "A");
+        assert_eq!(right.content, "BCDE");
+    }
+
+    #[test]
+    fn split_doc_block_at_last_position() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["ABCDE"]);
+
+        let (left, right) = store
+            .split_doc_block(&project, &doc_id, &ids[0], 4, author())
+            .unwrap();
+
+        assert_eq!(left.content, "ABCD");
+        assert_eq!(right.content, "E");
+    }
+
+    #[test]
+    fn split_doc_block_preserves_surrounding_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Before", "SplitMe", "After"]);
+
+        store
+            .split_doc_block(&project, &doc_id, &ids[1], 5, author())
+            .unwrap();
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].content, "Before");
+        assert_eq!(blocks[1].content, "Split");
+        assert_eq!(blocks[2].content, "Me");
+        assert_eq!(blocks[3].content, "After");
+    }
+
+    #[test]
+    fn split_doc_block_position_0_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Hello"]);
+
+        let err = store
+            .split_doc_block(&project, &doc_id, &ids[0], 0, author())
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn split_doc_block_position_at_length_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Hello"]);
+
+        let err = store
+            .split_doc_block(&project, &doc_id, &ids[0], 5, author())
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn split_doc_block_position_past_length_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Hello"]);
+
+        let err = store
+            .split_doc_block(&project, &doc_id, &ids[0], 100, author())
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn split_doc_block_non_markdown_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Doc")
+            .unwrap();
+        let svg_block = store
+            .create_doc_block_as_project_writer(
+                &doc.id,
+                NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Svg,
+                    content: "<svg/>".into(),
+                    author_key: "testuser".into(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+
+        let err = store
+            .split_doc_block(&project.slug, &doc.id, &svg_block.id, 3, author())
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn split_doc_block_multiline_at_newline() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let content = "Line one\nLine two\nLine three";
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &[content]);
+
+        // Split right at the first newline boundary (after "Line one\n")
+        let (left, right) = store
+            .split_doc_block(&project, &doc_id, &ids[0], 9, author())
+            .unwrap();
+
+        assert_eq!(left.content, "Line one\n");
+        assert_eq!(right.content, "Line two\nLine three");
+    }
+
+    // -----------------------------------------------------------------------
+    // combine_doc_blocks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn combine_two_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Hello", "World"]);
+
+        let merged = store
+            .combine_doc_blocks(&project, &doc_id, &[ids[0].clone(), ids[1].clone()], author())
+            .unwrap();
+
+        assert_eq!(merged.content, "Hello\nWorld");
+        assert_eq!(merged.id, ids[0]); // first block survives
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].content, "Hello\nWorld");
+    }
+
+    #[test]
+    fn combine_three_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["A", "B", "C"]);
+
+        let merged = store
+            .combine_doc_blocks(
+                &project,
+                &doc_id,
+                &[ids[0].clone(), ids[1].clone(), ids[2].clone()],
+                author(),
+            )
+            .unwrap();
+
+        assert_eq!(merged.content, "A\nB\nC");
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn combine_preserves_surrounding_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Before", "Merge A", "Merge B", "After"]);
+
+        store
+            .combine_doc_blocks(
+                &project,
+                &doc_id,
+                &[ids[1].clone(), ids[2].clone()],
+                author(),
+            )
+            .unwrap();
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].content, "Before");
+        assert_eq!(blocks[1].content, "Merge A\nMerge B");
+        assert_eq!(blocks[2].content, "After");
+    }
+
+    #[test]
+    fn combine_single_block_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Alone"]);
+
+        let err = store
+            .combine_doc_blocks(&project, &doc_id, &[ids[0].clone()], author())
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn combine_non_consecutive_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["A", "B", "C"]);
+
+        // Skip the middle block
+        let err = store
+            .combine_doc_blocks(
+                &project,
+                &doc_id,
+                &[ids[0].clone(), ids[2].clone()],
+                author(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn combine_non_markdown_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Doc")
+            .unwrap();
+        let md_block = store
+            .create_doc_block_as_project_writer(
+                &doc.id,
+                NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Markdown,
+                    content: "text".into(),
+                    author_key: "testuser".into(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+        let svg_block = store
+            .create_doc_block_as_project_writer(
+                &doc.id,
+                NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Svg,
+                    content: "<svg/>".into(),
+                    author_key: "testuser".into(),
+                    left: Some(md_block.order.clone()),
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+
+        let err = store
+            .combine_doc_blocks(
+                &project.slug,
+                &doc.id,
+                &[md_block.id, svg_block.id],
+                author(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // split + combine round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_then_combine_restores_original() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["HelloWorld"]);
+
+        let (left, right) = store
+            .split_doc_block(&project, &doc_id, &ids[0], 5, author())
+            .unwrap();
+
+        let merged = store
+            .combine_doc_blocks(
+                &project,
+                &doc_id,
+                &[left.id.clone(), right.id.clone()],
+                author(),
+            )
+            .unwrap();
+
+        // Content is joined with \n, not perfectly restored, but blocks are back to one
+        assert_eq!(merged.content, "Hello\nWorld");
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // read_document_text + write_document_text full round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_write_roundtrip_preserves_content() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) = setup_doc_with_blocks(
+            &store,
+            &[
+                "# Heading\n\nParagraph one.",
+                "## Subheading\n\nParagraph two with `code`.",
+                "Final block with **bold** text.",
+            ],
+        );
+
+        let text = store
+            .read_document_text(&project, &doc_id, None, None)
+            .unwrap();
+        let entries = parse_document_text(&text).unwrap();
+        let result = store
+            .write_document_text(&project, &doc_id, entries, author())
+            .unwrap();
+
+        // No changes expected
+        assert!(result.created.is_empty());
+        assert!(result.updated.is_empty());
+        assert!(result.deleted.is_empty());
+
+        // Content intact
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].content, "# Heading\n\nParagraph one.");
+        assert_eq!(blocks[0].id, ids[0]);
+    }
+
+    #[test]
+    fn write_then_read_reflects_changes() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["Original"]);
+
+        // Build new text with updated content and a new block
+        let text = format!(
+            "<<<< block:{id} type:markdown >>>>\nEdited\n<<<< end:{id} >>>>\n\n<<<< block:new1 type:markdown >>>>\nAppended\n<<<< end:new1 >>>>",
+            id = ids[0]
+        );
+        let entries = parse_document_text(&text).unwrap();
+        store
+            .write_document_text(&project, &doc_id, entries, author())
+            .unwrap();
+
+        // Read back and verify
+        let text2 = store
+            .read_document_text(&project, &doc_id, None, None)
+            .unwrap();
+        let parsed = parse_document_text(&text2).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].content, "Edited");
+        assert_eq!(parsed[0].id, ids[0].as_str());
+        assert_eq!(parsed[1].content, "Appended");
+        // New block should have a real UUID, not "new1"
+        assert!(uuid::Uuid::parse_str(&parsed[1].id).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Reserved blocks (project-level data)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_write_project_overview() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        let overview = store
+            .get_reserved_block(&project.slug, "_overview")
+            .unwrap();
+        assert_eq!(overview.content, "");
+
+        store
+            .update_reserved_block(&project.slug, "_overview", "Project description", false)
+            .unwrap();
+        let updated = store
+            .get_reserved_block(&project.slug, "_overview")
+            .unwrap();
+        assert_eq!(updated.content, "Project description");
+    }
+
+    #[test]
+    fn read_write_file_map() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        // Agents CAN write file map
+        store
+            .update_reserved_block(&project.slug, "_map", "src/\n  main.rs", true)
+            .unwrap();
+        let block = store
+            .get_reserved_block(&project.slug, "_map")
+            .unwrap();
+        assert_eq!(block.content, "src/\n  main.rs");
+    }
+
+    #[test]
+    fn agents_cannot_write_overview() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        let err = store
+            .update_reserved_block(&project.slug, "_overview", "nope", true)
+            .unwrap_err();
+        assert!(matches!(err, LoreError::PermissionDenied));
+    }
+
+    #[test]
+    fn agents_cannot_write_agent_context() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        let err = store
+            .update_reserved_block(&project.slug, "_agent-context", "nope", true)
+            .unwrap_err();
+        assert!(matches!(err, LoreError::PermissionDenied));
+    }
+
+    // -----------------------------------------------------------------------
+    // Document management
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_document_empty_name_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+
+        let err = store
+            .create_document(&project.slug, None, "  ")
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn rename_document_empty_name_errors() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Valid")
+            .unwrap();
+
+        let err = store
+            .rename_document(&project.slug, &doc.id, "  ")
+            .unwrap_err();
+        assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn doc_block_ordering_with_many_blocks() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let contents: Vec<String> = (0..20).map(|i| format!("Block {i}")).collect();
+        let content_refs: Vec<&str> = contents.iter().map(|s| s.as_str()).collect();
+        let (project, doc_id, _ids) =
+            setup_doc_with_blocks(&store, &content_refs);
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks.len(), 20);
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(block.content, format!("Block {i}"));
+        }
+
+        // Read as document text and verify order
+        let text = store
+            .read_document_text(&project, &doc_id, None, None)
+            .unwrap();
+        let parsed = parse_document_text(&text).unwrap();
+        for (i, entry) in parsed.iter().enumerate() {
+            assert_eq!(entry.content, format!("Block {i}"));
+        }
+    }
+
+    #[test]
+    fn write_document_text_type_change() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let (project, doc_id, ids) =
+            setup_doc_with_blocks(&store, &["some content"]);
+
+        // Change block type from markdown to svg
+        let text = format!(
+            "<<<< block:{id} type:svg >>>>\n<svg><text>hello</text></svg>\n<<<< end:{id} >>>>",
+            id = ids[0]
+        );
+        let entries = parse_document_text(&text).unwrap();
+        let result = store
+            .write_document_text(&project, &doc_id, entries, author())
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].block_type, BlockType::Svg);
+
+        let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
+        assert_eq!(blocks[0].block_type, BlockType::Svg);
+        assert_eq!(blocks[0].content, "<svg><text>hello</text></svg>");
     }
 }

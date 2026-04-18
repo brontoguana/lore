@@ -162,6 +162,15 @@ pub const RESERVED_OVERVIEW: &str = "_overview";
 pub const RESERVED_MAP: &str = "_map";
 pub const RESERVED_BLOCK_IDS: &[&str] = &[RESERVED_AGENT_CONTEXT, RESERVED_OVERVIEW, RESERVED_MAP];
 
+pub fn reserved_block_display_name(id: &str) -> &'static str {
+    match id {
+        RESERVED_AGENT_CONTEXT => "Agent Context",
+        RESERVED_OVERVIEW => "Overview",
+        RESERVED_MAP => "File Map",
+        _ => "Reserved",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct DocumentId(String);

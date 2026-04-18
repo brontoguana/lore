@@ -26,10 +26,13 @@ pub use config::{
 pub use error::{LoreError, Result};
 pub use model::{
     Block, BlockId, BlockType, KeyFingerprint, NewBlock, OrderKey, ProjectName, UpdateBlock,
-    slugify,
+    reserved_block_display_name, slugify,
 };
 pub use order::generate_order_key;
-pub use store::FileBlockStore;
+pub use store::{
+    DocumentWriteEntry, DocumentWriteResult, FileBlockStore, parse_document_text,
+    serialize_blocks_to_text,
+};
 pub use updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
     DEFAULT_UPDATE_REPO, ReleaseStream, SelfUpdateOutcome, apply_update_to_version,
