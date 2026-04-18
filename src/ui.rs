@@ -9081,7 +9081,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       min-height: 48px;
       padding: var(--s-3) var(--s-4);
       font-size: 16px;
-      border-radius: 8px;
+      border-radius: var(--s-3);
     }
 
     .create-agent-panel select,
