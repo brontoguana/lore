@@ -1212,6 +1212,7 @@ fn build_context(cli: &Cli, config: &CliConfig) -> CliResult<CliContext> {
     let token = cli
         .token
         .clone()
+        .or_else(|| env::var("LORE_AGENT_TOKEN").ok())
         .or_else(|| env::var("LORE_TOKEN").ok())
         .or_else(|| config.token.clone());
     let project = cli
@@ -2284,7 +2285,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
 
         let model_override = history["model"].as_str().map(|s| s.to_string());
         let effort_override = history["effort"].as_str().map(|s| s.to_string());
-        let mut child = match spawn_backend(backend, &full_prompt, model_override.as_deref(), effort_override.as_deref()).await {
+        let mut child = match spawn_backend(backend, &full_prompt, model_override.as_deref(), effort_override.as_deref(), context.token.as_deref()).await {
             Ok(c) => c,
             Err(e) => {
                 let rec = AgentErrorRecord::new("cli", format!("spawn {} failed: {e}", backend));
@@ -2501,7 +2502,7 @@ async fn run_manager_cli(
         let _ = fs::write(lore_dir.join("manager_context.txt"), &full_prompt);
     }
 
-    let mut child = match spawn_backend(backend, &full_prompt, None, None).await {
+    let mut child = match spawn_backend(backend, &full_prompt, None, None, context.token.as_deref()).await {
         Ok(c) => c,
         Err(e) => {
             let rec = AgentErrorRecord::new("manager", format!("spawn {} failed: {e}", backend));
@@ -3825,6 +3826,7 @@ async fn spawn_backend(
     prompt: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    agent_token: Option<&str>,
 ) -> CliResult<tokio::process::Child> {
     use tokio::io::AsyncWriteExt;
 
@@ -3846,14 +3848,17 @@ async fn spawn_backend(
                 args.push("--effort".to_string());
                 args.push(e.to_string());
             }
-            tokio::process::Command::new("claude")
-                .args(&args)
+            let mut cmd = tokio::process::Command::new("claude");
+            cmd.args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .env_remove("CLAUDECODE")
-                .spawn()?
+                .env_remove("CLAUDECODE");
+            if let Some(token) = agent_token {
+                cmd.env("LORE_AGENT_TOKEN", token);
+            }
+            cmd.spawn()?
         }
         AgentBackend::Gemini => {
             let mut args = vec![
@@ -3866,13 +3871,16 @@ async fn spawn_backend(
             }
             args.push("-p".to_string());
             args.push(String::new());
-            tokio::process::Command::new("gemini")
-                .args(&args)
+            let mut cmd = tokio::process::Command::new("gemini");
+            cmd.args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()?
+                .stderr(std::process::Stdio::piped());
+            if let Some(token) = agent_token {
+                cmd.env("LORE_AGENT_TOKEN", token);
+            }
+            cmd.spawn()?
         }
         AgentBackend::Codex => {
             let mut args = vec![
@@ -3884,13 +3892,16 @@ async fn spawn_backend(
                 args.push("--model".to_string());
                 args.push(m.to_string());
             }
-            tokio::process::Command::new("codex")
-                .args(&args)
+            let mut cmd = tokio::process::Command::new("codex");
+            cmd.args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()?
+                .stderr(std::process::Stdio::piped());
+            if let Some(token) = agent_token {
+                cmd.env("LORE_AGENT_TOKEN", token);
+            }
+            cmd.spawn()?
         }
         AgentBackend::OpenAi => {
             return Err("OpenAI backend is not yet implemented. Use claude, gemini, or codex.".into());
@@ -3996,14 +4007,17 @@ async fn run_compaction(context: &CliContext, backend: AgentBackend, prompt: &st
         AgentBackend::Claude => {
             // Claude without --output-format returns plain text
             use tokio::io::AsyncWriteExt;
-            let mut child = tokio::process::Command::new("claude")
-                .args(["-p", "--model", "sonnet", "--no-session-persistence"])
+            let mut cmd = tokio::process::Command::new("claude");
+            cmd.args(["-p", "--model", "sonnet", "--no-session-persistence"])
                 .current_dir(&agent_cwd())
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .env_remove("CLAUDECODE")
-                .spawn()?;
+                .env_remove("CLAUDECODE");
+            if let Some(token) = context.token.as_deref() {
+                cmd.env("LORE_AGENT_TOKEN", token);
+            }
+            let mut child = cmd.spawn()?;
             if let Some(mut stdin) = child.stdin.take() {
                 stdin.write_all(prompt.as_bytes()).await?;
                 drop(stdin);
@@ -4013,7 +4027,7 @@ async fn run_compaction(context: &CliContext, backend: AgentBackend, prompt: &st
         }
         AgentBackend::Gemini | AgentBackend::Codex => {
             // Spawn in JSON mode, parse streaming output, accumulate text
-            let mut child = spawn_backend(backend, prompt, None, None).await?;
+            let mut child = spawn_backend(backend, prompt, None, None, context.token.as_deref()).await?;
             let stdout = child.stdout.take().ok_or("no stdout")?;
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
@@ -4058,7 +4072,6 @@ struct ManagedAgent {
     name: String,
     pid: u32,
     folder: String,
-    backend: String,
     token: String,
 }
 
@@ -4326,17 +4339,17 @@ fn migrate_old_agents(_context: &CliContext, svc_state: &mut ServiceState) {
         // Find a running process for this agent by scanning /proc
         let found = find_old_agent_process(agent_name, my_pid);
 
-        let (folder, backend, old_pid) = match found {
+        let (folder, old_pid) = match found {
             Some(info) => info,
             None => {
                 // Agent isn't running, but we know about it from config.
-                // Use HOME as default folder, claude as default backend.
+                // Use HOME as default folder.
                 let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
                 eprintln!(
                     "[service] Agent '{}' not running, importing with folder={}",
                     agent_name, home
                 );
-                (home, "claude".to_string(), None)
+                (home, None)
             }
         };
 
@@ -4355,7 +4368,6 @@ fn migrate_old_agents(_context: &CliContext, svc_state: &mut ServiceState) {
             name: agent_name.clone(),
             pid: 0, // will be spawned by restart_crashed_agents
             folder,
-            backend,
             token: agent_token.clone(),
         };
         svc_state.agents.push(managed);
@@ -4366,8 +4378,8 @@ fn migrate_old_agents(_context: &CliContext, svc_state: &mut ServiceState) {
 }
 
 /// Scan /proc for a running `lore ... agent <name>` process.
-/// Returns (cwd, backend, pid) if found.
-fn find_old_agent_process(agent_name: &str, exclude_pid: u32) -> Option<(String, String, Option<u32>)> {
+/// Returns (cwd, pid) if found.
+fn find_old_agent_process(agent_name: &str, exclude_pid: u32) -> Option<(String, Option<u32>)> {
     #[cfg(target_os = "linux")]
     {
         let proc_dir = match fs::read_dir("/proc") {
@@ -4420,15 +4432,7 @@ fn find_old_agent_process(agent_name: &str, exclude_pid: u32) -> Option<(String,
                     env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
                 });
 
-            // Parse backend from args (--backend <value>)
-            let backend = args
-                .iter()
-                .position(|a| a == "--backend")
-                .and_then(|i| args.get(i + 1))
-                .cloned()
-                .unwrap_or_else(|| "claude".to_string());
-
-            return Some((cwd, backend, Some(pid)));
+            return Some((cwd, Some(pid)));
         }
         None
     }
@@ -4869,7 +4873,6 @@ async fn service_handle_create_agent(
 ) -> CliResult<serde_json::Value> {
     let agent_name = params["agent_name"].as_str().ok_or("missing agent_name")?;
     let folder = params["folder"].as_str().ok_or("missing folder")?;
-    let backend = params["backend"].as_str().unwrap_or("claude");
     let (_, folder_path) = match resolve_existing_service_path(folder) {
         Ok(v) => v,
         Err(e) => return Ok(serde_json::json!({ "error": e.to_string() })),
@@ -4883,7 +4886,6 @@ async fn service_handle_create_agent(
         .header("x-lore-version", env!("CARGO_PKG_VERSION"))
         .json(&serde_json::json!({
             "name": agent_name,
-            "backend": backend,
         }))
         .send()
         .await?;
@@ -4910,7 +4912,6 @@ async fn service_handle_create_agent(
         name: agent_slug.to_string(),
         pid: 0,
         folder: folder_path.to_string_lossy().into_owned(),
-        backend: backend.to_string(),
         token: agent_token.to_string(),
     };
 

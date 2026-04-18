@@ -1138,8 +1138,6 @@ struct RegisterMachineRequest {
 #[derive(Debug, Deserialize)]
 struct ProvisionAgentRequest {
     name: String,
-    #[serde(default)]
-    backend: String,
 }
 
 
@@ -12707,15 +12705,12 @@ async fn provision_agent_with_body(
         let _ = state.auth.update_machine_version(&machine.machine_name, &machine.user.username, version);
     }
 
-    let backend = req.backend.parse().unwrap_or_default();
-
     // Compute grants: all projects the user has access to
     let grants = build_user_all_grants(&state, &machine.user)?;
 
     let created = state.auth.provision_agent(
         &machine.user.username,
         &req.name,
-        backend,
         grants,
         Some(&machine.machine_name),
     )?;

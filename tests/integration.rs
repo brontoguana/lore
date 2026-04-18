@@ -1711,3 +1711,600 @@ async fn full_mcp_protocol_flow() {
     let tools = body["result"]["tools"].as_array().unwrap();
     assert!(!tools.is_empty(), "should have MCP tools");
 }
+
+// ---------------------------------------------------------------------------
+// Multi-agent isolation test
+// ---------------------------------------------------------------------------
+
+/// Helper: create a role, non-admin user, register a machine, provision an agent.
+/// Returns the agent token.
+async fn setup_agent_with_project(
+    client: &reqwest::Client,
+    addr: &SocketAddr,
+    role_name: &str,
+    project: &str,
+    username: &str,
+    password: &str,
+    machine_name: &str,
+    agent_display_name: &str,
+) -> String {
+    // Create role granting read_write to the project
+    let resp = client
+        .post(url(addr, "/v1/admin/roles"))
+        .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
+        .json(&json!({
+            "name": role_name,
+            "grants": [{"project": project, "permission": "read_write"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "create role {role_name} failed");
+
+    // Create non-admin user with that role
+    let resp = client
+        .post(url(addr, "/v1/admin/users"))
+        .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
+        .json(&json!({
+            "username": username,
+            "password": password,
+            "roles": [role_name],
+            "is_admin": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "create user {username} failed");
+
+    // Register machine (authenticates with user credentials)
+    let resp = client
+        .post(url(addr, "/v1/machines/register"))
+        .json(&json!({
+            "username": username,
+            "password": password,
+            "machine_name": machine_name
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "register machine {machine_name} failed");
+    let body: Value = resp.json().await.unwrap();
+    let machine_token = body["token"].as_str().unwrap().to_string();
+
+    // Provision agent via machine token
+    let resp = client
+        .post(url(addr, "/v1/agents/provision"))
+        .header("x-lore-key", &machine_token)
+        .json(&json!({"name": agent_display_name}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "provision agent {agent_display_name} failed");
+    let body: Value = resp.json().await.unwrap();
+    body["token"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_agent_isolation_and_concurrent_execution() {
+    let dir = tempdir().unwrap();
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    // --- Setup: two users, two agents, two projects ---
+
+    let token_alpha = setup_agent_with_project(
+        &client, &addr,
+        "role-alpha", "project.alpha",
+        "user-alpha", "pass-alpha-123",
+        "machine-alpha", "agent-alpha",
+    )
+    .await;
+
+    let token_beta = setup_agent_with_project(
+        &client, &addr,
+        "role-beta", "project.beta",
+        "user-beta", "pass-beta-456",
+        "machine-beta", "agent-beta",
+    )
+    .await;
+
+    // --- Seed both projects concurrently ---
+
+    let (seed_a, seed_b) = tokio::join!(
+        client
+            .post(url(&addr, "/v1/blocks"))
+            .header("x-lore-key", &token_alpha)
+            .json(&json!({"project": "project.alpha", "block_type": "markdown", "content": "Alpha secret data"}))
+            .send(),
+        client
+            .post(url(&addr, "/v1/blocks"))
+            .header("x-lore-key", &token_beta)
+            .json(&json!({"project": "project.beta", "block_type": "markdown", "content": "Beta secret data"}))
+            .send(),
+    );
+    assert_eq!(seed_a.unwrap().status(), 200, "seed alpha failed");
+    assert_eq!(seed_b.unwrap().status(), 200, "seed beta failed");
+
+    // Create documents in each project concurrently
+    let (doc_a_resp, doc_b_resp) = tokio::join!(
+        client
+            .post(url(&addr, "/v1/projects/project.alpha/documents"))
+            .header("x-lore-key", &token_alpha)
+            .json(&json!({"name": "Alpha Doc"}))
+            .send(),
+        client
+            .post(url(&addr, "/v1/projects/project.beta/documents"))
+            .header("x-lore-key", &token_beta)
+            .json(&json!({"name": "Beta Doc"}))
+            .send(),
+    );
+    let doc_a: Value = doc_a_resp.unwrap().json().await.unwrap();
+    let doc_b: Value = doc_b_resp.unwrap().json().await.unwrap();
+    let doc_a_id = doc_a["id"].as_str().unwrap().to_string();
+    let doc_b_id = doc_b["id"].as_str().unwrap().to_string();
+
+    // Create blocks in each document concurrently
+    let (blk_a, blk_b) = tokio::join!(
+        client
+            .post(url(&addr, &format!("/v1/projects/project.alpha/documents/{doc_a_id}/blocks")))
+            .header("x-lore-key", &token_alpha)
+            .json(&json!({"block_type": "markdown", "content": "Alpha confidential notes"}))
+            .send(),
+        client
+            .post(url(&addr, &format!("/v1/projects/project.beta/documents/{doc_b_id}/blocks")))
+            .header("x-lore-key", &token_beta)
+            .json(&json!({"block_type": "markdown", "content": "Beta confidential notes"}))
+            .send(),
+    );
+    assert_eq!(blk_a.unwrap().status(), 200, "create alpha block failed");
+    assert_eq!(blk_b.unwrap().status(), 200, "create beta block failed");
+
+    // --- Verify: each agent sees only its own project ---
+
+    // list_projects: alpha sees project.alpha, not project.beta
+    let resp = client
+        .get(url(&addr, "/v1/projects"))
+        .header("x-lore-key", &token_alpha)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let projects: Value = resp.json().await.unwrap();
+    let project_slugs: Vec<&str> = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| {
+            p["project"].as_str().or_else(|| p["project"]["slug"].as_str())
+        })
+        .collect();
+    assert!(
+        project_slugs.contains(&"project.alpha"),
+        "alpha should see project.alpha: {project_slugs:?}"
+    );
+    assert!(
+        !project_slugs.contains(&"project.beta"),
+        "alpha must NOT see project.beta: {project_slugs:?}"
+    );
+
+    // Same check for beta
+    let resp = client
+        .get(url(&addr, "/v1/projects"))
+        .header("x-lore-key", &token_beta)
+        .send()
+        .await
+        .unwrap();
+    let projects: Value = resp.json().await.unwrap();
+    let project_slugs: Vec<&str> = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| {
+            p["project"].as_str().or_else(|| p["project"]["slug"].as_str())
+        })
+        .collect();
+    assert!(
+        project_slugs.contains(&"project.beta"),
+        "beta should see project.beta: {project_slugs:?}"
+    );
+    assert!(
+        !project_slugs.contains(&"project.alpha"),
+        "beta must NOT see project.alpha: {project_slugs:?}"
+    );
+
+    // --- Cross-project access denied (concurrent checks) ---
+
+    let (cross_a, cross_b) = tokio::join!(
+        // Alpha tries to read beta's doc blocks
+        client
+            .get(url(&addr, &format!("/v1/projects/project.beta/documents/{doc_b_id}/blocks")))
+            .header("x-lore-key", &token_alpha)
+            .send(),
+        // Beta tries to read alpha's doc blocks
+        client
+            .get(url(&addr, &format!("/v1/projects/project.alpha/documents/{doc_a_id}/blocks")))
+            .header("x-lore-key", &token_beta)
+            .send(),
+    );
+    let cross_a_status = cross_a.unwrap().status().as_u16();
+    let cross_b_status = cross_b.unwrap().status().as_u16();
+    assert!(
+        cross_a_status >= 400,
+        "alpha reading beta's blocks should be denied, got {cross_a_status}"
+    );
+    assert!(
+        cross_b_status >= 400,
+        "beta reading alpha's blocks should be denied, got {cross_b_status}"
+    );
+
+    // Cross-project write denied
+    let (write_cross_a, write_cross_b) = tokio::join!(
+        client
+            .post(url(&addr, "/v1/blocks"))
+            .header("x-lore-key", &token_alpha)
+            .json(&json!({"project": "project.beta", "block_type": "markdown", "content": "infiltration"}))
+            .send(),
+        client
+            .post(url(&addr, "/v1/blocks"))
+            .header("x-lore-key", &token_beta)
+            .json(&json!({"project": "project.alpha", "block_type": "markdown", "content": "infiltration"}))
+            .send(),
+    );
+    assert!(
+        write_cross_a.unwrap().status().as_u16() >= 400,
+        "alpha writing to beta's project should be denied"
+    );
+    assert!(
+        write_cross_b.unwrap().status().as_u16() >= 400,
+        "beta writing to alpha's project should be denied"
+    );
+
+    // Cross-project MCP tool call denied
+    let (mcp_cross_a, mcp_cross_b) = tokio::join!(
+        client
+            .post(url(&addr, "/v1/chat/lore-tools"))
+            .header("x-lore-key", &token_alpha)
+            .json(&json!({"name": "list_blocks", "arguments": {"project": "project.beta", "document_id": doc_b_id}}))
+            .send(),
+        client
+            .post(url(&addr, "/v1/chat/lore-tools"))
+            .header("x-lore-key", &token_beta)
+            .json(&json!({"name": "list_blocks", "arguments": {"project": "project.alpha", "document_id": doc_a_id}}))
+            .send(),
+    );
+    let mcp_a_status = mcp_cross_a.unwrap().status().as_u16();
+    let mcp_b_status = mcp_cross_b.unwrap().status().as_u16();
+    assert!(
+        mcp_a_status >= 400,
+        "alpha MCP into beta should be denied, got status {mcp_a_status}"
+    );
+    assert!(
+        mcp_b_status >= 400,
+        "beta MCP into alpha should be denied, got status {mcp_b_status}"
+    );
+
+    // Cross-project document listing denied
+    let (list_docs_a, list_docs_b) = tokio::join!(
+        client
+            .get(url(&addr, "/v1/projects/project.beta/documents"))
+            .header("x-lore-key", &token_alpha)
+            .send(),
+        client
+            .get(url(&addr, "/v1/projects/project.alpha/documents"))
+            .header("x-lore-key", &token_beta)
+            .send(),
+    );
+    assert!(
+        list_docs_a.unwrap().status().as_u16() >= 400,
+        "alpha listing beta's documents should be denied"
+    );
+    assert!(
+        list_docs_b.unwrap().status().as_u16() >= 400,
+        "beta listing alpha's documents should be denied"
+    );
+
+    // Cross-project block deletion denied
+    // First, get a block ID from each project to attempt deletion
+    let own_blocks_a: Value = client
+        .get(url(&addr, &format!("/v1/projects/project.alpha/documents/{doc_a_id}/blocks")))
+        .header("x-lore-key", &token_alpha)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let block_a_id = own_blocks_a.as_array().unwrap()
+        .iter()
+        .find(|b| b["block_type"].as_str() == Some("markdown"))
+        .and_then(|b| b["id"].as_str())
+        .expect("alpha should have a markdown block");
+
+    let own_blocks_b: Value = client
+        .get(url(&addr, &format!("/v1/projects/project.beta/documents/{doc_b_id}/blocks")))
+        .header("x-lore-key", &token_beta)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let block_b_id = own_blocks_b.as_array().unwrap()
+        .iter()
+        .find(|b| b["block_type"].as_str() == Some("markdown"))
+        .and_then(|b| b["id"].as_str())
+        .expect("beta should have a markdown block");
+
+    let (del_cross_a, del_cross_b) = tokio::join!(
+        // Alpha tries to delete beta's block
+        client
+            .delete(url(&addr, &format!("/v1/blocks/{block_b_id}?project=project.beta")))
+            .header("x-lore-key", &token_alpha)
+            .send(),
+        // Beta tries to delete alpha's block
+        client
+            .delete(url(&addr, &format!("/v1/blocks/{block_a_id}?project=project.alpha")))
+            .header("x-lore-key", &token_beta)
+            .send(),
+    );
+    assert!(
+        del_cross_a.unwrap().status().as_u16() >= 400,
+        "alpha deleting beta's block should be denied"
+    );
+    assert!(
+        del_cross_b.unwrap().status().as_u16() >= 400,
+        "beta deleting alpha's block should be denied"
+    );
+
+    // Cross-project project-level block reads denied
+    let (proj_blocks_a, proj_blocks_b) = tokio::join!(
+        client
+            .get(url(&addr, "/v1/projects/project.beta/blocks"))
+            .header("x-lore-key", &token_alpha)
+            .send(),
+        client
+            .get(url(&addr, "/v1/projects/project.alpha/blocks"))
+            .header("x-lore-key", &token_beta)
+            .send(),
+    );
+    assert!(
+        proj_blocks_a.unwrap().status().as_u16() >= 400,
+        "alpha reading beta's project blocks should be denied"
+    );
+    assert!(
+        proj_blocks_b.unwrap().status().as_u16() >= 400,
+        "beta reading alpha's project blocks should be denied"
+    );
+
+    // --- Concurrent agent execution: fake LLM backends running in parallel ---
+    //
+    // This verifies that two agents can simultaneously receive chat requests,
+    // spawn backend subprocesses, and complete their work concurrently.
+    // A fake "claude" script sleeps 3 seconds then outputs valid stream-json.
+    // If agents run in parallel: wall clock ~3-4s.  If serialized: ~6-7s.
+
+    // Create a fake claude binary that takes 3+ seconds
+    let fake_bin_dir = dir.path().join("fake-bin");
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let fake_claude_path = fake_bin_dir.join("fake-claude");
+    std::fs::write(&fake_claude_path, concat!(
+        "#!/bin/sh\n",
+        "cat > /dev/null\n",
+        "sleep 3\n",
+        "echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Fake LLM done\"}]}}'\n",
+        "echo '{\"type\":\"result\",\"result\":\"Done\"}'\n",
+    )).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_claude_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Login as each user and get CSRF tokens
+    let resp_a = client
+        .post(url(&addr, "/login"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("username=user-alpha&password=pass-alpha-123")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_a.status(), 303);
+    let cookie_a = resp_a
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let page_a = client
+        .get(url(&addr, "/ui"))
+        .header("cookie", &cookie_a)
+        .send()
+        .await
+        .unwrap();
+    let csrf_a = extract_hidden_value(&page_a.text().await.unwrap(), "csrf_token").unwrap();
+
+    let resp_b = client
+        .post(url(&addr, "/login"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("username=user-beta&password=pass-beta-456")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_b.status(), 303);
+    let cookie_b = resp_b
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let page_b = client
+        .get(url(&addr, "/ui"))
+        .header("cookie", &cookie_b)
+        .send()
+        .await
+        .unwrap();
+    let csrf_b = extract_hidden_value(&page_b.text().await.unwrap(), "csrf_token").unwrap();
+
+    // Queue messages to both agents
+    let (send_a, send_b) = tokio::join!(
+        client
+            .post(url(&addr, "/ui/chat/agent-alpha/send"))
+            .header("cookie", &cookie_a)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("csrf_token={}&message=Hello+alpha+agent", csrf_a))
+            .send(),
+        client
+            .post(url(&addr, "/ui/chat/agent-beta/send"))
+            .header("cookie", &cookie_b)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("csrf_token={}&message=Hello+beta+agent", csrf_b))
+            .send(),
+    );
+    assert_eq!(send_a.unwrap().status(), 200, "send to alpha failed");
+    assert_eq!(send_b.unwrap().status(), 200, "send to beta failed");
+
+    // Now simulate two concurrent agent tasks:
+    //   1. Poll for the pending message
+    //   2. Spawn the fake backend (3s+ subprocess)
+    //   3. Read its output
+    //   4. Post the response back
+    // If these run in parallel, wall clock is ~3-4s. If serialized, ~6-7s.
+
+    let concurrency_start = std::time::Instant::now();
+    let fake_bin = fake_claude_path.clone();
+    let fake_bin2 = fake_claude_path.clone();
+    let client_ref = &client;
+    let addr_ref = &addr;
+
+    let agent_task = |token: String, agent_label: &'static str, fake_binary: std::path::PathBuf| {
+        let client = client_ref.clone();
+        let addr = *addr_ref;
+        async move {
+            // Poll for the pending message
+            let resp = client
+                .get(url(&addr, "/v1/chat/poll"))
+                .header("x-lore-key", &token)
+                .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .expect(&format!("{agent_label} poll failed"));
+            let body: Value = resp.json().await.unwrap();
+            let msgs = body["messages"].as_array().expect(&format!("{agent_label} should have messages"));
+            assert!(!msgs.is_empty(), "{agent_label} should have a pending message");
+            let msg_content = msgs[0]["content"].as_str().unwrap_or("");
+            assert!(
+                msg_content.contains(agent_label),
+                "{agent_label} got wrong message: {msg_content}"
+            );
+
+            // Spawn the fake backend subprocess (3 second task)
+            let mut child = tokio::process::Command::new(&fake_binary)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect(&format!("{agent_label} failed to spawn fake backend"));
+
+            // Close stdin so the script's `cat` finishes
+            drop(child.stdin.take());
+
+            // Read output line by line (like the real agent does)
+            let stdout = child.stdout.take().unwrap();
+            let reader = tokio::io::BufReader::new(stdout);
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = reader.lines();
+            let mut response_text = String::new();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.trim().is_empty() { continue; }
+                if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
+                    // Extract text from claude stream-json format
+                    if parsed["type"].as_str() == Some("assistant") {
+                        if let Some(content) = parsed["message"]["content"].as_array() {
+                            for block in content {
+                                if block["type"].as_str() == Some("text") {
+                                    if let Some(t) = block["text"].as_str() {
+                                        response_text.push_str(t);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let exit = child.wait().await.unwrap();
+            assert!(exit.success(), "{agent_label} fake backend exited with error");
+
+            // Post the response back
+            let resp = client
+                .post(url(&addr, "/v1/chat/respond"))
+                .header("x-lore-key", &token)
+                .json(&json!({
+                    "complete": true,
+                    "content": format!("{agent_label} agent done: {response_text}")
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{agent_label} respond failed");
+        }
+    };
+
+    let ((), ()) = tokio::join!(
+        agent_task(token_alpha.clone(), "alpha", fake_bin),
+        agent_task(token_beta.clone(), "beta", fake_bin2),
+    );
+
+    let concurrency_elapsed = concurrency_start.elapsed();
+    assert!(
+        concurrency_elapsed < std::time::Duration::from_secs(5),
+        "concurrent agent execution took {:?} -- two 3s backend tasks in parallel should \
+         complete in <5s; >=5s indicates serialized execution",
+        concurrency_elapsed
+    );
+    assert!(
+        concurrency_elapsed >= std::time::Duration::from_secs(3),
+        "concurrent agent execution took {:?} -- expected at least 3s from the backend sleep",
+        concurrency_elapsed
+    );
+
+    // Verify conversation histories are independent after the concurrent execution
+    let (hist_a, hist_b) = tokio::join!(
+        client
+            .get(url(&addr, "/v1/chat/history"))
+            .header("x-lore-key", &token_alpha)
+            .send(),
+        client
+            .get(url(&addr, "/v1/chat/history"))
+            .header("x-lore-key", &token_beta)
+            .send(),
+    );
+    let hist_a_body: Value = hist_a.unwrap().json().await.unwrap();
+    let hist_b_body: Value = hist_b.unwrap().json().await.unwrap();
+
+    let hist_a_msgs = hist_a_body["messages"].as_array().expect("alpha history");
+    let hist_b_msgs = hist_b_body["messages"].as_array().expect("beta history");
+
+    let a_texts: String = hist_a_msgs
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let b_texts: String = hist_b_msgs
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(a_texts.contains("alpha"), "alpha history should have alpha content");
+    assert!(!a_texts.contains("beta"), "alpha history must NOT contain beta content: {a_texts}");
+    assert!(b_texts.contains("beta"), "beta history should have beta content");
+    assert!(!b_texts.contains("alpha"), "beta history must NOT contain alpha content: {b_texts}");
+}

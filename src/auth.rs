@@ -1123,7 +1123,6 @@ impl LocalAuthStore {
         &self,
         username: &UserName,
         display_name: &str,
-        backend: AgentBackend,
         grants: Vec<ProjectGrant>,
         machine_name: Option<&str>,
     ) -> Result<CreatedAgentToken> {
@@ -1137,7 +1136,8 @@ impl LocalAuthStore {
         let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         let new_hash = hash_agent_token(&raw_token);
         let now = OffsetDateTime::now_utc();
-        // Re-provision if agent already exists for this user
+        // Re-provision if agent already exists for this user.
+        // Do NOT overwrite backend — it's configured separately via the UI.
         let existing: Option<i64> = conn.query_row(
             "SELECT rowid FROM agent_tokens WHERE name = ?1 AND owner = ?2",
             params![slug, username.as_str()], |row| row.get(0),
@@ -1149,13 +1149,13 @@ impl LocalAuthStore {
             let mn_update = machine_name.map(|s| s.to_string());
             if let Some(ref mn) = mn_update {
                 conn.execute(
-                    "UPDATE agent_tokens SET token_hash=?1, backend=?2, display_name=?3, machine_name=?4, grants=?5, created_at=?6 WHERE rowid=?7",
-                    params![new_hash, backend.to_string(), display_name, mn, grants_json, fmt_dt(&now), rowid],
+                    "UPDATE agent_tokens SET token_hash=?1, display_name=?2, machine_name=?3, grants=?4, created_at=?5 WHERE rowid=?6",
+                    params![new_hash, display_name, mn, grants_json, fmt_dt(&now), rowid],
                 ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
             } else {
                 conn.execute(
-                    "UPDATE agent_tokens SET token_hash=?1, backend=?2, display_name=?3, grants=?4, created_at=?5 WHERE rowid=?6",
-                    params![new_hash, backend.to_string(), display_name, grants_json, fmt_dt(&now), rowid],
+                    "UPDATE agent_tokens SET token_hash=?1, display_name=?2, grants=?3, created_at=?4 WHERE rowid=?5",
+                    params![new_hash, display_name, grants_json, fmt_dt(&now), rowid],
                 ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
             }
             let stored = Self::get_agent_token_from_conn(&conn, &slug, Some(username))?;
@@ -1164,9 +1164,10 @@ impl LocalAuthStore {
         let mut sorted_grants = grants;
         sorted_grants.sort_by(|a, b| a.project.cmp(&b.project));
         let grants_json = serde_json::to_string(&sorted_grants)?;
+        let default_backend = AgentBackend::default().to_string();
         conn.execute(
             "INSERT INTO agent_tokens (name, display_name, token_hash, owner, grants, backend, machine_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![slug, display_name, new_hash, username.as_str(), grants_json, backend.to_string(), machine_name, fmt_dt(&now)],
+            params![slug, display_name, new_hash, username.as_str(), grants_json, default_backend, machine_name, fmt_dt(&now)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let stored = Self::get_agent_token_from_conn(&conn, &slug, Some(username))?;
         Ok(CreatedAgentToken { token: raw_token, stored })
