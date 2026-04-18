@@ -48,9 +48,9 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
         format!(
             r#"<nav class="top-nav">
   <div class="top-nav-inner">
-    <div style="display:flex; align-items:center; gap:var(--s-4);">
+    <div style="display:flex; align-items:baseline; gap:var(--s-4);">
       <a href="/ui" class="logo">Lore</a>
-      <span class="eyebrow" style="margin-top:2px;">{username}</span>
+      <span class="eyebrow">{username}</span>
     </div>
     <div class="nav-right-btns">
       <a href="/ui" class="nav-projects-btn" aria-label="Projects">

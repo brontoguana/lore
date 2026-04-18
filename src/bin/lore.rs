@@ -584,17 +584,23 @@ async fn run() -> CliResult<()> {
             let log_path = lore_dir.join("service.log");
             let pid_path = lore_dir.join("service.pid");
 
-            // Kill existing service if running
+            // Kill existing service processes — PID file first, then sweep for orphans
             if pid_path.exists() {
                 if let Ok(pid_str) = fs::read_to_string(&pid_path) {
                     if let Ok(pid) = pid_str.trim().parse::<u32>() {
                         if is_process_running(pid) {
                             kill_process(pid);
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
                     }
                 }
                 let _ = fs::remove_file(&pid_path);
+            }
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-f", "lore.*service.*--fg"])
+                    .status();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
 
             let log_file = fs::OpenOptions::new()
@@ -1384,6 +1390,60 @@ async fn apply_cli_update_to_target(config: &mut CliConfig, target_version: &str
         }
     }
     Ok(())
+}
+
+/// Download the lore binary directly from the server's staged binary endpoint.
+/// Returns Ok(true) if updated, Ok(false) if not available, Err on failure.
+async fn download_binary_from_server(
+    context: &CliContext,
+    machine_token: &str,
+) -> CliResult<bool> {
+    let url = format!("{}/v1/machines/binary", context.url);
+    eprintln!("[service] Trying direct binary download from server...");
+    let resp = context
+        .client
+        .get(&url)
+        .header("x-lore-key", machine_token)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[service] Server binary download failed: {e}");
+            return Ok(false);
+        }
+    };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        eprintln!("[service] No staged binary on server, will try GitHub");
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        eprintln!("[service] Server binary download returned {}", resp.status());
+        return Ok(false);
+    }
+    let bytes = resp.bytes().await.map_err(|e| {
+        io::Error::other(format!("failed to read binary response: {e}"))
+    })?;
+    if bytes.len() < 1024 {
+        eprintln!("[service] Server binary too small ({}b), ignoring", bytes.len());
+        return Ok(false);
+    }
+    eprintln!("[service] Downloaded {}b binary from server, replacing executable...", bytes.len());
+    let executable_path = resolved_current_exe()?;
+    let parent = executable_path.parent().ok_or_else(|| {
+        io::Error::other("current executable has no parent directory")
+    })?;
+    let temp_path = parent.join(format!(".lore.update-{}", uuid::Uuid::new_v4()));
+    fs::write(&temp_path, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o755))?;
+    }
+    fs::rename(&temp_path, &executable_path)?;
+    eprintln!("[service] Binary replaced successfully");
+    Ok(true)
 }
 
 async fn apply_cli_update_with_source(
@@ -4395,18 +4455,26 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         let log_path = lore_dir.join("service.log");
         let pid_path = lore_dir.join("service.pid");
 
-        // Kill existing service if running
+        // Kill existing service processes — PID file first, then sweep for orphans
         if pid_path.exists() {
             if let Ok(pid_str) = fs::read_to_string(&pid_path) {
                 if let Ok(pid) = pid_str.trim().parse::<u32>() {
                     if is_process_running(pid) {
                         eprintln!("Stopping existing service (pid {})", pid);
                         kill_process(pid);
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                 }
             }
             let _ = fs::remove_file(&pid_path);
+        }
+        // Kill any orphaned service processes not tracked by PID file
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "lore.*service.*--fg"])
+                .status();
+            // Wait for old processes to exit
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
         let log_file = fs::OpenOptions::new()
@@ -4509,7 +4577,16 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                     // points to the deleted old binary which can cause exec issues.
                     let exe = resolved_current_exe()?;
                     let mut cfg = load_cli_config()?;
-                    match apply_cli_update_to_target(&mut cfg, &target_version, &repo).await {
+                    // Try direct download from server first (works after quick-deploy),
+                    // fall back to GitHub release if not available
+                    let update_result = match download_binary_from_server(context, machine_token).await {
+                        Ok(true) => Ok(()),
+                        _ => {
+                            eprintln!("[service] Falling back to GitHub release download...");
+                            apply_cli_update_to_target(&mut cfg, &target_version, &repo).await
+                        }
+                    };
+                    match update_result {
                         Ok(()) => {
                             eprintln!("[service] Updated CLI binary, re-launching as {}", exe.display());
                             let lore_dir = env::var("HOME").map(PathBuf::from)

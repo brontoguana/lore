@@ -60,6 +60,12 @@ echo "Uploading to ${SERVER}..."
 scp -q target/release/lore-server "${SERVER}:/tmp/lore-server-upload"
 ssh "$SERVER" "chmod +x /tmp/lore-server-upload && mv /tmp/lore-server-upload ${REMOTE_BIN}"
 
+# --- Stage client binary for machine self-update (direct download, no GitHub release needed) ---
+echo "Staging client binary for machine updates..."
+ssh "$SERVER" "mkdir -p /home/lore/lore/updates"
+scp -q target/release/lore "${SERVER}:/tmp/lore-client-upload"
+ssh "$SERVER" "chmod +x /tmp/lore-client-upload && mv /tmp/lore-client-upload /home/lore/lore/updates/lore"
+
 # --- Restart service ---
 echo "Restarting..."
 if ssh "$SERVER" "sudo systemctl restart lore-server" 2>/dev/null; then

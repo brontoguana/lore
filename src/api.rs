@@ -458,6 +458,7 @@ fn build_app_with_librarian(
         .route("/v1/context", get(get_all_agent_context))
         .route("/v1/machines/register", post(register_machine))
         .route("/v1/machines/poll", post(machine_service_poll))
+        .route("/v1/machines/binary", get(machine_binary_download))
         .route(
             "/v1/machines/command/{id}/result",
             post(machine_command_result),
@@ -13073,6 +13074,32 @@ fn notify_all_machine_polls(state: &AppState) {
     for notify in notifiers.values() {
         notify.notify_one();
     }
+}
+
+/// Serve the staged `lore` binary for direct machine self-update.
+/// Quick-deploy uploads this file so machines can update without a GitHub release.
+async fn machine_binary_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Authenticate with machine token
+    let machine_token = headers
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    state.auth.authenticate_machine_token(machine_token)?;
+
+    let binary_path = state.store.root().join("updates").join("lore");
+    if !binary_path.exists() {
+        return Ok(axum::http::StatusCode::NOT_FOUND.into_response());
+    }
+    let bytes = tokio::fs::read(&binary_path).await.map_err(|e| {
+        ApiError(LoreError::Io(e))
+    })?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    ).into_response())
 }
 
 #[derive(Deserialize)]
