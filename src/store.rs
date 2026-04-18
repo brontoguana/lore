@@ -8,8 +8,10 @@ use crate::versioning::{
     StoredBlockSnapshot, block_matches_snapshot, media_bytes, snapshot_from_stored_block,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -66,14 +68,41 @@ enum UpdateMode {
     ProjectWriter(KeyFingerprint),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FileBlockStore {
     root: PathBuf,
+    /// Per-project write locks to prevent concurrent file corruption.
+    project_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Cache of (project_slug, doc_id) -> directory path to avoid recursive fs walks.
+    doc_dir_cache: Mutex<HashMap<(String, String), PathBuf>>,
+}
+
+impl Clone for FileBlockStore {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            project_locks: Mutex::new(HashMap::new()),
+            doc_dir_cache: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl FileBlockStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            project_locks: Mutex::new(HashMap::new()),
+            doc_dir_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get a per-project lock for write operations.
+    fn project_lock(&self, project: &ProjectName) -> Arc<Mutex<()>> {
+        let mut locks = self.project_locks.lock().unwrap();
+        locks
+            .entry(project.as_str().to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub fn root(&self) -> &Path {
@@ -142,6 +171,12 @@ impl FileBlockStore {
     }
 
     pub fn write_project_meta(&self, project: &ProjectName, meta: &ProjectMeta) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
+        self.write_project_meta_unlocked(project, meta)
+    }
+
+    fn write_project_meta_unlocked(&self, project: &ProjectName, meta: &ProjectMeta) -> Result<()> {
         self.ensure_layout(project)?;
         let meta_path = self.project_dir(project).join("project.json");
         let bytes = serde_json::to_vec_pretty(meta)?;
@@ -150,6 +185,8 @@ impl FileBlockStore {
     }
 
     pub fn rename_project(&self, project: &ProjectName, new_display_name: &str) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let trimmed = new_display_name.trim();
         if trimmed.is_empty() {
             return Err(LoreError::Validation(
@@ -158,10 +195,12 @@ impl FileBlockStore {
         }
         let mut meta = self.read_project_meta(project);
         meta.display_name = trimmed.to_string();
-        self.write_project_meta(project, &meta)
+        self.write_project_meta_unlocked(project, &meta)
     }
 
     pub fn write_agent_context(&self, project: &ProjectName, context: &str) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let mut meta = self.read_project_meta(project);
         let trimmed = context.trim();
         meta.agent_context = if trimmed.is_empty() {
@@ -169,10 +208,12 @@ impl FileBlockStore {
         } else {
             Some(trimmed.to_string())
         };
-        self.write_project_meta(project, &meta)
+        self.write_project_meta_unlocked(project, &meta)
     }
 
     pub fn delete_project(&self, project: &ProjectName) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let dir = self.project_dir(project);
         if !dir.exists() {
             return Err(LoreError::Validation("project does not exist".into()));
@@ -181,11 +222,15 @@ impl FileBlockStore {
         let infos = self.list_project_infos()?;
         for info in &infos {
             if info.parent.as_deref() == Some(project.as_str()) {
-                let mut meta = self.read_project_meta(&info.slug);
-                meta.parent = None;
-                self.write_project_meta(&info.slug, &meta)?;
+                // Use the child's own lock for its meta write
+                self.write_project_meta(&info.slug, &{
+                    let mut meta = self.read_project_meta(&info.slug);
+                    meta.parent = None;
+                    meta
+                })?;
             }
         }
+        self.invalidate_doc_cache_for_project(project);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -199,6 +244,8 @@ impl FileBlockStore {
         new_parent: Option<&str>,
         after_slug: Option<&str>,
     ) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let dir = self.project_dir(project);
         if !dir.exists() {
             return Err(LoreError::Validation("project does not exist".into()));
@@ -270,7 +317,7 @@ impl FileBlockStore {
         let mut meta = self.read_project_meta(project);
         meta.parent = new_parent.map(|s| s.to_string());
         meta.sort_order = new_order;
-        self.write_project_meta(project, &meta)
+        self.write_project_meta_unlocked(project, &meta)
     }
 
     /// Resolve a lore:// link UUID to either a project or a block.
@@ -370,6 +417,8 @@ impl FileBlockStore {
     }
 
     fn create_block_internal(&self, new_block: NewBlock, author: KeyFingerprint) -> Result<Block> {
+        let _lock = self.project_lock(&new_block.project);
+        let _guard = _lock.lock().unwrap();
         new_block.validate()?;
 
         let order = generate_order_key(new_block.left.as_ref(), new_block.right.as_ref())?;
@@ -510,8 +559,10 @@ impl FileBlockStore {
         block_id: &BlockId,
         requesting_key: &str,
     ) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let fingerprint = KeyFingerprint::from_api_key(requesting_key)?;
-        self.delete_block_internal(project, block_id, Some(&fingerprint))
+        self.delete_block_unlocked(project, block_id, Some(&fingerprint))
     }
 
     pub fn delete_block_as_project_writer(
@@ -519,7 +570,9 @@ impl FileBlockStore {
         project: &ProjectName,
         block_id: &BlockId,
     ) -> Result<()> {
-        self.delete_block_internal(project, block_id, None)
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
+        self.delete_block_unlocked(project, block_id, None)
     }
 
     pub fn set_block_pinned(
@@ -528,6 +581,8 @@ impl FileBlockStore {
         block_id: &BlockId,
         pinned: bool,
     ) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let metadata_path = self.block_metadata_path(project, block_id);
         if !metadata_path.exists() {
             return Err(LoreError::BlockNotFound(block_id.as_str().to_string()));
@@ -543,6 +598,8 @@ impl FileBlockStore {
     /// with a newline. Pinned blocks break a run (they are never merged).
     /// Returns the number of blocks removed.
     pub fn compact_markdown_blocks(&self, project: &ProjectName) -> Result<usize> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let blocks = self.list_blocks(project)?;
         let mut removed = 0usize;
 
@@ -588,7 +645,7 @@ impl FileBlockStore {
 
             // Delete the remaining blocks in the run
             for block in &run[1..] {
-                self.delete_block_internal(project, &block.id, None)?;
+                self.delete_block_unlocked(project, &block.id, None)?;
                 removed += 1;
             }
         }
@@ -596,7 +653,7 @@ impl FileBlockStore {
         Ok(removed)
     }
 
-    fn delete_block_internal(
+    fn delete_block_unlocked(
         &self,
         project: &ProjectName,
         block_id: &BlockId,
@@ -640,6 +697,8 @@ impl FileBlockStore {
     }
 
     fn update_block_internal(&self, update: UpdateBlock, mode: UpdateMode) -> Result<Block> {
+        let _lock = self.project_lock(&update.project);
+        let _guard = _lock.lock().unwrap();
         update.validate()?;
 
         let metadata_path = self.block_metadata_path(&update.project, &update.block_id);
@@ -909,6 +968,8 @@ impl FileBlockStore {
         parent_doc: Option<&DocumentId>,
         display_name: &str,
     ) -> Result<DocumentInfo> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let trimmed = display_name.trim();
         if trimmed.is_empty() {
             return Err(LoreError::Validation(
@@ -948,6 +1009,8 @@ impl FileBlockStore {
         doc_id: &DocumentId,
         new_name: &str,
     ) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let trimmed = new_name.trim();
         if trimmed.is_empty() {
             return Err(LoreError::Validation(
@@ -967,7 +1030,10 @@ impl FileBlockStore {
         project: &ProjectName,
         doc_id: &DocumentId,
     ) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let doc_dir = self.find_doc_dir(project, doc_id)?;
+        self.invalidate_doc_cache_for_project(project);
         fs::remove_dir_all(doc_dir)?;
         Ok(())
     }
@@ -1019,6 +1085,8 @@ impl FileBlockStore {
     }
 
     pub fn create_doc_block(&self, doc_id: &DocumentId, new_block: NewBlock) -> Result<Block> {
+        let _lock = self.project_lock(&new_block.project);
+        let _guard = _lock.lock().unwrap();
         let author = KeyFingerprint::from_api_key(&new_block.author_key)?;
         let doc_dir = self.find_doc_dir(&new_block.project, doc_id)?;
         self.create_block_in_doc_dir(&doc_dir, new_block, author)
@@ -1029,12 +1097,16 @@ impl FileBlockStore {
         doc_id: &DocumentId,
         new_block: NewBlock,
     ) -> Result<Block> {
+        let _lock = self.project_lock(&new_block.project);
+        let _guard = _lock.lock().unwrap();
         let author = KeyFingerprint::from_user_name(&new_block.author_key)?;
         let doc_dir = self.find_doc_dir(&new_block.project, doc_id)?;
         self.create_block_in_doc_dir(&doc_dir, new_block, author)
     }
 
     pub fn update_doc_block(&self, doc_id: &DocumentId, update: UpdateBlock) -> Result<Block> {
+        let _lock = self.project_lock(&update.project);
+        let _guard = _lock.lock().unwrap();
         let fingerprint = KeyFingerprint::from_api_key(&update.author_key)?;
         let doc_dir = self.find_doc_dir(&update.project, doc_id)?;
         self.update_block_in_doc_dir(&doc_dir, update, UpdateMode::AgentOwner(fingerprint))
@@ -1045,6 +1117,8 @@ impl FileBlockStore {
         doc_id: &DocumentId,
         update: UpdateBlock,
     ) -> Result<Block> {
+        let _lock = self.project_lock(&update.project);
+        let _guard = _lock.lock().unwrap();
         let fingerprint = KeyFingerprint::from_user_name(&update.author_key)?;
         let doc_dir = self.find_doc_dir(&update.project, doc_id)?;
         self.update_block_in_doc_dir(&doc_dir, update, UpdateMode::ProjectWriter(fingerprint))
@@ -1057,6 +1131,8 @@ impl FileBlockStore {
         block_id: &BlockId,
         requesting_key: &str,
     ) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let fingerprint = KeyFingerprint::from_api_key(requesting_key)?;
         let doc_dir = self.find_doc_dir(project, doc_id)?;
         self.delete_block_in_doc_dir(&doc_dir, project, block_id, Some(&fingerprint))
@@ -1068,6 +1144,8 @@ impl FileBlockStore {
         doc_id: &DocumentId,
         block_id: &BlockId,
     ) -> Result<()> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let doc_dir = self.find_doc_dir(project, doc_id)?;
         self.delete_block_in_doc_dir(&doc_dir, project, block_id, None)
     }
@@ -1477,11 +1555,24 @@ impl FileBlockStore {
         project: &ProjectName,
         doc_id: &DocumentId,
     ) -> Result<PathBuf> {
+        let cache_key = (project.as_str().to_string(), doc_id.as_str().to_string());
+        if let Some(cached) = self.doc_dir_cache.lock().unwrap().get(&cache_key) {
+            if cached.exists() {
+                return Ok(cached.clone());
+            }
+        }
         let docs_root = self.project_dir(project).join("docs");
-        self.find_doc_dir_recursive(&docs_root, doc_id)
+        let result = self.find_doc_dir_recursive(&docs_root, doc_id)
             .ok_or_else(|| {
                 LoreError::Validation(format!("document '{}' not found", doc_id))
-            })
+            })?;
+        self.doc_dir_cache.lock().unwrap().insert(cache_key, result.clone());
+        Ok(result)
+    }
+
+    fn invalidate_doc_cache_for_project(&self, project: &ProjectName) {
+        let prefix = project.as_str().to_string();
+        self.doc_dir_cache.lock().unwrap().retain(|k, _| k.0 != prefix);
     }
 
     fn find_doc_dir_recursive(

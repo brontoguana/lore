@@ -294,8 +294,9 @@ impl AppState {
         let provider_status_root = root.clone();
         let auto_update_root = root.clone();
         let chat_root = root.clone();
-        let auth = LocalAuthStore::new(root.clone());
-        let chat = ChatStore::new(chat_root);
+        let db = crate::auth::open_lore_db(&root);
+        let auth = LocalAuthStore::from_conn(Arc::clone(&db));
+        let chat = ChatStore::from_conn(db);
         let chat_audit = ChatAuditLog::new(root.clone());
         chat_audit.cleanup_old_logs(90);
         auth.cleanup_orphans();
@@ -12230,6 +12231,7 @@ async fn chat_slash_command(
                     token: String::new(),
                     name: agent_name.clone(),
                     owner: Some(session.user.username.clone()),
+                    owner_is_admin: session.user.is_admin,
                     grants: agent_token.map(|a| a.grants.clone()).unwrap_or_default(),
                     backend: AgentBackend::default(),
                     endpoint_id: agent_token.and_then(|a| a.endpoint_id.clone()),
@@ -12560,6 +12562,7 @@ async fn chat_slash_command(
                         token: format!("btw-{}", agent_name),
                         name: agent_name.clone(),
                         owner: Some(session.user.username.clone()),
+                        owner_is_admin: session.user.is_admin,
                         grants: token.grants.clone(),
                         backend: token.backend,
                         endpoint_id: token.endpoint_id.clone(),

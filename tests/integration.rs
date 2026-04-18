@@ -997,9 +997,40 @@ async fn auth_rejects_bad_token() {
 async fn auth_rejects_cross_project_access() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token_a = api_create_agent_token(&client, &addr, "agent-a", &[("project.a", "read_write")]).await;
 
-    // Try to create a block in a project the agent doesn't have access to
+    // Create a role with access only to project.a
+    let resp = client
+        .post(url(&addr, "/v1/admin/roles"))
+        .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
+        .json(&json!({"name": "only-a", "grants": [{"project": "project.a", "permission": "read_write"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "create role failed");
+
+    // Create a non-admin user with that role
+    let resp = client
+        .post(url(&addr, "/v1/admin/users"))
+        .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
+        .json(&json!({"username": "limited-user", "password": "test-pass-123", "roles": ["only-a"], "is_admin": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "create user failed");
+
+    // Create an agent token owned by the limited user
+    let resp = client
+        .post(url(&addr, "/v1/admin/agent-tokens"))
+        .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
+        .json(&json!({"name": "agent-a", "owner": "limited-user", "grants": [{"project": "project.a", "permission": "read_write"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "create agent token failed");
+    let body: Value = resp.json().await.unwrap();
+    let token_a = body["token"].as_str().unwrap().to_string();
+
+    // Try to create a block in a project the owner doesn't have access to
     let resp = client
         .post(url(&addr, "/v1/blocks"))
         .header("x-lore-key", &token_a)

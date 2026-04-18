@@ -11,7 +11,7 @@ use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -161,6 +161,7 @@ pub struct AuthenticatedAgent {
     pub token: String,
     pub name: String,
     pub owner: Option<UserName>,
+    pub owner_is_admin: bool,
     pub grants: Vec<ProjectGrant>,
     pub backend: AgentBackend,
     pub endpoint_id: Option<String>,
@@ -169,13 +170,15 @@ pub struct AuthenticatedAgent {
 
 impl AuthenticatedAgent {
     pub fn can_read(&self, project: &ProjectName) -> bool {
-        self.grants.iter().any(|grant| &grant.project == project)
+        self.owner_is_admin
+            || self.grants.iter().any(|grant| &grant.project == project)
     }
 
     pub fn can_write(&self, project: &ProjectName) -> bool {
-        self.grants
-            .iter()
-            .any(|grant| &grant.project == project && grant.permission.allows_write())
+        self.owner_is_admin
+            || self.grants
+                .iter()
+                .any(|grant| &grant.project == project && grant.permission.allows_write())
     }
 }
 
@@ -376,7 +379,7 @@ impl AuthenticatedUser {
 
 #[derive(Debug)]
 pub struct LocalAuthStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Clone for LocalAuthStore {
@@ -453,22 +456,114 @@ fn parse_tool_repeat(line: &str) -> (&str, Option<u32>) {
     (line, None)
 }
 
-impl LocalAuthStore {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        let root: PathBuf = root.into();
-        let db_path = root.join("lore.db");
-        std::fs::create_dir_all(&root).expect("failed to create data directory");
-        let conn = Connection::open(&db_path).expect("failed to open database");
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-            .expect("failed to set pragmas");
-        conn.execute_batch(AUTH_SCHEMA).expect("failed to create schema");
-        let _ = conn.execute("ALTER TABLE agent_tokens ADD COLUMN endpoint_id TEXT", []);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+/// Check whether a column exists on a table.
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let mut stmt = match conn.prepare(&format!("PRAGMA table_info({})", table)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap_or_else(|_| panic!("PRAGMA table_info({table}) failed"))
+        .filter_map(|r| r.ok())
+        .collect();
+    cols.contains(&column.to_string())
+}
+
+fn run_migrations(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
+    )
+    .expect("failed to create schema_version table");
+
+    let current: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    struct Migration {
+        version: i64,
+        sql: &'static str,
+        table: &'static str,
+        column: &'static str,
+    }
+
+    let migrations: &[Migration] = &[
+        Migration {
+            version: 1,
+            sql: "ALTER TABLE agent_tokens ADD COLUMN endpoint_id TEXT",
+            table: "agent_tokens",
+            column: "endpoint_id",
+        },
+        Migration {
+            version: 2,
+            sql: "ALTER TABLE conversations ADD COLUMN pinned_context TEXT NOT NULL DEFAULT ''",
+            table: "conversations",
+            column: "pinned_context",
+        },
+        Migration {
+            version: 3,
+            sql: "ALTER TABLE conversations ADD COLUMN manage_config TEXT",
+            table: "conversations",
+            column: "manage_config",
+        },
+    ];
+
+    for m in migrations {
+        if current >= m.version {
+            continue;
         }
-        Self { conn: Mutex::new(conn) }
+        if !has_column(conn, m.table, m.column) {
+            conn.execute(m.sql, []).unwrap_or_else(|e| {
+                panic!("schema migration {} failed: {e}", m.version);
+            });
+        }
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![m.version],
+        )
+        .unwrap_or_else(|e| {
+            panic!("failed to record migration {}: {e}", m.version);
+        });
+        eprintln!("schema: applied migration {}", m.version);
+    }
+}
+
+/// Open (or create) the shared lore.db and run all schema creation
+/// and migrations.  Returns a connection that can be shared between
+/// LocalAuthStore and ChatStore.
+pub fn open_lore_db(root: &Path) -> Arc<Mutex<Connection>> {
+    let db_path = root.join("lore.db");
+    fs::create_dir_all(root).expect("failed to create data directory");
+    let conn = Connection::open(&db_path).expect("failed to open database");
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        .expect("failed to set pragmas");
+    conn.execute_batch(AUTH_SCHEMA)
+        .expect("failed to create auth schema");
+    conn.execute_batch(CHAT_SCHEMA)
+        .expect("failed to create chat schema");
+    run_migrations(&conn);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600));
+    }
+    Arc::new(Mutex::new(conn))
+}
+
+impl LocalAuthStore {
+    /// Open a standalone auth store (creates its own DB connection).
+    /// Used for CLI bootstrap commands and tests.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::from_conn(open_lore_db(&root.into()))
+    }
+
+    /// Create from an existing shared connection.
+    pub fn from_conn(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
     }
 
     pub fn cleanup_orphans(&self) {
@@ -891,12 +986,37 @@ impl LocalAuthStore {
             },
         ).map_err(|_| LoreError::PermissionDenied)?;
         let owner = row.2.map(|s| UserName::new(s)).transpose()?;
-        let grants: Vec<ProjectGrant> = serde_json::from_str(&row.3).unwrap_or_default();
         let backend: AgentBackend = row.4.parse().unwrap_or_default();
+
+        // Compute grants dynamically from the owner's current roles
+        let (owner_is_admin, grants) = if let Some(ref owner_name) = owner {
+            match Self::get_stored_user_from_conn(&conn, owner_name) {
+                Ok(stored_user) => {
+                    if stored_user.disabled_at.is_some() {
+                        return Err(LoreError::PermissionDenied);
+                    }
+                    let user = Self::user_from_stored_conn(&conn, &stored_user)?;
+                    let grants = user.roles.iter()
+                        .flat_map(|role| role.grants.clone())
+                        .collect();
+                    (user.is_admin, grants)
+                }
+                Err(_) => {
+                    // Owner no longer exists
+                    return Err(LoreError::PermissionDenied);
+                }
+            }
+        } else {
+            // No owner — fall back to static grants in the token
+            let grants: Vec<ProjectGrant> = serde_json::from_str(&row.3).unwrap_or_default();
+            (false, grants)
+        };
+
         Ok(AuthenticatedAgent {
             token: token.to_string(),
             name: row.0,
             owner,
+            owner_is_admin,
             grants,
             backend,
             endpoint_id: row.6,
@@ -1023,16 +1143,19 @@ impl LocalAuthStore {
             params![slug, username.as_str()], |row| row.get(0),
         ).ok();
         if let Some(rowid) = existing {
+            let mut sorted_grants = grants;
+            sorted_grants.sort_by(|a, b| a.project.cmp(&b.project));
+            let grants_json = serde_json::to_string(&sorted_grants)?;
             let mn_update = machine_name.map(|s| s.to_string());
             if let Some(ref mn) = mn_update {
                 conn.execute(
-                    "UPDATE agent_tokens SET token_hash=?1, backend=?2, display_name=?3, machine_name=?4, created_at=?5 WHERE rowid=?6",
-                    params![new_hash, backend.to_string(), display_name, mn, fmt_dt(&now), rowid],
+                    "UPDATE agent_tokens SET token_hash=?1, backend=?2, display_name=?3, machine_name=?4, grants=?5, created_at=?6 WHERE rowid=?7",
+                    params![new_hash, backend.to_string(), display_name, mn, grants_json, fmt_dt(&now), rowid],
                 ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
             } else {
                 conn.execute(
-                    "UPDATE agent_tokens SET token_hash=?1, backend=?2, display_name=?3, created_at=?4 WHERE rowid=?5",
-                    params![new_hash, backend.to_string(), display_name, fmt_dt(&now), rowid],
+                    "UPDATE agent_tokens SET token_hash=?1, backend=?2, display_name=?3, grants=?4, created_at=?5 WHERE rowid=?6",
+                    params![new_hash, backend.to_string(), display_name, grants_json, fmt_dt(&now), rowid],
                 ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
             }
             let stored = Self::get_agent_token_from_conn(&conn, &slug, Some(username))?;
@@ -1554,7 +1677,7 @@ impl Default for ChatConversation {
 
 #[derive(Debug)]
 pub struct ChatStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Clone for ChatStore {
@@ -1608,17 +1731,14 @@ CREATE TABLE IF NOT EXISTS backend_preferences (
 ";
 
 impl ChatStore {
+    /// Open a standalone chat store (creates its own DB connection).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        let root: PathBuf = root.into();
-        let db_path = root.join("lore.db");
-        std::fs::create_dir_all(&root).expect("failed to create data directory");
-        let conn = Connection::open(&db_path).expect("failed to open database");
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-            .expect("failed to set pragmas");
-        conn.execute_batch(CHAT_SCHEMA).expect("failed to create chat schema");
-        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN pinned_context TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN manage_config TEXT", []);
-        Self { conn: Mutex::new(conn) }
+        Self::from_conn(open_lore_db(&root.into()))
+    }
+
+    /// Create from an existing shared connection.
+    pub fn from_conn(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
     }
 
     pub fn cleanup_orphans(&self) {
