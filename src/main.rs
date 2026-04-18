@@ -407,6 +407,21 @@ async fn run_server(data_root: String, bind: String) {
             }
         }
     }
+    // Sync project directory names with display names
+    let renames = store.sync_project_slugs();
+    if !renames.is_empty() {
+        let auth = LocalAuthStore::new(data_root_path.clone());
+        for (old_slug, new_slug) in &renames {
+            eprintln!(
+                "synced project slug: '{}' -> '{}'",
+                old_slug.as_str(),
+                new_slug.as_str()
+            );
+            if let Err(e) = auth.rename_project_in_grants(old_slug, new_slug) {
+                eprintln!("warning: failed to update grants for rename: {e}");
+            }
+        }
+    }
     let app = build_app(store);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await

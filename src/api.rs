@@ -1426,9 +1426,9 @@ struct ErrorBody {
     error: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ProjectSummary {
-    project: ProjectName,
+    project: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1948,11 +1948,17 @@ async fn list_projects(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<ProjectSummary>>> {
     let actor = require_authenticated_actor(&state, &headers)?;
-    let projects = state.store.list_projects()?;
-    let visible_projects = filter_projects_for_actor(&actor, &projects);
-    let projects = visible_projects
+    let infos = state.store.list_project_infos()?;
+    let projects = infos
         .into_iter()
-        .map(|project| ProjectSummary { project })
+        .filter(|info| match &actor {
+            RequestActor::Agent(agent) => agent.can_read(&info.slug),
+            RequestActor::User(user) if user.is_admin => true,
+            RequestActor::User(user) => user.can_read(&info.slug),
+        })
+        .map(|info| ProjectSummary {
+            project: info.display_name,
+        })
         .collect();
     Ok(Json(projects))
 }
@@ -4221,10 +4227,18 @@ async fn rename_project_from_ui(
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     let project = ProjectName::new(&project)?;
-    state.store.rename_project(&project, &form.display_name)?;
+    let slug_change = state.store.rename_project(&project, &form.display_name)?;
+    let redirect_slug = if let Some((old_slug, new_slug)) = slug_change {
+        if let Err(e) = state.auth.rename_project_in_grants(&old_slug, &new_slug) {
+            eprintln!("warning: failed to update grants after rename: {e}");
+        }
+        new_slug
+    } else {
+        project
+    };
     Ok(Redirect::to(&format!(
         "/ui/{}?flash=Project%20renamed",
-        project.as_str(),
+        redirect_slug.as_str(),
     )))
 }
 
@@ -8530,30 +8544,29 @@ fn call_mcp_tool(
 
     let structured = match name {
         "list_projects" => {
-            let projects = state
-                .store
-                .list_projects()?
+            let infos = state.store.list_project_infos()?;
+            let projects = infos
                 .into_iter()
-                .filter(|project| agent.can_read(project))
-                .map(|project| {
-                    let perm = if agent.can_write(&project) {
+                .filter(|info| agent.can_read(&info.slug))
+                .map(|info| {
+                    let perm = if agent.can_write(&info.slug) {
                         "read-write"
                     } else {
                         "read"
                     };
-                    json!({ "project": project.as_str(), "permission": perm })
+                    json!({ "project": info.display_name, "permission": perm })
                 })
                 .collect::<Vec<_>>();
             json!({ "projects": projects })
         }
         "list_documents" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_read(agent, &project)?;
             let docs = state.store.list_documents(&project)?;
             json!({ "documents": serialize_doc_tree(&docs) })
         }
         "create_document" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
             let doc_name = required_string(&args, "name")?;
             let parent_doc = optional_string(&args, "parent_document_id")
@@ -8565,7 +8578,7 @@ fn call_mcp_tool(
             json!({ "document_id": doc.id.as_str(), "name": doc.display_name })
         }
         "rename_document" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
             let doc_id = required_document_id(&args, "document_id")?;
             let new_name = required_string(&args, "name")?;
@@ -8573,14 +8586,14 @@ fn call_mcp_tool(
             json!({ "renamed": true, "document_id": doc_id.as_str() })
         }
         "delete_document" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
             let doc_id = required_document_id(&args, "document_id")?;
             state.store.delete_document(&project, &doc_id)?;
             json!({ "deleted": true, "document_id": doc_id.as_str() })
         }
         "list_blocks" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_read(agent, &project)?;
             let doc_id = required_document_id(&args, "document_id")?;
             let blocks = state.store.list_doc_blocks(&project, &doc_id)?;
@@ -8599,7 +8612,7 @@ fn call_mcp_tool(
             json!({ "blocks": summaries })
         }
         "read_block" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_read(agent, &project)?;
             let block_id = required_block_id(&args, "block_id")?;
             let block = if block_id.is_reserved() {
@@ -8637,7 +8650,7 @@ fn call_mcp_tool(
             }
         }
         "update_block" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
             let block_id = required_block_id(&args, "block_id")?;
             let content = required_string(&args, "content")?;
@@ -8678,7 +8691,7 @@ fn call_mcp_tool(
             }
         }
         "edit_block" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
             let block_id = required_block_id(&args, "block_id")?;
             let old_string = required_string(&args, "old_string")?;
@@ -8739,7 +8752,7 @@ fn call_mcp_tool(
             }
         }
         "create_block" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
             let doc_id = required_document_id(&args, "document_id")?;
             let after_block_id = optional_block_id(&args, "after_block_id")?;
@@ -8772,7 +8785,7 @@ fn call_mcp_tool(
             json!({ "block": block })
         }
         "move_block" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
             let doc_id = required_document_id(&args, "document_id")?;
             let block_id = required_block_id(&args, "block_id")?;
@@ -8797,7 +8810,7 @@ fn call_mcp_tool(
             json!({ "block": block })
         }
         "delete_block" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_write(agent, &project)?;
             let doc_id = required_document_id(&args, "document_id")?;
             let block_id = required_block_id(&args, "block_id")?;
@@ -8820,7 +8833,7 @@ fn call_mcp_tool(
             json!({ "deleted": true, "block_id": block_id.as_str() })
         }
         "grep_blocks" => {
-            let project = required_project(&args, "project")?;
+            let project = required_project(&args, "project", &state.store)?;
             authorize_agent_read(agent, &project)?;
             let query = required_string(&args, "query")?;
             let ctx_lines = optional_usize(&args, "context_lines").unwrap_or(2);
@@ -8973,8 +8986,10 @@ fn optional_string(args: &serde_json::Map<String, Value>, key: &str) -> Option<S
 fn required_project(
     args: &serde_json::Map<String, Value>,
     key: &str,
+    store: &FileBlockStore,
 ) -> Result<ProjectName, LoreError> {
-    ProjectName::new(required_string(args, key)?)
+    let input = required_string(args, key)?;
+    store.resolve_project(&input)
 }
 
 fn required_block_id(

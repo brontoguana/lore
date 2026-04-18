@@ -26,6 +26,7 @@ pub use config::{
 pub use error::{LoreError, Result};
 pub use model::{
     Block, BlockId, BlockType, KeyFingerprint, NewBlock, OrderKey, ProjectName, UpdateBlock,
+    slugify,
 };
 pub use order::generate_order_key;
 pub use store::FileBlockStore;

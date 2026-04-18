@@ -691,6 +691,35 @@ impl LocalAuthStore {
         Ok(StoredRole { name: role.name, grants, created_at: parse_dt(&created_at) })
     }
 
+    /// Update all role grants that reference `old_slug` to point to `new_slug`.
+    pub fn rename_project_in_grants(
+        &self,
+        old_slug: &ProjectName,
+        new_slug: &ProjectName,
+    ) -> Result<()> {
+        let roles = self.list_roles()?;
+        for role in roles {
+            let needs_update = role.grants.iter().any(|g| &g.project == old_slug);
+            if needs_update {
+                let new_grants: Vec<ProjectGrant> = role
+                    .grants
+                    .into_iter()
+                    .map(|mut g| {
+                        if &g.project == old_slug {
+                            g.project = new_slug.clone();
+                        }
+                        g
+                    })
+                    .collect();
+                self.update_role(NewRole {
+                    name: role.name,
+                    grants: new_grants,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn list_users(&self) -> Result<Vec<StoredUser>> {
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::load_users_from_conn(&conn)

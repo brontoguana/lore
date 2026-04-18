@@ -1,7 +1,7 @@
 use crate::error::{LoreError, Result};
 use crate::model::{
     Block, BlockId, BlockType, ContentRef, DocumentId, KeyFingerprint, MediaRef, NewBlock,
-    OrderKey, ProjectName, StoredBlock, UpdateBlock, RESERVED_BLOCK_IDS,
+    OrderKey, ProjectName, StoredBlock, UpdateBlock, slugify, RESERVED_BLOCK_IDS,
 };
 use crate::order::generate_order_key;
 use crate::versioning::{
@@ -145,6 +145,91 @@ impl FileBlockStore {
         Ok(infos)
     }
 
+    /// Resolve a project identifier that may be a slug or a display name.
+    pub fn resolve_project(&self, input: &str) -> Result<ProjectName> {
+        // Try as a direct slug
+        if let Ok(name) = ProjectName::new(input) {
+            if self.project_dir(&name).exists() {
+                return Ok(name);
+            }
+        }
+        // Try slugifying (handles display names like "My Project" -> "my-project")
+        let slug = slugify(input);
+        if !slug.is_empty() {
+            if let Ok(name) = ProjectName::new(&slug) {
+                if self.project_dir(&name).exists() {
+                    return Ok(name);
+                }
+            }
+        }
+        Err(LoreError::Validation(format!(
+            "project '{}' not found",
+            input
+        )))
+    }
+
+    /// On startup, rename project directories whose slug doesn't match
+    /// `slugify(display_name)`. Returns the list of (old_slug, new_slug) renames.
+    pub fn sync_project_slugs(&self) -> Vec<(ProjectName, ProjectName)> {
+        let infos = match self.list_project_infos() {
+            Ok(infos) => infos,
+            Err(_) => return Vec::new(),
+        };
+        let mut renames = Vec::new();
+        for info in &infos {
+            let expected = slugify(&info.display_name);
+            if expected.is_empty() || expected == info.slug.as_str() {
+                continue;
+            }
+            let new_slug = match ProjectName::new(&expected) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "warning: cannot sync slug for '{}': {e}",
+                        info.display_name
+                    );
+                    continue;
+                }
+            };
+            if self.project_dir(&new_slug).exists() {
+                eprintln!(
+                    "warning: cannot rename '{}' -> '{}': target already exists",
+                    info.slug.as_str(),
+                    expected
+                );
+                continue;
+            }
+            let old_dir = self.project_dir(&info.slug);
+            if let Err(e) = fs::rename(&old_dir, &self.project_dir(&new_slug)) {
+                eprintln!(
+                    "warning: failed to rename '{}' -> '{}': {e}",
+                    info.slug.as_str(),
+                    expected
+                );
+                continue;
+            }
+            self.invalidate_doc_cache_for_project(&info.slug);
+            renames.push((info.slug.clone(), new_slug));
+        }
+        // Update parent references that pointed to old slugs
+        if !renames.is_empty() {
+            if let Ok(infos) = self.list_project_infos() {
+                for info in &infos {
+                    if let Some(parent) = &info.parent {
+                        if let Some((_, new_slug)) =
+                            renames.iter().find(|(old, _)| old.as_str() == parent)
+                        {
+                            let mut meta = self.read_project_meta(&info.slug);
+                            meta.parent = Some(new_slug.as_str().to_string());
+                            let _ = self.write_project_meta_unlocked(&info.slug, &meta);
+                        }
+                    }
+                }
+            }
+        }
+        renames
+    }
+
     pub fn read_project_meta(&self, project: &ProjectName) -> ProjectMeta {
         let meta_path = self.project_dir(project).join("project.json");
         if let Ok(bytes) = fs::read(&meta_path) {
@@ -184,7 +269,14 @@ impl FileBlockStore {
         Ok(())
     }
 
-    pub fn rename_project(&self, project: &ProjectName, new_display_name: &str) -> Result<()> {
+    /// Rename a project's display name and sync the directory slug to match.
+    /// Returns `Some((old_slug, new_slug))` if the directory was renamed, `None` if only
+    /// the display name changed without affecting the slug.
+    pub fn rename_project(
+        &self,
+        project: &ProjectName,
+        new_display_name: &str,
+    ) -> Result<Option<(ProjectName, ProjectName)>> {
         let _lock = self.project_lock(project);
         let _guard = _lock.lock().unwrap();
         let trimmed = new_display_name.trim();
@@ -195,7 +287,40 @@ impl FileBlockStore {
         }
         let mut meta = self.read_project_meta(project);
         meta.display_name = trimmed.to_string();
-        self.write_project_meta_unlocked(project, &meta)
+        let new_slug_str = slugify(trimmed);
+        if new_slug_str.is_empty() {
+            return Err(LoreError::Validation(
+                "project name must contain at least one letter or digit".into(),
+            ));
+        }
+        if new_slug_str != project.as_str() {
+            let new_slug = ProjectName::new(&new_slug_str)?;
+            let new_dir = self.project_dir(&new_slug);
+            if new_dir.exists() {
+                return Err(LoreError::Validation(format!(
+                    "a project with slug '{}' already exists",
+                    new_slug_str
+                )));
+            }
+            let old_dir = self.project_dir(project);
+            fs::rename(&old_dir, &new_dir)?;
+            // Update parent references in other projects
+            if let Ok(infos) = self.list_project_infos() {
+                for info in &infos {
+                    if info.parent.as_deref() == Some(project.as_str()) {
+                        let mut child_meta = self.read_project_meta(&info.slug);
+                        child_meta.parent = Some(new_slug_str.clone());
+                        let _ = self.write_project_meta_unlocked(&info.slug, &child_meta);
+                    }
+                }
+            }
+            self.invalidate_doc_cache_for_project(project);
+            self.write_project_meta_unlocked(&new_slug, &meta)?;
+            Ok(Some((project.clone(), new_slug)))
+        } else {
+            self.write_project_meta_unlocked(project, &meta)?;
+            Ok(None)
+        }
     }
 
     pub fn write_agent_context(&self, project: &ProjectName, context: &str) -> Result<()> {
@@ -2337,13 +2462,83 @@ mod tests {
         let store = FileBlockStore::new(dir.path());
         let info = store.create_project("Old Name", None).unwrap();
         assert_eq!(info.display_name, "Old Name");
+        assert_eq!(info.slug.as_str(), "old-name");
 
-        store.rename_project(&info.slug, "New Name").unwrap();
-        let meta = store.read_project_meta(&info.slug);
+        let result = store.rename_project(&info.slug, "New Name").unwrap();
+        // Slug changed: old-name -> new-name
+        let (old_slug, new_slug) = result.expect("slug should have changed");
+        assert_eq!(old_slug.as_str(), "old-name");
+        assert_eq!(new_slug.as_str(), "new-name");
+        let meta = store.read_project_meta(&new_slug);
         assert_eq!(meta.display_name, "New Name");
+        // Old slug dir should no longer exist
+        assert!(!dir.path().join("projects").join(old_slug.as_str()).exists());
+
+        // Rename without slug change (just capitalization tweak keeping same slug)
+        let result = store.rename_project(&new_slug, "new name").unwrap();
+        assert!(result.is_none(), "slug should not change for same slugified value");
+        let meta = store.read_project_meta(&new_slug);
+        assert_eq!(meta.display_name, "new name");
 
         // empty name should fail
-        assert!(store.rename_project(&info.slug, "  ").is_err());
+        assert!(store.rename_project(&new_slug, "  ").is_err());
+    }
+
+    #[test]
+    fn rename_project_updates_child_parent_refs() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let parent = store.create_project("Old Parent", None).unwrap();
+        let _child = store
+            .create_project("Child", Some(parent.slug.as_str()))
+            .unwrap();
+        // Rename parent -> slug changes
+        let result = store.rename_project(&parent.slug, "New Parent").unwrap();
+        let (_, new_slug) = result.expect("slug should change");
+        assert_eq!(new_slug.as_str(), "new-parent");
+        // Child's parent should now point to new slug
+        let child_slug = ProjectName::new("child").unwrap();
+        let child_meta = store.read_project_meta(&child_slug);
+        assert_eq!(child_meta.parent.as_deref(), Some("new-parent"));
+    }
+
+    #[test]
+    fn sync_project_slugs_renames_mismatched_dirs() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        // Create a project, then manually change its display name without renaming dir
+        let info = store.create_project("Original", None).unwrap();
+        assert_eq!(info.slug.as_str(), "original");
+        let mut meta = store.read_project_meta(&info.slug);
+        meta.display_name = "Renamed Project".to_string();
+        store.write_project_meta(&info.slug, &meta).unwrap();
+        // Directory is still "original" but display name is "Renamed Project"
+        let renames = store.sync_project_slugs();
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].0.as_str(), "original");
+        assert_eq!(renames[0].1.as_str(), "renamed-project");
+        // Old dir gone, new dir exists
+        assert!(!dir.path().join("projects/original").exists());
+        assert!(dir.path().join("projects/renamed-project").exists());
+        // Meta is readable at new location
+        let new_slug = ProjectName::new("renamed-project").unwrap();
+        let meta = store.read_project_meta(&new_slug);
+        assert_eq!(meta.display_name, "Renamed Project");
+    }
+
+    #[test]
+    fn resolve_project_by_display_name() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        store.create_project("My Project", None).unwrap();
+        // Resolve by slug
+        let p = store.resolve_project("my-project").unwrap();
+        assert_eq!(p.as_str(), "my-project");
+        // Resolve by display name
+        let p = store.resolve_project("My Project").unwrap();
+        assert_eq!(p.as_str(), "my-project");
+        // Non-existent
+        assert!(store.resolve_project("does-not-exist").is_err());
     }
 
     #[test]

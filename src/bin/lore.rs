@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use lore_core::{
     AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, ReleaseStream,
-    SelfUpdateOutcome, apply_update_to_version, check_for_update, maybe_apply_self_update,
+    SelfUpdateOutcome, apply_update_to_version, check_for_update, maybe_apply_self_update, slugify,
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -363,7 +363,7 @@ struct CliContext {
 
 #[derive(Debug, Deserialize)]
 struct ProjectSummary {
-    project: ProjectName,
+    project: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1233,7 +1233,14 @@ impl CliContext {
         let value = project
             .or_else(|| self.project.clone())
             .ok_or_else(|| io::Error::other("set --project, LORE_PROJECT, or config project"))?;
-        Ok(ProjectName::new(value)?)
+        // Try as slug first; if that fails, slugify the display name
+        match ProjectName::new(&value) {
+            Ok(name) => Ok(name),
+            Err(_) => {
+                let slug = slugify(&value);
+                Ok(ProjectName::new(slug)?)
+            }
+        }
     }
 
     fn require_token(&self) -> CliResult<&str> {
