@@ -9581,6 +9581,10 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         padding: var(--s-3);
       }
 
+      .timeline {
+        padding: var(--s-3);
+      }
+
       .block-header-btn {
         width: 28px;
         height: 28px;
