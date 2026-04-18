@@ -573,7 +573,33 @@ pub fn render_projects_page(
     </section>
     <script>
     var csrfToken = '{csrf_token}';
+    var treeUser = '{username}';
     var dragSlug = null;
+
+    function treeStateKey() {{ return 'lore-tree-' + treeUser; }}
+    function saveTreeState() {{
+      var expanded = [];
+      document.querySelectorAll('.tree-node').forEach(function(node) {{
+        var btn = node.querySelector(':scope > .tree-node-row > .tree-expand-btn');
+        if (btn && btn.classList.contains('tree-expand-open')) {{
+          expanded.push(node.getAttribute('data-slug'));
+        }}
+      }});
+      try {{ localStorage.setItem(treeStateKey(), JSON.stringify(expanded)); }} catch(e) {{}}
+    }}
+    function restoreTreeState() {{
+      var expanded;
+      try {{ expanded = JSON.parse(localStorage.getItem(treeStateKey())); }} catch(e) {{ return; }}
+      if (!expanded || !expanded.length) return;
+      expanded.forEach(function(slug) {{
+        var node = document.querySelector('.tree-node[data-slug="' + slug + '"]');
+        if (!node) return;
+        var btn = node.querySelector(':scope > .tree-node-row > .tree-expand-btn');
+        if (btn && !btn.classList.contains('tree-expand-open')) {{
+          toggleProjectDocs(btn);
+        }}
+      }});
+    }}
 
     function createRow(parentSlug) {{
       var li = document.createElement('li');
@@ -615,6 +641,7 @@ pub fn render_projects_page(
         btn.innerHTML = '&#9654;';
         btn.classList.remove('tree-expand-open');
       }}
+      saveTreeState();
     }}
     function addDocRow(btn, projectSlug, parentDocId) {{
       document.querySelectorAll('.tree-doc-inline-create').forEach(function(el) {{ el.remove(); }});
@@ -749,10 +776,12 @@ pub fn render_projects_page(
       document.body.appendChild(form);
       form.submit();
     }}
+    restoreTreeState();
     </script>"#,
         tree_html = tree_html,
         root_create = root_create,
         csrf_token = escape_attribute(csrf_token),
+        username = escape_attribute(username),
     );
 
     render_shell(
@@ -4874,7 +4903,7 @@ pub fn render_project_page(
         <a class="button-link" href="/ui/{project_slug}/history">History</a>
       </div>
     </div>
-    {reserved_html}
+    <div style="margin-top:var(--s-4);">{reserved_html}</div>
     {doc_list_html}
     {read_only_notice}
     {delete_project_html}"#,
@@ -5197,7 +5226,7 @@ pub fn render_document_page(
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
       {rename_html}
     </div>
-    <section class="panel" id="document">
+    <section class="panel" id="document" style="margin-top:var(--s-4);">
       <div class="timeline">{blocks_html}</div>
     </section>
     {child_doc_items}
@@ -5349,6 +5378,10 @@ fn render_doc_block(
     let edit_panel = if can_write {
         let block_type_options = render_block_type_options(block.block_type);
         let content_escaped = escape_text(&block.content);
+        let media_replace = match block.block_type {
+            crate::model::BlockType::Markdown | crate::model::BlockType::Html => "",
+            _ => r#"<label class="image-upload-label">Replace media <input type="file" name="image_file" accept="image/*,.svg"></label>"#,
+        };
         format!(
             r#"<div class="block-edit-panel" id="edit-{block_id}" style="display:none;">
   <form method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/edit" enctype="multipart/form-data">
@@ -5357,7 +5390,7 @@ fn render_doc_block(
       <select name="block_type" class="block-type-select">{block_type_options}</select>
     </div>
     <textarea name="content" class="block-edit-textarea">{content_escaped}</textarea>
-    <label class="image-upload-label">Replace media <input type="file" name="image_file" accept="image/*,.svg"></label>
+    {media_replace}
     <div class="block-edit-actions">
       <button type="submit" class="button-link">Save</button>
       <button type="button" class="button-link" onclick="cancelBlockEdit('{block_id}')">Cancel</button>
@@ -9542,6 +9575,10 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 
       .composer {
         position: static;
+      }
+
+      .panel {
+        padding: var(--s-3);
       }
 
       .block-header-btn {
