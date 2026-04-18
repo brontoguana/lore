@@ -9585,6 +9585,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         padding: var(--s-3);
       }
 
+      .block.editing {
+        padding: var(--s-2) var(--s-3);
+      }
+
+      .block-edit-actions button {
+        padding: var(--s-2) var(--s-3);
+      }
+
       .block-header-btn {
         width: 28px;
         height: 28px;
