@@ -3165,7 +3165,7 @@ pub fn render_chat_page(
     let librarian_entry = format!(
         r#"<div class="chat-agent-item{active_class}" data-agent="librarian" onclick="selectAgent('librarian')">
   <div class="chat-agent-header">
-    <div class="chat-avatar-sm-wrap chat-avatar-empty"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.4"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></div>
+    <div class="chat-avatar-sm-wrap chat-avatar-empty chat-avatar-librarian"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></div>
     <span class="chat-agent-name">Librarian</span>
     <span class="chat-status-dot chat-status-online"></span>
   </div>
@@ -8159,6 +8159,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       align-items: center;
       justify-content: center;
+    }
+    .chat-avatar-librarian {
+      background: var(--accent-soft);
+      color: var(--accent);
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
     }
     .chat-avatar-sm {
       width: 24px;

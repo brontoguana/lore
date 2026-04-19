@@ -4581,7 +4581,9 @@ async fn create_role_from_ui(
         Some(role_name),
         None,
     )?;
-    Ok(Redirect::to("/ui/admin?flash=Role%20created"))
+    Ok(Redirect::to(
+        "/ui/admin?section=roles&flash=Role%20created",
+    ))
 }
 
 async fn update_role_from_ui(
@@ -4607,7 +4609,9 @@ async fn update_role_from_ui(
         Some(role_name),
         None,
     )?;
-    Ok(Redirect::to("/ui/admin?flash=Role%20updated"))
+    Ok(Redirect::to(
+        "/ui/admin?section=roles&flash=Role%20updated",
+    ))
 }
 
 async fn create_user_from_ui(
