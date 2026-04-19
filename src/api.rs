@@ -632,6 +632,7 @@ fn build_app_with_librarian(
         .route("/ui/chat/librarian/config", get(librarian_chat_get_config).post(librarian_chat_save_config))
         .route("/ui/chat/librarian/action/{id}/approve", post(librarian_chat_approve_action))
         .route("/ui/chat/librarian/action/{id}/reject", post(librarian_chat_reject_action))
+        .route("/ui/chat/librarian/clear", post(librarian_chat_clear))
         .route("/ui/chat/{agent}/send", post(chat_send_message))
         .route("/ui/chat/{agent}/command", post(chat_slash_command))
         .route("/ui/chat/{agent}/config", post(chat_save_config).get(chat_get_config))
@@ -10583,6 +10584,44 @@ fn librarian_chat_reject_inner(
     let project = pending.project.clone();
     state.auth.authorize_write(&session.user, &project)?;
     reject_pending_project_librarian_action(state, &project, id, &session.user)?;
+    Ok(json!({ "ok": true }))
+}
+
+#[derive(Debug, Deserialize)]
+struct LibrarianClearForm {
+    csrf_token: String,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+async fn librarian_chat_clear(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LibrarianClearForm>,
+) -> Response {
+    match librarian_chat_clear_inner(&state, &headers, &form) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })).into_response(),
+    }
+}
+
+fn librarian_chat_clear_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: &LibrarianClearForm,
+) -> Result<Value, LoreError> {
+    let session = require_ui_session(state, headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    if let Some(ref project_str) = form.project {
+        if !project_str.is_empty() {
+            let project = ProjectName::new(project_str)?;
+            state.librarian_history.clear_project(&project)?;
+        } else {
+            state.librarian_history.clear_all()?;
+        }
+    } else {
+        state.librarian_history.clear_all()?;
+    }
     Ok(json!({ "ok": true }))
 }
 

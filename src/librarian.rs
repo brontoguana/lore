@@ -758,6 +758,27 @@ impl LibrarianHistoryStore {
             .join(format!("{}.json", project.as_str()))
     }
 
+    pub fn clear_project(&self, project: &ProjectName) -> Result<()> {
+        let path = self.project_history_path(project);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_all(&self) -> Result<()> {
+        let dir = self.history_dir();
+        if dir.exists() {
+            for entry in fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_layout(&self) -> Result<()> {
         fs::create_dir_all(self.history_dir())?;
         #[cfg(unix)]

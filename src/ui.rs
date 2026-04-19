@@ -4382,12 +4382,105 @@ function saveConfig() {{
   }});
 }}
 
+function handleLibrarianCommand(text) {{
+  var parts = text.split(/\s+/);
+  var cmd = parts[0].toLowerCase();
+  var arg = parts.slice(1).join(' ').trim();
+
+  if (cmd === '/help') {{
+    return 'Available commands:\n/clear \u2014 clear chat history\n/project <name> \u2014 switch project\n/history on|off \u2014 toggle include history\n/edits on|off \u2014 toggle allow edits\n/help \u2014 show this message';
+  }}
+
+  if (cmd === '/clear') {{
+    fetch('/ui/chat/librarian/clear', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+      body: 'csrf_token=' + encodeURIComponent(csrfToken) + '&project=' + encodeURIComponent(libProject)
+    }});
+    chatMessages = [];
+    renderMessages();
+    return null;
+  }}
+
+  if (cmd === '/project') {{
+    if (!arg) return 'Usage: /project <name>';
+    var sel = document.getElementById('lib-project');
+    if (!sel) return 'Project selector not found.';
+    var found = false;
+    var argLower = arg.toLowerCase();
+    for (var i = 0; i < sel.options.length; i++) {{
+      var optText = sel.options[i].text.toLowerCase();
+      var optVal = sel.options[i].value.toLowerCase();
+      if (optText === argLower || optVal === argLower) {{
+        sel.selectedIndex = i;
+        found = true;
+        break;
+      }}
+    }}
+    if (!found) {{
+      for (var i = 0; i < sel.options.length; i++) {{
+        if (sel.options[i].text.toLowerCase().indexOf(argLower) !== -1) {{
+          sel.selectedIndex = i;
+          found = true;
+          break;
+        }}
+      }}
+    }}
+    if (!found) return 'No project matching "' + arg + '" found.';
+    onLibProjectChange();
+    return 'Switched to project: ' + sel.options[sel.selectedIndex].text;
+  }}
+
+  if (cmd === '/history') {{
+    var btn = document.getElementById('lib-toggle-history');
+    if (!btn) return 'History toggle not found.';
+    if (arg === 'on') {{
+      if (!btn.classList.contains('active')) btn.classList.add('active');
+      return 'Include history: on';
+    }} else if (arg === 'off') {{
+      btn.classList.remove('active');
+      return 'Include history: off';
+    }} else {{
+      btn.classList.toggle('active');
+      return 'Include history: ' + (btn.classList.contains('active') ? 'on' : 'off');
+    }}
+  }}
+
+  if (cmd === '/edits') {{
+    var btn = document.getElementById('lib-toggle-edits');
+    if (!btn) return 'Edits toggle not found.';
+    if (arg === 'on') {{
+      if (!btn.classList.contains('active')) btn.classList.add('active');
+      return 'Allow edits: on';
+    }} else if (arg === 'off') {{
+      btn.classList.remove('active');
+      return 'Allow edits: off';
+    }} else {{
+      btn.classList.toggle('active');
+      return 'Allow edits: ' + (btn.classList.contains('active') ? 'on' : 'off');
+    }}
+  }}
+
+  return 'Unknown command: ' + cmd + '\nType /help for available commands.';
+}}
+
 function sendLibrarianMessage(e) {{
   e.preventDefault();
   var input = document.getElementById('chat-input');
   var text = input.value.trim();
   if (!text) return false;
   input.value = '';
+
+  if (text.startsWith('/')) {{
+    chatMessages.push({{ role: 'user', content: text }});
+    var result = handleLibrarianCommand(text);
+    if (result) {{
+      chatMessages.push({{ role: 'system', content: result }});
+    }}
+    renderMessages();
+    return false;
+  }}
+
   chatMessages.push({{ role: 'user', content: text }});
   chatMessages.push({{ role: 'assistant', content: 'Thinking\u2026', _thinking: true }});
   renderMessages();
