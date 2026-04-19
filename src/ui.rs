@@ -3465,25 +3465,93 @@ function showAgentList() {{
 }}
 
 /* Fix mobile keyboard: on dismiss, browser sometimes leaves page scrolled
-   so chat-header hides behind the sticky top-nav. Reset on viewport grow.
-   On first keyboard open, iOS doesn't recalculate fixed layout — nudge input into view. */
+   so chat-header hides behind the sticky top-nav. On first keyboard open,
+   iOS may not recalculate fixed layout in time, so drive the shell inset
+   from the visual viewport and keep nudging the composer into view. */
+function chatInputIsFocused() {{
+  var ci = document.getElementById('chat-input');
+  return !!(ci && ci === document.activeElement);
+}}
+
+function currentKeyboardInset() {{
+  if (!window.visualViewport) return 0;
+  var visibleBottom = window.visualViewport.height + window.visualViewport.offsetTop;
+  return Math.max(0, Math.round(window.innerHeight - visibleBottom));
+}}
+
+function applyChatViewportFix() {{
+  var shell = document.querySelector('.shell');
+  var form = document.getElementById('chat-input-form');
+  var input = document.getElementById('chat-input');
+  var messages = document.getElementById('chat-messages');
+  var hasFocus = chatInputIsFocused();
+  var inset = currentKeyboardInset();
+
+  if (shell) {{
+    if (inset > 0 || hasFocus) {{
+      shell.style.bottom = inset > 0 ? (inset + 'px') : '0px';
+    }} else {{
+      shell.style.bottom = '';
+    }}
+  }}
+
+  if (!window.visualViewport) {{
+    if (!hasFocus) window.scrollTo(0, 0);
+    return;
+  }}
+
+  if (!hasFocus || !form || !messages || !input) {{
+    if (!hasFocus && inset === 0) window.scrollTo(0, 0);
+    return;
+  }}
+
+  var viewportBottom = window.visualViewport.offsetTop + window.visualViewport.height;
+  var formRect = form.getBoundingClientRect();
+  var inputRect = input.getBoundingClientRect();
+  var targetBottom = viewportBottom - 12;
+  var overlap = Math.max(formRect.bottom - targetBottom, inputRect.bottom - targetBottom);
+  if (overlap > 0) {{
+    messages.scrollTop += overlap;
+  }}
+}}
+
+function scheduleChatViewportFix() {{
+  applyChatViewportFix();
+  requestAnimationFrame(function() {{
+    applyChatViewportFix();
+    requestAnimationFrame(function() {{
+      applyChatViewportFix();
+      setTimeout(applyChatViewportFix, 60);
+      setTimeout(applyChatViewportFix, 180);
+    }});
+  }});
+}}
+
 if (window.visualViewport) {{
   var _lastVVH = window.visualViewport.height;
-  var _firstKb = true;
   window.visualViewport.addEventListener('resize', function() {{
     var h = window.visualViewport.height;
     if (h > _lastVVH) {{
       window.scrollTo(0, 0);
-    }} else if (_firstKb) {{
-      _firstKb = false;
-      var ci = document.getElementById('chat-input');
-      if (ci && ci === document.activeElement) {{
-        setTimeout(function() {{ ci.scrollIntoView({{ block: 'nearest' }}); }}, 50);
-      }}
     }}
+    applyChatViewportFix();
     _lastVVH = h;
   }});
+  window.visualViewport.addEventListener('scroll', applyChatViewportFix);
 }}
+
+document.addEventListener('focusin', function(e) {{
+  if (e.target && e.target.id === 'chat-input') {{
+    scheduleChatViewportFix();
+  }}
+}});
+
+document.addEventListener('focusout', function(e) {{
+  if (e.target && e.target.id === 'chat-input') {{
+    setTimeout(applyChatViewportFix, 0);
+    setTimeout(applyChatViewportFix, 120);
+  }}
+}});
 
 function openProfilePic(el) {{
   var agent = el.getAttribute('data-agent');
