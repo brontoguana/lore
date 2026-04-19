@@ -8179,15 +8179,21 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-header-name {
       font-weight: 600;
       font-size: 1rem;
+      align-self: baseline;
+      line-height: 1.2;
     }
     .chat-header-status {
       font-size: 0.82rem;
       color: var(--fg-muted);
+      align-self: baseline;
+      line-height: 1.2;
     }
     .chat-header-cwd {
       margin-left: auto;
       font-size: 0.82rem;
       color: var(--fg-muted);
+      align-self: baseline;
+      line-height: 1.2;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
