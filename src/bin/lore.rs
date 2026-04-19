@@ -4519,6 +4519,8 @@ struct ManagedAgent {
     pid: u32,
     folder: String,
     token: String,
+    #[serde(default)]
+    backend: Option<String>,
 }
 
 struct ServiceState {
@@ -4698,6 +4700,7 @@ fn spawn_agent_task(
 ) -> tokio::task::JoinHandle<()> {
     let folder = PathBuf::from(&agent.folder);
     let name = agent.name.clone();
+    let backend_override = agent.backend.as_ref().and_then(|b| b.parse().ok());
     let ctx = CliContext {
         client: context.client.clone(),
         url: context.url.clone(),
@@ -4713,7 +4716,7 @@ fn spawn_agent_task(
         eprintln!("[agent] Task started for '{}'", name);
         let mut consecutive_errors: u32 = 0;
         loop {
-            let outcome = agent_poll_and_process(&ctx, &name, None).await;
+            let outcome = agent_poll_and_process(&ctx, &name, backend_override).await;
             match outcome {
                 Ok(AgentPollAction::Continue) => { consecutive_errors = 0; }
                 Ok(AgentPollAction::Stop) => {
@@ -4815,6 +4818,7 @@ fn migrate_old_agents(_context: &CliContext, svc_state: &mut ServiceState) {
             pid: 0, // will be spawned by restart_crashed_agents
             folder,
             token: agent_token.clone(),
+            backend: None,
         };
         svc_state.agents.push(managed);
         eprintln!("[service] Migrated agent '{}'", agent_name);
@@ -5319,6 +5323,8 @@ async fn service_handle_create_agent(
 ) -> CliResult<serde_json::Value> {
     let agent_name = params["agent_name"].as_str().ok_or("missing agent_name")?;
     let folder = params["folder"].as_str().ok_or("missing folder")?;
+    let backend = params["backend"].as_str().unwrap_or("claude");
+    let grants = params["grants"].clone();
     let (_, folder_path) = match resolve_existing_service_path(folder) {
         Ok(v) => v,
         Err(e) => return Ok(serde_json::json!({ "error": e.to_string() })),
@@ -5332,6 +5338,8 @@ async fn service_handle_create_agent(
         .header("x-lore-version", env!("CARGO_PKG_VERSION"))
         .json(&serde_json::json!({
             "name": agent_name,
+            "backend": backend,
+            "grants": grants,
         }))
         .send()
         .await?;
@@ -5359,6 +5367,7 @@ async fn service_handle_create_agent(
         pid: 0,
         folder: folder_path.to_string_lossy().into_owned(),
         token: agent_token.to_string(),
+        backend: Some(backend.to_string()),
     };
 
     // Start the agent as a task within this process

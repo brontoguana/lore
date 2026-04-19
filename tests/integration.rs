@@ -527,7 +527,6 @@ async fn reserved_blocks() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
     let (cookie, csrf) = admin_login(&client, &addr).await;
-    let token = api_create_agent_token(&client, &addr, "reserved-agent", &[("reserved-project", "read_write")]).await;
 
     // Create project via UI form (this calls create_project which sets up reserved blocks)
     let resp = client
@@ -539,6 +538,9 @@ async fn reserved_blocks() {
         .await
         .unwrap();
     assert!(resp.status().as_u16() < 400 || resp.status() == 303, "project create: {}", resp.status());
+
+    let token =
+        api_create_agent_token(&client, &addr, "reserved-agent", &[("reserved-project", "read_write")]).await;
 
     // Read _overview reserved block
     let resp = client

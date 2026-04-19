@@ -170,15 +170,13 @@ pub struct AuthenticatedAgent {
 
 impl AuthenticatedAgent {
     pub fn can_read(&self, project: &ProjectName) -> bool {
-        self.owner_is_admin
-            || self.grants.iter().any(|grant| &grant.project == project)
+        self.grants.iter().any(|grant| &grant.project == project)
     }
 
     pub fn can_write(&self, project: &ProjectName) -> bool {
-        self.owner_is_admin
-            || self.grants
-                .iter()
-                .any(|grant| &grant.project == project && grant.permission.allows_write())
+        self.grants
+            .iter()
+            .any(|grant| &grant.project == project && grant.permission.allows_write())
     }
 }
 
@@ -966,11 +964,6 @@ impl LocalAuthStore {
         grants: Vec<ProjectGrant>,
     ) -> Result<StoredAgentToken> {
         validate_agent_token_name(name)?;
-        if grants.is_empty() {
-            return Err(LoreError::Validation(
-                "agent must grant at least one project permission".into(),
-            ));
-        }
         let mut seen = std::collections::BTreeSet::new();
         for grant in &grants {
             if !seen.insert(grant.project.clone()) {
@@ -991,6 +984,26 @@ impl LocalAuthStore {
             return Err(LoreError::Validation("agent does not exist".into()));
         }
         Self::get_agent_token_from_conn(&conn, name, Some(owner))
+    }
+
+    pub fn remove_project_from_all_agent_grants(&self, project: &ProjectName) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let mut tokens = Self::load_agent_tokens_filtered(&conn, None)?;
+        let mut updated = 0usize;
+        for token in &mut tokens {
+            let original_len = token.grants.len();
+            token.grants.retain(|grant| &grant.project != project);
+            if token.grants.len() == original_len {
+                continue;
+            }
+            let grants_json = serde_json::to_string(&token.grants)?;
+            conn.execute(
+                "UPDATE agent_tokens SET grants = ?1 WHERE name = ?2",
+                params![grants_json, token.name],
+            ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+            updated += 1;
+        }
+        Ok(updated)
     }
 
     pub fn authenticate_agent_token(&self, token: &str) -> Result<AuthenticatedAgent> {
@@ -1017,7 +1030,10 @@ impl LocalAuthStore {
         let owner = row.2.map(|s| UserName::new(s)).transpose()?;
         let backend: AgentBackend = row.4.parse().unwrap_or_default();
 
-        // Compute grants dynamically from the owner's current roles
+        let stored_grants: Vec<ProjectGrant> = serde_json::from_str(&row.3).unwrap_or_default();
+
+        // Owner-backed agents stay scoped to their stored grants, further bounded
+        // by the owner's current permissions.
         let (owner_is_admin, grants) = if let Some(ref owner_name) = owner {
             match Self::get_stored_user_from_conn(&conn, owner_name) {
                 Ok(stored_user) => {
@@ -1025,9 +1041,31 @@ impl LocalAuthStore {
                         return Err(LoreError::PermissionDenied);
                     }
                     let user = Self::user_from_stored_conn(&conn, &stored_user)?;
-                    let grants = user.roles.iter()
-                        .flat_map(|role| role.grants.clone())
-                        .collect();
+                    let grants = if user.is_admin {
+                        stored_grants.clone()
+                    } else {
+                        stored_grants
+                            .iter()
+                            .filter_map(|grant| {
+                                let best = user
+                                    .roles
+                                    .iter()
+                                    .flat_map(|role| &role.grants)
+                                    .filter(|g| g.project == grant.project)
+                                    .map(|g| g.permission)
+                                    .max_by_key(|perm| if perm.allows_write() { 1 } else { 0 })?;
+                                let permission = if grant.permission.allows_write() && !best.allows_write() {
+                                    ProjectPermission::Read
+                                } else {
+                                    grant.permission
+                                };
+                                Some(ProjectGrant {
+                                    project: grant.project.clone(),
+                                    permission,
+                                })
+                            })
+                            .collect()
+                    };
                     (user.is_admin, grants)
                 }
                 Err(_) => {
@@ -1036,9 +1074,7 @@ impl LocalAuthStore {
                 }
             }
         } else {
-            // No owner — fall back to static grants in the token
-            let grants: Vec<ProjectGrant> = serde_json::from_str(&row.3).unwrap_or_default();
-            (false, grants)
+            (false, stored_grants)
         };
 
         Ok(AuthenticatedAgent {
@@ -1153,14 +1189,12 @@ impl LocalAuthStore {
         username: &UserName,
         display_name: &str,
         grants: Vec<ProjectGrant>,
+        backend: Option<AgentBackend>,
         machine_name: Option<&str>,
     ) -> Result<CreatedAgentToken> {
         validate_agent_display_name(display_name)?;
         let slug = slugify_agent_name(display_name);
         validate_agent_token_name(&slug)?;
-        if grants.is_empty() {
-            return Err(LoreError::Validation("agent must have at least one project grant".into()));
-        }
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         let new_hash = hash_agent_token(&raw_token);
@@ -1193,10 +1227,10 @@ impl LocalAuthStore {
         let mut sorted_grants = grants;
         sorted_grants.sort_by(|a, b| a.project.cmp(&b.project));
         let grants_json = serde_json::to_string(&sorted_grants)?;
-        let default_backend = AgentBackend::default().to_string();
+        let initial_backend = backend.unwrap_or_default().to_string();
         conn.execute(
             "INSERT INTO agent_tokens (name, display_name, token_hash, owner, grants, backend, machine_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![slug, display_name, new_hash, username.as_str(), grants_json, default_backend, machine_name, fmt_dt(&now)],
+            params![slug, display_name, new_hash, username.as_str(), grants_json, initial_backend, machine_name, fmt_dt(&now)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let stored = Self::get_agent_token_from_conn(&conn, &slug, Some(username))?;
         Ok(CreatedAgentToken { token: raw_token, stored })
@@ -1789,7 +1823,7 @@ impl ChatStore {
 
         // Conversations for agents with no token
         match conn.execute(
-            "DELETE FROM conversations WHERE agent NOT IN (SELECT DISTINCT name FROM agent_tokens)",
+            "DELETE FROM conversations WHERE agent NOT IN (SELECT DISTINCT name FROM agent_tokens) AND agent != 'librarian' AND agent NOT LIKE 'librarian:%'",
             [],
         ) {
             Ok(n) if n > 0 => eprintln!("cleanup: removed {n} conversation(s) for deleted agent(s)"),
@@ -2105,6 +2139,19 @@ impl ChatStore {
         conn.execute(
             "UPDATE conversations SET next_id = 1 WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(())
+    }
+
+    pub fn clear_librarian_messages(&self, owner: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute(
+            "DELETE FROM messages WHERE owner = ?1 AND (agent = 'librarian' OR agent LIKE 'librarian:%')",
+            params![owner],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "UPDATE conversations SET next_id = 1 WHERE owner = ?1 AND (agent = 'librarian' OR agent LIKE 'librarian:%')",
+            params![owner],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
@@ -2478,6 +2525,58 @@ mod tests {
         let agent = auth.authenticate_agent_token(&created.token).unwrap();
         assert_eq!(agent.name, "worker-alpha");
         assert!(agent.can_write(&ProjectName::new("alpha.docs").unwrap()));
+    }
+
+    #[test]
+    fn owner_backed_agent_tokens_stay_scoped_to_stored_grants() {
+        let dir = tempdir().unwrap();
+        let auth = LocalAuthStore::new(dir.path());
+        auth.bootstrap_admin(
+            UserName::new("admin".to_string()).unwrap(),
+            "correct-horse-battery".into(),
+        )
+        .unwrap();
+
+        auth.create_role(NewRole {
+            name: RoleName::new("reader".to_string()).unwrap(),
+            grants: vec![
+                ProjectGrant {
+                    project: ProjectName::new("alpha.docs").unwrap(),
+                    permission: ProjectPermission::ReadWrite,
+                },
+                ProjectGrant {
+                    project: ProjectName::new("beta.docs").unwrap(),
+                    permission: ProjectPermission::ReadWrite,
+                },
+            ],
+        })
+        .unwrap();
+
+        auth.create_user(NewUser {
+            username: UserName::new("alice".to_string()).unwrap(),
+            password: "very-secure-passphrase".into(),
+            role_names: vec![RoleName::new("reader".to_string()).unwrap()],
+            is_admin: false,
+        })
+        .unwrap();
+
+        let created = auth
+            .create_agent_token(NewAgentToken {
+                display_name: "scoped-agent".into(),
+                owner: UserName::new("alice").unwrap(),
+                grants: vec![ProjectGrant {
+                    project: ProjectName::new("alpha.docs").unwrap(),
+                    permission: ProjectPermission::Read,
+                }],
+                backend: AgentBackend::default(),
+                endpoint_id: None,
+            })
+            .unwrap();
+
+        let agent = auth.authenticate_agent_token(&created.token).unwrap();
+        assert!(agent.can_read(&ProjectName::new("alpha.docs").unwrap()));
+        assert!(!agent.can_write(&ProjectName::new("alpha.docs").unwrap()));
+        assert!(!agent.can_read(&ProjectName::new("beta.docs").unwrap()));
     }
 
     #[test]

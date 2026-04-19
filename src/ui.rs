@@ -2216,6 +2216,36 @@ pub fn render_agents_page(
         machines
             .iter()
             .map(|m| {
+                let create_grants_html = if user_projects.is_empty() {
+                    "<p class=\"hint\" style=\"margin-top:var(--s-3);\">No projects available yet.</p>".to_string()
+                } else {
+                    let rows = user_projects
+                        .iter()
+                        .map(|p| {
+                            let rw_option = if p.max_permission.allows_write() {
+                                r#"<option value="read_write">Read/write</option>"#
+                            } else {
+                                ""
+                            };
+                            format!(
+                                r#"<div class="grant-row" data-create-project-grant="{}">
+                                  <span class="grant-project-name">{}</span>
+                                  <select>
+                                    <option value="" selected>No access</option>
+                                    <option value="read">Read</option>
+                                    {rw_option}
+                                  </select>
+                                </div>"#,
+                                escape_attribute(&p.slug),
+                                escape_text(&p.display_name),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    format!(
+                        r#"<fieldset class="grant-fieldset create-agent-grants"><legend>Project access</legend>{}</fieldset>"#,
+                        rows.join("")
+                    )
+                };
                 let version_display = m.cli_version.as_deref().unwrap_or("unknown");
                 let is_outdated = m.cli_version.as_deref().map(|v| v.trim_start_matches('v') != server_version).unwrap_or(true);
                 let update_btn = if is_outdated && !m.pending_update {
@@ -2258,13 +2288,13 @@ pub fn render_agents_page(
                           </label>
                           <div style="display:flex; flex-direction:column; gap:var(--s-1);">
                             <span style="font-size:0.8rem; color:var(--fg-2);">Backend</span>
-                            <div style="display:flex; align-items:stretch; gap:var(--s-2);">
+                            <div class="create-agent-backend-row">
                               <select id="create-backend-{name_attr}">
                                 <option value="claude">Claude</option>
                                 <option value="gemini">Gemini</option>
                                 <option value="codex">Codex</option>
                               </select>
-                              <button type="button" style="width:auto; min-height:0; padding:0; aspect-ratio:1; display:inline-flex; align-items:center; justify-content:center;" onclick="toggleMkdir('{name_attr}')" title="Create folder" aria-label="Create folder">
+                              <button type="button" class="btn-sm create-folder-toggle" onclick="toggleMkdir('{name_attr}')" title="Create folder" aria-label="Create folder">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
                                   <path d="M12 11v6"/>
@@ -2293,8 +2323,11 @@ pub fn render_agents_page(
                             <input type="hidden" id="create-home-{name_attr}">
                           </div>
                         </div>
+                        <div style="margin-top:var(--s-3);">
+                          {create_grants_html}
+                        </div>
                         <div style="margin-top:var(--s-3); display:flex; gap:var(--s-2);">
-                          <button type="button" onclick="submitCreateAgent('{name_attr}')" style="font-size:0.8rem; padding:var(--s-1) var(--s-3);">Create agent</button>
+                          <button type="button" class="btn-lg" onclick="submitCreateAgent('{name_attr}')">Create Agent</button>
                           <span id="create-status-{name_attr}" class="hint" style="font-size:0.8rem; align-self:center;"></span>
                         </div>
                       </div>
@@ -2305,6 +2338,7 @@ pub fn render_agents_page(
                     update_btn = update_btn,
                     name_attr = escape_attribute(&m.name),
                     csrf = escape_attribute(csrf_token),
+                    create_grants_html = create_grants_html,
                 )
             })
             .collect::<Vec<_>>()
@@ -2734,10 +2768,21 @@ pub fn render_agents_page(
       var nameInput = document.getElementById('create-name-' + machine);
       var pathInput = document.getElementById('create-path-' + machine);
       var backendSelect = document.getElementById('create-backend-' + machine);
+      var panel = document.getElementById('create-panel-' + machine);
       var statusEl = document.getElementById('create-status-' + machine);
       var agentName = nameInput ? nameInput.value.trim() : '';
       var folder = pathInput ? pathInput.value.trim() : '';
       var backend = backendSelect ? backendSelect.value : 'claude';
+      var grants = [];
+      if (panel) {{
+        var rows = panel.querySelectorAll('[data-create-project-grant]');
+        rows.forEach(function(row) {{
+          var sel = row.querySelector('select');
+          if (sel && sel.value) {{
+            grants.push(row.getAttribute('data-create-project-grant') + ':' + sel.value);
+          }}
+        }});
+      }}
       if (!agentName) {{
         if (statusEl) {{ statusEl.textContent = 'Enter an agent name'; statusEl.style.color = 'var(--danger)'; }}
         return;
@@ -2750,7 +2795,13 @@ pub fn render_agents_page(
       fetch('/ui/agents/machines/' + encodeURIComponent(machine) + '/create-agent', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{ csrf_token: getCsrf(machine), agent_name: agentName, folder: folder, backend: backend }})
+        body: JSON.stringify({{
+          csrf_token: getCsrf(machine),
+          agent_name: agentName,
+          folder: folder,
+          backend: backend,
+          grants: grants.join('\\n')
+        }})
       }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
         if (data.error) {{
           if (statusEl) {{ statusEl.textContent = data.error; statusEl.style.color = 'var(--danger)'; }}
@@ -9303,9 +9354,27 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
 
     .create-agent-panel select,
-    .create-agent-panel button {
+    .create-agent-panel button:not(.btn-lg) {
       width: auto;
       min-height: auto;
+    }
+
+    .create-agent-backend-row {
+      display: flex;
+      align-items: stretch;
+      gap: var(--s-2);
+    }
+
+    .create-agent-backend-row select {
+      min-width: 0;
+    }
+
+    .create-folder-toggle {
+      min-width: 28px;
+      width: 28px;
+      height: 28px;
+      flex: 0 0 28px;
+      align-self: flex-end;
     }
 
     .callout {

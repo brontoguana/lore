@@ -81,6 +81,40 @@ const GLOBAL_LIBRARIAN_RATE_LIMIT: usize = 30;
 const GLOBAL_LIBRARIAN_RATE_LIMIT_WINDOW_SECS: i64 = 60;
 const MACHINE_COMMAND_TIMEOUT_SECS: u64 = 15;
 
+fn librarian_chat_agent_name(project: Option<&ProjectName>) -> String {
+    match project {
+        Some(project) => format!("librarian:{}", project.as_str()),
+        None => "librarian".to_string(),
+    }
+}
+
+fn librarian_history_messages_from_runs(runs: &[crate::librarian::StoredLibrarianRun]) -> Vec<Value> {
+    let mut messages: Vec<Value> = Vec::new();
+    for run in runs {
+        messages.push(json!({
+            "role": "user",
+            "content": run.question.clone(),
+            "timestamp": run.created_at.unix_timestamp(),
+        }));
+        let content = if let Some(ref answer) = run.answer {
+            answer.clone()
+        } else if let Some(ref error) = run.error {
+            format!("Error: {}", error)
+        } else {
+            "No response.".to_string()
+        };
+        let status = format!("{:?}", run.status);
+        messages.push(json!({
+            "role": "assistant",
+            "content": content,
+            "status": status,
+            "run_id": run.id,
+            "context_block_count": run.source_block_ids.len(),
+        }));
+    }
+    messages
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MachineCommand {
     id: String,
@@ -1209,6 +1243,9 @@ struct RegisterMachineRequest {
 #[derive(Debug, Deserialize)]
 struct ProvisionAgentRequest {
     name: String,
+    backend: Option<String>,
+    #[serde(default)]
+    grants: Option<Vec<CreateProjectGrantRequest>>,
 }
 
 
@@ -3960,7 +3997,7 @@ async fn update_agent_grants_from_ui(
 ) -> UiResult<Response> {
     let session = require_ui_session(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
-    let grants = parse_role_grants(&form.grants)?;
+    let grants = parse_agent_grants(&form.grants)?;
     validate_user_grants(&state, &session.user, &grants)?;
     state
         .auth
@@ -4159,6 +4196,9 @@ async fn create_project_from_ui(
         Some(form.parent.trim())
     };
     let info = state.store.create_project(&form.project_name, parent)?;
+    state
+        .auth
+        .remove_project_from_all_agent_grants(&info.slug)?;
     // Create an initial markdown block so the user can start editing immediately
     let initial_block = NewBlock {
         project: info.slug.clone(),
@@ -9995,6 +10035,20 @@ fn parse_block_type(value: &str) -> Result<BlockType, LoreError> {
 }
 
 fn parse_role_grants(input: &str) -> Result<Vec<ProjectGrant>, LoreError> {
+    let grants = parse_project_grants(input)?;
+    if grants.is_empty() {
+        return Err(LoreError::Validation(
+            "role must grant at least one project permission".into(),
+        ));
+    }
+    Ok(grants)
+}
+
+fn parse_agent_grants(input: &str) -> Result<Vec<ProjectGrant>, LoreError> {
+    parse_project_grants(input)
+}
+
+fn parse_project_grants(input: &str) -> Result<Vec<ProjectGrant>, LoreError> {
     let mut grants = Vec::new();
     for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let (project, permission) = line.split_once(':').ok_or_else(|| {
@@ -10018,11 +10072,6 @@ fn parse_role_grants(input: &str) -> Result<Vec<ProjectGrant>, LoreError> {
             project: ProjectName::new(project.trim())?,
             permission,
         });
-    }
-    if grants.is_empty() {
-        return Err(LoreError::Validation(
-            "role must grant at least one project permission".into(),
-        ));
     }
     Ok(grants)
 }
@@ -10191,6 +10240,7 @@ async fn librarian_chat_history_inner(
     query: &LibrarianChatHistoryQuery,
 ) -> Result<Value, LoreError> {
     let session = require_ui_session(state, headers)?;
+    let owner = session.user.username.as_str();
     let specific_project = match query.project {
         Some(ref p) if !p.is_empty() => Some(ProjectName::new(p.clone())?),
         _ => None,
@@ -10216,29 +10266,24 @@ async fn librarian_chat_history_inner(
         (accessible_runs, accessible_pending)
     };
 
-    let mut messages: Vec<Value> = Vec::new();
-    for run in &runs {
-        messages.push(json!({
-            "role": "user",
-            "content": run.question.clone(),
-            "timestamp": run.created_at.unix_timestamp(),
-        }));
-        let content = if let Some(ref answer) = run.answer {
-            answer.clone()
-        } else if let Some(ref error) = run.error {
-            format!("Error: {}", error)
-        } else {
-            "No response.".to_string()
-        };
-        let status = format!("{:?}", run.status);
-        messages.push(json!({
-            "role": "assistant",
-            "content": content,
-            "status": status,
-            "run_id": run.id,
-            "context_block_count": run.source_block_ids.len(),
-        }));
-    }
+    let conv = state
+        .chat
+        .load_conversation(owner, &librarian_chat_agent_name(specific_project.as_ref()))?;
+    let messages: Vec<Value> = if conv.messages.is_empty() {
+        librarian_history_messages_from_runs(&runs)
+    } else {
+        conv.messages
+            .iter()
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
+                    "content": m.content,
+                    "timestamp": m.timestamp.unix_timestamp(),
+                })
+            })
+            .collect()
+    };
 
     let pending_json: Vec<Value> = pending
         .iter()
@@ -10281,6 +10326,7 @@ async fn librarian_chat_ask_inner(
 ) -> Result<Value, LoreError> {
     let session = require_ui_session(state, headers)?;
     verify_csrf(&session, &form.csrf_token)?;
+    let owner = session.user.username.as_str();
 
     let options = librarian_options_from_parts(
         None,
@@ -10293,6 +10339,10 @@ async fn librarian_chat_ask_inner(
     let allow_edits = form.allow_edits.as_deref() == Some("1");
 
     if form.project.is_empty() {
+        let chat_agent = librarian_chat_agent_name(None);
+        let _ = state
+            .chat
+            .append_message(owner, &chat_agent, ChatRole::User, form.question.clone());
         let projects: Vec<ProjectName> = state
             .store
             .list_projects()?
@@ -10300,6 +10350,10 @@ async fn librarian_chat_ask_inner(
             .filter(|p| session.user.can_read(p))
             .collect();
         if projects.is_empty() {
+            let answer = "No accessible projects.".to_string();
+            let _ = state
+                .chat
+                .append_message(owner, &chat_agent, ChatRole::Assistant, answer.clone());
             return Ok(json!({ "ok": true, "answer": "No accessible projects." }));
         }
         if allow_edits {
@@ -10331,13 +10385,20 @@ async fn librarian_chat_ask_inner(
                 }
             }
             if combined_answers.is_empty() && !errors.is_empty() {
-                return Ok(json!({ "ok": false, "error": errors.join("\n") }));
+                let error_text = errors.join("\n");
+                let _ = state
+                    .chat
+                    .append_message(owner, &chat_agent, ChatRole::Error, error_text.clone());
+                return Ok(json!({ "ok": false, "error": error_text }));
             }
             let answer = if combined_answers.is_empty() {
                 "No results found across projects.".to_string()
             } else {
                 combined_answers.join("\n\n")
             };
+            let _ = state
+                .chat
+                .append_message(owner, &chat_agent, ChatRole::Assistant, answer.clone());
             return Ok(json!({ "ok": true, "answer": answer, "pending": any_pending }));
         }
 
@@ -10357,6 +10418,10 @@ async fn librarian_chat_ask_inner(
             }
         }
         if projects_context.is_empty() {
+            let answer = "No relevant content found across projects.".to_string();
+            let _ = state
+                .chat
+                .append_message(owner, &chat_agent, ChatRole::Assistant, answer.clone());
             return Ok(json!({ "ok": true, "answer": "No relevant content found across projects." }));
         }
         let system = "You are Lore Answer Librarian. You are read-only. You have access to multiple Lore projects and only the project context provided in this request. Answer from that context, referencing project names where relevant. If the context is insufficient, say so plainly. Do not claim to run commands, browse the web, inspect anything outside the provided Lore blocks, or take actions. If a 'Recent agent/server errors' section is provided, you may reference it when the user asks about errors, agent failures, or reliability.";
@@ -10409,13 +10474,28 @@ async fn librarian_chat_ask_inner(
         );
         state.librarian_history.append(audit)?;
         return match result {
-            Ok(answer) => Ok(json!({ "ok": true, "answer": answer.answer })),
-            Err(e) => Ok(json!({ "ok": false, "error": e.to_string() })),
+            Ok(answer) => {
+                let _ = state
+                    .chat
+                    .append_message(owner, &chat_agent, ChatRole::Assistant, answer.answer.clone());
+                Ok(json!({ "ok": true, "answer": answer.answer }))
+            }
+            Err(e) => {
+                let err = e.to_string();
+                let _ = state
+                    .chat
+                    .append_message(owner, &chat_agent, ChatRole::Error, err.clone());
+                Ok(json!({ "ok": false, "error": err }))
+            }
         };
     }
 
     let project = ProjectName::new(form.project)?;
     state.auth.authorize_read(&session.user, &project)?;
+    let chat_agent = librarian_chat_agent_name(Some(&project));
+    let _ = state
+        .chat
+        .append_message(owner, &chat_agent, ChatRole::User, form.question.clone());
 
     let result = if allow_edits && session.user.can_write(&project) {
         let action_result = execute_project_librarian_action(
@@ -10448,6 +10528,26 @@ async fn librarian_chat_ask_inner(
             "status": format!("{:?}", answer.status),
         })
     };
+
+    if result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let answer_text = result
+            .get("answer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("No response.")
+            .to_string();
+        let _ = state
+            .chat
+            .append_message(owner, &chat_agent, ChatRole::Assistant, answer_text);
+    } else {
+        let error_text = result
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("request failed")
+            .to_string();
+        let _ = state
+            .chat
+            .append_message(owner, &chat_agent, ChatRole::Error, error_text);
+    }
 
     Ok(result)
 }
@@ -10621,15 +10721,21 @@ fn librarian_chat_clear_inner(
 ) -> Result<Value, LoreError> {
     let session = require_ui_session(state, headers)?;
     verify_csrf(&session, &form.csrf_token)?;
+    let owner = session.user.username.as_str();
     if let Some(ref project_str) = form.project {
         if !project_str.is_empty() {
             let project = ProjectName::new(project_str)?;
             state.librarian_history.clear_project(&project)?;
+            state
+                .chat
+                .clear_messages(owner, &librarian_chat_agent_name(Some(&project)))?;
         } else {
             state.librarian_history.clear_all()?;
+            state.chat.clear_librarian_messages(owner)?;
         }
     } else {
         state.librarian_history.clear_all()?;
+        state.chat.clear_librarian_messages(owner)?;
     }
     Ok(json!({ "ok": true }))
 }
@@ -13348,13 +13454,28 @@ async fn provision_agent_with_body(
         let _ = state.auth.update_machine_version(&machine.machine_name, &machine.user.username, version);
     }
 
-    // Compute grants: all projects the user has access to
-    let grants = build_user_all_grants(&state, &machine.user)?;
+    let grants = match req.grants {
+        Some(grants) => {
+            let grants = grants
+                .into_iter()
+                .map(|grant| {
+                    Ok(ProjectGrant {
+                        project: ProjectName::new(grant.project)?,
+                        permission: grant.permission,
+                    })
+                })
+                .collect::<Result<Vec<_>, LoreError>>()?;
+            validate_user_grants(&state, &machine.user, &grants)?;
+            grants
+        }
+        None => build_user_all_grants(&state, &machine.user)?,
+    };
 
     let created = state.auth.provision_agent(
         &machine.user.username,
         &req.name,
         grants,
+        req.backend.as_deref().and_then(|b| b.parse().ok()),
         Some(&machine.machine_name),
     )?;
     append_audit_event(
@@ -13772,6 +13893,8 @@ struct MachineCreateAgentRequest {
     agent_name: String,
     folder: String,
     backend: Option<String>,
+    #[serde(default)]
+    grants: String,
 }
 
 #[derive(Deserialize)]
@@ -13790,12 +13913,15 @@ async fn machine_create_agent_json(
     let session = require_ui_session(&state, &headers)?;
     verify_csrf(&session, &req.csrf_token)?;
     let machine_key = format!("{}_{}", session.user.username, machine_name);
+    let grants = parse_agent_grants(&req.grants)?;
+    validate_user_grants(&state, &session.user, &grants)?;
 
     let backend = req.backend.as_deref().unwrap_or("claude");
     let params = json!({
         "agent_name": req.agent_name,
         "folder": req.folder,
         "backend": backend,
+        "grants": grants,
     });
     match queue_machine_command_and_wait(&state, &machine_key, "create_agent", params).await {
         Ok(data) => Ok(Json(data)),
@@ -13886,7 +14012,7 @@ mod tests {
         AGENT_AUTH_RATE_LIMIT_ATTEMPTS, API_KEY_HEADER, GLOBAL_LIBRARIAN_RATE_LIMIT,
         LOGIN_RATE_LIMIT_ATTEMPTS, MCP_PROTOCOL_VERSION, build_app, build_app_with_librarian,
         constant_time_eq, enforce_agent_auth_rate_limit, enforce_global_librarian_rate_limit,
-        parse_role_grants, record_failed_agent_auth, session_cookie_value,
+        parse_agent_grants, parse_role_grants, record_failed_agent_auth, session_cookie_value,
     };
     use async_trait::async_trait;
     use axum::body::Body;
@@ -13929,6 +14055,12 @@ mod tests {
         assert_eq!(grants[1].permission, ProjectPermission::Read);
         assert_eq!(grants[2].permission, ProjectPermission::ReadWrite);
         assert_eq!(grants[3].permission, ProjectPermission::ReadWrite);
+    }
+
+    #[test]
+    fn parse_agent_grants_allows_empty_access() {
+        let grants = parse_agent_grants("").unwrap();
+        assert!(grants.is_empty());
     }
 
     #[derive(Clone)]
@@ -15228,6 +15360,97 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let messages = json["messages"].as_array().unwrap();
         assert!(messages.iter().any(|m| m["content"].as_str().unwrap_or("").contains("Persisted librarian answer")));
+    }
+
+    #[tokio::test]
+    async fn librarian_chat_history_reads_project_scoped_conversation_messages() {
+        let dir = tempdir().unwrap();
+        let mock = RecordingLibrarianClient::new("Scoped librarian answer");
+        let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let agent_token =
+            issue_agent_token(&app, dir.path(), "agent-scoped-history", ProjectPermission::ReadWrite).await;
+
+        configure_librarian(&app, dir.path()).await;
+        create_block_in_project(&app, &agent_token, "alpha.docs", "scoped source block").await;
+
+        let ask = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/librarian/ask")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={csrf_token}&project=alpha.docs&question=Explain+alpha"
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(ask).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let history = Request::builder()
+            .method("GET")
+            .uri("/ui/chat/librarian/history?project=alpha.docs")
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(history).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|m| m["content"] == "Explain alpha"));
+        assert!(messages.iter().any(|m| m["content"] == "Scoped librarian answer"));
+    }
+
+    #[tokio::test]
+    async fn librarian_chat_history_reads_all_projects_conversation_messages() {
+        let dir = tempdir().unwrap();
+        let mock = RecordingLibrarianClient::new("Combined librarian answer");
+        let app = build_app_with_librarian(FileBlockStore::new(dir.path()), Arc::new(mock));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let agent_token = issue_agent_token_multi_project(
+            &app,
+            dir.path(),
+            "agent-all-history",
+            &[
+                ("alpha.docs", ProjectPermission::ReadWrite),
+                ("beta.docs", ProjectPermission::ReadWrite),
+            ],
+        )
+        .await;
+
+        configure_librarian(&app, dir.path()).await;
+        create_block_in_project(&app, &agent_token, "alpha.docs", "alpha source block").await;
+        create_block_in_project(&app, &agent_token, "beta.docs", "beta source block").await;
+
+        let ask = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/librarian/ask")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={csrf_token}&project=&question=Summarise+everything"
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(ask).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let history = Request::builder()
+            .method("GET")
+            .uri("/ui/chat/librarian/history?project=")
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(history).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|m| m["content"] == "Summarise everything"));
+        assert!(messages.iter().any(|m| m["content"] == "Combined librarian answer"));
     }
 
     #[tokio::test]
