@@ -3447,13 +3447,27 @@ var agentStatus = '';
 var isLibrarian = currentAgent === 'librarian';
 var libProject = '';
 
+function isMobileChatLayout() {{
+  return !!(window.matchMedia && window.matchMedia('(max-width: 860px)').matches);
+}}
+
+function scheduleMobileLastChatNavigation(agent) {{
+  requestAnimationFrame(function() {{
+    requestAnimationFrame(function() {{
+      setTimeout(function() {{
+        window.location.href = '/ui/chat?agent=' + encodeURIComponent(agent);
+      }}, 80);
+    }});
+  }});
+}}
+
 if (currentAgent) {{
   localStorage.setItem('lastChatAgent', currentAgent);
 }} else {{
   var last = localStorage.getItem('lastChatAgent');
-  if (last && !(history.state && history.state.agentList)) {{
-    history.replaceState({{agentList: true}}, '', '/ui/chat');
-    window.location.href = '/ui/chat?agent=' + encodeURIComponent(last);
+  if (last && isMobileChatLayout() && !(history.state && history.state.mobileAutoOpenedLastChat)) {{
+    history.replaceState({{mobileAutoOpenedLastChat: true}}, '', '/ui/chat');
+    scheduleMobileLastChatNavigation(last);
   }}
 }}
 
