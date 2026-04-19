@@ -3451,7 +3451,7 @@ if (currentAgent) {{
   localStorage.setItem('lastChatAgent', currentAgent);
 }} else {{
   var last = localStorage.getItem('lastChatAgent');
-  if (last) window.location.replace('/ui/chat?agent=' + encodeURIComponent(last));
+  if (last) window.location.href = '/ui/chat?agent=' + encodeURIComponent(last);
 }}
 
 function selectAgent(name) {{
