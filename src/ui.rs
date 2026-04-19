@@ -8201,7 +8201,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       width: 28px;
       height: 28px;
       border-radius: 6px;
-      background: rgba(0,0,0,0.12);
+      background: var(--accent-soft);
+      color: var(--accent);
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
       flex-shrink: 0;
     }
     .chat-config-panel {
