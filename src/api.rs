@@ -9996,10 +9996,14 @@ fn parse_role_grants(input: &str) -> Result<Vec<ProjectGrant>, LoreError> {
         let (project, permission) = line.split_once(':').ok_or_else(|| {
             LoreError::Validation("grants must use one project:permission pair per line".into())
         })?;
-        let permission = match permission.trim().to_ascii_lowercase().as_str() {
-            "" | "none" | "no access" | "no_access" => continue,
-            "read" => ProjectPermission::Read,
-            "read_write" => ProjectPermission::ReadWrite,
+        let permission = permission
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_");
+        let permission = match permission.as_str() {
+            "" | "none" | "no_access" => continue,
+            "read" | "read_only" | "readonly" => ProjectPermission::Read,
+            "read_write" | "readwrite" | "read/write" => ProjectPermission::ReadWrite,
             _ => {
                 return Err(LoreError::Validation(
                     "permission must be read or read_write".into(),
@@ -13907,6 +13911,20 @@ mod tests {
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].project.as_str(), "alpha.docs");
         assert_eq!(grants[0].permission, ProjectPermission::ReadWrite);
+    }
+
+    #[test]
+    fn parse_role_grants_accepts_ui_permission_labels() {
+        let grants = parse_role_grants(
+            "alpha.docs:Read\nbeta.docs:read only\ngamma.docs:Read/Write\ndelta.docs:read-write\nepsilon.docs:No Access\n",
+        )
+        .unwrap();
+
+        assert_eq!(grants.len(), 4);
+        assert_eq!(grants[0].permission, ProjectPermission::Read);
+        assert_eq!(grants[1].permission, ProjectPermission::Read);
+        assert_eq!(grants[2].permission, ProjectPermission::ReadWrite);
+        assert_eq!(grants[3].permission, ProjectPermission::ReadWrite);
     }
 
     #[derive(Clone)]
