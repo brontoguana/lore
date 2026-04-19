@@ -9996,7 +9996,8 @@ fn parse_role_grants(input: &str) -> Result<Vec<ProjectGrant>, LoreError> {
         let (project, permission) = line.split_once(':').ok_or_else(|| {
             LoreError::Validation("grants must use one project:permission pair per line".into())
         })?;
-        let permission = match permission.trim() {
+        let permission = match permission.trim().to_ascii_lowercase().as_str() {
+            "" | "none" | "no access" | "no_access" => continue,
             "read" => ProjectPermission::Read,
             "read_write" => ProjectPermission::ReadWrite,
             _ => {
@@ -13877,7 +13878,7 @@ mod tests {
         AGENT_AUTH_RATE_LIMIT_ATTEMPTS, API_KEY_HEADER, GLOBAL_LIBRARIAN_RATE_LIMIT,
         LOGIN_RATE_LIMIT_ATTEMPTS, MCP_PROTOCOL_VERSION, build_app, build_app_with_librarian,
         constant_time_eq, enforce_agent_auth_rate_limit, enforce_global_librarian_rate_limit,
-        record_failed_agent_auth, session_cookie_value,
+        parse_role_grants, record_failed_agent_auth, session_cookie_value,
     };
     use async_trait::async_trait;
     use axum::body::Body;
@@ -13895,6 +13896,18 @@ mod tests {
     };
     use crate::store::FileBlockStore;
     use crate::{BlockType, LocalAuthStore, ProjectPermission, UserName};
+
+    #[test]
+    fn parse_role_grants_skips_no_access_rows() {
+        let grants = parse_role_grants(
+            "alpha.docs:read_write\nbeta.docs:no access\ngamma.docs:none\ndelta.docs:no_access\n",
+        )
+        .unwrap();
+
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].project.as_str(), "alpha.docs");
+        assert_eq!(grants[0].permission, ProjectPermission::ReadWrite);
+    }
 
     #[derive(Clone)]
     struct RecordingLibrarianClient {
