@@ -258,6 +258,8 @@ fn parse_tool_use_for_tracking(detail: &str) -> Option<(&str, &str, &str)> {
         Some(("file", rest.trim(), "edit"))
     } else if let Some(rest) = d.strip_prefix("Write ") {
         Some(("file", rest.trim(), "write"))
+    } else if let Some(rest) = d.strip_prefix("Delete ") {
+        Some(("file", rest.trim(), "delete"))
     } else if let Some(rest) = d.strip_prefix("MultiEdit ") {
         Some(("file", rest.trim(), "edit"))
     } else if let Some(rest) = d.strip_prefix("Bash: ") {

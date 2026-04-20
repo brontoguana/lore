@@ -4912,6 +4912,28 @@ fn format_tool_use_codex(item: &serde_json::Value) -> Option<String> {
         return Some(format!("Bash: {truncated}"));
     }
 
+    if item["type"].as_str() == Some("file_change") {
+        let changes = item.get("changes").and_then(|v| v.as_array())?;
+        let mut details = Vec::new();
+        for change in changes {
+            let path = change.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if path.is_empty() {
+                continue;
+            }
+            let detail = match change.get("kind").and_then(|v| v.as_str()).unwrap_or("") {
+                "add" | "create" | "write" => format!("Write {}", short_path(path)),
+                "delete" | "remove" => format!("Delete {}", short_path(path)),
+                _ => format!("Edit {}", short_path(path)),
+            };
+            details.push(detail);
+        }
+        return if details.is_empty() {
+            Some("Edit files".to_string())
+        } else {
+            Some(details.join("\n"))
+        };
+    }
+
     let tool_name = item
         .get("name")
         .and_then(|v| v.as_str())
@@ -6303,6 +6325,58 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             super::BackendEvent::ToolUse(detail) => assert_eq!(detail, "Edit files"),
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn parse_codex_line_surfaces_file_change_updates() {
+        let events = parse_codex_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "type": "file_change",
+                "changes": [
+                    {
+                        "path": "/tmp/example.txt",
+                        "kind": "update"
+                    }
+                ],
+                "status": "completed"
+            }
+        }));
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            super::BackendEvent::ToolUse(detail) => assert_eq!(detail, "Edit tmp/example.txt"),
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn parse_codex_line_surfaces_file_change_creates_and_deletes() {
+        let events = parse_codex_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "type": "file_change",
+                "changes": [
+                    {
+                        "path": "/tmp/new.txt",
+                        "kind": "add"
+                    },
+                    {
+                        "path": "/tmp/old.txt",
+                        "kind": "delete"
+                    }
+                ],
+                "status": "completed"
+            }
+        }));
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            super::BackendEvent::ToolUse(detail) => {
+                assert_eq!(detail, "Write tmp/new.txt\nDelete tmp/old.txt")
+            }
             _ => panic!("unexpected event"),
         }
     }
