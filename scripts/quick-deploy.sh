@@ -82,6 +82,16 @@ restart_remote_service() {
     fi
 }
 
+restart_remote_proxy() {
+    if ssh "$SERVER" "sudo -n systemctl restart lore-caddy" 2>/dev/null; then
+        echo "Restarted lore-caddy via systemd"
+        return 0
+    fi
+
+    echo "lore-caddy restart unavailable without sudo"
+    return 1
+}
+
 check_remote_health() {
     ssh "$SERVER" '
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -96,6 +106,20 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 exit 1
 '
+}
+
+check_public_health() {
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://lore.simplehelp.io/ || true)
+        case "$status" in
+            200|302|303|401|403|404)
+                echo "$status"
+                return 0
+                ;;
+        esac
+        sleep 1
+    done
+    return 1
 }
 
 # --- Version bump ---
@@ -177,6 +201,9 @@ ssh "$SERVER" "chmod +x '${REMOTE_CLIENT_UPLOAD}' && mv '${REMOTE_CLIENT_UPLOAD}
 echo "Restarting..."
 restart_remote_service
 
+echo "Ensuring public proxy is up..."
+ssh "$SERVER" "systemctl is-active lore-caddy >/dev/null 2>&1" || restart_remote_proxy || true
+
 # --- Verify ---
 echo "Verifying remote binary..."
 REMOTE_VERSION=$(ssh "$SERVER" "${REMOTE_BIN} --version 2>/dev/null" || echo "unknown")
@@ -186,5 +213,12 @@ echo "Checking service health..."
 HEALTH_STATUS=$(check_remote_health)
 
 echo "Health check HTTP status: ${HEALTH_STATUS}"
+echo "Checking public health..."
+PUBLIC_STATUS=$(check_public_health) || {
+    echo "Public health check failed: https://lore.simplehelp.io/ is unreachable"
+    ssh "$SERVER" "systemctl status lore-caddy --no-pager -n 20 || true" || true
+    exit 1
+}
+echo "Public health HTTP status: ${PUBLIC_STATUS}"
 DEPLOY_VERIFIED=1
 echo "Done: ${TAG}"
