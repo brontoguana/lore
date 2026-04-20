@@ -122,11 +122,7 @@ impl BlockId {
     pub fn from_string(value: String) -> Result<Self> {
         if value.starts_with('_') {
             let rest = &value[1..];
-            if rest.is_empty()
-                || !rest
-                    .chars()
-                    .all(|ch| ch.is_ascii_lowercase() || ch == '-')
-            {
+            if rest.is_empty() || !rest.chars().all(|ch| ch.is_ascii_lowercase() || ch == '-') {
                 return Err(LoreError::Validation(
                     "reserved block id must be _[a-z-]+".into(),
                 ));

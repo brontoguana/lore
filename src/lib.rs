@@ -19,9 +19,9 @@ pub use auth::{
     StoredAgentToken, StoredMachine, UserName,
 };
 pub use config::{
-    ExternalAuthConfig, ExternalAuthSecretUpdate, ExternalAuthStore, ExternalScheme, OidcConfig,
-    OidcConfigStore, OidcLoginStateStore, OidcSecretUpdate, OidcUsernameClaim, ServerConfig,
-    ServerConfigStore, UiTheme, ColorMode,
+    ColorMode, ExternalAuthConfig, ExternalAuthSecretUpdate, ExternalAuthStore, ExternalScheme,
+    OidcConfig, OidcConfigStore, OidcLoginStateStore, OidcSecretUpdate, OidcUsernameClaim,
+    ServerConfig, ServerConfigStore, UiTheme,
 };
 pub use error::{LoreError, Result};
 pub use model::{

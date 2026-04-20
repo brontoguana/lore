@@ -327,7 +327,10 @@ fn create_admin_interactive(data_root: &str) {
     };
 
     match auth.bootstrap_admin(UserName::new(username.clone()).unwrap(), password) {
-        Ok(_) => eprintln!("admin account '{}' created — you can now start the server\n", username),
+        Ok(_) => eprintln!(
+            "admin account '{}' created — you can now start the server\n",
+            username
+        ),
         Err(err) => {
             eprintln!("error creating admin account: {err}");
             std::process::exit(1);

@@ -427,7 +427,8 @@ CREATE TABLE IF NOT EXISTS machines (
 ";
 
 fn fmt_dt(dt: &OffsetDateTime) -> String {
-    dt.format(&time::format_description::well_known::Rfc3339).unwrap_or_default()
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
 }
 
 fn parse_dt(s: &str) -> OffsetDateTime {
@@ -470,10 +471,8 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
 }
 
 fn run_migrations(conn: &Connection) {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
-    )
-    .expect("failed to create schema_version table");
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+        .expect("failed to create schema_version table");
 
     let current: i64 = conn
         .query_row(
@@ -508,6 +507,18 @@ fn run_migrations(conn: &Connection) {
             sql: "ALTER TABLE conversations ADD COLUMN manage_config TEXT",
             table: "conversations",
             column: "manage_config",
+        },
+        Migration {
+            version: 4,
+            sql: "ALTER TABLE conversations ADD COLUMN last_delivered_user_id INTEGER NOT NULL DEFAULT 0",
+            table: "conversations",
+            column: "last_delivered_user_id",
+        },
+        Migration {
+            version: 5,
+            sql: "ALTER TABLE conversations ADD COLUMN active_turn_user_id INTEGER NOT NULL DEFAULT 0",
+            table: "conversations",
+            column: "active_turn_user_id",
         },
     ];
 
@@ -568,7 +579,10 @@ impl LocalAuthStore {
     pub fn cleanup_orphans(&self) {
         let conn = match self.conn.lock() {
             Ok(c) => c,
-            Err(_) => { eprintln!("warning: could not acquire db lock for auth cleanup"); return; }
+            Err(_) => {
+                eprintln!("warning: could not acquire db lock for auth cleanup");
+                return;
+            }
         };
 
         // Expired sessions
@@ -604,15 +618,21 @@ impl LocalAuthStore {
             "DELETE FROM machines WHERE username NOT IN (SELECT username FROM users)",
             [],
         ) {
-            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} machine registration(s) for deleted user(s)"),
+            Ok(n) if n > 0 => {
+                eprintln!("cleanup: removed {n} machine registration(s) for deleted user(s)")
+            }
             Ok(_) => {}
             Err(e) => eprintln!("warning: machine cleanup failed: {e}"),
         }
     }
 
     pub fn has_users(&self) -> Result<bool> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(count > 0)
     }
@@ -631,18 +651,25 @@ impl LocalAuthStore {
     }
 
     pub fn list_roles(&self) -> Result<Vec<StoredRole>> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let mut stmt = conn.prepare("SELECT name, grants, created_at FROM roles ORDER BY name")
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let mut stmt = conn
+            .prepare("SELECT name, grants, created_at FROM roles ORDER BY name")
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        let rows = stmt.query_map([], |row| {
-            let name: String = row.get(0)?;
-            let grants_json: String = row.get(1)?;
-            let created_at: String = row.get(2)?;
-            Ok((name, grants_json, created_at))
-        }).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let grants_json: String = row.get(1)?;
+                let created_at: String = row.get(2)?;
+                Ok((name, grants_json, created_at))
+            })
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let mut roles = Vec::new();
         for row in rows {
-            let (name, grants_json, created_at) = row.map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+            let (name, grants_json, created_at) =
+                row.map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
             roles.push(StoredRole {
                 name: RoleName::new(name)?,
                 grants: serde_json::from_str(&grants_json).unwrap_or_default(),
@@ -654,11 +681,17 @@ impl LocalAuthStore {
 
     pub fn create_role(&self, role: NewRole) -> Result<StoredRole> {
         role.validate()?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let existing: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM roles WHERE name = ?1", params![role.name.as_str()],
-            |row| row.get(0),
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let existing: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM roles WHERE name = ?1",
+                params![role.name.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if existing {
             return Err(LoreError::Validation("role already exists".into()));
         }
@@ -669,25 +702,41 @@ impl LocalAuthStore {
         conn.execute(
             "INSERT INTO roles (name, grants, created_at) VALUES (?1, ?2, ?3)",
             params![role.name.as_str(), grants_json, fmt_dt(&now)],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        Ok(StoredRole { name: role.name, grants, created_at: now })
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(StoredRole {
+            name: role.name,
+            grants,
+            created_at: now,
+        })
     }
 
     pub fn update_role(&self, role: NewRole) -> Result<StoredRole> {
         role.validate()?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let created_at: String = conn.query_row(
-            "SELECT created_at FROM roles WHERE name = ?1", params![role.name.as_str()],
-            |row| row.get(0),
-        ).map_err(|_| LoreError::Validation("role does not exist".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let created_at: String = conn
+            .query_row(
+                "SELECT created_at FROM roles WHERE name = ?1",
+                params![role.name.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| LoreError::Validation("role does not exist".into()))?;
         let mut grants = role.grants;
         grants.sort_by(|a, b| a.project.cmp(&b.project));
         let grants_json = serde_json::to_string(&grants)?;
         conn.execute(
             "UPDATE roles SET grants = ?1 WHERE name = ?2",
             params![grants_json, role.name.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        Ok(StoredRole { name: role.name, grants, created_at: parse_dt(&created_at) })
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(StoredRole {
+            name: role.name,
+            grants,
+            created_at: parse_dt(&created_at),
+        })
     }
 
     /// Update all role grants that reference `old_slug` to point to `new_slug`.
@@ -720,37 +769,57 @@ impl LocalAuthStore {
     }
 
     pub fn list_users(&self) -> Result<Vec<StoredUser>> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::load_users_from_conn(&conn)
     }
 
     pub fn create_user(&self, user: NewUser) -> Result<StoredUser> {
         user.validate()?;
         {
-            let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-            let mut stmt = conn.prepare("SELECT name FROM roles")
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+            let mut stmt = conn
+                .prepare("SELECT name FROM roles")
                 .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-            let known_roles: Vec<String> = stmt.query_map([], |row| row.get(0))
+            let known_roles: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
                 .map_err(|e| LoreError::Validation(format!("db error: {e}")))?
                 .filter_map(|r| r.ok())
                 .collect();
             for role_name in &user.role_names {
                 if !known_roles.iter().any(|r| r == role_name.as_str()) {
-                    return Err(LoreError::Validation(format!("unknown role: {}", role_name.as_str())));
+                    return Err(LoreError::Validation(format!(
+                        "unknown role: {}",
+                        role_name.as_str()
+                    )));
                 }
             }
         }
         self.create_user_unchecked(user)
     }
 
-    pub fn update_user_password(&self, username: &UserName, password: String) -> Result<StoredUser> {
+    pub fn update_user_password(
+        &self,
+        username: &UserName,
+        password: String,
+    ) -> Result<StoredUser> {
         validate_password(&password)?;
         let new_hash = hash_password(&password)?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let updated = conn.execute(
-            "UPDATE users SET password_hash = ?1 WHERE username = ?2",
-            params![new_hash, username.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let updated = conn
+            .execute(
+                "UPDATE users SET password_hash = ?1 WHERE username = ?2",
+                params![new_hash, username.as_str()],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if updated == 0 {
             return Err(LoreError::PermissionDenied);
         }
@@ -758,27 +827,43 @@ impl LocalAuthStore {
     }
 
     pub fn set_user_disabled(&self, username: &UserName, disabled: bool) -> Result<StoredUser> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let user = Self::get_stored_user_from_conn(&conn, username)?;
         if disabled && user.is_admin {
-            let active_admins: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND disabled_at IS NULL", [],
-                |row| row.get(0),
-            ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+            let active_admins: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND disabled_at IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
             if active_admins <= 1 {
-                return Err(LoreError::Validation("cannot disable the last admin user".into()));
+                return Err(LoreError::Validation(
+                    "cannot disable the last admin user".into(),
+                ));
             }
         }
-        let disabled_at = if disabled { Some(fmt_dt(&OffsetDateTime::now_utc())) } else { None };
+        let disabled_at = if disabled {
+            Some(fmt_dt(&OffsetDateTime::now_utc()))
+        } else {
+            None
+        };
         conn.execute(
             "UPDATE users SET disabled_at = ?1 WHERE username = ?2",
             params![disabled_at, username.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         drop(conn);
         if disabled {
             self.revoke_sessions_for_user(username)?;
         }
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::get_stored_user_from_conn(&conn, username)
     }
 
@@ -788,13 +873,30 @@ impl LocalAuthStore {
         theme: Option<UiTheme>,
         color_mode: Option<ColorMode>,
     ) -> Result<StoredUser> {
-        let theme_str = theme.map(|t| serde_json::to_value(t).unwrap().as_str().unwrap().to_string());
-        let color_str = color_mode.map(|c| serde_json::to_value(c).unwrap().as_str().unwrap().to_string());
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let updated = conn.execute(
-            "UPDATE users SET theme = ?1, color_mode = ?2 WHERE username = ?3",
-            params![theme_str, color_str, username.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let theme_str = theme.map(|t| {
+            serde_json::to_value(t)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        });
+        let color_str = color_mode.map(|c| {
+            serde_json::to_value(c)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        });
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let updated = conn
+            .execute(
+                "UPDATE users SET theme = ?1, color_mode = ?2 WHERE username = ?3",
+                params![theme_str, color_str, username.as_str()],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if updated == 0 {
             return Err(LoreError::PermissionDenied);
         }
@@ -802,18 +904,27 @@ impl LocalAuthStore {
     }
 
     pub fn list_agent_tokens(&self) -> Result<Vec<StoredAgentToken>> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::load_agent_tokens_from_conn(&conn)
     }
 
     pub fn create_agent_token(&self, token: NewAgentToken) -> Result<CreatedAgentToken> {
         token.validate()?;
         let slug = token.slug();
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM agent_tokens WHERE name = ?1 AND owner = ?2",
-            params![slug, token.owner.as_str()], |row| row.get(0),
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM agent_tokens WHERE name = ?1 AND owner = ?2",
+                params![slug, token.owner.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if exists {
             return Err(LoreError::Validation("agent already exists".into()));
         }
@@ -839,7 +950,10 @@ impl LocalAuthStore {
                     serde_json::to_string(&grants)?,
                     stored.backend.to_string(), stored.endpoint_id, stored.machine_name, fmt_dt(&now)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        Ok(CreatedAgentToken { token: raw_token, stored })
+        Ok(CreatedAgentToken {
+            token: raw_token,
+            stored,
+        })
     }
 
     pub fn rotate_agent_token(&self, name: &str, owner: &UserName) -> Result<CreatedAgentToken> {
@@ -847,7 +961,10 @@ impl LocalAuthStore {
         let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         let new_hash = hash_agent_token(&raw_token);
         let now = OffsetDateTime::now_utc();
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let updated = conn.execute(
             "UPDATE agent_tokens SET token_hash = ?1, created_at = ?2 WHERE name = ?3 AND owner = ?4",
             params![new_hash, fmt_dt(&now), name, owner.as_str()],
@@ -856,16 +973,24 @@ impl LocalAuthStore {
             return Err(LoreError::Validation("agent does not exist".into()));
         }
         let stored = Self::get_agent_token_from_conn(&conn, name, Some(owner))?;
-        Ok(CreatedAgentToken { token: raw_token, stored })
+        Ok(CreatedAgentToken {
+            token: raw_token,
+            stored,
+        })
     }
 
     pub fn revoke_agent_token(&self, name: &str, owner: &UserName) -> Result<()> {
         validate_agent_token_name(name)?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let deleted = conn.execute(
-            "DELETE FROM agent_tokens WHERE name = ?1 AND owner = ?2",
-            params![name, owner.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM agent_tokens WHERE name = ?1 AND owner = ?2",
+                params![name, owner.as_str()],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if deleted == 0 {
             return Err(LoreError::Validation("agent does not exist".into()));
         }
@@ -874,10 +999,13 @@ impl LocalAuthStore {
 
     pub fn revoke_agent_token_by_name(&self, name: &str) -> Result<()> {
         validate_agent_token_name(name)?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let deleted = conn.execute(
-            "DELETE FROM agent_tokens WHERE name = ?1", params![name],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let deleted = conn
+            .execute("DELETE FROM agent_tokens WHERE name = ?1", params![name])
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if deleted == 0 {
             return Err(LoreError::Validation("agent does not exist".into()));
         }
@@ -889,20 +1017,31 @@ impl LocalAuthStore {
         let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         let new_hash = hash_agent_token(&raw_token);
         let now = OffsetDateTime::now_utc();
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let updated = conn.execute(
-            "UPDATE agent_tokens SET token_hash = ?1, created_at = ?2 WHERE name = ?3",
-            params![new_hash, fmt_dt(&now), name],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let updated = conn
+            .execute(
+                "UPDATE agent_tokens SET token_hash = ?1, created_at = ?2 WHERE name = ?3",
+                params![new_hash, fmt_dt(&now), name],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if updated == 0 {
             return Err(LoreError::Validation("agent does not exist".into()));
         }
         let stored = Self::get_agent_token_from_conn(&conn, name, None)?;
-        Ok(CreatedAgentToken { token: raw_token, stored })
+        Ok(CreatedAgentToken {
+            token: raw_token,
+            stored,
+        })
     }
 
     pub fn list_agent_tokens_for_user(&self, owner: &UserName) -> Result<Vec<StoredAgentToken>> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::load_agent_tokens_filtered(&conn, Some(owner))
     }
 
@@ -913,11 +1052,16 @@ impl LocalAuthStore {
         new_display_name: &str,
     ) -> Result<()> {
         validate_agent_display_name(new_display_name)?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let updated = conn.execute(
-            "UPDATE agent_tokens SET display_name = ?1 WHERE name = ?2 AND owner = ?3",
-            params![new_display_name, name, owner.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let updated = conn
+            .execute(
+                "UPDATE agent_tokens SET display_name = ?1 WHERE name = ?2 AND owner = ?3",
+                params![new_display_name, name, owner.as_str()],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if updated == 0 {
             return Err(LoreError::Validation("agent does not exist".into()));
         }
@@ -930,11 +1074,16 @@ impl LocalAuthStore {
         owner: &UserName,
         backend: AgentBackend,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let updated = conn.execute(
-            "UPDATE agent_tokens SET backend = ?1 WHERE name = ?2 AND owner = ?3",
-            params![backend.to_string(), name, owner.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let updated = conn
+            .execute(
+                "UPDATE agent_tokens SET backend = ?1 WHERE name = ?2 AND owner = ?3",
+                params![backend.to_string(), name, owner.as_str()],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if updated == 0 {
             return Err(LoreError::Validation("agent does not exist".into()));
         }
@@ -947,11 +1096,16 @@ impl LocalAuthStore {
         owner: &UserName,
         endpoint_id: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let updated = conn.execute(
-            "UPDATE agent_tokens SET endpoint_id = ?1 WHERE name = ?2 AND owner = ?3",
-            params![endpoint_id, name, owner.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let updated = conn
+            .execute(
+                "UPDATE agent_tokens SET endpoint_id = ?1 WHERE name = ?2 AND owner = ?3",
+                params![endpoint_id, name, owner.as_str()],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if updated == 0 {
             return Err(LoreError::Validation("agent does not exist".into()));
         }
@@ -976,11 +1130,16 @@ impl LocalAuthStore {
         let mut sorted_grants = grants;
         sorted_grants.sort_by(|a, b| a.project.cmp(&b.project));
         let grants_json = serde_json::to_string(&sorted_grants)?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let updated = conn.execute(
-            "UPDATE agent_tokens SET grants = ?1 WHERE name = ?2 AND owner = ?3",
-            params![grants_json, name, owner.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let updated = conn
+            .execute(
+                "UPDATE agent_tokens SET grants = ?1 WHERE name = ?2 AND owner = ?3",
+                params![grants_json, name, owner.as_str()],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if updated == 0 {
             return Err(LoreError::Validation("agent does not exist".into()));
         }
@@ -988,7 +1147,10 @@ impl LocalAuthStore {
     }
 
     pub fn remove_project_from_all_agent_grants(&self, project: &ProjectName) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let mut tokens = Self::load_agent_tokens_filtered(&conn, None)?;
         let mut updated = 0usize;
         for token in &mut tokens {
@@ -1001,7 +1163,8 @@ impl LocalAuthStore {
             conn.execute(
                 "UPDATE agent_tokens SET grants = ?1 WHERE name = ?2",
                 params![grants_json, token.name],
-            ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
             updated += 1;
         }
         Ok(updated)
@@ -1012,7 +1175,10 @@ impl LocalAuthStore {
             return Err(LoreError::PermissionDenied);
         }
         let token_hash = hash_agent_token(token);
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let row = conn.query_row(
             "SELECT name, display_name, owner, grants, backend, machine_name, endpoint_id FROM agent_tokens WHERE token_hash = ?1",
             params![token_hash],
@@ -1055,11 +1221,12 @@ impl LocalAuthStore {
                                     .filter(|g| g.project == grant.project)
                                     .map(|g| g.permission)
                                     .max_by_key(|perm| if perm.allows_write() { 1 } else { 0 })?;
-                                let permission = if grant.permission.allows_write() && !best.allows_write() {
-                                    ProjectPermission::Read
-                                } else {
-                                    grant.permission
-                                };
+                                let permission =
+                                    if grant.permission.allows_write() && !best.allows_write() {
+                                        ProjectPermission::Read
+                                    } else {
+                                        grant.permission
+                                    };
                                 Some(ProjectGrant {
                                     project: grant.project.clone(),
                                     permission,
@@ -1101,18 +1268,25 @@ impl LocalAuthStore {
         let user = self.authenticate(username, password)?;
         let machine_name = machine_name.trim().to_string();
         if machine_name.is_empty() || machine_name.len() > 64 {
-            return Err(LoreError::Validation("machine name must be 1..=64 characters".into()));
+            return Err(LoreError::Validation(
+                "machine name must be 1..=64 characters".into(),
+            ));
         }
         let raw_token = format!("lore_mt_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         let token_hash = hash_agent_token(&raw_token);
         let now = OffsetDateTime::now_utc();
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         // Upsert: if machine exists for this user, rotate token
-        let existing: Option<String> = conn.query_row(
-            "SELECT token_hash FROM machines WHERE name = ?1 AND username = ?2",
-            params![machine_name, user.username.as_str()],
-            |row| row.get(0),
-        ).ok();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT token_hash FROM machines WHERE name = ?1 AND username = ?2",
+                params![machine_name, user.username.as_str()],
+                |row| row.get(0),
+            )
+            .ok();
         if existing.is_some() {
             conn.execute(
                 "UPDATE machines SET token_hash = ?1, created_at = ?2 WHERE name = ?3 AND username = ?4",
@@ -1134,33 +1308,53 @@ impl LocalAuthStore {
             return Err(LoreError::PermissionDenied);
         }
         let token_hash = hash_agent_token(token);
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let row = conn.query_row(
-            "SELECT name, username FROM machines WHERE token_hash = ?1",
-            params![token_hash], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        ).map_err(|_| LoreError::PermissionDenied)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let row = conn
+            .query_row(
+                "SELECT name, username FROM machines WHERE token_hash = ?1",
+                params![token_hash],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|_| LoreError::PermissionDenied)?;
         let username = UserName::new(row.1)?;
         let user_row = Self::get_stored_user_from_conn(&conn, &username)?;
         let user = Self::user_from_stored_conn(&conn, &user_row)?;
-        Ok(AuthenticatedMachine { machine_name: row.0, user })
+        Ok(AuthenticatedMachine {
+            machine_name: row.0,
+            user,
+        })
     }
 
     pub fn list_machines_for_user(&self, username: &UserName) -> Result<Vec<StoredMachine>> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::load_machines_filtered(&conn, Some(username))
     }
 
     pub fn list_all_machines(&self) -> Result<Vec<StoredMachine>> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::load_machines_filtered(&conn, None)
     }
 
     pub fn revoke_machine(&self, name: &str, username: &UserName) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let deleted = conn.execute(
-            "DELETE FROM machines WHERE name = ?1 AND username = ?2",
-            params![name, username.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM machines WHERE name = ?1 AND username = ?2",
+                params![name, username.as_str()],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         if deleted == 0 {
             return Err(LoreError::Validation("machine does not exist".into()));
         }
@@ -1171,17 +1365,29 @@ impl LocalAuthStore {
         self.revoke_machine(name, username)
     }
 
-    pub fn update_machine_version(&self, name: &str, username: &UserName, version: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn update_machine_version(
+        &self,
+        name: &str,
+        username: &UserName,
+        version: &str,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         conn.execute(
             "UPDATE machines SET cli_version = ?1 WHERE name = ?2 AND username = ?3",
             params![version, name, username.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn get_machine(&self, name: &str, username: &UserName) -> Result<Option<StoredMachine>> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::get_machine_from_conn(&conn, name, username)
     }
 
@@ -1196,16 +1402,22 @@ impl LocalAuthStore {
         validate_agent_display_name(display_name)?;
         let slug = slugify_agent_name(display_name);
         validate_agent_token_name(&slug)?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let raw_token = format!("lore_at_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         let new_hash = hash_agent_token(&raw_token);
         let now = OffsetDateTime::now_utc();
         // Re-provision if agent already exists for this user.
         // Do NOT overwrite backend — it's configured separately via the UI.
-        let existing: Option<i64> = conn.query_row(
-            "SELECT rowid FROM agent_tokens WHERE name = ?1 AND owner = ?2",
-            params![slug, username.as_str()], |row| row.get(0),
-        ).ok();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM agent_tokens WHERE name = ?1 AND owner = ?2",
+                params![slug, username.as_str()],
+                |row| row.get(0),
+            )
+            .ok();
         if let Some(rowid) = existing {
             let mut sorted_grants = grants;
             sorted_grants.sort_by(|a, b| a.project.cmp(&b.project));
@@ -1223,7 +1435,10 @@ impl LocalAuthStore {
                 ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
             }
             let stored = Self::get_agent_token_from_conn(&conn, &slug, Some(username))?;
-            return Ok(CreatedAgentToken { token: raw_token, stored });
+            return Ok(CreatedAgentToken {
+                token: raw_token,
+                stored,
+            });
         }
         let mut sorted_grants = grants;
         sorted_grants.sort_by(|a, b| a.project.cmp(&b.project));
@@ -1234,12 +1449,18 @@ impl LocalAuthStore {
             params![slug, display_name, new_hash, username.as_str(), grants_json, initial_backend, machine_name, fmt_dt(&now)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let stored = Self::get_agent_token_from_conn(&conn, &slug, Some(username))?;
-        Ok(CreatedAgentToken { token: raw_token, stored })
+        Ok(CreatedAgentToken {
+            token: raw_token,
+            stored,
+        })
     }
 
     pub fn authenticate(&self, username: &str, password: &str) -> Result<AuthenticatedUser> {
         let username = UserName::new(username.to_string())?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let user = Self::get_stored_user_from_conn(&conn, &username)?;
         verify_password_hash(&user.password_hash, password)?;
         Self::user_from_stored_conn(&conn, &user)
@@ -1251,7 +1472,10 @@ impl LocalAuthStore {
     }
 
     pub fn create_session_for_user(&self, username: &UserName) -> Result<NewSession> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let stored = Self::get_stored_user_from_conn(&conn, username)?;
         let user = Self::user_from_stored_conn(&conn, &stored)?;
         drop(conn);
@@ -1260,7 +1484,10 @@ impl LocalAuthStore {
 
     pub fn authenticate_external_username(&self, username: &str) -> Result<AuthenticatedUser> {
         let username = UserName::new(username.to_string())?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let stored = Self::get_stored_user_from_conn(&conn, &username)?;
         Self::user_from_stored_conn(&conn, &stored)
     }
@@ -1279,29 +1506,48 @@ impl LocalAuthStore {
             created_at: now,
             expires_at,
         };
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         conn.execute(
             "INSERT INTO sessions (token_hash, username, csrf_token, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![session.token_hash, session.username.as_str(), session.csrf_token, fmt_dt(&now), fmt_dt(&expires_at)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        Ok(NewSession { token, csrf_token, user })
+        Ok(NewSession {
+            token,
+            csrf_token,
+            user,
+        })
     }
 
     pub fn revoke_sessions_for_user(&self, username: &UserName) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let removed = conn.execute(
-            "DELETE FROM sessions WHERE username = ?1", params![username.as_str()],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let removed = conn
+            .execute(
+                "DELETE FROM sessions WHERE username = ?1",
+                params![username.as_str()],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(removed)
     }
 
     pub fn active_session_count(&self, username: &UserName) -> Result<usize> {
         let now = fmt_dt(&OffsetDateTime::now_utc());
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE username = ?1 AND expires_at > ?2",
-            params![username.as_str(), now], |row| row.get(0),
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE username = ?1 AND expires_at > ?2",
+                params![username.as_str(), now],
+                |row| row.get(0),
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(count as usize)
     }
 
@@ -1311,7 +1557,10 @@ impl LocalAuthStore {
         }
         let token_hash = hash_session_token(token);
         let now = OffsetDateTime::now_utc();
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let row = conn.query_row(
             "SELECT username, csrf_token, created_at, expires_at FROM sessions WHERE token_hash = ?1",
             params![token_hash],
@@ -1319,7 +1568,10 @@ impl LocalAuthStore {
         ).map_err(|_| LoreError::PermissionDenied)?;
         let expires_at = parse_dt(&row.3);
         if expires_at <= now {
-            let _ = conn.execute("DELETE FROM sessions WHERE token_hash = ?1", params![token_hash]);
+            let _ = conn.execute(
+                "DELETE FROM sessions WHERE token_hash = ?1",
+                params![token_hash],
+            );
             return Err(LoreError::PermissionDenied);
         }
         let username = UserName::new(row.0)?;
@@ -1339,20 +1591,32 @@ impl LocalAuthStore {
         if token.trim().is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         conn.execute(
             "DELETE FROM sessions WHERE token_hash = ?1",
             params![hash_session_token(token)],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn authorize_read(&self, user: &AuthenticatedUser, project: &ProjectName) -> Result<()> {
-        if user.can_read(project) { Ok(()) } else { Err(LoreError::PermissionDenied) }
+        if user.can_read(project) {
+            Ok(())
+        } else {
+            Err(LoreError::PermissionDenied)
+        }
     }
 
     pub fn authorize_write(&self, user: &AuthenticatedUser, project: &ProjectName) -> Result<()> {
-        if user.can_write(project) { Ok(()) } else { Err(LoreError::PermissionDenied) }
+        if user.can_write(project) {
+            Ok(())
+        } else {
+            Err(LoreError::PermissionDenied)
+        }
     }
 
     pub(crate) fn create_user_unchecked(&self, user: NewUser) -> Result<StoredUser> {
@@ -1360,7 +1624,10 @@ impl LocalAuthStore {
         let password_hash = hash_password(&user.password)?;
         let now = OffsetDateTime::now_utc();
         let role_names_json = serde_json::to_string(&user.role_names)?;
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         conn.execute(
             "INSERT INTO users (username, password_hash, role_names, is_admin, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![user.username.as_str(), password_hash, role_names_json, user.is_admin as i32, fmt_dt(&now)],
@@ -1399,18 +1666,24 @@ impl LocalAuthStore {
         let mut stmt = conn.prepare(
             "SELECT username, password_hash, role_names, is_admin, theme, color_mode, disabled_at, created_at FROM users ORDER BY username"
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        let rows = stmt.query_map([], |row| {
-            Ok(StoredUser {
-                username: UserName::new(row.get::<_, String>(0)?).unwrap(),
-                password_hash: row.get(1)?,
-                role_names: serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
-                is_admin: row.get::<_, i32>(3)? != 0,
-                theme: row.get::<_, Option<String>>(4)?.and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
-                color_mode: row.get::<_, Option<String>>(5)?.and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
-                disabled_at: row.get::<_, Option<String>>(6)?.map(|s| parse_dt(&s)),
-                created_at: parse_dt(&row.get::<_, String>(7)?),
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StoredUser {
+                    username: UserName::new(row.get::<_, String>(0)?).unwrap(),
+                    password_hash: row.get(1)?,
+                    role_names: serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
+                    is_admin: row.get::<_, i32>(3)? != 0,
+                    theme: row
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
+                    color_mode: row
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
+                    disabled_at: row.get::<_, Option<String>>(6)?.map(|s| parse_dt(&s)),
+                    created_at: parse_dt(&row.get::<_, String>(7)?),
+                })
             })
-        }).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))
     }
@@ -1451,18 +1724,24 @@ impl LocalAuthStore {
         Self::load_agent_tokens_filtered(conn, None)
     }
 
-    fn load_agent_tokens_filtered(conn: &Connection, owner: Option<&UserName>) -> Result<Vec<StoredAgentToken>> {
+    fn load_agent_tokens_filtered(
+        conn: &Connection,
+        owner: Option<&UserName>,
+    ) -> Result<Vec<StoredAgentToken>> {
         let sql = if owner.is_some() {
             "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at, endpoint_id FROM agent_tokens WHERE owner = ?1 ORDER BY name"
         } else {
             "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at, endpoint_id FROM agent_tokens ORDER BY name"
         };
-        let mut stmt = conn.prepare(sql).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let rows = if let Some(o) = owner {
             stmt.query_map(params![o.as_str()], Self::row_to_agent_token)
         } else {
             stmt.query_map([], Self::row_to_agent_token)
-        }.map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        }
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))
     }
@@ -1472,7 +1751,9 @@ impl LocalAuthStore {
             name: row.get(0)?,
             display_name: row.get(1)?,
             token_hash: row.get(2)?,
-            owner: row.get::<_, Option<String>>(3)?.map(|s| UserName::new(s).unwrap()),
+            owner: row
+                .get::<_, Option<String>>(3)?
+                .map(|s| UserName::new(s).unwrap()),
             grants: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
             backend: row.get::<_, String>(5)?.parse().unwrap_or_default(),
             machine_name: row.get(6)?,
@@ -1481,7 +1762,11 @@ impl LocalAuthStore {
         })
     }
 
-    fn get_agent_token_from_conn(conn: &Connection, name: &str, owner: Option<&UserName>) -> Result<StoredAgentToken> {
+    fn get_agent_token_from_conn(
+        conn: &Connection,
+        name: &str,
+        owner: Option<&UserName>,
+    ) -> Result<StoredAgentToken> {
         let result = if let Some(o) = owner {
             conn.query_row(
                 "SELECT name, display_name, token_hash, owner, grants, backend, machine_name, created_at, endpoint_id FROM agent_tokens WHERE name = ?1 AND owner = ?2",
@@ -1496,18 +1781,24 @@ impl LocalAuthStore {
         result.map_err(|_| LoreError::Validation("agent does not exist".into()))
     }
 
-    fn load_machines_filtered(conn: &Connection, username: Option<&UserName>) -> Result<Vec<StoredMachine>> {
+    fn load_machines_filtered(
+        conn: &Connection,
+        username: Option<&UserName>,
+    ) -> Result<Vec<StoredMachine>> {
         let sql = if username.is_some() {
             "SELECT name, username, token_hash, created_at, cli_version, pending_update FROM machines WHERE username = ?1"
         } else {
             "SELECT name, username, token_hash, created_at, cli_version, pending_update FROM machines"
         };
-        let mut stmt = conn.prepare(sql).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let rows = if let Some(u) = username {
             stmt.query_map(params![u.as_str()], Self::row_to_machine)
         } else {
             stmt.query_map([], Self::row_to_machine)
-        }.map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        }
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))
     }
@@ -1523,7 +1814,11 @@ impl LocalAuthStore {
         })
     }
 
-    fn get_machine_from_conn(conn: &Connection, name: &str, username: &UserName) -> Result<Option<StoredMachine>> {
+    fn get_machine_from_conn(
+        conn: &Connection,
+        name: &str,
+        username: &UserName,
+    ) -> Result<Option<StoredMachine>> {
         let result = conn.query_row(
             "SELECT name, username, token_hash, created_at, cli_version, pending_update FROM machines WHERE name = ?1 AND username = ?2",
             params![name, username.as_str()], Self::row_to_machine,
@@ -1643,7 +1938,6 @@ pub fn hash_agent_token(token: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-
 // --- Chat types and storage ---
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1706,6 +2000,10 @@ pub struct ChatConversation {
     pub summary: String,
     pub window_size: usize,
     pub next_id: u64,
+    #[serde(default)]
+    pub last_delivered_user_id: u64,
+    #[serde(default)]
+    pub active_turn_user_id: u64,
     pub agent_status: AgentChatStatus,
     pub last_seen: Option<OffsetDateTime>,
     #[serde(default)]
@@ -1729,6 +2027,8 @@ impl Default for ChatConversation {
             summary: String::new(),
             window_size: 22,
             next_id: 1,
+            last_delivered_user_id: 0,
+            active_turn_user_id: 0,
             agent_status: AgentChatStatus::Offline,
             last_seen: None,
             profile_url: None,
@@ -1767,6 +2067,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     auto_message TEXT,
     next_id INTEGER NOT NULL DEFAULT 1,
     pinned_context TEXT NOT NULL DEFAULT '',
+    last_delivered_user_id INTEGER NOT NULL DEFAULT 0,
+    active_turn_user_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (owner, agent)
 );
 CREATE TABLE IF NOT EXISTS messages (
@@ -1809,7 +2111,10 @@ impl ChatStore {
     pub fn cleanup_orphans(&self) {
         let conn = match self.conn.lock() {
             Ok(c) => c,
-            Err(_) => { eprintln!("warning: could not acquire db lock for chat cleanup"); return; }
+            Err(_) => {
+                eprintln!("warning: could not acquire db lock for chat cleanup");
+                return;
+            }
         };
 
         // Conversations for non-existent users
@@ -1857,7 +2162,9 @@ impl ChatStore {
             "DELETE FROM backend_preferences WHERE owner NOT IN (SELECT username FROM users)",
             [],
         ) {
-            Ok(n) if n > 0 => eprintln!("cleanup: removed {n} backend preference(s) for deleted user(s)"),
+            Ok(n) if n > 0 => {
+                eprintln!("cleanup: removed {n} backend preference(s) for deleted user(s)")
+            }
             Ok(_) => {}
             Err(e) => eprintln!("warning: backend preference cleanup failed: {e}"),
         }
@@ -1872,9 +2179,12 @@ impl ChatStore {
     }
 
     pub fn load_conversation(&self, owner: &str, agent: &str) -> Result<ChatConversation> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let conv = conn.query_row(
-            "SELECT agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config FROM conversations WHERE owner = ?1 AND agent = ?2",
+            "SELECT agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config, last_delivered_user_id, active_turn_user_id FROM conversations WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
             |row| {
                 let mc_json: Option<String> = row.get(10)?;
@@ -1886,6 +2196,8 @@ impl ChatStore {
                     summary: row.get::<_, String>(2)?,
                     window_size: row.get::<_, i64>(3)? as usize,
                     next_id: row.get::<_, i64>(8)? as u64,
+                    last_delivered_user_id: row.get::<_, i64>(11)? as u64,
+                    active_turn_user_id: row.get::<_, i64>(12)? as u64,
                     agent_status: match row.get::<_, String>(0)?.as_str() {
                         "idle" => AgentChatStatus::Idle,
                         "thinking" => AgentChatStatus::Thinking,
@@ -1909,35 +2221,41 @@ impl ChatStore {
         let mut stmt = conn.prepare(
             "SELECT id, role, content, timestamp FROM messages WHERE owner = ?1 AND agent = ?2 ORDER BY id"
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        conv.messages = stmt.query_map(params![owner, agent], |row| {
-            Ok(ChatMessage {
-                id: row.get::<_, i64>(0)? as u64,
-                role: match row.get::<_, String>(1)?.as_str() {
-                    "assistant" => ChatRole::Assistant,
-                    "tool" => ChatRole::Tool,
-                    "error" => ChatRole::Error,
-                    // fallback to User for unknown roles
-                    _ => ChatRole::User,
-                },
-                content: row.get(2)?,
-                timestamp: parse_dt(&row.get::<_, String>(3)?),
+        conv.messages = stmt
+            .query_map(params![owner, agent], |row| {
+                Ok(ChatMessage {
+                    id: row.get::<_, i64>(0)? as u64,
+                    role: match row.get::<_, String>(1)?.as_str() {
+                        "assistant" => ChatRole::Assistant,
+                        "tool" => ChatRole::Tool,
+                        "error" => ChatRole::Error,
+                        // fallback to User for unknown roles
+                        _ => ChatRole::User,
+                    },
+                    content: row.get(2)?,
+                    timestamp: parse_dt(&row.get::<_, String>(3)?),
+                })
             })
-        }).map_err(|e| LoreError::Validation(format!("db error: {e}")))?
-        .filter_map(|r| r.ok())
-        .collect();
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
         // Load pins
-        let mut stmt = conn.prepare(
-            "SELECT id, text, timestamp FROM pins WHERE owner = ?1 AND agent = ?2 ORDER BY id"
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        conv.pins = stmt.query_map(params![owner, agent], |row| {
-            Ok(PinnedChatItem {
-                id: row.get::<_, i64>(0)? as u64,
-                text: row.get(1)?,
-                timestamp: parse_dt(&row.get::<_, String>(2)?),
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, text, timestamp FROM pins WHERE owner = ?1 AND agent = ?2 ORDER BY id",
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conv.pins = stmt
+            .query_map(params![owner, agent], |row| {
+                Ok(PinnedChatItem {
+                    id: row.get::<_, i64>(0)? as u64,
+                    text: row.get(1)?,
+                    timestamp: parse_dt(&row.get::<_, String>(2)?),
+                })
             })
-        }).map_err(|e| LoreError::Validation(format!("db error: {e}")))?
-        .filter_map(|r| r.ok())
-        .collect();
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
         if conv.pinned_context.is_empty() && !conv.pins.is_empty() {
             let migrated: Vec<&str> = conv.pins.iter().map(|p| p.text.as_str()).collect();
             conv.pinned_context = migrated.join("\n");
@@ -1949,25 +2267,39 @@ impl ChatStore {
         Ok(conv)
     }
 
-    pub fn save_conversation(&self, owner: &str, agent: &str, conv: &ChatConversation) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn save_conversation(
+        &self,
+        owner: &str,
+        agent: &str,
+        conv: &ChatConversation,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let status_str = match conv.agent_status {
             AgentChatStatus::Idle => "idle",
             AgentChatStatus::Thinking => "thinking",
             AgentChatStatus::Offline => "offline",
         };
         let last_seen_str = conv.last_seen.as_ref().map(|dt| fmt_dt(dt));
-        let manage_json = conv.manage_config.as_ref().map(|mc| serde_json::to_string(mc).unwrap_or_default());
+        let manage_json = conv
+            .manage_config
+            .as_ref()
+            .map(|mc| serde_json::to_string(mc).unwrap_or_default());
         conn.execute(
-            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
-             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, window_size=?6, cwd=?7, git_branch=?8, profile_url=?9, auto_message=?10, next_id=?11, pinned_context=?12, manage_config=?13",
+            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config, last_delivered_user_id, active_turn_user_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, window_size=?6, cwd=?7, git_branch=?8, profile_url=?9, auto_message=?10, next_id=?11, pinned_context=?12, manage_config=?13, last_delivered_user_id=?14, active_turn_user_id=?15",
             params![owner, agent, status_str, last_seen_str, conv.summary, conv.window_size as i64,
-                    conv.cwd, conv.git_branch, conv.profile_url, conv.auto_message, conv.next_id as i64, conv.pinned_context, manage_json],
+                    conv.cwd, conv.git_branch, conv.profile_url, conv.auto_message, conv.next_id as i64, conv.pinned_context, manage_json, conv.last_delivered_user_id as i64, conv.active_turn_user_id as i64],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         // Replace messages
-        conn.execute("DELETE FROM messages WHERE owner = ?1 AND agent = ?2", params![owner, agent])
-            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "DELETE FROM messages WHERE owner = ?1 AND agent = ?2",
+            params![owner, agent],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         for msg in &conv.messages {
             let role_str = match msg.role {
                 ChatRole::User => "user",
@@ -1981,25 +2313,47 @@ impl ChatStore {
             ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         }
         // Replace pins
-        conn.execute("DELETE FROM pins WHERE owner = ?1 AND agent = ?2", params![owner, agent])
-            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "DELETE FROM pins WHERE owner = ?1 AND agent = ?2",
+            params![owner, agent],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         for pin in &conv.pins {
             conn.execute(
                 "INSERT INTO pins (owner, agent, id, text, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![owner, agent, pin.id as i64, pin.text, fmt_dt(&pin.timestamp)],
-            ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+                params![
+                    owner,
+                    agent,
+                    pin.id as i64,
+                    pin.text,
+                    fmt_dt(&pin.timestamp)
+                ],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         }
         Ok(())
     }
 
-    pub fn append_message(&self, owner: &str, agent: &str, role: ChatRole, content: String) -> Result<ChatMessage> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn append_message(
+        &self,
+        owner: &str,
+        agent: &str,
+        role: ChatRole,
+        content: String,
+    ) -> Result<ChatMessage> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        let next_id: i64 = conn.query_row(
-            "SELECT next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
-            params![owner, agent], |row| row.get(0),
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let next_id: i64 = conn
+            .query_row(
+                "SELECT next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+                params![owner, agent],
+                |row| row.get(0),
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let now = OffsetDateTime::now_utc();
         let role_str = match role {
             ChatRole::User => "user",
@@ -2014,16 +2368,30 @@ impl ChatStore {
         conn.execute(
             "UPDATE conversations SET next_id = ?1 WHERE owner = ?2 AND agent = ?3",
             params![next_id + 1, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        Ok(ChatMessage { id: next_id as u64, role, content, timestamp: now })
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(ChatMessage {
+            id: next_id as u64,
+            role,
+            content,
+            timestamp: now,
+        })
     }
 
     /// Append a tool-use detail. If the most recent message for this (owner,agent)
     /// is already a Tool message, extend it with a new line (with x-count dedup on
     /// consecutive duplicates, mirroring the live UI aggregation). Otherwise insert
     /// a new Tool message. Returns the resulting stored message.
-    pub fn append_or_extend_tool(&self, owner: &str, agent: &str, detail: &str) -> Result<ChatMessage> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn append_or_extend_tool(
+        &self,
+        owner: &str,
+        agent: &str,
+        detail: &str,
+    ) -> Result<ChatMessage> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
 
@@ -2035,7 +2403,8 @@ impl ChatStore {
 
         if let Some((last_id, last_role, last_content, last_ts)) = last {
             if last_role == "tool" {
-                let mut lines: Vec<String> = last_content.split('\n').map(|s| s.to_string()).collect();
+                let mut lines: Vec<String> =
+                    last_content.split('\n').map(|s| s.to_string()).collect();
                 let prev = lines.last().cloned().unwrap_or_default();
                 let (prev_base, prev_count) = parse_tool_repeat(&prev);
                 if prev_base == detail {
@@ -2050,7 +2419,8 @@ impl ChatStore {
                 conn.execute(
                     "UPDATE messages SET content = ?1 WHERE owner = ?2 AND agent = ?3 AND id = ?4",
                     params![new_content, owner, agent, last_id],
-                ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+                )
+                .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
                 return Ok(ChatMessage {
                     id: last_id as u64,
                     role: ChatRole::Tool,
@@ -2060,10 +2430,13 @@ impl ChatStore {
             }
         }
 
-        let next_id: i64 = conn.query_row(
-            "SELECT next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
-            params![owner, agent], |row| row.get(0),
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let next_id: i64 = conn
+            .query_row(
+                "SELECT next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+                params![owner, agent],
+                |row| row.get(0),
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let now = OffsetDateTime::now_utc();
         conn.execute(
             "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, 'tool', ?4, ?5)",
@@ -2072,7 +2445,8 @@ impl ChatStore {
         conn.execute(
             "UPDATE conversations SET next_id = ?1 WHERE owner = ?2 AND agent = ?3",
             params![next_id + 1, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(ChatMessage {
             id: next_id as u64,
             role: ChatRole::Tool,
@@ -2084,8 +2458,16 @@ impl ChatStore {
     /// Append an error detail. If the most recent message is already an Error
     /// message with the same content, extend it with an x-count instead of
     /// inserting another row.
-    pub fn append_or_extend_error(&self, owner: &str, agent: &str, detail: &str) -> Result<ChatMessage> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn append_or_extend_error(
+        &self,
+        owner: &str,
+        agent: &str,
+        detail: &str,
+    ) -> Result<ChatMessage> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
 
@@ -2115,10 +2497,13 @@ impl ChatStore {
             }
         }
 
-        let next_id: i64 = conn.query_row(
-            "SELECT next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
-            params![owner, agent], |row| row.get(0),
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let next_id: i64 = conn
+            .query_row(
+                "SELECT next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+                params![owner, agent],
+                |row| row.get(0),
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let now = OffsetDateTime::now_utc();
         conn.execute(
             "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, 'error', ?4, ?5)",
@@ -2127,7 +2512,8 @@ impl ChatStore {
         conn.execute(
             "UPDATE conversations SET next_id = ?1 WHERE owner = ?2 AND agent = ?3",
             params![next_id + 1, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(ChatMessage {
             id: next_id as u64,
             role: ChatRole::Error,
@@ -2136,8 +2522,16 @@ impl ChatStore {
         })
     }
 
-    pub fn update_agent_status(&self, owner: &str, agent: &str, status: AgentChatStatus) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn update_agent_status(
+        &self,
+        owner: &str,
+        agent: &str,
+        status: AgentChatStatus,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let status_str = match status {
@@ -2153,71 +2547,196 @@ impl ChatStore {
         Ok(())
     }
 
-    pub fn update_cwd(&self, owner: &str, agent: &str, cwd: &str, git_branch: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn update_cwd(
+        &self,
+        owner: &str,
+        agent: &str,
+        cwd: &str,
+        git_branch: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
             "UPDATE conversations SET cwd = ?1, git_branch = ?2 WHERE owner = ?3 AND agent = ?4",
             params![cwd, git_branch, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn update_summary(&self, owner: &str, agent: &str, summary: String) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
             "UPDATE conversations SET summary = ?1 WHERE owner = ?2 AND agent = ?3",
             params![summary, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn update_window_size(&self, owner: &str, agent: &str, size: usize) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
             "UPDATE conversations SET window_size = ?1 WHERE owner = ?2 AND agent = ?3",
             params![size as i64, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn clear_messages(&self, owner: &str, agent: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        conn.execute("DELETE FROM messages WHERE owner = ?1 AND agent = ?2", params![owner, agent])
-            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
-            "UPDATE conversations SET next_id = 1 WHERE owner = ?1 AND agent = ?2",
+            "DELETE FROM messages WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "UPDATE conversations SET next_id = 1, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND agent = ?2",
+            params![owner, agent],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn clear_librarian_messages(&self, owner: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         conn.execute(
             "DELETE FROM messages WHERE owner = ?1 AND (agent = 'librarian' OR agent LIKE 'librarian:%')",
             params![owner],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
-            "UPDATE conversations SET next_id = 1 WHERE owner = ?1 AND (agent = 'librarian' OR agent LIKE 'librarian:%')",
+            "UPDATE conversations SET next_id = 1, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND (agent = 'librarian' OR agent LIKE 'librarian:%')",
             params![owner],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
-    pub fn set_messages(&self, owner: &str, agent: &str, messages: Vec<ChatMessage>, summary: String) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn claim_pending_user_messages(
+        &self,
+        owner: &str,
+        agent: &str,
+    ) -> Result<Vec<ChatMessage>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
-        conn.execute("DELETE FROM messages WHERE owner = ?1 AND agent = ?2", params![owner, agent])
+
+        let (last_delivered_user_id, active_turn_user_id): (i64, i64) = conn
+            .query_row(
+                "SELECT last_delivered_user_id, active_turn_user_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+                params![owner, agent],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+
+        let claimed_cutoff = if active_turn_user_id > last_delivered_user_id {
+            conn.execute(
+                "UPDATE conversations SET active_turn_user_id = ?1 WHERE owner = ?2 AND agent = ?3",
+                params![last_delivered_user_id, owner, agent],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+            last_delivered_user_id
+        } else {
+            active_turn_user_id
+        };
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, timestamp FROM messages \
+                 WHERE owner = ?1 AND agent = ?2 AND role = 'user' AND id > ?3 ORDER BY id",
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let pending: Vec<ChatMessage> = stmt
+            .query_map(params![owner, agent, claimed_cutoff], |row| {
+                Ok(ChatMessage {
+                    id: row.get::<_, i64>(0)? as u64,
+                    role: ChatRole::User,
+                    content: row.get(1)?,
+                    timestamp: parse_dt(&row.get::<_, String>(2)?),
+                })
+            })
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if let Some(last) = pending.last() {
+            conn.execute(
+                "UPDATE conversations SET active_turn_user_id = ?1 WHERE owner = ?2 AND agent = ?3",
+                params![last.id as i64, owner, agent],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        }
+
+        Ok(pending)
+    }
+
+    pub fn complete_active_turn(&self, owner: &str, agent: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::ensure_conversation(&conn, owner, agent)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+
+        let (last_delivered_user_id, active_turn_user_id): (i64, i64) = conn
+            .query_row(
+                "SELECT last_delivered_user_id, active_turn_user_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+                params![owner, agent],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let completed_turn_user_id = last_delivered_user_id.max(active_turn_user_id);
+        conn.execute(
+            "UPDATE conversations SET last_delivered_user_id = ?1, active_turn_user_id = ?1 WHERE owner = ?2 AND agent = ?3",
+            params![completed_turn_user_id, owner, agent],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(())
+    }
+
+    pub fn set_messages(
+        &self,
+        owner: &str,
+        agent: &str,
+        messages: Vec<ChatMessage>,
+        summary: String,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::ensure_conversation(&conn, owner, agent)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "DELETE FROM messages WHERE owner = ?1 AND agent = ?2",
+            params![owner, agent],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         for msg in &messages {
             let role_str = match msg.role {
                 ChatRole::User => "user",
@@ -2233,23 +2752,31 @@ impl ChatStore {
         conn.execute(
             "UPDATE conversations SET summary = ?1 WHERE owner = ?2 AND agent = ?3",
             params![summary, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn set_pinned_context(&self, owner: &str, agent: &str, text: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
             "UPDATE conversations SET pinned_context = ?1 WHERE owner = ?2 AND agent = ?3",
             params![text, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn get_pinned_context(&self, owner: &str, agent: &str) -> Result<String> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let result = conn.query_row(
             "SELECT pinned_context FROM conversations WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
@@ -2263,7 +2790,10 @@ impl ChatStore {
     }
 
     pub fn get_manage_config(&self, owner: &str, agent: &str) -> Result<Option<ManageConfig>> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let result = conn.query_row(
             "SELECT manage_config FROM conversations WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
@@ -2277,20 +2807,36 @@ impl ChatStore {
         }
     }
 
-    pub fn save_manage_config(&self, owner: &str, agent: &str, config: &ManageConfig) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn save_manage_config(
+        &self,
+        owner: &str,
+        agent: &str,
+        config: &ManageConfig,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let json = serde_json::to_string(config).unwrap_or_default();
         conn.execute(
             "UPDATE conversations SET manage_config = ?1 WHERE owner = ?2 AND agent = ?3",
             params![json, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
-    pub fn get_backend_prefs(&self, owner: &str, backend: &str) -> Result<(Option<String>, Option<String>)> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn get_backend_prefs(
+        &self,
+        owner: &str,
+        backend: &str,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let result = conn.query_row(
             "SELECT model, effort FROM backend_preferences WHERE owner = ?1 AND backend = ?2",
             params![owner, backend],
@@ -2303,45 +2849,71 @@ impl ChatStore {
         }
     }
 
-    pub fn set_backend_model(&self, owner: &str, backend: &str, model: Option<String>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn set_backend_model(
+        &self,
+        owner: &str,
+        backend: &str,
+        model: Option<String>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         conn.execute(
             "INSERT INTO backend_preferences (owner, backend, model) VALUES (?1, ?2, ?3) \
              ON CONFLICT(owner, backend) DO UPDATE SET model = ?3",
             params![owner, backend, model],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
-    pub fn set_backend_effort(&self, owner: &str, backend: &str, effort: Option<String>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+    pub fn set_backend_effort(
+        &self,
+        owner: &str,
+        backend: &str,
+        effort: Option<String>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         conn.execute(
             "INSERT INTO backend_preferences (owner, backend, effort) VALUES (?1, ?2, ?3) \
              ON CONFLICT(owner, backend) DO UPDATE SET effort = ?3",
             params![owner, backend, effort],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn update_profile_url(&self, owner: &str, agent: &str, url: Option<String>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
             "UPDATE conversations SET profile_url = ?1 WHERE owner = ?2 AND agent = ?3",
             params![url, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 
     pub fn update_auto_message(&self, owner: &str, agent: &str, msg: Option<String>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
             "UPDATE conversations SET auto_message = ?1 WHERE owner = ?2 AND agent = ?3",
             params![msg, owner, agent],
-        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
     }
 }
@@ -2362,20 +2934,38 @@ impl ChatAuditLog {
         }
     }
 
-    fn write_entry(&self, agent: &str, owner: &str, kind: &str, content: &str) -> std::io::Result<()> {
+    fn write_entry(
+        &self,
+        agent: &str,
+        owner: &str,
+        kind: &str,
+        content: &str,
+    ) -> std::io::Result<()> {
         let agent_dir = self.root.join(sanitize_path_component(agent));
         fs::create_dir_all(&agent_dir)?;
         let now = OffsetDateTime::now_utc();
-        let date_str = format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
+        let date_str = format!(
+            "{:04}-{:02}-{:02}",
+            now.year(),
+            now.month() as u8,
+            now.day()
+        );
         let log_path = agent_dir.join(format!("{date_str}.log"));
         let ts = format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            now.year(), now.month() as u8, now.day(),
-            now.hour(), now.minute(), now.second()
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
         );
         let escaped = content.replace('\n', "\\n");
         let line = format!("[{ts}] [{kind}:{owner}] {escaped}\n");
-        let mut f = OpenOptions::new().create(true).append(true).open(&log_path)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
         f.write_all(line.as_bytes())
     }
 
@@ -2420,12 +3010,22 @@ impl ChatAuditLog {
 }
 
 fn sanitize_path_component(s: &str) -> String {
-    s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn parse_date(s: &str) -> Option<OffsetDateTime> {
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 { return None; }
+    if parts.len() != 3 {
+        return None;
+    }
     let y: i32 = parts[0].parse().ok()?;
     let m: u8 = parts[1].parse().ok()?;
     let d: u8 = parts[2].parse().ok()?;
@@ -2435,7 +3035,9 @@ fn parse_date(s: &str) -> Option<OffsetDateTime> {
 }
 
 fn dir_is_empty(path: &Path) -> bool {
-    fs::read_dir(path).map(|mut d| d.next().is_none()).unwrap_or(true)
+    fs::read_dir(path)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -2701,13 +3303,25 @@ mod tests {
         let chat = ChatStore::new(dir.path());
 
         let first = chat
-            .append_or_extend_error("alice", "krasis", "CLI: spawn codex failed: No such file or directory")
+            .append_or_extend_error(
+                "alice",
+                "krasis",
+                "CLI: spawn codex failed: No such file or directory",
+            )
             .unwrap();
         let second = chat
-            .append_or_extend_error("alice", "krasis", "CLI: spawn codex failed: No such file or directory")
+            .append_or_extend_error(
+                "alice",
+                "krasis",
+                "CLI: spawn codex failed: No such file or directory",
+            )
             .unwrap();
         let third = chat
-            .append_or_extend_error("alice", "krasis", "CLI: spawn codex failed: No such file or directory")
+            .append_or_extend_error(
+                "alice",
+                "krasis",
+                "CLI: spawn codex failed: No such file or directory",
+            )
             .unwrap();
 
         assert_eq!(first.id, second.id);

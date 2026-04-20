@@ -43,9 +43,7 @@ impl std::str::FromStr for EndpointKind {
             "anthropic" => Ok(Self::Anthropic),
             "gemini" => Ok(Self::Gemini),
             "openai" => Ok(Self::OpenAi),
-            _ => Err(LoreError::Validation(format!(
-                "unknown endpoint kind: {s}"
-            ))),
+            _ => Err(LoreError::Validation(format!("unknown endpoint kind: {s}"))),
         }
     }
 }
@@ -910,10 +908,9 @@ async fn send_librarian_llm_request(
         let detail = extract_provider_error(&value);
         return Err(LoreError::ExternalService(detail));
     }
-    let answer = extract_provider_response_text(endpoint, &value)
-        .ok_or_else(|| {
-            LoreError::ExternalService("provider response did not contain answer text".into())
-        })?;
+    let answer = extract_provider_response_text(endpoint, &value).ok_or_else(|| {
+        LoreError::ExternalService("provider response did not contain answer text".into())
+    })?;
     let answer = answer.trim();
     if answer.is_empty() {
         return Err(LoreError::ExternalService(
@@ -1025,12 +1022,11 @@ impl AnswerLibrarianClient for HttpLibrarianClient {
             let detail = extract_provider_error(&value);
             return Err(LoreError::ExternalService(detail));
         }
-        let content = extract_provider_response_text(endpoint, &value)
-            .ok_or_else(|| {
-                LoreError::ExternalService(
-                    "provider response did not contain project action plan text".into(),
-                )
-            })?;
+        let content = extract_provider_response_text(endpoint, &value).ok_or_else(|| {
+            LoreError::ExternalService(
+                "provider response did not contain project action plan text".into(),
+            )
+        })?;
         let content = content.trim();
         if content.is_empty() {
             return Err(LoreError::ExternalService(
@@ -1130,10 +1126,7 @@ pub async fn list_provider_models(
                             .get("supportedGenerationMethods")
                             .and_then(|m| m.as_array());
                         let supports_generate = methods
-                            .map(|arr| {
-                                arr.iter()
-                                    .any(|v| v.as_str() == Some("generateContent"))
-                            })
+                            .map(|arr| arr.iter().any(|v| v.as_str() == Some("generateContent")))
                             .unwrap_or(true);
                         if supports_generate {
                             models.push(model_name.to_string());
@@ -1187,10 +1180,7 @@ fn build_provider_url(endpoint: &Endpoint) -> String {
     match endpoint.kind {
         EndpointKind::Gemini => {
             let base = endpoint.url.trim_end_matches('/');
-            let url = format!(
-                "{base}/v1beta/models/{}:generateContent",
-                endpoint.model
-            );
+            let url = format!("{base}/v1beta/models/{}:generateContent", endpoint.model);
             if let Some(ref api_key) = endpoint.api_key {
                 format!("{url}?key={api_key}")
             } else {
@@ -1338,7 +1328,10 @@ pub fn build_prompt_multi_project(
             prompt.push('\n');
         }
     }
-    let total_blocks: usize = projects_context.iter().map(|(_, blocks)| blocks.len()).sum();
+    let total_blocks: usize = projects_context
+        .iter()
+        .map(|(_, blocks)| blocks.len())
+        .sum();
     if total_blocks == 0 {
         prompt.push_str("\nNo blocks were available.\n");
         return prompt;
@@ -1577,7 +1570,11 @@ pub struct ProxyChatRequest {
 
 #[derive(Debug, Clone)]
 pub enum ProxyStreamChunk {
-    Delta { content: Option<String>, tool_calls: Option<Vec<serde_json::Value>>, finish_reason: Option<String> },
+    Delta {
+        content: Option<String>,
+        tool_calls: Option<Vec<serde_json::Value>>,
+        finish_reason: Option<String>,
+    },
     Done,
     Error(String),
 }
@@ -1585,7 +1582,11 @@ pub enum ProxyStreamChunk {
 fn translate_messages_to_anthropic(
     messages: &[ProxyChatMessage],
     tools: &Option<Vec<serde_json::Value>>,
-) -> (Option<String>, Vec<serde_json::Value>, Option<Vec<serde_json::Value>>) {
+) -> (
+    Option<String>,
+    Vec<serde_json::Value>,
+    Option<Vec<serde_json::Value>>,
+) {
     let mut system_prompt = None;
     let mut out = Vec::new();
     for msg in messages {
@@ -1620,7 +1621,8 @@ fn translate_messages_to_anthropic(
             }
             if let Some(ref tcs) = msg.tool_calls {
                 for tc in tcs {
-                    let input: serde_json::Value = tc.get("function")
+                    let input: serde_json::Value = tc
+                        .get("function")
                         .and_then(|f| f.get("arguments"))
                         .and_then(|a| a.as_str())
                         .and_then(|s| serde_json::from_str(s).ok())
@@ -1659,7 +1661,11 @@ fn translate_messages_to_anthropic(
 fn translate_messages_to_gemini(
     messages: &[ProxyChatMessage],
     tools: &Option<Vec<serde_json::Value>>,
-) -> (Option<serde_json::Value>, Vec<serde_json::Value>, Option<serde_json::Value>) {
+) -> (
+    Option<serde_json::Value>,
+    Vec<serde_json::Value>,
+    Option<serde_json::Value>,
+) {
     let mut system_instruction = None;
     let mut contents = Vec::new();
     for msg in messages {
@@ -1691,7 +1697,8 @@ fn translate_messages_to_gemini(
             }
             if let Some(ref tcs) = msg.tool_calls {
                 for tc in tcs {
-                    let args: serde_json::Value = tc.get("function")
+                    let args: serde_json::Value = tc
+                        .get("function")
                         .and_then(|f| f.get("arguments"))
                         .and_then(|a| a.as_str())
                         .and_then(|s| serde_json::from_str(s).ok())
@@ -1764,9 +1771,15 @@ pub fn build_proxy_request(
                 "messages": req.messages,
                 "stream": streaming,
             });
-            if let Some(t) = req.temperature { body["temperature"] = json!(t); }
-            if let Some(p) = req.top_p { body["top_p"] = json!(p); }
-            if let Some(ref s) = req.stop { body["stop"] = s.clone(); }
+            if let Some(t) = req.temperature {
+                body["temperature"] = json!(t);
+            }
+            if let Some(p) = req.top_p {
+                body["top_p"] = json!(p);
+            }
+            if let Some(ref s) = req.stop {
+                body["stop"] = s.clone();
+            }
             body["max_tokens"] = json!(max_tokens);
             if let Some(ref tools) = req.tools {
                 if !tools.is_empty() {
@@ -1776,17 +1789,26 @@ pub fn build_proxy_request(
             (endpoint.url.clone(), body)
         }
         EndpointKind::Anthropic => {
-            let (system, messages, tools) = translate_messages_to_anthropic(&req.messages, &req.tools);
+            let (system, messages, tools) =
+                translate_messages_to_anthropic(&req.messages, &req.tools);
             let mut body = json!({
                 "model": model,
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "stream": streaming,
             });
-            if let Some(sys) = system { body["system"] = json!(sys); }
-            if let Some(t) = req.temperature { body["temperature"] = json!(t); }
-            if let Some(p) = req.top_p { body["top_p"] = json!(p); }
-            if let Some(ref s) = req.stop { body["stop_sequences"] = s.clone(); }
+            if let Some(sys) = system {
+                body["system"] = json!(sys);
+            }
+            if let Some(t) = req.temperature {
+                body["temperature"] = json!(t);
+            }
+            if let Some(p) = req.top_p {
+                body["top_p"] = json!(p);
+            }
+            if let Some(ref s) = req.stop {
+                body["stop_sequences"] = s.clone();
+            }
             if let Some(tl) = tools {
                 if !tl.is_empty() {
                     body["tools"] = json!(tl);
@@ -1796,14 +1818,18 @@ pub fn build_proxy_request(
             let url = if base.ends_with("/messages") {
                 base.to_string()
             } else if base.contains("/v1") {
-                format!("{}/messages", base.split("/v1").next().unwrap_or(base).to_string() + "/v1")
+                format!(
+                    "{}/messages",
+                    base.split("/v1").next().unwrap_or(base).to_string() + "/v1"
+                )
             } else {
                 format!("{base}/v1/messages")
             };
             (url, body)
         }
         EndpointKind::Gemini => {
-            let (system_instruction, contents, tools) = translate_messages_to_gemini(&req.messages, &req.tools);
+            let (system_instruction, contents, tools) =
+                translate_messages_to_gemini(&req.messages, &req.tools);
             let mut body = json!({
                 "contents": contents,
                 "generationConfig": {
@@ -1813,15 +1839,31 @@ pub fn build_proxy_request(
             if let Some(si) = system_instruction {
                 body["system_instruction"] = si;
             }
-            if let Some(t) = req.temperature { body["generationConfig"]["temperature"] = json!(t); }
-            if let Some(p) = req.top_p { body["generationConfig"]["topP"] = json!(p); }
-            if let Some(ref s) = req.stop { body["generationConfig"]["stopSequences"] = s.clone(); }
+            if let Some(t) = req.temperature {
+                body["generationConfig"]["temperature"] = json!(t);
+            }
+            if let Some(p) = req.top_p {
+                body["generationConfig"]["topP"] = json!(p);
+            }
+            if let Some(ref s) = req.stop {
+                body["generationConfig"]["stopSequences"] = s.clone();
+            }
             if let Some(tl) = tools {
                 body["tools"] = tl;
             }
             let base = endpoint.url.trim_end_matches('/');
-            let base_clean = base.split("/v1beta").next().unwrap_or(base).split("/v1").next().unwrap_or(base);
-            let action = if streaming { "streamGenerateContent?alt=sse" } else { "generateContent" };
+            let base_clean = base
+                .split("/v1beta")
+                .next()
+                .unwrap_or(base)
+                .split("/v1")
+                .next()
+                .unwrap_or(base);
+            let action = if streaming {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            };
             let url = if let Some(ref key) = endpoint.api_key {
                 format!("{base_clean}/v1beta/models/{model}:{action}&key={key}")
             } else {
@@ -1880,7 +1922,8 @@ pub async fn proxy_non_streaming(
     body: &serde_json::Value,
     timeout_secs: u64,
 ) -> Result<serde_json::Value> {
-    let (status, value) = proxy_non_streaming_raw(client, endpoint, url, body, timeout_secs).await?;
+    let (status, value) =
+        proxy_non_streaming_raw(client, endpoint, url, body, timeout_secs).await?;
     if !status.is_success() {
         return Err(LoreError::ExternalService(extract_provider_error(&value)));
     }
@@ -1895,10 +1938,15 @@ pub async fn proxy_non_streaming_raw(
     timeout_secs: u64,
 ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
     let http = add_provider_auth(client.post(url).json(body), endpoint);
-    let response = http.timeout(Duration::from_secs(timeout_secs)).send().await
+    let response = http
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
         .map_err(|e| LoreError::ExternalService(e.to_string()))?;
     let status = response.status();
-    let value: serde_json::Value = response.json().await
+    let value: serde_json::Value = response
+        .json()
+        .await
         .map_err(|e| LoreError::ExternalService(e.to_string()))?;
     let translated = if status.is_success() {
         match endpoint.kind {
@@ -1940,16 +1988,24 @@ fn anthropic_response_to_openai(value: &serde_json::Value) -> serde_json::Value 
             }
         }
     }
-    let finish = value.get("stop_reason").and_then(|s| s.as_str()).map(|s| match s {
-        "end_turn" => "stop",
-        "tool_use" => "tool_calls",
-        "max_tokens" => "length",
-        other => other,
-    }).unwrap_or("stop");
+    let finish = value
+        .get("stop_reason")
+        .and_then(|s| s.as_str())
+        .map(|s| match s {
+            "end_turn" => "stop",
+            "tool_use" => "tool_calls",
+            "max_tokens" => "length",
+            other => other,
+        })
+        .unwrap_or("stop");
 
     let mut msg = json!({"role": "assistant"});
-    if !content_text.is_empty() { msg["content"] = json!(content_text); }
-    if !tool_calls.is_empty() { msg["tool_calls"] = json!(tool_calls); }
+    if !content_text.is_empty() {
+        msg["content"] = json!(content_text);
+    }
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = json!(tool_calls);
+    }
     json!({
         "id": value.get("id").and_then(|i| i.as_str()).unwrap_or(""),
         "object": "chat.completion",
@@ -1960,11 +2016,18 @@ fn anthropic_response_to_openai(value: &serde_json::Value) -> serde_json::Value 
 }
 
 fn gemini_response_to_openai(value: &serde_json::Value, model: &str) -> serde_json::Value {
-    let candidate = value.get("candidates").and_then(|c| c.as_array()).and_then(|c| c.first());
+    let candidate = value
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first());
     let mut content_text = String::new();
     let mut tool_calls = Vec::new();
     let mut tc_idx = 0;
-    if let Some(parts) = candidate.and_then(|c| c.get("content")).and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+    if let Some(parts) = candidate
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+    {
         for part in parts {
             if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
                 content_text.push_str(t);
@@ -1983,13 +2046,25 @@ fn gemini_response_to_openai(value: &serde_json::Value, model: &str) -> serde_js
             }
         }
     }
-    let finish = if !tool_calls.is_empty() { "tool_calls" }
-        else if candidate.and_then(|c| c.get("finishReason")).and_then(|f| f.as_str()) == Some("MAX_TOKENS") { "length" }
-        else { "stop" };
+    let finish = if !tool_calls.is_empty() {
+        "tool_calls"
+    } else if candidate
+        .and_then(|c| c.get("finishReason"))
+        .and_then(|f| f.as_str())
+        == Some("MAX_TOKENS")
+    {
+        "length"
+    } else {
+        "stop"
+    };
 
     let mut msg = json!({"role": "assistant"});
-    if !content_text.is_empty() { msg["content"] = json!(content_text); }
-    if !tool_calls.is_empty() { msg["tool_calls"] = json!(tool_calls); }
+    if !content_text.is_empty() {
+        msg["content"] = json!(content_text);
+    }
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = json!(tool_calls);
+    }
     json!({
         "id": format!("chatcmpl-{}", Uuid::new_v4()),
         "object": "chat.completion",
@@ -2007,7 +2082,10 @@ async fn stream_openai(response: reqwest::Response, tx: mpsc::Sender<ProxyStream
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
-            Err(e) => { let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await; return; }
+            Err(e) => {
+                let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await;
+                return;
+            }
         };
         buf.push_str(&String::from_utf8_lossy(&bytes));
         while let Some(pos) = buf.find("\n\n") {
@@ -2020,13 +2098,28 @@ async fn stream_openai(response: reqwest::Response, tx: mpsc::Sender<ProxyStream
                         return;
                     }
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()) {
+                        if let Some(choice) = v
+                            .get("choices")
+                            .and_then(|c| c.as_array())
+                            .and_then(|c| c.first())
+                        {
                             let delta = choice.get("delta").cloned().unwrap_or(json!({}));
-                            let _ = tx.send(ProxyStreamChunk::Delta {
-                                content: delta.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()),
-                                tool_calls: delta.get("tool_calls").and_then(|t| t.as_array()).cloned(),
-                                finish_reason: choice.get("finish_reason").and_then(|f| f.as_str()).map(|s| s.to_string()),
-                            }).await;
+                            let _ = tx
+                                .send(ProxyStreamChunk::Delta {
+                                    content: delta
+                                        .get("content")
+                                        .and_then(|c| c.as_str())
+                                        .map(|s| s.to_string()),
+                                    tool_calls: delta
+                                        .get("tool_calls")
+                                        .and_then(|t| t.as_array())
+                                        .cloned(),
+                                    finish_reason: choice
+                                        .get("finish_reason")
+                                        .and_then(|f| f.as_str())
+                                        .map(|s| s.to_string()),
+                                })
+                                .await;
                         }
                     }
                 }
@@ -2048,7 +2141,10 @@ async fn stream_anthropic(response: reqwest::Response, tx: mpsc::Sender<ProxyStr
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
-            Err(e) => { let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await; return; }
+            Err(e) => {
+                let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await;
+                return;
+            }
         };
         buf.push_str(&String::from_utf8_lossy(&bytes));
         while let Some(pos) = buf.find("\n\n") {
@@ -2064,7 +2160,9 @@ async fn stream_anthropic(response: reqwest::Response, tx: mpsc::Sender<ProxyStr
                     data_str = d;
                 }
             }
-            if data_str.is_empty() { continue; }
+            if data_str.is_empty() {
+                continue;
+            }
             let data: serde_json::Value = match serde_json::from_str(data_str) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -2075,23 +2173,32 @@ async fn stream_anthropic(response: reqwest::Response, tx: mpsc::Sender<ProxyStr
                     if let Some(delta) = data.get("delta") {
                         match delta.get("type").and_then(|t| t.as_str()) {
                             Some("text_delta") => {
-                                let _ = tx.send(ProxyStreamChunk::Delta {
-                                    content: delta.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()),
-                                    tool_calls: None,
-                                    finish_reason: None,
-                                }).await;
+                                let _ = tx
+                                    .send(ProxyStreamChunk::Delta {
+                                        content: delta
+                                            .get("text")
+                                            .and_then(|t| t.as_str())
+                                            .map(|s| s.to_string()),
+                                        tool_calls: None,
+                                        finish_reason: None,
+                                    })
+                                    .await;
                             }
                             Some("input_json_delta") => {
-                                if let Some(partial) = delta.get("partial_json").and_then(|p| p.as_str()) {
+                                if let Some(partial) =
+                                    delta.get("partial_json").and_then(|p| p.as_str())
+                                {
                                     current_tool_args.push_str(partial);
-                                    let _ = tx.send(ProxyStreamChunk::Delta {
-                                        content: None,
-                                        tool_calls: Some(vec![json!({
-                                            "index": tool_index,
-                                            "function": {"arguments": partial}
-                                        })]),
-                                        finish_reason: None,
-                                    }).await;
+                                    let _ = tx
+                                        .send(ProxyStreamChunk::Delta {
+                                            content: None,
+                                            tool_calls: Some(vec![json!({
+                                                "index": tool_index,
+                                                "function": {"arguments": partial}
+                                            })]),
+                                            finish_reason: None,
+                                        })
+                                        .await;
                                 }
                             }
                             _ => {}
@@ -2102,24 +2209,37 @@ async fn stream_anthropic(response: reqwest::Response, tx: mpsc::Sender<ProxyStr
                     if let Some(cb) = data.get("content_block") {
                         if cb.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             tool_index += 1;
-                            current_tool_id = cb.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                            current_tool_name = cb.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                            current_tool_id = cb
+                                .get("id")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            current_tool_name = cb
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             current_tool_args.clear();
-                            let _ = tx.send(ProxyStreamChunk::Delta {
-                                content: None,
-                                tool_calls: Some(vec![json!({
-                                    "index": tool_index,
-                                    "id": current_tool_id,
-                                    "type": "function",
-                                    "function": {"name": current_tool_name, "arguments": ""}
-                                })]),
-                                finish_reason: None,
-                            }).await;
+                            let _ = tx
+                                .send(ProxyStreamChunk::Delta {
+                                    content: None,
+                                    tool_calls: Some(vec![json!({
+                                        "index": tool_index,
+                                        "id": current_tool_id,
+                                        "type": "function",
+                                        "function": {"name": current_tool_name, "arguments": ""}
+                                    })]),
+                                    finish_reason: None,
+                                })
+                                .await;
                         }
                     }
                 }
                 "message_delta" => {
-                    let reason = data.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str());
+                    let reason = data
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(|s| s.as_str());
                     let finish = reason.map(|r| match r {
                         "end_turn" => "stop".to_string(),
                         "tool_use" => "tool_calls".to_string(),
@@ -2127,11 +2247,13 @@ async fn stream_anthropic(response: reqwest::Response, tx: mpsc::Sender<ProxyStr
                         other => other.to_string(),
                     });
                     if finish.is_some() {
-                        let _ = tx.send(ProxyStreamChunk::Delta {
-                            content: None,
-                            tool_calls: None,
-                            finish_reason: finish,
-                        }).await;
+                        let _ = tx
+                            .send(ProxyStreamChunk::Delta {
+                                content: None,
+                                tool_calls: None,
+                                finish_reason: finish,
+                            })
+                            .await;
                     }
                 }
                 "message_stop" => {
@@ -2139,7 +2261,11 @@ async fn stream_anthropic(response: reqwest::Response, tx: mpsc::Sender<ProxyStr
                     return;
                 }
                 "error" => {
-                    let msg = data.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("stream error");
+                    let msg = data
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("stream error");
                     let _ = tx.send(ProxyStreamChunk::Error(msg.to_string())).await;
                     return;
                 }
@@ -2159,7 +2285,10 @@ async fn stream_gemini(response: reqwest::Response, tx: mpsc::Sender<ProxyStream
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
-            Err(e) => { let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await; return; }
+            Err(e) => {
+                let _ = tx.send(ProxyStreamChunk::Error(e.to_string())).await;
+                return;
+            }
         };
         buf.push_str(&String::from_utf8_lossy(&bytes));
         while let Some(pos) = buf.find("\n\n") {
@@ -2171,15 +2300,24 @@ async fn stream_gemini(response: reqwest::Response, tx: mpsc::Sender<ProxyStream
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let candidate = v.get("candidates").and_then(|c| c.as_array()).and_then(|c| c.first());
-                    if let Some(parts) = candidate.and_then(|c| c.get("content")).and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                    let candidate = v
+                        .get("candidates")
+                        .and_then(|c| c.as_array())
+                        .and_then(|c| c.first());
+                    if let Some(parts) = candidate
+                        .and_then(|c| c.get("content"))
+                        .and_then(|c| c.get("parts"))
+                        .and_then(|p| p.as_array())
+                    {
                         for part in parts {
                             if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                                let _ = tx.send(ProxyStreamChunk::Delta {
-                                    content: Some(t.to_string()),
-                                    tool_calls: None,
-                                    finish_reason: None,
-                                }).await;
+                                let _ = tx
+                                    .send(ProxyStreamChunk::Delta {
+                                        content: Some(t.to_string()),
+                                        tool_calls: None,
+                                        finish_reason: None,
+                                    })
+                                    .await;
                             }
                             if let Some(fc) = part.get("functionCall") {
                                 let _ = tx.send(ProxyStreamChunk::Delta {
@@ -2199,18 +2337,28 @@ async fn stream_gemini(response: reqwest::Response, tx: mpsc::Sender<ProxyStream
                             }
                         }
                     }
-                    let finish = candidate.and_then(|c| c.get("finishReason")).and_then(|f| f.as_str());
+                    let finish = candidate
+                        .and_then(|c| c.get("finishReason"))
+                        .and_then(|f| f.as_str());
                     if let Some(reason) = finish {
                         let fr = match reason {
                             "STOP" => "stop",
                             "MAX_TOKENS" => "length",
-                            _ => if tool_idx_offset > 0 { "tool_calls" } else { "stop" },
+                            _ => {
+                                if tool_idx_offset > 0 {
+                                    "tool_calls"
+                                } else {
+                                    "stop"
+                                }
+                            }
                         };
-                        let _ = tx.send(ProxyStreamChunk::Delta {
-                            content: None,
-                            tool_calls: None,
-                            finish_reason: Some(fr.to_string()),
-                        }).await;
+                        let _ = tx
+                            .send(ProxyStreamChunk::Delta {
+                                content: None,
+                                tool_calls: None,
+                                finish_reason: Some(fr.to_string()),
+                            })
+                            .await;
                     }
                 }
             }
@@ -2225,12 +2373,22 @@ pub fn format_openai_stream_chunk(
     completion_id: &str,
 ) -> Option<String> {
     match chunk {
-        ProxyStreamChunk::Delta { content, tool_calls, finish_reason } => {
+        ProxyStreamChunk::Delta {
+            content,
+            tool_calls,
+            finish_reason,
+        } => {
             let mut delta = json!({});
-            if let Some(c) = content { delta["content"] = json!(c); }
-            if let Some(tc) = tool_calls { delta["tool_calls"] = json!(tc); }
+            if let Some(c) = content {
+                delta["content"] = json!(c);
+            }
+            if let Some(tc) = tool_calls {
+                delta["tool_calls"] = json!(tc);
+            }
             let mut choice = json!({"index": 0, "delta": delta});
-            if let Some(fr) = finish_reason { choice["finish_reason"] = json!(fr); }
+            if let Some(fr) = finish_reason {
+                choice["finish_reason"] = json!(fr);
+            }
             let obj = json!({
                 "id": completion_id,
                 "object": "chat.completion.chunk",

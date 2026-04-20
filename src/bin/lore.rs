@@ -1,8 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use lore_core::{
     AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, ReleaseStream,
-    SelfUpdateOutcome, apply_update_to_version, check_for_update, maybe_apply_self_update,
-    slugify,
+    SelfUpdateOutcome, apply_update_to_version, check_for_update, maybe_apply_self_update, slugify,
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -48,18 +47,15 @@ fn resolve_executable_path(executable: &str, fallback_relative_paths: &[&str]) -
 
 fn resolve_backend_executable(backend: AgentBackend) -> PathBuf {
     match backend {
-        AgentBackend::Claude => resolve_executable_path(
-            "claude",
-            &[".local/bin/claude", ".npm-global/bin/claude"],
-        ),
-        AgentBackend::Gemini => resolve_executable_path(
-            "gemini",
-            &[".local/bin/gemini", ".npm-global/bin/gemini"],
-        ),
-        AgentBackend::Codex => resolve_executable_path(
-            "codex",
-            &[".local/bin/codex", ".npm-global/bin/codex"],
-        ),
+        AgentBackend::Claude => {
+            resolve_executable_path("claude", &[".local/bin/claude", ".npm-global/bin/claude"])
+        }
+        AgentBackend::Gemini => {
+            resolve_executable_path("gemini", &[".local/bin/gemini", ".npm-global/bin/gemini"])
+        }
+        AgentBackend::Codex => {
+            resolve_executable_path("codex", &[".local/bin/codex", ".npm-global/bin/codex"])
+        }
         AgentBackend::OpenAi => PathBuf::from("openai"),
     }
 }
@@ -410,7 +406,6 @@ struct GrepArgs {
     #[arg(long, default_value_t = 20)]
     limit: usize,
 }
-
 
 #[derive(Args)]
 struct SetupArgs {
@@ -783,7 +778,8 @@ async fn run() -> CliResult<()> {
             // Auto-start the machine service daemon
             println!("Starting machine service...");
             let exe = resolved_current_exe()?;
-            let lore_dir = env::var("HOME").map(PathBuf::from)
+            let lore_dir = env::var("HOME")
+                .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join("lore-service");
             fs::create_dir_all(&lore_dir)?;
@@ -1190,15 +1186,25 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             );
             let block: Block = context.get_json(&path).await?;
             let content = match (args.offset, args.limit) {
-                (Some(off), Some(lim)) => {
-                    block.content.lines().skip(off).take(lim).collect::<Vec<_>>().join("\n")
-                }
-                (Some(off), None) => {
-                    block.content.lines().skip(off).collect::<Vec<_>>().join("\n")
-                }
-                (None, Some(lim)) => {
-                    block.content.lines().take(lim).collect::<Vec<_>>().join("\n")
-                }
+                (Some(off), Some(lim)) => block
+                    .content
+                    .lines()
+                    .skip(off)
+                    .take(lim)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                (Some(off), None) => block
+                    .content
+                    .lines()
+                    .skip(off)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                (None, Some(lim)) => block
+                    .content
+                    .lines()
+                    .take(lim)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 (None, None) => block.content.clone(),
             };
             println!("{}", content);
@@ -1828,7 +1834,11 @@ fn resolved_current_exe() -> io::Result<PathBuf> {
     }
 }
 
-async fn apply_cli_update_to_target(config: &mut CliConfig, target_version: &str, repo: &str) -> CliResult<()> {
+async fn apply_cli_update_to_target(
+    config: &mut CliConfig,
+    target_version: &str,
+    repo: &str,
+) -> CliResult<()> {
     let client = reqwest::Client::new();
     let executable_path = resolved_current_exe()?;
     match apply_update_to_version(
@@ -1858,10 +1868,7 @@ async fn apply_cli_update_to_target(config: &mut CliConfig, target_version: &str
 
 /// Download the lore binary directly from the server's staged binary endpoint.
 /// Returns Ok(true) if updated, Ok(false) if not available, Err on failure.
-async fn download_binary_from_server(
-    context: &CliContext,
-    machine_token: &str,
-) -> CliResult<bool> {
+async fn download_binary_from_server(context: &CliContext, machine_token: &str) -> CliResult<bool> {
     let url = format!("{}/v1/machines/binary", context.url);
     eprintln!("[service] Trying direct binary download from server...");
     let resp = context
@@ -1883,21 +1890,31 @@ async fn download_binary_from_server(
         return Ok(false);
     }
     if !resp.status().is_success() {
-        eprintln!("[service] Server binary download returned {}", resp.status());
+        eprintln!(
+            "[service] Server binary download returned {}",
+            resp.status()
+        );
         return Ok(false);
     }
-    let bytes = resp.bytes().await.map_err(|e| {
-        io::Error::other(format!("failed to read binary response: {e}"))
-    })?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| io::Error::other(format!("failed to read binary response: {e}")))?;
     if bytes.len() < 1024 {
-        eprintln!("[service] Server binary too small ({}b), ignoring", bytes.len());
+        eprintln!(
+            "[service] Server binary too small ({}b), ignoring",
+            bytes.len()
+        );
         return Ok(false);
     }
-    eprintln!("[service] Downloaded {}b binary from server, replacing executable...", bytes.len());
+    eprintln!(
+        "[service] Downloaded {}b binary from server, replacing executable...",
+        bytes.len()
+    );
     let executable_path = resolved_current_exe()?;
-    let parent = executable_path.parent().ok_or_else(|| {
-        io::Error::other("current executable has no parent directory")
-    })?;
+    let parent = executable_path
+        .parent()
+        .ok_or_else(|| io::Error::other("current executable has no parent directory"))?;
     let temp_path = parent.join(format!(".lore.update-{}", uuid::Uuid::new_v4()));
     fs::write(&temp_path, &bytes)?;
     #[cfg(unix)]
@@ -2041,13 +2058,25 @@ fn format_relative_time(timestamp_str: &str, now: OffsetDateTime) -> String {
                 "just now".to_string()
             } else if secs < 3600 {
                 let mins = secs / 60;
-                if mins == 1 { "1 min ago".to_string() } else { format!("{mins} mins ago") }
+                if mins == 1 {
+                    "1 min ago".to_string()
+                } else {
+                    format!("{mins} mins ago")
+                }
             } else if secs < 86400 {
                 let hours = secs / 3600;
-                if hours == 1 { "1 hour ago".to_string() } else { format!("{hours} hours ago") }
+                if hours == 1 {
+                    "1 hour ago".to_string()
+                } else {
+                    format!("{hours} hours ago")
+                }
             } else {
                 let days = secs / 86400;
-                if days == 1 { "1 day ago".to_string() } else { format!("{days} days ago") }
+                if days == 1 {
+                    "1 day ago".to_string()
+                } else {
+                    format!("{days} days ago")
+                }
             }
         }
         Err(_) => "unknown time".to_string(),
@@ -2254,9 +2283,10 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
         token.clone()
     } else {
         // Auto-provision: use machine token to create agent on server
-        let machine_token = context.token.as_deref().ok_or(
-            "no machine token configured. Run 'lore setup <url>' first.",
-        )?;
+        let machine_token = context
+            .token
+            .as_deref()
+            .ok_or("no machine token configured. Run 'lore setup <url>' first.")?;
         let backend_str = args.backend.as_deref().unwrap_or("claude");
         eprintln!("Provisioning agent '{}'...", args.name);
         let resp = context
@@ -2364,29 +2394,41 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
 
     let cli_backend_override = args.backend.as_ref().and_then(|b| b.parse().ok());
 
-    eprintln!("[agent] Starting agent '{}' (backend: {})", args.name,
-        cli_backend_override.map(|b: AgentBackend| b.to_string()).as_deref().unwrap_or("server config"));
+    eprintln!(
+        "[agent] Starting agent '{}' (backend: {})",
+        args.name,
+        cli_backend_override
+            .map(|b: AgentBackend| b.to_string())
+            .as_deref()
+            .unwrap_or("server config")
+    );
 
     // Main agent loop: poll for messages, process them
-    AGENT_CWD.scope(folder, async move {
-        let mut consecutive_errors: u32 = 0;
-        loop {
-            match agent_poll_and_process(&agent_context, &args.name, cli_backend_override).await {
-                Ok(AgentPollAction::Continue) => { consecutive_errors = 0; }
-                Ok(AgentPollAction::Stop | AgentPollAction::UpdateAvailable) => break,
-                Ok(AgentPollAction::Restart) => {
-                    eprintln!("[agent] Restarting...");
-                    break;
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    let delay = std::cmp::min(5 * (1u64 << consecutive_errors.saturating_sub(1)), 60);
-                    eprintln!("[agent] Error (#{consecutive_errors}, retry in {delay}s): {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+    AGENT_CWD
+        .scope(folder, async move {
+            let mut consecutive_errors: u32 = 0;
+            loop {
+                match agent_poll_and_process(&agent_context, &args.name, cli_backend_override).await
+                {
+                    Ok(AgentPollAction::Continue) => {
+                        consecutive_errors = 0;
+                    }
+                    Ok(AgentPollAction::Stop | AgentPollAction::UpdateAvailable) => break,
+                    Ok(AgentPollAction::Restart) => {
+                        eprintln!("[agent] Restarting...");
+                        break;
+                    }
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        let delay =
+                            std::cmp::min(5 * (1u64 << consecutive_errors.saturating_sub(1)), 60);
+                        eprintln!("[agent] Error (#{consecutive_errors}, retry in {delay}s): {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    }
                 }
             }
-        }
-    }).await;
+        })
+        .await;
     Ok(())
 }
 
@@ -2404,7 +2446,11 @@ enum AgentPollAction {
     UpdateAvailable,
 }
 
-async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_backend_override: Option<AgentBackend>) -> CliResult<AgentPollAction> {
+async fn agent_poll_and_process(
+    context: &CliContext,
+    agent_name: &str,
+    cli_backend_override: Option<AgentBackend>,
+) -> CliResult<AgentPollAction> {
     let token = context.token.as_deref().ok_or("no token configured")?;
 
     // Long-poll for messages
@@ -2426,9 +2472,9 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         });
     // Read machine name once (blocking file read, but off the async thread)
     let machine_name = {
-        let mn = tokio::task::spawn_blocking(|| {
-            load_cli_config().ok().and_then(|c| c.machine_name)
-        }).await;
+        let mn =
+            tokio::task::spawn_blocking(|| load_cli_config().ok().and_then(|c| c.machine_name))
+                .await;
         mn.ok().flatten()
     };
     let mut req = context
@@ -2443,10 +2489,7 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     if let Some(ref branch) = git_branch {
         req = req.header("x-lore-git-branch", branch);
     }
-    let resp = req
-        .timeout(std::time::Duration::from_secs(35))
-        .send()
-        .await;
+    let resp = req.timeout(std::time::Duration::from_secs(35)).send().await;
 
     let resp = match resp {
         Ok(r) => r,
@@ -2456,7 +2499,10 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
 
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(format!("server rejected agent token ({status}) — agent may need re-provisioning").into());
+        return Err(format!(
+            "server rejected agent token ({status}) — agent may need re-provisioning"
+        )
+        .into());
     }
     let body: serde_json::Value = resp.error_for_status()?.json().await?;
 
@@ -2490,7 +2536,11 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
             let trimmed = content.trim();
             if trimmed == "/compact" {
                 eprintln!("[agent] Received /compact command");
-                let cb = if has_endpoint { AgentBackend::OpenAi } else { backend };
+                let cb = if has_endpoint {
+                    AgentBackend::OpenAi
+                } else {
+                    backend
+                };
                 do_compact(context, agent_name, true, cb).await?;
                 return Ok(AgentPollAction::Continue);
             } else if trimmed == "/stop" {
@@ -2511,16 +2561,30 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         return Ok(AgentPollAction::Continue);
     }
 
-    eprintln!("[agent] Received message: {}...", &combined.chars().take(80).collect::<String>());
+    eprintln!(
+        "[agent] Received message: {}...",
+        &combined.chars().take(80).collect::<String>()
+    );
 
     // Log user message to .lore chat log
     {
         let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
         let ts = time::OffsetDateTime::now_utc();
-        let timestamp = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            ts.year(), ts.month() as u8, ts.day(), ts.hour(), ts.minute(), ts.second());
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(lore_dir.join("lore.log")) {
+        let timestamp = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            ts.year(),
+            ts.month() as u8,
+            ts.day(),
+            ts.hour(),
+            ts.minute(),
+            ts.second()
+        );
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(lore_dir.join("lore.log"))
+        {
             use std::io::Write;
             let _ = write!(f, "[{timestamp}] USER:\n{combined}\n\n");
         }
@@ -2548,19 +2612,25 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
             Ok(resp) => resp.json().await.unwrap_or(serde_json::Value::Null),
             Err(e) => {
                 let err_msg = format!("[Agent error: failed to fetch history: {e}]");
-                let _ = context.client.post(format!("{}/v1/chat/respond", context.url))
+                let _ = context
+                    .client
+                    .post(format!("{}/v1/chat/respond", context.url))
                     .header("x-lore-key", token)
                     .json(&serde_json::json!({ "text": err_msg, "done": true }))
-                    .send().await;
+                    .send()
+                    .await;
                 return Ok(AgentPollAction::Continue);
             }
         },
         Err(e) => {
             let err_msg = format!("[Agent error: failed to fetch history: {e}]");
-            let _ = context.client.post(format!("{}/v1/chat/respond", context.url))
+            let _ = context
+                .client
+                .post(format!("{}/v1/chat/respond", context.url))
                 .header("x-lore-key", token)
                 .json(&serde_json::json!({ "text": err_msg, "done": true }))
-                .send().await;
+                .send()
+                .await;
             return Ok(AgentPollAction::Continue);
         }
     };
@@ -2603,7 +2673,10 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     };
     prompt_parts.push(format!(
         "Current date and time: {weekday}, {month} {}, {} at {:02}:{:02} UTC",
-        now.day(), now.year(), now.hour(), now.minute()
+        now.day(),
+        now.year(),
+        now.hour(),
+        now.minute()
     ));
 
     // Git repository context (gathered locally from the agent's working directory)
@@ -2621,11 +2694,15 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         .filter(|o| o.status.success())
         .and_then(|o| {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            std::path::Path::new(&s).file_name().map(|n| n.to_string_lossy().into_owned())
+            std::path::Path::new(&s)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
         });
     if let Some(ref repo) = repo_name {
         let branch_display = git_branch.as_deref().unwrap_or("unknown");
-        git_section.push_str(&format!("## Git Repository\n\n{repo}/ (branch: {branch_display})\n"));
+        git_section.push_str(&format!(
+            "## Git Repository\n\n{repo}/ (branch: {branch_display})\n"
+        ));
 
         // Last commit
         if let Some(last_commit) = tokio::process::Command::new("git")
@@ -2741,11 +2818,23 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
         eprintln!("[agent] Using API endpoint mode");
         let model_override = history["model"].as_str().map(|s| s.to_string());
         let endpoint_id = body["endpoint_id"].as_str().map(|s| s.to_string());
-        run_api_agent_turn(context, agent_name, &user_context, project_context, accessible_projects, recent_activity, model_override.as_deref(), endpoint_id.as_deref()).await?
+        run_api_agent_turn(
+            context,
+            agent_name,
+            &user_context,
+            project_context,
+            accessible_projects,
+            recent_activity,
+            model_override.as_deref(),
+            endpoint_id.as_deref(),
+        )
+        .await?
     } else {
         // CLI mode: spawn backend process — prepend system instructions to user context
         let system_instructions = build_lore_system_instructions(
-            project_context, accessible_projects, recent_activity,
+            project_context,
+            accessible_projects,
+            recent_activity,
             &build_cli_tool_section(),
         );
         let full_prompt = format!("{system_instructions}\n\n---\n\n{user_context}");
@@ -2758,7 +2847,15 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
 
         let model_override = history["model"].as_str().map(|s| s.to_string());
         let effort_override = history["effort"].as_str().map(|s| s.to_string());
-        let mut child = match spawn_backend(backend, &full_prompt, model_override.as_deref(), effort_override.as_deref(), context.token.as_deref()).await {
+        let mut child = match spawn_backend(
+            backend,
+            &full_prompt,
+            model_override.as_deref(),
+            effort_override.as_deref(),
+            context.token.as_deref(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 let rec = AgentErrorRecord::new("cli", format!("spawn {} failed: {e}", backend));
@@ -2774,7 +2871,9 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
 
         while let Some(line) = lines.next_line().await? {
             let line = line.trim().to_string();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let parsed: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -2783,18 +2882,22 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
                 match event {
                     BackendEvent::Text(text) => {
                         response.push_str(&text);
-                        let _ = context.client
+                        let _ = context
+                            .client
                             .post(format!("{}/v1/chat/respond", context.url))
                             .header("x-lore-key", token)
                             .json(&serde_json::json!({ "text": text }))
-                            .send().await;
+                            .send()
+                            .await;
                     }
                     BackendEvent::ToolUse(detail) => {
-                        let _ = context.client
+                        let _ = context
+                            .client
                             .post(format!("{}/v1/chat/respond", context.url))
                             .header("x-lore-key", token)
                             .json(&serde_json::json!({ "tool_use": detail }))
-                            .send().await;
+                            .send()
+                            .await;
                     }
                     BackendEvent::Result(text) => {
                         if response.is_empty() && !text.is_empty() {
@@ -2827,16 +2930,31 @@ async fn agent_poll_and_process(context: &CliContext, agent_name: &str, cli_back
     {
         let lore_dir = agent_lore_dir(agent_name);
         let ts = time::OffsetDateTime::now_utc();
-        let timestamp = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            ts.year(), ts.month() as u8, ts.day(), ts.hour(), ts.minute(), ts.second());
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(lore_dir.join("lore.log")) {
+        let timestamp = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            ts.year(),
+            ts.month() as u8,
+            ts.day(),
+            ts.hour(),
+            ts.minute(),
+            ts.second()
+        );
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(lore_dir.join("lore.log"))
+        {
             use std::io::Write;
             let _ = write!(f, "[{timestamp}] AGENT:\n{full_response}\n\n");
         }
     }
 
     // Check if compaction is needed
-    let compact_backend = if has_endpoint { AgentBackend::OpenAi } else { backend };
+    let compact_backend = if has_endpoint {
+        AgentBackend::OpenAi
+    } else {
+        backend
+    };
     if let Err(e) = maybe_auto_compact(context, agent_name, compact_backend).await {
         eprintln!("[agent] Compaction error: {e}");
     }
@@ -2932,9 +3050,20 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
         let ts = time::OffsetDateTime::now_utc();
-        let timestamp = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            ts.year(), ts.month() as u8, ts.day(), ts.hour(), ts.minute(), ts.second());
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(lore_dir.join("lore.log")) {
+        let timestamp = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            ts.year(),
+            ts.month() as u8,
+            ts.day(),
+            ts.hour(),
+            ts.minute(),
+            ts.second()
+        );
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(lore_dir.join("lore.log"))
+        {
             use std::io::Write;
             let _ = write!(f, "[{timestamp}] MANAGER:\n{display}\n\n");
         }
@@ -2975,7 +3104,9 @@ async fn run_manager_cli(
         let _ = fs::write(lore_dir.join("manager_context.txt"), &full_prompt);
     }
 
-    let mut child = match spawn_backend(backend, &full_prompt, None, None, context.token.as_deref()).await {
+    let mut child = match spawn_backend(backend, &full_prompt, None, None, context.token.as_deref())
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             let rec = AgentErrorRecord::new("manager", format!("spawn {} failed: {e}", backend));
@@ -2992,7 +3123,9 @@ async fn run_manager_cli(
     let read_output = async {
         while let Some(line) = lines.next_line().await? {
             let line = line.trim().to_string();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let parsed: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -3022,7 +3155,8 @@ async fn run_manager_cli(
         Err(_) => {
             eprintln!("[manager] CLI timed out after 5 minutes, killing process");
             let _ = child.kill().await;
-            let rec = AgentErrorRecord::new("manager", format!("{} cli timed out after 300s", backend));
+            let rec =
+                AgentErrorRecord::new("manager", format!("{} cli timed out after 300s", backend));
             record_agent_error(context, agent_name, rec).await;
             if full_response.is_empty() {
                 full_response = "[Manager timed out after 5 minutes]".to_string();
@@ -3041,9 +3175,7 @@ async fn run_manager_endpoint(
 ) -> CliResult<String> {
     let token = context.token.as_deref().ok_or("no token configured")?;
 
-    let mut api_messages = vec![
-        serde_json::json!({ "role": "system", "content": system_prompt }),
-    ];
+    let mut api_messages = vec![serde_json::json!({ "role": "system", "content": system_prompt })];
     if let Some(msgs) = messages {
         for msg in msgs {
             api_messages.push(serde_json::json!({
@@ -3060,7 +3192,8 @@ async fn run_manager_endpoint(
         "max_tokens": 2048,
     });
 
-    let resp = context.client
+    let resp = context
+        .client
         .post(format!("{}/v1/chat/manager/completions", context.url))
         .header("x-lore-key", token)
         .header("Content-Type", "application/json")
@@ -3073,13 +3206,15 @@ async fn run_manager_endpoint(
     let resp_body: serde_json::Value = resp.json().await?;
 
     if !status.is_success() {
-        let err = resp_body["error"]["message"].as_str()
+        let err = resp_body["error"]["message"]
+            .as_str()
             .or_else(|| resp_body["error"].as_str())
             .unwrap_or("unknown error");
         return Err(format!("Manager endpoint error ({}): {}", status, err).into());
     }
 
-    let text = resp_body["choices"].as_array()
+    let text = resp_body["choices"]
+        .as_array()
         .and_then(|c| c.first())
         .and_then(|c| c["message"]["content"].as_str())
         .unwrap_or("")
@@ -3209,8 +3344,8 @@ const ERROR_RETENTION_DAYS: i64 = 3;
 #[derive(Debug, Clone, Serialize)]
 struct AgentErrorRecord {
     ts: String,
-    category: String,          // llm_api | cli | tool | parse | manager
-    detail: String,            // short human-readable message
+    category: String, // llm_api | cli | tool | parse | manager
+    detail: String,   // short human-readable message
     endpoint_id: Option<String>,
     status_code: Option<u16>,
     duration_ms: Option<u64>,
@@ -3223,8 +3358,12 @@ impl AgentErrorRecord {
         let now = time::OffsetDateTime::now_utc();
         let ts = format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            now.year(), now.month() as u8, now.day(),
-            now.hour(), now.minute(), now.second()
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
         );
         Self {
             ts,
@@ -3237,8 +3376,14 @@ impl AgentErrorRecord {
             preview_response: None,
         }
     }
-    fn with_status(mut self, s: u16) -> Self { self.status_code = Some(s); self }
-    fn with_endpoint(mut self, e: Option<String>) -> Self { self.endpoint_id = e; self }
+    fn with_status(mut self, s: u16) -> Self {
+        self.status_code = Some(s);
+        self
+    }
+    fn with_endpoint(mut self, e: Option<String>) -> Self {
+        self.endpoint_id = e;
+        self
+    }
     fn with_preview_request(mut self, s: impl Into<String>) -> Self {
         self.preview_request = Some(truncate_preview(&s.into()));
         self
@@ -3269,25 +3414,47 @@ fn truncate_head_tail(s: &str, head: usize, tail: usize) -> String {
 
 fn today_utc_date() -> String {
     let now = time::OffsetDateTime::now_utc();
-    format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day())
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        now.month() as u8,
+        now.day()
+    )
 }
 
 fn prune_old_error_files(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     let today = time::OffsetDateTime::now_utc().date();
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        let Some(date_part) = name.strip_prefix("error-").and_then(|s| s.strip_suffix(".jsonl")) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(date_part) = name
+            .strip_prefix("error-")
+            .and_then(|s| s.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
         let parts: Vec<&str> = date_part.split('-').collect();
-        if parts.len() != 3 { continue; }
+        if parts.len() != 3 {
+            continue;
+        }
         let (Ok(y), Ok(m), Ok(d)) = (
             parts[0].parse::<i32>(),
             parts[1].parse::<u8>(),
             parts[2].parse::<u8>(),
-        ) else { continue };
-        let Some(month) = time::Month::try_from(m).ok() else { continue };
-        let Ok(file_date) = time::Date::from_calendar_date(y, month, d) else { continue };
+        ) else {
+            continue;
+        };
+        let Some(month) = time::Month::try_from(m).ok() else {
+            continue;
+        };
+        let Ok(file_date) = time::Date::from_calendar_date(y, month, d) else {
+            continue;
+        };
         if (today - file_date).whole_days() > ERROR_RETENTION_DAYS {
             let _ = fs::remove_file(&path);
         }
@@ -3298,17 +3465,27 @@ async fn write_agent_error_locally(agent_name: &str, record: &AgentErrorRecord) 
     let dir = agent_lore_dir(agent_name);
     let record = record.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        if fs::create_dir_all(&dir).is_err() { return; }
+        if fs::create_dir_all(&dir).is_err() {
+            return;
+        }
         prune_old_error_files(&dir);
         let path = dir.join(format!("error-{}.jsonl", today_utc_date()));
         if let Ok(meta) = fs::metadata(&path) {
-            if meta.len() >= ERROR_FILE_MAX_BYTES { return; }
+            if meta.len() >= ERROR_FILE_MAX_BYTES {
+                return;
+            }
         }
-        let Ok(mut line) = serde_json::to_string(&record) else { return };
+        let Ok(mut line) = serde_json::to_string(&record) else {
+            return;
+        };
         if line.len() > ERROR_ENTRY_MAX_BYTES {
             let mut trimmed = record.clone();
-            trimmed.preview_response = trimmed.preview_response.map(|s| truncate_head_tail(&s, 350, 150));
-            trimmed.preview_request = trimmed.preview_request.map(|s| truncate_head_tail(&s, 350, 150));
+            trimmed.preview_response = trimmed
+                .preview_response
+                .map(|s| truncate_head_tail(&s, 350, 150));
+            trimmed.preview_request = trimmed
+                .preview_request
+                .map(|s| truncate_head_tail(&s, 350, 150));
             line = serde_json::to_string(&trimmed).unwrap_or(line);
             if line.len() > ERROR_ENTRY_MAX_BYTES {
                 trimmed.preview_response = None;
@@ -3320,15 +3497,19 @@ async fn write_agent_error_locally(agent_name: &str, record: &AgentErrorRecord) 
             use std::io::Write;
             let _ = writeln!(f, "{line}");
         }
-    }).await;
+    })
+    .await;
 }
 
 async fn report_agent_error_to_server(context: &CliContext, record: &AgentErrorRecord) {
-    let Some(token) = context.token.as_deref() else { return };
+    let Some(token) = context.token.as_deref() else {
+        return;
+    };
     let url = format!("{}/v1/chat/errors/report", context.url);
     let body = serde_json::to_value(record).unwrap_or(serde_json::json!({}));
     let send = || async {
-        context.client
+        context
+            .client
             .post(&url)
             .header("x-lore-key", token)
             .timeout(std::time::Duration::from_secs(5))
@@ -3376,20 +3557,25 @@ async fn run_api_agent_turn(
     for t in &lore_tool_names {
         tools.push(t.clone());
     }
-    let lore_names: std::collections::HashSet<String> = lore_tool_names.iter()
+    let lore_names: std::collections::HashSet<String> = lore_tool_names
+        .iter()
         .filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string()))
         .collect();
     let lore_name_list: Vec<String> = lore_names.iter().cloned().collect();
 
     let system_content = build_lore_system_instructions(
-        project_context, accessible_projects, recent_activity,
+        project_context,
+        accessible_projects,
+        recent_activity,
         &build_api_tool_section(&lore_name_list),
     );
 
     {
         let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
-        let prompt_dump = format!("=== SYSTEM PROMPT ===\n{system_content}\n\n=== USER CONTEXT ===\n{user_context}");
+        let prompt_dump = format!(
+            "=== SYSTEM PROMPT ===\n{system_content}\n\n=== USER CONTEXT ===\n{user_context}"
+        );
         let _ = fs::write(lore_dir.join("prompt.txt"), &prompt_dump);
     }
 
@@ -3421,7 +3607,8 @@ async fn run_api_agent_turn(
             body["model"] = serde_json::json!(m);
         }
 
-        let resp = context.client
+        let resp = context
+            .client
             .post(format!("{}/v1/chat/completions", context.url))
             .header("x-lore-key", token)
             .timeout(std::time::Duration::from_secs(120))
@@ -3430,7 +3617,10 @@ async fn run_api_agent_turn(
             .await;
 
         let resp = match resp {
-            Ok(r) => { timeout_retries = 0; r }
+            Ok(r) => {
+                timeout_retries = 0;
+                r
+            }
             Err(e) => {
                 if e.is_timeout() && timeout_retries < API_AGENT_MAX_RETRIES {
                     timeout_retries += 1;
@@ -3453,12 +3643,20 @@ async fn run_api_agent_turn(
 
         let status = resp.status();
         let resp_text = resp.text().await.unwrap_or_default();
-        let resp_body: serde_json::Value = serde_json::from_str(&resp_text).unwrap_or(serde_json::Value::Null);
+        let resp_body: serde_json::Value =
+            serde_json::from_str(&resp_text).unwrap_or(serde_json::Value::Null);
 
         if !status.is_success() {
-            let err = resp_body["error"]["message"].as_str()
+            let err = resp_body["error"]["message"]
+                .as_str()
                 .or_else(|| resp_body["error"].as_str())
-                .unwrap_or_else(|| if resp_text.is_empty() { "unknown error" } else { resp_text.as_str() });
+                .unwrap_or_else(|| {
+                    if resp_text.is_empty() {
+                        "unknown error"
+                    } else {
+                        resp_text.as_str()
+                    }
+                });
 
             if status.as_u16() == 429 && !rate_limit_retried {
                 rate_limit_retried = true;
@@ -3467,15 +3665,21 @@ async fn run_api_agent_turn(
                     .header("x-lore-key", token)
                     .json(&serde_json::json!({ "tool_use": format!("\u{23f3} Rate limited, retrying in {API_AGENT_RATE_LIMIT_WAIT_SECS}s...") }))
                     .send().await;
-                tokio::time::sleep(std::time::Duration::from_secs(API_AGENT_RATE_LIMIT_WAIT_SECS)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    API_AGENT_RATE_LIMIT_WAIT_SECS,
+                ))
+                .await;
                 continue;
             }
 
             if status.as_u16() == 400 {
-                let has_untrimmed = messages.iter().any(|m|
-                    m["role"].as_str() == Some("tool") &&
-                    m["content"].as_str().map(|s| s != API_AGENT_TRIMMED_STUB).unwrap_or(false)
-                );
+                let has_untrimmed = messages.iter().any(|m| {
+                    m["role"].as_str() == Some("tool")
+                        && m["content"]
+                            .as_str()
+                            .map(|s| s != API_AGENT_TRIMMED_STUB)
+                            .unwrap_or(false)
+                });
                 if has_untrimmed {
                     aggressive_trim_api_context(&mut messages);
                     let _ = context.client
@@ -3502,17 +3706,24 @@ async fn run_api_agent_turn(
 
         let choice = resp_body["choices"].as_array().and_then(|c| c.first());
         let message = choice.and_then(|c| c.get("message"));
-        let content = message.and_then(|m| m["content"].as_str()).unwrap_or("").to_string();
-        let finish_reason = choice.and_then(|c| c["finish_reason"].as_str()).unwrap_or("");
+        let content = message
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let finish_reason = choice
+            .and_then(|c| c["finish_reason"].as_str())
+            .unwrap_or("");
         let tool_calls = message.and_then(|m| m["tool_calls"].as_array()).cloned();
 
         if !content.is_empty() {
             accumulated_text.push_str(&content);
-            let _ = context.client
+            let _ = context
+                .client
                 .post(format!("{}/v1/chat/respond", context.url))
                 .header("x-lore-key", token)
                 .json(&serde_json::json!({ "text": &content }))
-                .send().await;
+                .send()
+                .await;
         }
 
         if let Some(ref tcs) = tool_calls {
@@ -3529,16 +3740,20 @@ async fn run_api_agent_turn(
                     let tool_name = func.and_then(|f| f["name"].as_str()).unwrap_or("");
                     let raw_args = func.and_then(|f| f["arguments"].as_str()).unwrap_or("{}");
 
-                    let (tool_args, parse_error) = match serde_json::from_str::<serde_json::Value>(raw_args) {
-                        Ok(v) => (v, false),
-                        Err(e) => {
-                            let rec = AgentErrorRecord::new("parse", format!("tool arg JSON parse failed: {e}"))
+                    let (tool_args, parse_error) =
+                        match serde_json::from_str::<serde_json::Value>(raw_args) {
+                            Ok(v) => (v, false),
+                            Err(e) => {
+                                let rec = AgentErrorRecord::new(
+                                    "parse",
+                                    format!("tool arg JSON parse failed: {e}"),
+                                )
                                 .with_endpoint(endpoint_id_owned.clone())
                                 .with_preview_request(format!("tool={tool_name} args={raw_args}"));
-                            record_agent_error(context, agent_name, rec).await;
-                            (serde_json::json!({}), true)
-                        }
-                    };
+                                record_agent_error(context, agent_name, rec).await;
+                                (serde_json::json!({}), true)
+                            }
+                        };
 
                     let is_lore_tool = lore_names.contains(tool_name);
                     let display = if is_lore_tool {
@@ -3546,11 +3761,13 @@ async fn run_api_agent_turn(
                     } else {
                         format_local_tool_display(tool_name, &tool_args)
                     };
-                    let _ = context.client
+                    let _ = context
+                        .client
                         .post(format!("{}/v1/chat/respond", context.url))
                         .header("x-lore-key", token)
                         .json(&serde_json::json!({ "tool_use": display }))
-                        .send().await;
+                        .send()
+                        .await;
 
                     let result_text = if parse_error {
                         "Error: Failed to parse tool arguments (malformed JSON). Retry with valid JSON.".to_string()
@@ -3589,7 +3806,8 @@ async fn run_api_agent_turn(
             continue;
         }
         if finish_reason == "length" && !content.is_empty() {
-            accumulated_text.push_str("\n\n\u{26a0}\u{fe0f} Response was truncated (hit output token limit).");
+            accumulated_text
+                .push_str("\n\n\u{26a0}\u{fe0f} Response was truncated (hit output token limit).");
         }
 
         break;
@@ -3603,11 +3821,19 @@ async fn run_api_agent_turn(
     {
         let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
-        let debug: String = messages.iter().map(|m| {
-            let role = m["role"].as_str().unwrap_or("?");
-            let content = m["content"].as_str().unwrap_or("").chars().take(200).collect::<String>();
-            format!("[{role}] {content}\n")
-        }).collect();
+        let debug: String = messages
+            .iter()
+            .map(|m| {
+                let role = m["role"].as_str().unwrap_or("?");
+                let content = m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                format!("[{role}] {content}\n")
+            })
+            .collect();
         let _ = fs::write(lore_dir.join("api_context.txt"), &debug);
     }
 
@@ -3615,10 +3841,13 @@ async fn run_api_agent_turn(
 }
 
 fn trim_api_context(messages: &mut Vec<serde_json::Value>) {
-    let size: usize = messages.iter().map(|m| {
-        serde_json::to_string(m).map(|s| s.len()).unwrap_or(0)
-    }).sum();
-    if size <= API_AGENT_MAX_CONTEXT_CHARS { return; }
+    let size: usize = messages
+        .iter()
+        .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
+        .sum();
+    if size <= API_AGENT_MAX_CONTEXT_CHARS {
+        return;
+    }
 
     for m in messages.iter_mut() {
         let role = m["role"].as_str().unwrap_or("");
@@ -3632,7 +3861,8 @@ fn trim_api_context(messages: &mut Vec<serde_json::Value>) {
             if let Some(s) = m["content"].as_str() {
                 if s.len() > 2000 {
                     let preview: String = s.chars().take(500).collect();
-                    m["content"] = serde_json::json!(format!("{preview}\n[Earlier analysis trimmed]"));
+                    m["content"] =
+                        serde_json::json!(format!("{preview}\n[Earlier analysis trimmed]"));
                 }
             }
         }
@@ -3657,15 +3887,20 @@ fn truncate_local_tool_result(text: &str) -> String {
     if lines.len() <= 1000 && text.len() <= 100_000 {
         return text.to_string();
     }
-    let shown = if lines.len() > 1000 { 1000 } else { lines.len() };
+    let shown = if lines.len() > 1000 {
+        1000
+    } else {
+        lines.len()
+    };
     let truncated: String = lines[..shown].join("\n");
-    format!("{truncated}\n\n[Output truncated \u{2014} {shown} of {} lines shown]", lines.len())
+    format!(
+        "{truncated}\n\n[Output truncated \u{2014} {shown} of {} lines shown]",
+        lines.len()
+    )
 }
 
 fn format_local_tool_display(name: &str, args: &serde_json::Value) -> String {
-    let get_str = |key: &str| -> &str {
-        args.get(key).and_then(|v| v.as_str()).unwrap_or("")
-    };
+    let get_str = |key: &str| -> &str { args.get(key).and_then(|v| v.as_str()).unwrap_or("") };
     match name {
         "read_file" => format!("Read {}", short_path(get_str("path"))),
         "write_file" => format!("Write {}", short_path(get_str("path"))),
@@ -3677,7 +3912,11 @@ fn format_local_tool_display(name: &str, args: &serde_json::Value) -> String {
         }
         "grep" => {
             let pattern = get_str("pattern");
-            let path = if get_str("path").is_empty() { "." } else { get_str("path") };
+            let path = if get_str("path").is_empty() {
+                "."
+            } else {
+                get_str("path")
+            };
             format!("Grep \"{pattern}\" in {}", short_path(path))
         }
         "glob" => format!("Glob {}", get_str("pattern")),
@@ -3691,7 +3930,8 @@ async fn fetch_lore_tools(context: &CliContext) -> Vec<serde_json::Value> {
         Some(t) => t,
         None => return vec![],
     };
-    let resp = context.client
+    let resp = context
+        .client
         .get(format!("{}/v1/chat/lore-tools", context.url))
         .header("x-lore-key", token)
         .timeout(std::time::Duration::from_secs(10))
@@ -3714,7 +3954,8 @@ async fn execute_lore_tool(context: &CliContext, name: &str, args: &serde_json::
         Some(t) => t,
         None => return "Error: no token configured".to_string(),
     };
-    let resp = context.client
+    let resp = context
+        .client
         .post(format!("{}/v1/chat/lore-tools", context.url))
         .header("x-lore-key", token)
         .timeout(std::time::Duration::from_secs(30))
@@ -3724,7 +3965,10 @@ async fn execute_lore_tool(context: &CliContext, name: &str, args: &serde_json::
     match resp {
         Ok(r) => {
             if let Ok(body) = r.json::<serde_json::Value>().await {
-                body["result"].as_str().unwrap_or("(empty result)").to_string()
+                body["result"]
+                    .as_str()
+                    .unwrap_or("(empty result)")
+                    .to_string()
             } else {
                 "Error: failed to parse server response".to_string()
             }
@@ -3734,9 +3978,7 @@ async fn execute_lore_tool(context: &CliContext, name: &str, args: &serde_json::
 }
 
 fn format_lore_tool_display(name: &str, args: &serde_json::Value) -> String {
-    let get_str = |key: &str| -> &str {
-        args.get(key).and_then(|v| v.as_str()).unwrap_or("")
-    };
+    let get_str = |key: &str| -> &str { args.get(key).and_then(|v| v.as_str()).unwrap_or("") };
     let short_id = |key: &str| -> String {
         let id = get_str(key);
         if id.starts_with('_') {
@@ -3752,7 +3994,10 @@ fn format_lore_tool_display(name: &str, args: &serde_json::Value) -> String {
         "list_documents" => format!("\u{1f4c1} list_documents {}", get_str("project")),
         "create_document" => format!("\u{1f4c4} create_document \"{}\"", get_str("name")),
         "rename_document" => format!("\u{1f4c4} rename_document \"{}\"", get_str("name")),
-        "delete_document" => format!("\u{1f5d1}\u{fe0f} delete_document {}", short_id("document_id")),
+        "delete_document" => format!(
+            "\u{1f5d1}\u{fe0f} delete_document {}",
+            short_id("document_id")
+        ),
         "list_blocks" => format!("\u{1f4cb} list_blocks {}", short_id("document_id")),
         "read_block" => format!("\u{1f4d6} read_block {}", short_id("block_id")),
         "update_block" => format!("\u{270f}\u{fe0f} update_block {}", short_id("block_id")),
@@ -3898,27 +4143,38 @@ async fn execute_read_file(args: &serde_json::Value) -> String {
     let limit = args["limit"].as_u64().map(|l| l as usize);
 
     // Run blocking file read off the async runtime
-    tokio::task::spawn_blocking(move || {
-        match fs::read_to_string(&resolved) {
-            Ok(content) => {
-                let lines: Vec<&str> = content.lines().collect();
-                let start = if offset > 0 { offset.saturating_sub(1) } else { 0 };
-                let end = match limit {
-                    Some(l) => (start + l).min(lines.len()),
-                    None => lines.len(),
-                };
-                if start >= lines.len() {
-                    return format!("Error: offset {offset} beyond end of file ({} lines)", lines.len());
-                }
-                let mut result = String::new();
-                for (i, line) in lines[start..end].iter().enumerate() {
-                    result.push_str(&format!("{:>6}\t{}\n", start + i + 1, line));
-                }
-                if result.is_empty() { "(empty file)".to_string() } else { result }
+    tokio::task::spawn_blocking(move || match fs::read_to_string(&resolved) {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = if offset > 0 {
+                offset.saturating_sub(1)
+            } else {
+                0
+            };
+            let end = match limit {
+                Some(l) => (start + l).min(lines.len()),
+                None => lines.len(),
+            };
+            if start >= lines.len() {
+                return format!(
+                    "Error: offset {offset} beyond end of file ({} lines)",
+                    lines.len()
+                );
             }
-            Err(e) => format!("Error reading {}: {e}", path),
+            let mut result = String::new();
+            for (i, line) in lines[start..end].iter().enumerate() {
+                result.push_str(&format!("{:>6}\t{}\n", start + i + 1, line));
+            }
+            if result.is_empty() {
+                "(empty file)".to_string()
+            } else {
+                result
+            }
         }
-    }).await.unwrap_or_else(|e| format!("Error: task failed: {e}"))
+        Err(e) => format!("Error reading {}: {e}", path),
+    })
+    .await
+    .unwrap_or_else(|e| format!("Error: task failed: {e}"))
 }
 
 async fn execute_write_file(args: &serde_json::Value) -> String {
@@ -3936,7 +4192,9 @@ async fn execute_write_file(args: &serde_json::Value) -> String {
             Ok(()) => format!("Wrote {} bytes to {}", content.len(), path),
             Err(e) => format!("Error writing {}: {e}", path),
         }
-    }).await.unwrap_or_else(|e| format!("Error: task failed: {e}"))
+    })
+    .await
+    .unwrap_or_else(|e| format!("Error: task failed: {e}"))
 }
 
 async fn execute_edit_file(args: &serde_json::Value) -> String {
@@ -3982,21 +4240,32 @@ async fn execute_bash(args: &serde_json::Value) -> String {
             .current_dir(&agent_cwd())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .output()
-    ).await;
+            .output(),
+    )
+    .await;
     match result {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let exit_code = output.status.code().unwrap_or(-1);
             let mut r = String::new();
-            if !stdout.is_empty() { r.push_str(&stdout); }
+            if !stdout.is_empty() {
+                r.push_str(&stdout);
+            }
             if !stderr.is_empty() {
-                if !r.is_empty() { r.push('\n'); }
+                if !r.is_empty() {
+                    r.push('\n');
+                }
                 r.push_str(&format!("(stderr) {stderr}"));
             }
-            if exit_code != 0 { r.push_str(&format!("\n(exit code: {exit_code})")); }
-            if r.is_empty() { format!("(no output, exit code: {exit_code})") } else { r }
+            if exit_code != 0 {
+                r.push_str(&format!("\n(exit code: {exit_code})"));
+            }
+            if r.is_empty() {
+                format!("(no output, exit code: {exit_code})")
+            } else {
+                r
+            }
         }
         Ok(Err(e)) => format!("Error running command: {e}"),
         Err(_) => "Error: command timed out after 120 seconds".to_string(),
@@ -4013,14 +4282,21 @@ async fn execute_grep(args: &serde_json::Value) -> String {
     let include = args["include"].as_str();
     let mut cmd = tokio::process::Command::new("grep");
     cmd.args(["-rn", "--color=never"]);
-    if let Some(inc) = include { cmd.args(["--include", inc]); }
+    if let Some(inc) = include {
+        cmd.args(["--include", inc]);
+    }
     cmd.arg("--").arg(pattern).arg(&resolved);
     cmd.current_dir(&agent_cwd());
-    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.is_empty() { "No matches found".to_string() } else { stdout.to_string() }
+            if stdout.is_empty() {
+                "No matches found".to_string()
+            } else {
+                stdout.to_string()
+            }
         }
         Ok(Err(e)) => format!("Error: {e}"),
         Err(_) => "Error: grep timed out".to_string(),
@@ -4037,11 +4313,16 @@ async fn execute_glob(args: &serde_json::Value) -> String {
     let mut cmd = tokio::process::Command::new("find");
     cmd.arg(&resolved).args(["-name", pattern, "-type", "f"]);
     cmd.current_dir(&agent_cwd());
-    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     match tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.is_empty() { "No files found".to_string() } else { stdout.to_string() }
+            if stdout.is_empty() {
+                "No files found".to_string()
+            } else {
+                stdout.to_string()
+            }
         }
         Ok(Err(e)) => format!("Error: {e}"),
         Err(_) => "Error: glob search timed out".to_string(),
@@ -4051,21 +4332,25 @@ async fn execute_glob(args: &serde_json::Value) -> String {
 async fn execute_list_directory(args: &serde_json::Value) -> String {
     let path = args["path"].as_str().unwrap_or(".").to_string();
     let resolved = resolve_agent_path(&path);
-    tokio::task::spawn_blocking(move || {
-        match fs::read_dir(&resolved) {
-            Ok(entries) => {
-                let mut items: Vec<String> = Vec::new();
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    items.push(if is_dir { format!("{name}/") } else { name });
-                }
-                items.sort();
-                if items.is_empty() { "(empty directory)".to_string() } else { items.join("\n") }
+    tokio::task::spawn_blocking(move || match fs::read_dir(&resolved) {
+        Ok(entries) => {
+            let mut items: Vec<String> = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                items.push(if is_dir { format!("{name}/") } else { name });
             }
-            Err(e) => format!("Error listing {}: {e}", path),
+            items.sort();
+            if items.is_empty() {
+                "(empty directory)".to_string()
+            } else {
+                items.join("\n")
+            }
         }
-    }).await.unwrap_or_else(|e| format!("Error: task failed: {e}"))
+        Err(e) => format!("Error listing {}: {e}", path),
+    })
+    .await
+    .unwrap_or_else(|e| format!("Error: task failed: {e}"))
 }
 
 // --- API-based compaction (for API agents without CLI) ---
@@ -4083,7 +4368,8 @@ async fn run_api_compaction(context: &CliContext, prompt: &str) -> CliResult<Str
         "temperature": 0.3,
     });
 
-    let resp = context.client
+    let resp = context
+        .client
         .post(format!("{}/v1/chat/completions", context.url))
         .header("x-lore-key", token)
         .timeout(std::time::Duration::from_secs(60))
@@ -4094,11 +4380,14 @@ async fn run_api_compaction(context: &CliContext, prompt: &str) -> CliResult<Str
     let status = resp.status();
     let resp_body: serde_json::Value = resp.json().await?;
     if !status.is_success() {
-        let err = resp_body["error"]["message"].as_str().unwrap_or("unknown error");
+        let err = resp_body["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown error");
         return Err(format!("Compaction error ({status}): {err}").into());
     }
 
-    let text = resp_body["choices"].as_array()
+    let text = resp_body["choices"]
+        .as_array()
         .and_then(|c| c.first())
         .and_then(|c| c["message"]["content"].as_str())
         .unwrap_or("")
@@ -4125,11 +4414,20 @@ Do NOT include:
 
 Keep it concise. A few dense paragraphs are better than an exhaustive log. If there is a current summary, integrate the new messages into it — update or replace outdated information rather than appending."#;
 
-async fn maybe_auto_compact(context: &CliContext, agent_name: &str, backend: AgentBackend) -> CliResult<()> {
+async fn maybe_auto_compact(
+    context: &CliContext,
+    agent_name: &str,
+    backend: AgentBackend,
+) -> CliResult<()> {
     do_compact(context, agent_name, false, backend).await
 }
 
-async fn do_compact(context: &CliContext, agent_name: &str, aggressive: bool, backend: AgentBackend) -> CliResult<()> {
+async fn do_compact(
+    context: &CliContext,
+    agent_name: &str,
+    aggressive: bool,
+    backend: AgentBackend,
+) -> CliResult<()> {
     let token = context.token.as_deref().ok_or("no token configured")?;
 
     // Get current history
@@ -4161,7 +4459,10 @@ async fn do_compact(context: &CliContext, agent_name: &str, aggressive: bool, ba
     } else {
         window_size.saturating_sub(7).max(1)
     };
-    let compact_count = msg_count.saturating_sub(target).max(1).min(msg_count.saturating_sub(1));
+    let compact_count = msg_count
+        .saturating_sub(target)
+        .max(1)
+        .min(msg_count.saturating_sub(1));
 
     let to_compact = &messages[..compact_count];
     let to_keep = &messages[compact_count..];
@@ -4175,7 +4476,9 @@ async fn do_compact(context: &CliContext, agent_name: &str, aggressive: bool, ba
     let current_summary = history["summary"].as_str().unwrap_or("");
     let mut input = String::new();
     if !current_summary.is_empty() {
-        input.push_str(&format!("<current_summary>\n{current_summary}\n</current_summary>\n\n"));
+        input.push_str(&format!(
+            "<current_summary>\n{current_summary}\n</current_summary>\n\n"
+        ));
     }
     input.push_str("<messages_to_compact>\n");
     for msg in to_compact {
@@ -4213,7 +4516,10 @@ async fn do_compact(context: &CliContext, agent_name: &str, aggressive: bool, ba
         .await?
         .error_for_status()?;
 
-    eprintln!("[agent] Compaction complete. {} messages remaining", to_keep.len());
+    eprintln!(
+        "[agent] Compaction complete. {} messages remaining",
+        to_keep.len()
+    );
     Ok(())
 }
 
@@ -4228,8 +4534,14 @@ enum BackendEvent {
 
 fn short_path(p: &str) -> String {
     let path = std::path::Path::new(p);
-    let file = path.file_name().map(|f| f.to_string_lossy()).unwrap_or_default();
-    let dir = path.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy());
+    let file = path
+        .file_name()
+        .map(|f| f.to_string_lossy())
+        .unwrap_or_default();
+    let dir = path
+        .parent()
+        .and_then(|d| d.file_name())
+        .map(|d| d.to_string_lossy());
     match dir {
         Some(d) if !d.is_empty() && d != "." => format!("{d}/{file}"),
         _ => file.to_string(),
@@ -4238,10 +4550,34 @@ fn short_path(p: &str) -> String {
 
 fn format_tool_use_claude(name: &str, input: &serde_json::Value) -> String {
     match name {
-        "Read" => format!("Read {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
-        "Edit" => format!("Edit {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
-        "Write" => format!("Write {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
-        "MultiEdit" => format!("MultiEdit {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
+        "Read" => format!(
+            "Read {}",
+            input["file_path"]
+                .as_str()
+                .map(short_path)
+                .unwrap_or_default()
+        ),
+        "Edit" => format!(
+            "Edit {}",
+            input["file_path"]
+                .as_str()
+                .map(short_path)
+                .unwrap_or_default()
+        ),
+        "Write" => format!(
+            "Write {}",
+            input["file_path"]
+                .as_str()
+                .map(short_path)
+                .unwrap_or_default()
+        ),
+        "MultiEdit" => format!(
+            "MultiEdit {}",
+            input["file_path"]
+                .as_str()
+                .map(short_path)
+                .unwrap_or_default()
+        ),
         "Bash" => {
             let cmd = input["command"].as_str().unwrap_or("");
             let truncated: String = cmd.chars().take(120).collect();
@@ -4249,7 +4585,10 @@ fn format_tool_use_claude(name: &str, input: &serde_json::Value) -> String {
         }
         "Grep" => {
             let pattern = input["pattern"].as_str().unwrap_or("");
-            let path = input["path"].as_str().map(|p| short_path(p)).unwrap_or_else(|| ".".to_string());
+            let path = input["path"]
+                .as_str()
+                .map(|p| short_path(p))
+                .unwrap_or_else(|| ".".to_string());
             format!("Grep \"{pattern}\" in {path}")
         }
         "Glob" => format!("Glob {}", input["pattern"].as_str().unwrap_or("")),
@@ -4265,7 +4604,10 @@ fn format_tool_use_claude(name: &str, input: &serde_json::Value) -> String {
         }
         "LSP" => {
             let op = input["operation"].as_str().unwrap_or("");
-            let file = input["filePath"].as_str().map(short_path).unwrap_or_default();
+            let file = input["filePath"]
+                .as_str()
+                .map(short_path)
+                .unwrap_or_default();
             format!("LSP {op} {file}")
         }
         _ => name.to_string(),
@@ -4274,9 +4616,27 @@ fn format_tool_use_claude(name: &str, input: &serde_json::Value) -> String {
 
 fn format_tool_use_gemini(name: &str, input: &serde_json::Value) -> String {
     match name {
-        "read_file" => format!("Read {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
-        "replace" => format!("Edit {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
-        "write_file" => format!("Write {}", input["file_path"].as_str().map(short_path).unwrap_or_default()),
+        "read_file" => format!(
+            "Read {}",
+            input["file_path"]
+                .as_str()
+                .map(short_path)
+                .unwrap_or_default()
+        ),
+        "replace" => format!(
+            "Edit {}",
+            input["file_path"]
+                .as_str()
+                .map(short_path)
+                .unwrap_or_default()
+        ),
+        "write_file" => format!(
+            "Write {}",
+            input["file_path"]
+                .as_str()
+                .map(short_path)
+                .unwrap_or_default()
+        ),
         "run_shell_command" => {
             let cmd = input["command"].as_str().unwrap_or("");
             let truncated: String = cmd.chars().take(120).collect();
@@ -4284,7 +4644,10 @@ fn format_tool_use_gemini(name: &str, input: &serde_json::Value) -> String {
         }
         "grep_search" => {
             let pattern = input["pattern"].as_str().unwrap_or("");
-            let path = input["dir_path"].as_str().map(|p| short_path(p)).unwrap_or_else(|| ".".to_string());
+            let path = input["dir_path"]
+                .as_str()
+                .map(|p| short_path(p))
+                .unwrap_or_else(|| ".".to_string());
             format!("Grep \"{pattern}\" in {path}")
         }
         "glob" => format!("Glob {}", input["pattern"].as_str().unwrap_or("")),
@@ -4304,7 +4667,9 @@ fn format_tool_use_gemini(name: &str, input: &serde_json::Value) -> String {
 
 fn format_tool_use_codex(item: &serde_json::Value) -> String {
     if item["type"].as_str() == Some("command_execution") {
-        let cmd = item["command"].as_str().unwrap_or("")
+        let cmd = item["command"]
+            .as_str()
+            .unwrap_or("")
             .trim_start_matches("/bin/bash -lc ");
         let truncated: String = cmd.chars().take(120).collect();
         format!("Bash: {truncated}")
@@ -4327,9 +4692,11 @@ async fn spawn_backend(
         AgentBackend::Claude => {
             let mut args = vec![
                 "-p".to_string(),
-                "--output-format".to_string(), "stream-json".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
                 "--verbose".to_string(),
-                "--permission-mode".to_string(), "bypassPermissions".to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
                 "--no-session-persistence".to_string(),
             ];
             if let Some(m) = model {
@@ -4340,7 +4707,8 @@ async fn spawn_backend(
                 args.push("--effort".to_string());
                 args.push(e.to_string());
             }
-            let mut cmd = tokio::process::Command::new(resolve_backend_executable(AgentBackend::Claude));
+            let mut cmd =
+                tokio::process::Command::new(resolve_backend_executable(AgentBackend::Claude));
             cmd.args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
@@ -4354,7 +4722,8 @@ async fn spawn_backend(
         }
         AgentBackend::Gemini => {
             let mut args = vec![
-                "-o".to_string(), "stream-json".to_string(),
+                "-o".to_string(),
+                "stream-json".to_string(),
                 "--yolo".to_string(),
             ];
             if let Some(m) = model {
@@ -4363,7 +4732,8 @@ async fn spawn_backend(
             }
             args.push("-p".to_string());
             args.push(String::new());
-            let mut cmd = tokio::process::Command::new(resolve_backend_executable(AgentBackend::Gemini));
+            let mut cmd =
+                tokio::process::Command::new(resolve_backend_executable(AgentBackend::Gemini));
             cmd.args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
@@ -4376,15 +4746,18 @@ async fn spawn_backend(
         }
         AgentBackend::Codex => {
             let mut args = vec![
-                "exec".to_string(), "--json".to_string(),
+                "exec".to_string(),
+                "--json".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--ephemeral".to_string(), "-".to_string(),
+                "--ephemeral".to_string(),
+                "-".to_string(),
             ];
             if let Some(m) = model {
                 args.push("--model".to_string());
                 args.push(m.to_string());
             }
-            let mut cmd = tokio::process::Command::new(resolve_backend_executable(AgentBackend::Codex));
+            let mut cmd =
+                tokio::process::Command::new(resolve_backend_executable(AgentBackend::Codex));
             cmd.args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
@@ -4396,7 +4769,9 @@ async fn spawn_backend(
             cmd.spawn()?
         }
         AgentBackend::OpenAi => {
-            return Err("OpenAI backend is not yet implemented. Use claude, gemini, or codex.".into());
+            return Err(
+                "OpenAI backend is not yet implemented. Use claude, gemini, or codex.".into(),
+            );
         }
     };
 
@@ -4439,7 +4814,11 @@ fn parse_claude_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
                     events.insert(0, BackendEvent::Text(text));
                 }
             }
-            if events.is_empty() { vec![BackendEvent::Skip] } else { events }
+            if events.is_empty() {
+                vec![BackendEvent::Skip]
+            } else {
+                events
+            }
         }
         Some("result") => {
             let text = parsed["result"].as_str().unwrap_or("").to_string();
@@ -4494,12 +4873,17 @@ fn parse_codex_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
 
 /// Run a prompt through the backend and collect the full text output.
 /// Used for compaction where we need the complete response, not streaming.
-async fn run_compaction(context: &CliContext, backend: AgentBackend, prompt: &str) -> CliResult<String> {
+async fn run_compaction(
+    context: &CliContext,
+    backend: AgentBackend,
+    prompt: &str,
+) -> CliResult<String> {
     match backend {
         AgentBackend::Claude => {
             // Claude without --output-format returns plain text
             use tokio::io::AsyncWriteExt;
-            let mut cmd = tokio::process::Command::new(resolve_backend_executable(AgentBackend::Claude));
+            let mut cmd =
+                tokio::process::Command::new(resolve_backend_executable(AgentBackend::Claude));
             cmd.args(["-p", "--model", "sonnet", "--no-session-persistence"])
                 .current_dir(&agent_cwd())
                 .stdin(std::process::Stdio::piped())
@@ -4519,7 +4903,8 @@ async fn run_compaction(context: &CliContext, backend: AgentBackend, prompt: &st
         }
         AgentBackend::Gemini | AgentBackend::Codex => {
             // Spawn in JSON mode, parse streaming output, accumulate text
-            let mut child = spawn_backend(backend, prompt, None, None, context.token.as_deref()).await?;
+            let mut child =
+                spawn_backend(backend, prompt, None, None, context.token.as_deref()).await?;
             let stdout = child.stdout.take().ok_or("no stdout")?;
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
@@ -4549,9 +4934,7 @@ async fn run_compaction(context: &CliContext, backend: AgentBackend, prompt: &st
             let _ = child.wait().await;
             Ok(result.trim().to_string())
         }
-        AgentBackend::OpenAi => {
-            run_api_compaction(context, prompt).await
-        }
+        AgentBackend::OpenAi => run_api_compaction(context, prompt).await,
     }
 }
 
@@ -4596,7 +4979,9 @@ impl ServiceState {
             state_dir: state_dir.to_path_buf(),
             tasks: std::collections::HashMap::new(),
             stopped: std::collections::HashSet::new(),
-            self_stops: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            self_stops: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashSet::new()),
+            ),
         }
     }
 
@@ -4648,22 +5033,29 @@ impl ServiceState {
     }
 
     fn agent_statuses(&self) -> Vec<serde_json::Value> {
-        self.agents.iter().map(|a| {
-            let running = self.tasks.get(&a.name).map(|h| !h.is_finished()).unwrap_or(false);
-            let status = if running {
-                "running"
-            } else if self.stopped.contains(&a.name) {
-                "stopped"
-            } else {
-                "restarting"
-            };
-            serde_json::json!({
-                "name": a.name,
-                "pid": std::process::id(),
-                "status": status,
-                "folder": a.folder,
+        self.agents
+            .iter()
+            .map(|a| {
+                let running = self
+                    .tasks
+                    .get(&a.name)
+                    .map(|h| !h.is_finished())
+                    .unwrap_or(false);
+                let status = if running {
+                    "running"
+                } else if self.stopped.contains(&a.name) {
+                    "stopped"
+                } else {
+                    "restarting"
+                };
+                serde_json::json!({
+                    "name": a.name,
+                    "pid": std::process::id(),
+                    "status": status,
+                    "folder": a.folder,
+                })
             })
-        }).collect()
+            .collect()
     }
 
     fn stop_agent(&mut self, name: &str) -> serde_json::Value {
@@ -4764,7 +5156,9 @@ fn spawn_agent_task(
         loop {
             let outcome = agent_poll_and_process(&ctx, &name, backend_override).await;
             match outcome {
-                Ok(AgentPollAction::Continue) => { consecutive_errors = 0; }
+                Ok(AgentPollAction::Continue) => {
+                    consecutive_errors = 0;
+                }
                 Ok(AgentPollAction::Stop) => {
                     eprintln!("[agent] Task for '{}' stopped via /stop", name);
                     if let Ok(mut stops) = self_stops.lock() {
@@ -4779,14 +5173,21 @@ fn spawn_agent_task(
                 }
                 Ok(AgentPollAction::UpdateAvailable) => {
                     // Service handles updates centrally — just keep polling.
-                    eprintln!("[agent] '{}' ignoring update_to (service handles updates)", name);
+                    eprintln!(
+                        "[agent] '{}' ignoring update_to (service handles updates)",
+                        name
+                    );
                     consecutive_errors = 0;
                 }
                 Err(e) => {
                     consecutive_errors += 1;
                     // Exponential backoff: 5s, 10s, 20s, 40s, capped at 60s
-                    let delay = std::cmp::min(5 * (1u64 << consecutive_errors.saturating_sub(1)), 60);
-                    eprintln!("[agent] '{}' error (#{consecutive_errors}, retry in {delay}s): {e}", name);
+                    let delay =
+                        std::cmp::min(5 * (1u64 << consecutive_errors.saturating_sub(1)), 60);
+                    eprintln!(
+                        "[agent] '{}' error (#{consecutive_errors}, retry in {delay}s): {e}",
+                        name
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 }
             }
@@ -4805,10 +5206,13 @@ fn rotate_log_if_needed(log_path: &Path) {
             // the backup file. The next write will go there, but the file won't
             // grow because we'll re-open on the next daemon spawn/restart.
             // For the running process, just truncate and carry on.
-            let _ = fs::write(log_path, format!(
-                "[service] Log rotated at {}\n",
-                time::OffsetDateTime::now_utc()
-            ));
+            let _ = fs::write(
+                log_path,
+                format!(
+                    "[service] Log rotated at {}\n",
+                    time::OffsetDateTime::now_utc()
+                ),
+            );
             eprintln!("[service] Log rotated ({} -> .log.1)", log_path.display());
         }
     }
@@ -4924,9 +5328,7 @@ fn find_old_agent_process(agent_name: &str, exclude_pid: u32) -> Option<(String,
             let cwd_link = format!("/proc/{}/cwd", pid);
             let cwd = fs::read_link(&cwd_link)
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| {
-                    env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
-                });
+                .unwrap_or_else(|_| env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
 
             return Some((cwd, Some(pid)));
         }
@@ -4942,13 +5344,15 @@ fn find_old_agent_process(agent_name: &str, exclude_pid: u32) -> Option<(String,
 
 async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<()> {
     let is_daemon = env::var(LORE_SERVICE_DAEMON_ENV).unwrap_or_default() == "1";
-    let machine_token = context.token.as_deref().ok_or(
-        "no machine token configured. Run 'lore setup <url>' first.",
-    )?;
+    let machine_token = context
+        .token
+        .as_deref()
+        .ok_or("no machine token configured. Run 'lore setup <url>' first.")?;
 
     if !args.fg && !is_daemon {
         // Daemonize
-        let lore_dir = env::var("HOME").map(PathBuf::from)
+        let lore_dir = env::var("HOME")
+            .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("lore-service");
         fs::create_dir_all(&lore_dir)?;
@@ -4983,7 +5387,14 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             .open(&log_path)?;
         let exe = resolved_current_exe()?;
         let child = std::process::Command::new(&exe)
-            .args(["--url", &context.url, "--token", machine_token, "service", "--fg"])
+            .args([
+                "--url",
+                &context.url,
+                "--token",
+                machine_token,
+                "service",
+                "--fg",
+            ])
             .env(LORE_SERVICE_DAEMON_ENV, "1")
             .stdout(log_file.try_clone()?)
             .stderr(log_file)
@@ -4997,7 +5408,8 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
     }
 
     // Write PID file for daemon mode
-    let lore_dir = env::var("HOME").map(PathBuf::from)
+    let lore_dir = env::var("HOME")
+        .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("lore-service");
     fs::create_dir_all(&lore_dir)?;
@@ -5005,7 +5417,10 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         fs::write(lore_dir.join("service.pid"), std::process::id().to_string())?;
     }
 
-    eprintln!("[service] Machine service starting (version {})", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "[service] Machine service starting (version {})",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Load managed agents state
     let mut svc_state = ServiceState::load(&lore_dir);
@@ -5015,7 +5430,10 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         migrate_old_agents(context, &mut svc_state);
     }
 
-    eprintln!("[service] Loaded {} managed agent(s)", svc_state.agents.len());
+    eprintln!(
+        "[service] Loaded {} managed agent(s)",
+        svc_state.agents.len()
+    );
 
     // Start all agents as tasks within this process
     svc_state.check_agents();
@@ -5071,7 +5489,9 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             Ok(update_info) => {
                 consecutive_service_errors = 0;
                 if let Some((target_version, repo)) = update_info {
-                    eprintln!("[service] Self-update to v{target_version} requested, stopping all agents...");
+                    eprintln!(
+                        "[service] Self-update to v{target_version} requested, stopping all agents..."
+                    );
                     svc_state.stop_all_agents();
                     // Resolve exe path BEFORE update — after update /proc/self/exe
                     // points to the deleted old binary which can cause exec issues.
@@ -5079,17 +5499,22 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                     let mut cfg = load_cli_config()?;
                     // Try direct download from server first (works after quick-deploy),
                     // fall back to GitHub release if not available
-                    let update_result = match download_binary_from_server(context, machine_token).await {
-                        Ok(true) => Ok(()),
-                        _ => {
-                            eprintln!("[service] Falling back to GitHub release download...");
-                            apply_cli_update_to_target(&mut cfg, &target_version, &repo).await
-                        }
-                    };
+                    let update_result =
+                        match download_binary_from_server(context, machine_token).await {
+                            Ok(true) => Ok(()),
+                            _ => {
+                                eprintln!("[service] Falling back to GitHub release download...");
+                                apply_cli_update_to_target(&mut cfg, &target_version, &repo).await
+                            }
+                        };
                     match update_result {
                         Ok(()) => {
-                            eprintln!("[service] Updated CLI binary, re-launching as {}", exe.display());
-                            let lore_dir = env::var("HOME").map(PathBuf::from)
+                            eprintln!(
+                                "[service] Updated CLI binary, re-launching as {}",
+                                exe.display()
+                            );
+                            let lore_dir = env::var("HOME")
+                                .map(PathBuf::from)
                                 .unwrap_or_else(|_| PathBuf::from("."))
                                 .join("lore-service");
                             let log_path = lore_dir.join("service.log");
@@ -5101,16 +5526,28 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                             match log_file {
                                 Ok(log_file) => {
                                     match std::process::Command::new(&exe)
-                                        .args(["--url", &context.url, "--token", machine_token, "service", "--fg"])
+                                        .args([
+                                            "--url",
+                                            &context.url,
+                                            "--token",
+                                            machine_token,
+                                            "service",
+                                            "--fg",
+                                        ])
                                         .env(LORE_SERVICE_DAEMON_ENV, "1")
-                                        .stdout(log_file.try_clone().unwrap_or_else(|_| log_file.try_clone().expect("log clone")))
+                                        .stdout(log_file.try_clone().unwrap_or_else(|_| {
+                                            log_file.try_clone().expect("log clone")
+                                        }))
                                         .stderr(log_file)
                                         .stdin(std::process::Stdio::null())
                                         .spawn()
                                     {
                                         Ok(child) => {
                                             let _ = fs::write(&pid_path, child.id().to_string());
-                                            eprintln!("[service] New service started (pid {}), exiting old.", child.id());
+                                            eprintln!(
+                                                "[service] New service started (pid {}), exiting old.",
+                                                child.id()
+                                            );
                                             std::process::exit(0);
                                         }
                                         Err(e) => {
@@ -5138,8 +5575,13 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             }
             Err(e) => {
                 consecutive_service_errors += 1;
-                let delay = std::cmp::min(5 * (1u64 << consecutive_service_errors.saturating_sub(1)), 120);
-                eprintln!("[service] Error (#{consecutive_service_errors}, retry in {delay}s): {e}");
+                let delay = std::cmp::min(
+                    5 * (1u64 << consecutive_service_errors.saturating_sub(1)),
+                    120,
+                );
+                eprintln!(
+                    "[service] Error (#{consecutive_service_errors}, retry in {delay}s): {e}"
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
@@ -5180,7 +5622,9 @@ async fn service_poll_and_execute(
 
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(format!("server rejected machine token ({status}) — check token config").into());
+        return Err(
+            format!("server rejected machine token ({status}) — check token config").into(),
+        );
     }
     let body: serde_json::Value = resp.error_for_status()?.json().await?;
 
@@ -5189,7 +5633,12 @@ async fn service_poll_and_execute(
         let repo = body["update_repo"]
             .as_str()
             .map(str::to_owned)
-            .unwrap_or_else(|| load_cli_config().ok().map(|cfg| cfg.update_repo).unwrap_or_else(default_update_repo_string));
+            .unwrap_or_else(|| {
+                load_cli_config()
+                    .ok()
+                    .map(|cfg| cfg.update_repo)
+                    .unwrap_or_else(default_update_repo_string)
+            });
         return Ok(Some((target_version.to_string(), repo)));
     }
 
@@ -5209,7 +5658,8 @@ async fn service_poll_and_execute(
             "list_dir" => service_handle_list_dir(params).await,
             "mkdir" => service_handle_mkdir(params).await,
             "create_agent" => {
-                let r = service_handle_create_agent(context, machine_token, params, svc_state).await;
+                let r =
+                    service_handle_create_agent(context, machine_token, params, svc_state).await;
                 svc_state.save();
                 r
             }
@@ -5236,7 +5686,10 @@ async fn service_poll_and_execute(
         // Post result back to server
         let _ = context
             .client
-            .post(format!("{}/v1/machines/command/{}/result", context.url, cmd_id))
+            .post(format!(
+                "{}/v1/machines/command/{}/result",
+                context.url, cmd_id
+            ))
             .header("x-lore-key", machine_token)
             .json(&serde_json::json!({ "data": result_data }))
             .send()
@@ -5247,7 +5700,9 @@ async fn service_poll_and_execute(
 }
 
 fn service_home_dir() -> CliResult<PathBuf> {
-    let raw_home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
+    let raw_home = env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"));
     Ok(fs::canonicalize(&raw_home)?)
 }
 
@@ -5404,7 +5859,9 @@ async fn service_handle_create_agent(
 
     // Save agent token in CLI config
     let mut config = load_cli_config()?;
-    config.agent_tokens.insert(agent_slug.to_string(), agent_token.to_string());
+    config
+        .agent_tokens
+        .insert(agent_slug.to_string(), agent_token.to_string());
     save_cli_config(&config)?;
 
     // Create managed agent entry

@@ -187,7 +187,10 @@ pub async fn check_for_update(
 ) -> Result<UpdateCheck> {
     validate_github_repo(github_repo)?;
     let target = detect_target()?;
-    eprintln!("updater: checking {github_repo} ({}) for {binary_name} on {target}, current version {current_version}", release_stream.as_str());
+    eprintln!(
+        "updater: checking {github_repo} ({}) for {binary_name} on {target}, current version {current_version}",
+        release_stream.as_str()
+    );
     let release = fetch_release(client, github_repo, release_stream, binary_name, &target).await?;
     eprintln!("updater: found release {}", release.tag_name);
     let archive_name = format!("{binary_name}-{target}.tar.gz");
@@ -238,8 +241,14 @@ pub async fn maybe_apply_self_update(
     release_stream: ReleaseStream,
     executable_path: &Path,
 ) -> Result<SelfUpdateOutcome> {
-    let check =
-        check_for_update(client, binary_name, current_version, github_repo, release_stream).await?;
+    let check = check_for_update(
+        client,
+        binary_name,
+        current_version,
+        github_repo,
+        release_stream,
+    )
+    .await?;
     if !check.needs_update {
         eprintln!("updater: no update needed");
         return Ok(SelfUpdateOutcome::UpToDate(AutoUpdateStatus {
@@ -251,12 +260,21 @@ pub async fn maybe_apply_self_update(
             ok: true,
         }));
     }
-    eprintln!("updater: downloading {} -> {}", check.current_version, check.latest_version);
+    eprintln!(
+        "updater: downloading {} -> {}",
+        check.current_version, check.latest_version
+    );
     let archive = fetch_bytes(client, &check.archive_url).await?;
-    eprintln!("updater: downloaded {} bytes, verifying checksum", archive.len());
+    eprintln!(
+        "updater: downloaded {} bytes, verifying checksum",
+        archive.len()
+    );
     let checksum = fetch_text(client, &check.checksum_url).await?;
     verify_checksum(&archive, &checksum)?;
-    eprintln!("updater: checksum verified, replacing binary at {}", executable_path.display());
+    eprintln!(
+        "updater: checksum verified, replacing binary at {}",
+        executable_path.display()
+    );
     replace_executable(binary_name, executable_path, &archive)?;
     eprintln!("updater: binary replaced successfully");
     let current_version = check.current_version.clone();
@@ -320,10 +338,16 @@ pub async fn apply_update_to_version(
         })?;
     eprintln!("updater: downloading {current_version} -> {target_version}");
     let archive = fetch_bytes(client, &archive_url).await?;
-    eprintln!("updater: downloaded {} bytes, verifying checksum", archive.len());
+    eprintln!(
+        "updater: downloaded {} bytes, verifying checksum",
+        archive.len()
+    );
     let checksum = fetch_text(client, &checksum_url).await?;
     verify_checksum(&archive, &checksum)?;
-    eprintln!("updater: checksum verified, replacing binary at {}", executable_path.display());
+    eprintln!(
+        "updater: checksum verified, replacing binary at {}",
+        executable_path.display()
+    );
     replace_executable(binary_name, executable_path, &archive)?;
     eprintln!("updater: binary replaced successfully");
     Ok(SelfUpdateOutcome::Updated(AutoUpdateStatus {
@@ -417,7 +441,9 @@ async fn fetch_latest_prerelease(
     let archive_name = format!("{binary_name}-{target}.tar.gz");
     let checksum_name = format!("{archive_name}.sha256");
     let releases = client
-        .get(format!("https://api.github.com/repos/{github_repo}/releases"))
+        .get(format!(
+            "https://api.github.com/repos/{github_repo}/releases"
+        ))
         .header(USER_AGENT, format!("lore/{}", env!("CARGO_PKG_VERSION")))
         .header(ACCEPT, "application/vnd.github+json")
         .send()
@@ -433,8 +459,14 @@ async fn fetch_latest_prerelease(
         .filter(|release| {
             release.prerelease
                 && !release.draft
-                && release.assets.iter().any(|asset| asset.name == archive_name)
-                && release.assets.iter().any(|asset| asset.name == checksum_name)
+                && release
+                    .assets
+                    .iter()
+                    .any(|asset| asset.name == archive_name)
+                && release
+                    .assets
+                    .iter()
+                    .any(|asset| asset.name == checksum_name)
         })
         .collect();
     candidates.sort_by(|a, b| {
@@ -443,9 +475,7 @@ async fn fetch_latest_prerelease(
         compare_versions(&b_ver, &a_ver)
     });
     candidates.into_iter().next().ok_or_else(|| {
-        LoreError::ExternalService(format!(
-            "no matching prerelease found for target {target}"
-        ))
+        LoreError::ExternalService(format!("no matching prerelease found for target {target}"))
     })
 }
 

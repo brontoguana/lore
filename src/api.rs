@@ -10460,22 +10460,22 @@ fn build_chat_agents(
 ) -> Result<Vec<ChatAgentSummary>, LoreError> {
     let user = username.as_str().to_string();
     let agents: Vec<StoredAgentToken> = state.auth.list_agent_tokens_for_user(username)?;
-    let mut chat_agents: Vec<(Option<i64>, ChatAgentSummary)> = Vec::new();
+    let mut chat_agents: Vec<(Option<OffsetDateTime>, ChatAgentSummary)> = Vec::new();
     for agent in &agents {
         let owner = agent.owner.as_ref().map(|o| o.as_str()).unwrap_or("");
         let conv = state.chat.load_conversation(owner, &agent.name)?;
         let last_msg = conv.messages.last();
-        let last_user_ts = conv
+        let last_user_at = conv
             .messages
             .iter()
             .rev()
             .find(|m| m.role == ChatRole::User)
-            .map(|m| m.timestamp.unix_timestamp())
-            .or_else(|| last_msg.map(|m| m.timestamp.unix_timestamp()));
+            .map(|m| m.timestamp)
+            .or_else(|| last_msg.map(|m| m.timestamp));
         let snippet = last_msg.map(|m| m.content.chars().take(60).collect::<String>());
         let time_str = last_msg.map(|m| format_chat_time(m.timestamp));
         chat_agents.push((
-            last_user_ts,
+            last_user_at,
             ChatAgentSummary {
                 name: agent.name.clone(),
                 display_name: agent
@@ -11333,23 +11333,12 @@ async fn chat_agent_poll(
         },
     );
 
-    // Check for unprocessed user messages
-    let conv = state.chat.load_conversation(owner_str, &agent.name)?;
-    let last_assistant_idx = conv
-        .messages
-        .iter()
-        .rposition(|m| m.role == ChatRole::Assistant);
-    let pending: Vec<&ChatMessage> = match last_assistant_idx {
-        Some(idx) => conv.messages[idx + 1..]
-            .iter()
-            .filter(|m| m.role == ChatRole::User)
-            .collect(),
-        None => conv
-            .messages
-            .iter()
-            .filter(|m| m.role == ChatRole::User)
-            .collect(),
-    };
+    // Claim unprocessed user messages. This uses a delivery cursor instead of
+    // inferring pending state from the last assistant message, which breaks if
+    // the user sends follow-up input while the agent is still thinking.
+    let pending = state
+        .chat
+        .claim_pending_user_messages(owner_str, &agent.name)?;
 
     // Check if machine has a pending update (transient, auto-expires after 3 min)
     let server_version = env!("CARGO_PKG_VERSION");
@@ -11413,22 +11402,9 @@ async fn chat_agent_poll(
 
     // Re-check for messages after waking
     if result.is_ok() {
-        let conv = state.chat.load_conversation(owner_str, &agent.name)?;
-        let last_assistant_idx = conv
-            .messages
-            .iter()
-            .rposition(|m| m.role == ChatRole::Assistant);
-        let pending: Vec<&ChatMessage> = match last_assistant_idx {
-            Some(idx) => conv.messages[idx + 1..]
-                .iter()
-                .filter(|m| m.role == ChatRole::User)
-                .collect(),
-            None => conv
-                .messages
-                .iter()
-                .filter(|m| m.role == ChatRole::User)
-                .collect(),
-        };
+        let pending = state
+            .chat
+            .claim_pending_user_messages(owner_str, &agent.name)?;
         if !pending.is_empty() {
             let msgs: Vec<Value> = pending
                 .iter()
@@ -11497,6 +11473,8 @@ async fn chat_agent_respond(
         state
             .chat_audit
             .log(&agent.name, owner_str, "agent", &content);
+
+        let _ = state.chat.complete_active_turn(owner_str, &agent.name);
 
         push_chat_event(
             &state,
@@ -13123,6 +13101,81 @@ fn format_api_tool_display(name: &str, args: &Value) -> String {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct PendingStreamToolCall {
+    name: String,
+    arguments: String,
+}
+
+fn merge_pending_stream_tool_call(
+    pending: &mut BTreeMap<i64, PendingStreamToolCall>,
+    tool_call: &Value,
+) {
+    let index = tool_call
+        .get("index")
+        .and_then(|i| i.as_i64())
+        .unwrap_or(pending.len() as i64);
+    let entry = pending.entry(index).or_default();
+    if let Some(name) = tool_call
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+        .filter(|name| !name.is_empty())
+    {
+        entry.name = name.to_string();
+    }
+    if let Some(arguments) = tool_call
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(|a| a.as_str())
+        .filter(|arguments| !arguments.is_empty())
+    {
+        entry.arguments.push_str(arguments);
+    }
+}
+
+fn finalize_pending_stream_tool_call(name: &str, raw_arguments: &str) -> (String, Option<Value>) {
+    let trimmed = raw_arguments.trim();
+    if trimmed.is_empty() {
+        let args = json!({});
+        return (format_api_tool_display(name, &args), Some(args));
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(args) => (format_api_tool_display(name, &args), Some(args)),
+        Err(_) => (format!("\u{1f527} {name}"), None),
+    }
+}
+
+fn flush_pending_stream_tool_calls(
+    state: &AppState,
+    owner: &str,
+    agent: &str,
+    pending: &mut BTreeMap<i64, PendingStreamToolCall>,
+) {
+    for (_, tool_call) in std::mem::take(pending) {
+        if tool_call.name.is_empty() {
+            continue;
+        }
+        let (detail, args) =
+            finalize_pending_stream_tool_call(&tool_call.name, &tool_call.arguments);
+        let _ = state.chat.append_or_extend_tool(owner, agent, &detail);
+        state.chat_audit.log(agent, owner, "tool", &detail);
+        push_chat_event(
+            state,
+            owner,
+            ChatEvent {
+                event_type: "tool_use".into(),
+                agent: agent.to_string(),
+                owner: owner.to_string(),
+                data: json!({ "detail": detail }),
+            },
+        );
+        if let Some(args) = args.as_ref() {
+            record_api_tool_activity(state, owner, agent, &tool_call.name, args);
+        }
+    }
+}
+
 // --- API agent compact (delegates to do_exchange_compact) ---
 
 async fn run_api_compact(
@@ -13460,24 +13513,26 @@ async fn chat_proxy_completions(
         let endpoint_id_for_stream = endpoint.id.clone();
         let body_preview = serde_json::to_string(&body).ok();
         let stream = async_stream::stream! {
+            let mut pending_tool_calls: BTreeMap<i64, PendingStreamToolCall> = BTreeMap::new();
             while let Some(chunk) = rx.recv().await {
-                // Forward tool_calls to chat UI
-                if let crate::librarian::ProxyStreamChunk::Delta { tool_calls: ref tc_opt, .. } = chunk {
+                if let crate::librarian::ProxyStreamChunk::Delta {
+                    tool_calls: ref tc_opt,
+                    finish_reason: ref finish_reason_opt,
+                    ..
+                } = chunk
+                {
                     if let Some(tcs) = tc_opt {
                         for tc in tcs {
-                            if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
-                                if !name.is_empty() {
-                                    let _ = state_clone.chat.append_or_extend_tool(&owner_str, &agent_name, name);
-                                    state_clone.chat_audit.log(&agent_name, &owner_str, "tool", name);
-                                    push_chat_event(&state_clone, &owner_str, ChatEvent {
-                                        event_type: "tool_use".into(),
-                                        agent: agent_name.clone(),
-                                        owner: owner_str.clone(),
-                                        data: json!({"detail": name}),
-                                    });
-                                }
-                            }
+                            merge_pending_stream_tool_call(&mut pending_tool_calls, tc);
                         }
+                    }
+                    if finish_reason_opt.as_deref() == Some("tool_calls") {
+                        flush_pending_stream_tool_calls(
+                            &state_clone,
+                            &owner_str,
+                            &agent_name,
+                            &mut pending_tool_calls,
+                        );
                     }
                 }
                 if let crate::librarian::ProxyStreamChunk::Error(ref msg) = chunk {
@@ -13495,6 +13550,12 @@ async fn chat_proxy_completions(
                     yield Ok::<_, std::convert::Infallible>(formatted);
                 }
                 if matches!(chunk, crate::librarian::ProxyStreamChunk::Done) {
+                    flush_pending_stream_tool_calls(
+                        &state_clone,
+                        &owner_str,
+                        &agent_name,
+                        &mut pending_tool_calls,
+                    );
                     break;
                 }
             }
@@ -14921,25 +14982,33 @@ mod tests {
     use super::{
         AGENT_AUTH_RATE_LIMIT_ATTEMPTS, API_KEY_HEADER, GLOBAL_LIBRARIAN_RATE_LIMIT,
         LOGIN_RATE_LIMIT_ATTEMPTS, MCP_PROTOCOL_VERSION, build_app, build_app_with_librarian,
-        constant_time_eq, enforce_agent_auth_rate_limit, enforce_global_librarian_rate_limit,
-        parse_agent_grants, parse_role_grants, record_failed_agent_auth, session_cookie_value,
+        build_chat_agents, constant_time_eq, enforce_agent_auth_rate_limit,
+        enforce_global_librarian_rate_limit, parse_agent_grants, parse_role_grants,
+        record_failed_agent_auth, session_cookie_value,
     };
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use base64::Engine;
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+    use time::{Duration, OffsetDateTime};
     use tower::util::ServiceExt;
 
+    use super::{finalize_pending_stream_tool_call, merge_pending_stream_tool_call};
+    use crate::auth::{ChatConversation, ChatMessage, ChatRole};
     use crate::librarian::{
         AnswerLibrarianClient, Endpoint, LibrarianAnswer, LibrarianConfig, LibrarianRequest,
         ProjectLibrarianOperation, ProjectLibrarianPlan, ProjectLibrarianRequest,
         ProviderCheckResult, RATE_LIMIT_REQUESTS,
     };
     use crate::store::FileBlockStore;
-    use crate::{BlockType, LocalAuthStore, ProjectPermission, UserName};
+    use crate::{
+        AgentBackend, BlockType, LocalAuthStore, NewAgentToken, ProjectGrant, ProjectName,
+        ProjectPermission, UserName,
+    };
 
     #[test]
     fn parse_role_grants_skips_no_access_rows() {
@@ -14971,6 +15040,64 @@ mod tests {
     fn parse_agent_grants_allows_empty_access() {
         let grants = parse_agent_grants("").unwrap();
         assert!(grants.is_empty());
+    }
+
+    #[test]
+    fn chat_agents_sort_by_full_last_user_timestamp() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let owner = UserName::new("alice").unwrap();
+        state
+            .auth
+            .bootstrap_admin(owner.clone(), "correct-horse-battery".into())
+            .unwrap();
+
+        for display_name in ["alpha", "bravo"] {
+            state
+                .auth
+                .create_agent_token(NewAgentToken {
+                    display_name: display_name.to_string(),
+                    owner: owner.clone(),
+                    grants: vec![ProjectGrant {
+                        project: ProjectName::new("alpha.docs").unwrap(),
+                        permission: ProjectPermission::ReadWrite,
+                    }],
+                    backend: AgentBackend::Claude,
+                    endpoint_id: None,
+                })
+                .unwrap();
+        }
+
+        let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut alpha_conv = ChatConversation::default();
+        alpha_conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "first".into(),
+            timestamp: base + Duration::milliseconds(100),
+        });
+        alpha_conv.next_id = 2;
+        state
+            .chat
+            .save_conversation(owner.as_str(), "alpha", &alpha_conv)
+            .unwrap();
+
+        let mut bravo_conv = ChatConversation::default();
+        bravo_conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "second".into(),
+            timestamp: base + Duration::milliseconds(900),
+        });
+        bravo_conv.next_id = 2;
+        state
+            .chat
+            .save_conversation(owner.as_str(), "bravo", &bravo_conv)
+            .unwrap();
+
+        let agents = build_chat_agents(&state, &owner).unwrap();
+        let ordered_names: Vec<&str> = agents.iter().map(|agent| agent.name.as_str()).collect();
+        assert_eq!(ordered_names, vec!["bravo", "alpha"]);
     }
 
     #[derive(Clone)]
@@ -18085,6 +18212,70 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("too many failed agent authentication")
+        );
+    }
+
+    #[test]
+    fn streamed_tool_call_deltas_accumulate_into_formatted_file_read() {
+        let mut pending = BTreeMap::new();
+        merge_pending_stream_tool_call(
+            &mut pending,
+            &json!({
+                "index": 0,
+                "function": {
+                    "name": "read_document",
+                    "arguments": ""
+                }
+            }),
+        );
+        merge_pending_stream_tool_call(
+            &mut pending,
+            &json!({
+                "index": 0,
+                "function": {
+                    "arguments": "{\"document_id\":\"abcdefghi\"}"
+                }
+            }),
+        );
+        let call = pending.remove(&0).unwrap();
+        let (detail, args) = finalize_pending_stream_tool_call(&call.name, &call.arguments);
+        let args = args.unwrap();
+        assert_eq!(detail, "\u{1f4d6} read_document abcdefgh");
+        assert_eq!(
+            args.get("document_id").and_then(|v| v.as_str()),
+            Some("abcdefghi")
+        );
+    }
+
+    #[test]
+    fn streamed_tool_call_deltas_accumulate_into_formatted_file_edit() {
+        let mut pending = BTreeMap::new();
+        merge_pending_stream_tool_call(
+            &mut pending,
+            &json!({
+                "index": 2,
+                "function": {
+                    "name": "update_block",
+                    "arguments": "{\"block_id\":\"_block123\""
+                }
+            }),
+        );
+        merge_pending_stream_tool_call(
+            &mut pending,
+            &json!({
+                "index": 2,
+                "function": {
+                    "arguments": "}"
+                }
+            }),
+        );
+        let call = pending.remove(&2).unwrap();
+        let (detail, args) = finalize_pending_stream_tool_call(&call.name, &call.arguments);
+        let args = args.unwrap();
+        assert_eq!(detail, "\u{270f}\u{fe0f} update_block _block123");
+        assert_eq!(
+            args.get("block_id").and_then(|v| v.as_str()),
+            Some("_block123")
         );
     }
 

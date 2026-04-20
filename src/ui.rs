@@ -3136,7 +3136,10 @@ pub fn render_chat_main_panel(
   <button type="button" class="btn-sm button-link lib-toggle" id="lib-toggle-history" style="margin-left:auto;" onclick="toggleLibOption('history')" title="Include history"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></button>
   <button type="button" class="btn-sm button-link lib-toggle" id="lib-toggle-edits" style="margin-left:var(--s-1);" onclick="toggleLibOption('edits')" title="Allow edits"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
 </div>
-<div class="chat-messages" id="chat-messages"></div>
+<div class="chat-messages-wrap" id="chat-messages-wrap">
+  <div class="chat-messages" id="chat-messages"></div>
+  <button type="button" class="btn-lg chat-jump-btn" id="chat-jump-btn" onclick="return jumpToChatLatest()">Jump to end</button>
+</div>
 <form class="chat-input-form" id="chat-input-form" onsubmit="return sendLibrarianMessage(event)">
   <input type="hidden" name="csrf_token" value="{csrf_token}">
   <textarea class="chat-input" id="chat-input" placeholder="Ask the librarian..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
@@ -3207,7 +3210,10 @@ pub fn render_chat_main_panel(
   <button type="button" class="btn-sm button-link" id="chat-manage-btn" style="margin-left:auto;" onclick="toggleManagePanel()" title="Manage"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>
   <button type="button" class="btn-sm button-link" id="chat-config-btn" style="margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
 </div>
-<div class="chat-messages" id="chat-messages"></div>
+<div class="chat-messages-wrap" id="chat-messages-wrap">
+  <div class="chat-messages" id="chat-messages"></div>
+  <button type="button" class="btn-lg chat-jump-btn" id="chat-jump-btn" onclick="return jumpToChatLatest()">Jump to end</button>
+</div>
 <div class="chat-config-panel" id="chat-config-panel" style="display:none;">
   <div class="chat-config-inner">
     <div class="chat-config-field">
@@ -3529,6 +3535,11 @@ var agentConfig = {{ backend: '', model: '', effort: '' }};
 var agentStatus = '';
 var isLibrarian = currentAgent === 'librarian';
 var libProject = '';
+var chatFollowScroll = true;
+var chatResumeRefreshInFlight = false;
+var chatLastResumeRefreshAt = 0;
+var chatLastStreamEventAt = Date.now();
+var chatWasBackgrounded = false;
 
 function isMobileChatLayout() {{
   return !!(window.matchMedia && window.matchMedia('(max-width: 860px)').matches);
@@ -3588,6 +3599,7 @@ function initializeChatPanel() {{
   streamingContent = '';
   agentConfig = {{ backend: '', model: '', effort: '' }};
   agentStatus = '';
+  chatFollowScroll = true;
   closeAllPanels();
   setActiveAgentInList(currentAgent);
   if (eventSource) {{
@@ -3596,6 +3608,7 @@ function initializeChatPanel() {{
   }}
   connectSSE();
   initChatComposer();
+  bindChatScrollState();
 
   if (isLibrarian) {{
     var params = new URLSearchParams(window.location.search);
@@ -3668,6 +3681,52 @@ function loadDesktopChatPanel(agent, pushHistory) {{
       }}
       initializeChatPanel();
       applyChatViewportFix();
+    }});
+}}
+
+function markChatStreamAlive() {{
+  chatLastStreamEventAt = Date.now();
+}}
+
+function shouldRefreshChatOnResume(force) {{
+  if (document.visibilityState && document.visibilityState === 'hidden') return false;
+  if (chatResumeRefreshInFlight) return false;
+  var now = Date.now();
+  if (!force && now - chatLastResumeRefreshAt < 1000) return false;
+  if (force || chatWasBackgrounded) return true;
+  if (!eventSource) return true;
+  if (typeof EventSource !== 'undefined' && eventSource.readyState === EventSource.CLOSED) return true;
+  return (now - chatLastStreamEventAt) > 10000;
+}}
+
+function refreshChatOnResume(force) {{
+  if (!shouldRefreshChatOnResume(force)) return;
+  chatWasBackgrounded = false;
+  chatResumeRefreshInFlight = true;
+  chatLastResumeRefreshAt = Date.now();
+  var url = '/ui/chat/panel';
+  if (currentAgent) url += '?agent=' + encodeURIComponent(currentAgent);
+  fetch(url, {{ cache: 'no-store' }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      if (!data || !data.ok) return;
+      var main = document.getElementById('chat-main');
+      if (!main) return;
+      main.innerHTML = data.panel_html || '';
+      currentAgent = data.selected_agent || null;
+      chatMessages = data.messages || [];
+      agentProfileUrl = data.profile_url || null;
+      if (currentAgent) {{
+        localStorage.setItem('lastChatAgent', currentAgent);
+      }} else {{
+        localStorage.removeItem('lastChatAgent');
+      }}
+      initializeChatPanel();
+      applyChatViewportFix();
+    }})
+    .catch(function() {{}})
+    .finally(function() {{
+      chatResumeRefreshInFlight = false;
     }});
 }}
 
@@ -3762,11 +3821,13 @@ function scheduleChatViewportFix() {{
 
 function resizeChatInput() {{
   var input = document.getElementById('chat-input');
-  if (!input) return;
+  if (!input) return false;
   var form = document.getElementById('chat-input-form');
   var header = document.querySelector('.chat-header');
   var viewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
   var headerBottom = 0;
+  var prevHeight = input.offsetHeight;
+  var prevOverflow = input.style.overflowY;
   if (header) {{
     var headerRect = header.getBoundingClientRect();
     headerBottom = Math.max(0, headerRect.bottom);
@@ -3776,8 +3837,10 @@ function resizeChatInput() {{
   var minHeight = 38;
   var maxHeight = Math.max(120, Math.floor(viewportHeight - headerBottom - formChrome - 16));
   var nextHeight = Math.max(minHeight, Math.min(input.scrollHeight, maxHeight));
+  var nextOverflow = input.scrollHeight > maxHeight ? 'auto' : 'hidden';
   input.style.height = nextHeight + 'px';
-  input.style.overflowY = input.scrollHeight > maxHeight ? 'auto' : 'hidden';
+  input.style.overflowY = nextOverflow;
+  return Math.abs(nextHeight - prevHeight) > 1 || prevOverflow !== nextOverflow;
 }}
 
 function initChatComposer() {{
@@ -3786,8 +3849,9 @@ function initChatComposer() {{
   if (input.dataset.chatComposerBound !== '1') {{
     input.dataset.chatComposerBound = '1';
     input.addEventListener('input', function() {{
-      resizeChatInput();
-      scheduleChatViewportFix();
+      if (resizeChatInput()) {{
+        scheduleChatViewportFix();
+      }}
     }});
   }}
   resizeChatInput();
@@ -3888,6 +3952,8 @@ function resizeAndUpload(file, agent, el) {{
 function renderMessages() {{
   var container = document.getElementById('chat-messages');
   if (!container) return;
+  var bottomOffset = container.scrollHeight - container.scrollTop;
+  var shouldFollow = chatFollowScroll;
   var html = '';
   for (var i = 0; i < chatMessages.length; i++) {{
     var msg = chatMessages[i];
@@ -3906,7 +3972,52 @@ function renderMessages() {{
     html += '</div>';
   }}
   container.innerHTML = html;
+  if (shouldFollow) {{
+    chatFollowScroll = true;
+    container.scrollTop = container.scrollHeight;
+  }} else {{
+    container.scrollTop = Math.max(0, container.scrollHeight - bottomOffset);
+  }}
+  updateChatJumpButton();
+}}
+
+function chatIsNearBottom(container) {{
+  if (!container) return true;
+  return container.scrollHeight - container.clientHeight - container.scrollTop <= 2;
+}}
+
+function updateChatJumpButton() {{
+  var button = document.getElementById('chat-jump-btn');
+  var container = document.getElementById('chat-messages');
+  if (!button) return;
+  if (!container || chatConfigOpen || chatManageOpen) {{
+    button.style.display = 'none';
+    return;
+  }}
+  var hasOverflow = container.scrollHeight > container.clientHeight + 8;
+  button.style.display = (!chatFollowScroll && hasOverflow) ? 'inline-flex' : 'none';
+}}
+
+function bindChatScrollState() {{
+  var container = document.getElementById('chat-messages');
+  if (!container) return;
+  if (container.dataset.scrollBound !== '1') {{
+    container.dataset.scrollBound = '1';
+    container.addEventListener('scroll', function() {{
+      chatFollowScroll = chatIsNearBottom(container);
+      updateChatJumpButton();
+    }});
+  }}
+  updateChatJumpButton();
+}}
+
+function jumpToChatLatest() {{
+  var container = document.getElementById('chat-messages');
+  if (!container) return false;
+  chatFollowScroll = true;
   container.scrollTop = container.scrollHeight;
+  updateChatJumpButton();
+  return false;
 }}
 
 function escapeHtml(text) {{
@@ -4091,6 +4202,7 @@ function sendMessage(e) {{
 
   // Slash commands go to the command endpoint
   if (text.startsWith('/')) {{
+    chatFollowScroll = true;
     chatMessages.push({{ role: 'user', content: text }});
     moveAgentItemToTop(currentAgent);
     updateAgentListPreview(currentAgent, text);
@@ -4114,6 +4226,7 @@ function sendMessage(e) {{
     return false;
   }}
 
+  chatFollowScroll = true;
   chatMessages.push({{ role: 'user', content: text }});
   moveAgentItemToTop(currentAgent);
   updateAgentListPreview(currentAgent, text);
@@ -4164,11 +4277,21 @@ function updateAgentListStatus(agent, status) {{
   dot.classList.add(chatStatusClass(status));
 }}
 
+function maybeAppendFinishedMessage(nextStatus) {{
+  if (agentStatus !== 'thinking' || nextStatus === 'thinking') return;
+  var lastMsg = chatMessages[chatMessages.length - 1];
+  if (lastMsg && lastMsg.role === 'system' && lastMsg.content === '\u2705 Finished') return;
+  chatMessages.push({{ role: 'system', content: '\u2705 Finished' }});
+  renderMessages();
+}}
+
 function connectSSE() {{
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/ui/chat/stream');
+  markChatStreamAlive();
   eventSource.onmessage = function(e) {{
     try {{
+      markChatStreamAlive();
       var evt = JSON.parse(e.data);
       if (evt.event_type === 'message_sent') {{
         moveAgentItemToTop(evt.agent);
@@ -4240,6 +4363,7 @@ function connectSSE() {{
         agentConfig.effort = evt.data.effort || '';
         updateHeaderStatus();
       }} else if (evt.event_type === 'status') {{
+        maybeAppendFinishedMessage(evt.data && evt.data.status ? evt.data.status : '');
         agentStatus = evt.data.status || '';
         updateHeaderStatus();
         if (evt.data.cwd) {{
@@ -4285,13 +4409,13 @@ var backendEfforts = {{
 }};
 
 function closeAllPanels() {{
-  var msgs = document.getElementById('chat-messages');
+  var msgsWrap = document.getElementById('chat-messages-wrap');
   var form = document.getElementById('chat-input-form');
   var cfg = document.getElementById('chat-config-panel');
   var mgr = document.getElementById('chat-manage-panel');
   var cfgBtn = document.getElementById('chat-config-btn');
   var mgrBtn = document.getElementById('chat-manage-btn');
-  if (msgs) msgs.style.display = '';
+  if (msgsWrap) msgsWrap.style.display = '';
   if (form) form.style.display = '';
   if (cfg) cfg.style.display = 'none';
   if (mgr) mgr.style.display = 'none';
@@ -4299,37 +4423,40 @@ function closeAllPanels() {{
   if (mgrBtn) mgrBtn.classList.remove('active');
   chatConfigOpen = false;
   chatManageOpen = false;
+  updateChatJumpButton();
 }}
 
 function toggleChatConfig() {{
   if (chatConfigOpen) {{ closeAllPanels(); return; }}
   closeAllPanels();
-  var msgs = document.getElementById('chat-messages');
+  var msgsWrap = document.getElementById('chat-messages-wrap');
   var cfg = document.getElementById('chat-config-panel');
   var btn = document.getElementById('chat-config-btn');
   var form = document.getElementById('chat-input-form');
-  if (!msgs || !cfg) return;
+  if (!msgsWrap || !cfg) return;
   chatConfigOpen = true;
-  msgs.style.display = 'none';
+  msgsWrap.style.display = 'none';
   cfg.style.display = '';
   if (form) form.style.display = 'none';
   if (btn) btn.classList.add('active');
+  updateChatJumpButton();
   if (!isLibrarian) {{ loadChatConfig(); }}
 }}
 
 function toggleManagePanel() {{
   if (chatManageOpen) {{ closeAllPanels(); return; }}
   closeAllPanels();
-  var msgs = document.getElementById('chat-messages');
+  var msgsWrap = document.getElementById('chat-messages-wrap');
   var mgr = document.getElementById('chat-manage-panel');
   var btn = document.getElementById('chat-manage-btn');
   var form = document.getElementById('chat-input-form');
-  if (!msgs || !mgr) return;
+  if (!msgsWrap || !mgr) return;
   chatManageOpen = true;
-  msgs.style.display = 'none';
+  msgsWrap.style.display = 'none';
   mgr.style.display = '';
   if (form) form.style.display = 'none';
   if (btn) btn.classList.add('active');
+  updateChatJumpButton();
   loadManageConfig();
 }}
 
@@ -4780,6 +4907,7 @@ function sendLibrarianMessage(e) {{
   resizeChatInput();
 
   if (text.startsWith('/')) {{
+    chatFollowScroll = true;
     chatMessages.push({{ role: 'user', content: text }});
     var result = handleLibrarianCommand(text);
     if (result) {{
@@ -4789,6 +4917,7 @@ function sendLibrarianMessage(e) {{
     return false;
   }}
 
+  chatFollowScroll = true;
   chatMessages.push({{ role: 'user', content: text }});
   chatMessages.push({{ role: 'assistant', content: 'Thinking\u2026', _thinking: true }});
   renderMessages();
@@ -4892,7 +5021,26 @@ window.addEventListener('pageshow', function(e) {{
     document.querySelectorAll('.svg-overlay').forEach(function(ov) {{ ov.remove(); }});
     applyChatViewportFix();
   }}
+  if (e.persisted) refreshChatOnResume(true);
   if (e.persisted && chatConfigOpen) loadChatConfig();
+}});
+
+document.addEventListener('visibilitychange', function() {{
+  if (document.visibilityState === 'hidden') {{
+    chatWasBackgrounded = true;
+    return;
+  }}
+  if (document.visibilityState === 'visible') {{
+    refreshChatOnResume(false);
+  }}
+}});
+
+window.addEventListener('pagehide', function() {{
+  chatWasBackgrounded = true;
+}});
+
+window.addEventListener('focus', function() {{
+  refreshChatOnResume(false);
 }});
 
 window.addEventListener('popstate', function() {{
@@ -8288,6 +8436,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: var(--hero-button-ink);
     }
 
+    .btn-sm.button-link {
+      width: 28px;
+      height: 28px;
+      min-height: auto;
+      padding: 0;
+      border-radius: 6px;
+    }
+
     .hero-actions a.primary:hover,
     .button-link:hover {
       opacity: 0.9;
@@ -8495,12 +8651,17 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       gap: var(--s-3);
       flex-shrink: 0;
       background: var(--panel);
+      min-width: 0;
     }
     .chat-header-name {
       font-weight: 600;
       font-size: 1rem;
       align-self: baseline;
       line-height: 1.2;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .chat-header-status {
       font-size: 0.82rem;
@@ -8634,15 +8795,34 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       opacity: 0.75;
       cursor: default;
     }
-    .chat-messages {
+    .chat-messages-wrap {
+      position: relative;
       flex: 1;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .chat-messages {
+      height: 100%;
       min-height: 0;
       overflow-y: auto;
       overscroll-behavior: none;
+      overflow-anchor: none;
       padding: var(--s-4);
       display: flex;
       flex-direction: column;
       gap: var(--s-3);
+    }
+    .chat-jump-btn {
+      position: absolute;
+      right: var(--s-4);
+      bottom: var(--s-4);
+      z-index: 2;
+      display: none;
+      width: auto;
+      min-height: 44px;
+      padding: var(--s-2) var(--s-4);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.16);
     }
     .chat-msg {
       max-width: 80%;
@@ -8980,6 +9160,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       align-items: flex-end;
       flex-shrink: 0;
       background: var(--panel);
+      overflow-anchor: none;
     }
     .chat-input {
       flex: 1;
@@ -10261,18 +10442,40 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-layout {
         flex-direction: column;
         height: 100%;
+        width: 100%;
+        max-width: 100%;
+        overflow-x: hidden;
       }
       .chat-sidebar {
         width: 100%;
         min-width: 100%;
+        max-width: 100%;
         border-right: none;
         max-height: none;
       }
       .chat-main { display: none; }
       .chat-has-agent .chat-sidebar { display: none; }
-      .chat-has-agent .chat-main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+      .chat-has-agent .chat-main {
+        display: flex;
+        flex: 1;
+        min-height: 0;
+        min-width: 0;
+        width: 100%;
+        max-width: 100%;
+        overflow: hidden;
+      }
       .chat-back-btn { display: flex; margin: 0 4px 0 6px; }
       .chat-header { gap: 4px; padding: 8px 8px 8px 0; }
+      .chat-header,
+      .chat-messages-wrap,
+      .chat-messages,
+      .chat-config-panel,
+      .chat-input-form,
+      .chat-empty {
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+      }
       .chat-header .chat-avatar-sm-wrap { margin-right: 0; margin-left: 0; }
       .chat-header .chat-avatar-header { margin: 0; }
       .chat-header-cwd { display: none; }

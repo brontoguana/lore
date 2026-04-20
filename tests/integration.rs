@@ -159,7 +159,13 @@ async fn health_check() {
 async fn project_lifecycle() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "test-agent", &[("test.project", "read_write")]).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "test-agent",
+        &[("test.project", "read_write")],
+    )
+    .await;
 
     // Create a block to auto-create the project
     let resp = client
@@ -181,17 +187,26 @@ async fn project_lifecycle() {
     assert_eq!(resp.status(), 200);
     let projects: Value = resp.json().await.unwrap();
     let arr = projects.as_array().unwrap();
-    assert!(arr.iter().any(|p| {
-        let proj = &p["project"];
-        proj.as_str() == Some("test.project") || proj["slug"].as_str() == Some("test.project")
-    }), "project not in list: {projects:?}");
+    assert!(
+        arr.iter().any(|p| {
+            let proj = &p["project"];
+            proj.as_str() == Some("test.project") || proj["slug"].as_str() == Some("test.project")
+        }),
+        "project not in list: {projects:?}"
+    );
 }
 
 #[tokio::test]
 async fn document_crud() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "doc-agent", &[("docs.project", "read_write")]).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "doc-agent",
+        &[("docs.project", "read_write")],
+    )
+    .await;
 
     // Seed project
     let resp = client
@@ -228,14 +243,23 @@ async fn document_crud() {
     let doc_arr = docs["documents"].as_array().unwrap();
     // Tree is hierarchical -- root doc may contain children, or new doc is a sibling
     fn count_docs(arr: &[Value]) -> usize {
-        arr.iter().map(|d| 1 + count_docs(d["children"].as_array().unwrap_or(&vec![]))).sum()
+        arr.iter()
+            .map(|d| 1 + count_docs(d["children"].as_array().unwrap_or(&vec![])))
+            .sum()
     }
     let total = count_docs(doc_arr);
-    assert!(total >= 1, "should have at least our new doc, got {} (tree: {docs:?})", total);
+    assert!(
+        total >= 1,
+        "should have at least our new doc, got {} (tree: {docs:?})",
+        total
+    );
 
     // Rename document
     let resp = client
-        .put(url(&addr, &format!("/v1/projects/docs.project/documents/{doc_id}")))
+        .put(url(
+            &addr,
+            &format!("/v1/projects/docs.project/documents/{doc_id}"),
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"name": "Design Notes"}))
         .send()
@@ -253,13 +277,21 @@ async fn document_crud() {
     let docs: Value = resp.json().await.unwrap();
     let doc_arr = docs["documents"].as_array().unwrap();
     fn find_in_tree(arr: &[Value], name: &str) -> bool {
-        arr.iter().any(|d| d["name"] == name || find_in_tree(d["children"].as_array().unwrap_or(&vec![]), name))
+        arr.iter().any(|d| {
+            d["name"] == name || find_in_tree(d["children"].as_array().unwrap_or(&vec![]), name)
+        })
     }
-    assert!(find_in_tree(doc_arr, "Design Notes"), "renamed doc not found: {docs:?}");
+    assert!(
+        find_in_tree(doc_arr, "Design Notes"),
+        "renamed doc not found: {docs:?}"
+    );
 
     // Delete document
     let resp = client
-        .delete(url(&addr, &format!("/v1/projects/docs.project/documents/{doc_id}")))
+        .delete(url(
+            &addr,
+            &format!("/v1/projects/docs.project/documents/{doc_id}"),
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
@@ -276,7 +308,9 @@ async fn document_crud() {
     let docs: Value = resp.json().await.unwrap();
     let doc_arr = docs["documents"].as_array().unwrap();
     fn find_deleted(arr: &[Value], name: &str) -> bool {
-        arr.iter().any(|d| d["name"] == name || find_deleted(d["children"].as_array().unwrap_or(&vec![]), name))
+        arr.iter().any(|d| {
+            d["name"] == name || find_deleted(d["children"].as_array().unwrap_or(&vec![]), name)
+        })
     }
     assert!(!find_deleted(doc_arr, "Design Notes"));
 }
@@ -285,7 +319,13 @@ async fn document_crud() {
 async fn document_block_crud() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "block-agent", &[("blocks.proj", "read_write")]).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "block-agent",
+        &[("blocks.proj", "read_write")],
+    )
+    .await;
 
     // Seed project
     client
@@ -309,9 +349,14 @@ async fn document_block_crud() {
 
     // Create block in document
     let resp = client
-        .post(url(&addr, &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks")))
+        .post(url(
+            &addr,
+            &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks"),
+        ))
         .header("x-lore-key", &token)
-        .json(&json!({"block_type": "markdown", "content": "# Hello World\n\nThis is a test block."}))
+        .json(
+            &json!({"block_type": "markdown", "content": "# Hello World\n\nThis is a test block."}),
+        )
         .send()
         .await
         .unwrap();
@@ -321,21 +366,28 @@ async fn document_block_crud() {
 
     // Read block
     let resp = client
-        .get(url(&addr, &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block_id}")))
+        .get(url(
+            &addr,
+            &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block_id}"),
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let read_block: Value = resp.json().await.unwrap();
-    let content = read_block["block"]["content"].as_str()
+    let content = read_block["block"]["content"]
+        .as_str()
         .or_else(|| read_block["content"].as_str())
         .unwrap();
     assert!(content.contains("Hello World"));
 
     // Update block
     let resp = client
-        .patch(url(&addr, &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block_id}")))
+        .patch(url(
+            &addr,
+            &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block_id}"),
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"block_type": "markdown", "content": "# Updated Title\n\nNew content here."}))
         .send()
@@ -345,20 +397,27 @@ async fn document_block_crud() {
 
     // Verify update
     let resp = client
-        .get(url(&addr, &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block_id}")))
+        .get(url(
+            &addr,
+            &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block_id}"),
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
         .unwrap();
     let read_block: Value = resp.json().await.unwrap();
-    let content = read_block["block"]["content"].as_str()
+    let content = read_block["block"]["content"]
+        .as_str()
         .or_else(|| read_block["content"].as_str())
         .unwrap();
     assert!(content.contains("Updated Title"));
 
     // List blocks
     let resp = client
-        .get(url(&addr, &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks")))
+        .get(url(
+            &addr,
+            &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks"),
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
@@ -369,7 +428,10 @@ async fn document_block_crud() {
 
     // Create a second block
     let resp = client
-        .post(url(&addr, &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks")))
+        .post(url(
+            &addr,
+            &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks"),
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"block_type": "markdown", "content": "Second block"}))
         .send()
@@ -381,7 +443,10 @@ async fn document_block_crud() {
 
     // Move block
     let resp = client
-        .post(url(&addr, &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block2_id}/move")))
+        .post(url(
+            &addr,
+            &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block2_id}/move"),
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"right": block_id}))
         .send()
@@ -391,16 +456,26 @@ async fn document_block_crud() {
 
     // Delete block
     let resp = client
-        .delete(url(&addr, &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block2_id}")))
+        .delete(url(
+            &addr,
+            &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks/{block2_id}"),
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
         .unwrap();
-    assert!(resp.status() == 200 || resp.status() == 204, "delete returned {}", resp.status());
+    assert!(
+        resp.status() == 200 || resp.status() == 204,
+        "delete returned {}",
+        resp.status()
+    );
 
     // Verify only one block remains
     let resp = client
-        .get(url(&addr, &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks")))
+        .get(url(
+            &addr,
+            &format!("/v1/projects/blocks.proj/documents/{doc_id}/blocks"),
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
@@ -413,7 +488,8 @@ async fn document_block_crud() {
 async fn edit_block_find_replace() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "edit-agent", &[("edit.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "edit-agent", &[("edit.proj", "read_write")]).await;
 
     // Seed project + document + block
     client
@@ -446,7 +522,10 @@ async fn edit_block_find_replace() {
 
     // Find and replace
     let resp = client
-        .post(url(&addr, &format!("/v1/projects/edit.proj/documents/{doc_id}/blocks/{block_id}/edit")))
+        .post(url(
+            &addr,
+            &format!("/v1/projects/edit.proj/documents/{doc_id}/blocks/{block_id}/edit"),
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"old_string": "quick brown fox", "new_string": "slow red turtle"}))
         .send()
@@ -456,13 +535,17 @@ async fn edit_block_find_replace() {
 
     // Verify
     let resp = client
-        .get(url(&addr, &format!("/v1/projects/edit.proj/documents/{doc_id}/blocks/{block_id}")))
+        .get(url(
+            &addr,
+            &format!("/v1/projects/edit.proj/documents/{doc_id}/blocks/{block_id}"),
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
         .unwrap();
     let block: Value = resp.json().await.unwrap();
-    let content = block["block"]["content"].as_str()
+    let content = block["block"]["content"]
+        .as_str()
         .or_else(|| block["content"].as_str())
         .unwrap();
     assert_eq!(content, "The slow red turtle jumps over the lazy dog.");
@@ -472,7 +555,8 @@ async fn edit_block_find_replace() {
 async fn grep_doc_blocks() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "grep-agent", &[("grep.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "grep-agent", &[("grep.proj", "read_write")]).await;
 
     // Seed project + document + blocks
     client
@@ -502,7 +586,10 @@ async fn grep_doc_blocks() {
         .unwrap();
 
     client
-        .post(url(&addr, &format!("/v1/projects/grep.proj/documents/{doc_id}/blocks")))
+        .post(url(
+            &addr,
+            &format!("/v1/projects/grep.proj/documents/{doc_id}/blocks"),
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"block_type": "markdown", "content": "No match here"}))
         .send()
@@ -511,7 +598,10 @@ async fn grep_doc_blocks() {
 
     // Grep
     let resp = client
-        .get(url(&addr, &format!("/v1/projects/grep.proj/documents/{doc_id}/grep?q=KEYWORD")))
+        .get(url(
+            &addr,
+            &format!("/v1/projects/grep.proj/documents/{doc_id}/grep?q=KEYWORD"),
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
@@ -533,18 +623,32 @@ async fn reserved_blocks() {
         .post(url(&addr, "/ui/projects"))
         .header("cookie", &cookie)
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!("csrf_token={csrf}&project_name=Reserved+Project&parent="))
+        .body(format!(
+            "csrf_token={csrf}&project_name=Reserved+Project&parent="
+        ))
         .send()
         .await
         .unwrap();
-    assert!(resp.status().as_u16() < 400 || resp.status() == 303, "project create: {}", resp.status());
+    assert!(
+        resp.status().as_u16() < 400 || resp.status() == 303,
+        "project create: {}",
+        resp.status()
+    );
 
-    let token =
-        api_create_agent_token(&client, &addr, "reserved-agent", &[("reserved-project", "read_write")]).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "reserved-agent",
+        &[("reserved-project", "read_write")],
+    )
+    .await;
 
     // Read _overview reserved block
     let resp = client
-        .get(url(&addr, "/v1/projects/reserved-project/reserved/_overview"))
+        .get(url(
+            &addr,
+            "/v1/projects/reserved-project/reserved/_overview",
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
@@ -555,7 +659,10 @@ async fn reserved_blocks() {
 
     // Update _overview (user-only, must use basic auth)
     let resp = client
-        .patch(url(&addr, "/v1/projects/reserved-project/reserved/_overview"))
+        .patch(url(
+            &addr,
+            "/v1/projects/reserved-project/reserved/_overview",
+        ))
         .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
         .json(&json!({"content": "This project covers testing infrastructure."}))
         .send()
@@ -565,17 +672,26 @@ async fn reserved_blocks() {
 
     // Verify
     let resp = client
-        .get(url(&addr, "/v1/projects/reserved-project/reserved/_overview"))
+        .get(url(
+            &addr,
+            "/v1/projects/reserved-project/reserved/_overview",
+        ))
         .header("x-lore-key", &token)
         .send()
         .await
         .unwrap();
     let block: Value = resp.json().await.unwrap();
-    assert_eq!(block["content"], "This project covers testing infrastructure.");
+    assert_eq!(
+        block["content"],
+        "This project covers testing infrastructure."
+    );
 
     // Update _agent-context (user-only)
     let resp = client
-        .patch(url(&addr, "/v1/projects/reserved-project/reserved/_agent-context"))
+        .patch(url(
+            &addr,
+            "/v1/projects/reserved-project/reserved/_agent-context",
+        ))
         .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
         .json(&json!({"content": "Focus on Rust testing patterns."}))
         .send()
@@ -585,13 +701,20 @@ async fn reserved_blocks() {
 
     // Verify agent is rejected for _overview update
     let resp = client
-        .patch(url(&addr, "/v1/projects/reserved-project/reserved/_overview"))
+        .patch(url(
+            &addr,
+            "/v1/projects/reserved-project/reserved/_overview",
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"content": "agent should not be allowed"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403, "agents should not be able to update _overview");
+    assert_eq!(
+        resp.status(),
+        403,
+        "agents should not be able to update _overview"
+    );
 
     // Update _map (agent-writable)
     let resp = client
@@ -606,21 +729,28 @@ async fn reserved_blocks() {
     // Verify _overview has size limit (2000 chars)
     let long_content = "x".repeat(2001);
     let resp = client
-        .patch(url(&addr, "/v1/projects/reserved-project/reserved/_overview"))
+        .patch(url(
+            &addr,
+            "/v1/projects/reserved-project/reserved/_overview",
+        ))
         .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
         .json(&json!({"content": long_content}))
         .send()
         .await
         .unwrap();
     let status = resp.status().as_u16();
-    assert!(status >= 400, "should reject content over 2000 chars, got {status}");
+    assert!(
+        status >= 400,
+        "should reject content over 2000 chars, got {status}"
+    );
 }
 
 #[tokio::test]
 async fn mcp_tool_list() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "mcp-agent", &[("mcp.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "mcp-agent", &[("mcp.proj", "read_write")]).await;
 
     let resp = client
         .get(url(&addr, "/v1/chat/lore-tools"))
@@ -663,7 +793,13 @@ async fn mcp_tool_list() {
 async fn mcp_tool_call_list_projects() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "mcp-call-agent", &[("mcp.call.proj", "read_write")]).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "mcp-call-agent",
+        &[("mcp.call.proj", "read_write")],
+    )
+    .await;
 
     // Seed project
     client
@@ -685,14 +821,23 @@ async fn mcp_tool_call_list_projects() {
     assert_eq!(resp.status(), 200);
     let result: Value = resp.json().await.unwrap();
     let content = result["result"].as_str().unwrap_or("");
-    assert!(content.contains("mcp.call.proj"), "list_projects should include our project: {content}");
+    assert!(
+        content.contains("mcp.call.proj"),
+        "list_projects should include our project: {content}"
+    );
 }
 
 #[tokio::test]
 async fn mcp_tool_call_document_workflow() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "mcp-doc-agent", &[("mcp.doc.proj", "read_write")]).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "mcp-doc-agent",
+        &[("mcp.doc.proj", "read_write")],
+    )
+    .await;
 
     // Seed
     client
@@ -714,7 +859,12 @@ async fn mcp_tool_call_document_workflow() {
     assert_eq!(resp.status(), 200);
     let result: Value = resp.json().await.unwrap();
     let content = result["result"].as_str().unwrap_or("");
-    assert!(content.contains("MCP Created Doc") || content.contains("created") || content.contains("Created"), "doc creation should succeed: {content}");
+    assert!(
+        content.contains("MCP Created Doc")
+            || content.contains("created")
+            || content.contains("Created"),
+        "doc creation should succeed: {content}"
+    );
 
     // List documents via MCP
     let resp = client
@@ -727,14 +877,23 @@ async fn mcp_tool_call_document_workflow() {
     assert_eq!(resp.status(), 200);
     let result: Value = resp.json().await.unwrap();
     let content = result["result"].as_str().unwrap_or("");
-    assert!(content.contains("MCP Created Doc"), "list_documents should include our doc: {content}");
+    assert!(
+        content.contains("MCP Created Doc"),
+        "list_documents should include our doc: {content}"
+    );
 }
 
 #[tokio::test]
 async fn mcp_tool_call_block_workflow() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "mcp-blk-agent", &[("mcp.blk.proj", "read_write")]).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "mcp-blk-agent",
+        &[("mcp.blk.proj", "read_write")],
+    )
+    .await;
 
     // Seed
     client
@@ -788,7 +947,10 @@ async fn mcp_tool_call_block_workflow() {
     assert_eq!(resp.status(), 200);
     let result: Value = resp.json().await.unwrap();
     let content = result["result"].as_str().unwrap_or("");
-    assert!(content.contains("Created via MCP"), "list_blocks should contain our block: {content}");
+    assert!(
+        content.contains("Created via MCP"),
+        "list_blocks should contain our block: {content}"
+    );
 
     // Grep via MCP
     let resp = client
@@ -804,14 +966,18 @@ async fn mcp_tool_call_block_workflow() {
     assert_eq!(resp.status(), 200);
     let result: Value = resp.json().await.unwrap();
     let content = result["result"].as_str().unwrap_or("");
-    assert!(content.contains("tool interface"), "grep should find our text: {content}");
+    assert!(
+        content.contains("tool interface"),
+        "grep should find our text: {content}"
+    );
 }
 
 #[tokio::test]
 async fn version_history_for_doc_blocks() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "hist-agent", &[("hist.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "hist-agent", &[("hist.proj", "read_write")]).await;
 
     // Seed + doc + block
     client
@@ -833,7 +999,10 @@ async fn version_history_for_doc_blocks() {
     let doc_id = doc["id"].as_str().unwrap();
 
     let resp = client
-        .post(url(&addr, &format!("/v1/projects/hist.proj/documents/{doc_id}/blocks")))
+        .post(url(
+            &addr,
+            &format!("/v1/projects/hist.proj/documents/{doc_id}/blocks"),
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"block_type": "markdown", "content": "version 1"}))
         .send()
@@ -844,7 +1013,10 @@ async fn version_history_for_doc_blocks() {
 
     // Update to create a version
     client
-        .patch(url(&addr, &format!("/v1/projects/hist.proj/documents/{doc_id}/blocks/{block_id}")))
+        .patch(url(
+            &addr,
+            &format!("/v1/projects/hist.proj/documents/{doc_id}/blocks/{block_id}"),
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"block_type": "markdown", "content": "version 2"}))
         .send()
@@ -860,17 +1032,22 @@ async fn version_history_for_doc_blocks() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let history: Value = resp.json().await.unwrap();
-    let versions = history["versions"].as_array().unwrap_or_else(|| {
-        panic!("expected versions array, got: {history:?}")
-    });
-    assert!(versions.len() >= 2, "should have at least 2 versions (create + update), got {}", versions.len());
+    let versions = history["versions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected versions array, got: {history:?}"));
+    assert!(
+        versions.len() >= 2,
+        "should have at least 2 versions (create + update), got {}",
+        versions.len()
+    );
 }
 
 #[tokio::test]
 async fn ui_project_page_shows_documents() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "ui-agent", &[("ui.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "ui-agent", &[("ui.proj", "read_write")]).await;
     let (cookie, _csrf) = admin_login(&client, &addr).await;
 
     // Seed project + document
@@ -899,17 +1076,30 @@ async fn ui_project_page_shows_documents() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let html = resp.text().await.unwrap();
-    assert!(html.contains("UI Visible Doc"), "project page should show document name");
-    assert!(html.contains("Agent Context"), "project page should show reserved blocks");
-    assert!(html.contains("Overview"), "project page should show overview");
-    assert!(html.contains("File Map"), "project page should show file map");
+    assert!(
+        html.contains("UI Visible Doc"),
+        "project page should show document name"
+    );
+    assert!(
+        html.contains("Agent Context"),
+        "project page should show reserved blocks"
+    );
+    assert!(
+        html.contains("Overview"),
+        "project page should show overview"
+    );
+    assert!(
+        html.contains("File Map"),
+        "project page should show file map"
+    );
 }
 
 #[tokio::test]
 async fn ui_document_page_shows_blocks() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "uid-agent", &[("uid.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "uid-agent", &[("uid.proj", "read_write")]).await;
     let (cookie, _csrf) = admin_login(&client, &addr).await;
 
     // Seed + doc + block
@@ -932,7 +1122,10 @@ async fn ui_document_page_shows_blocks() {
     let doc_id = doc["id"].as_str().unwrap();
 
     client
-        .post(url(&addr, &format!("/v1/projects/uid.proj/documents/{doc_id}/blocks")))
+        .post(url(
+            &addr,
+            &format!("/v1/projects/uid.proj/documents/{doc_id}/blocks"),
+        ))
         .header("x-lore-key", &token)
         .json(&json!({"block_type": "markdown", "content": "# Visible Heading\n\nBody text here."}))
         .send()
@@ -948,15 +1141,22 @@ async fn ui_document_page_shows_blocks() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let html = resp.text().await.unwrap();
-    assert!(html.contains("<h1>Visible Heading</h1>"), "document page should render markdown");
-    assert!(html.contains("Body text here"), "document page should show body text");
+    assert!(
+        html.contains("<h1>Visible Heading</h1>"),
+        "document page should render markdown"
+    );
+    assert!(
+        html.contains("Body text here"),
+        "document page should show body text"
+    );
 }
 
 #[tokio::test]
 async fn ui_projects_list_shows_tree() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "tree-agent", &[("tree.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "tree-agent", &[("tree.proj", "read_write")]).await;
     let (cookie, _csrf) = admin_login(&client, &addr).await;
 
     // Seed project
@@ -977,7 +1177,10 @@ async fn ui_projects_list_shows_tree() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let html = resp.text().await.unwrap();
-    assert!(html.contains("tree.proj"), "projects page should show project");
+    assert!(
+        html.contains("tree.proj"),
+        "projects page should show project"
+    );
 }
 
 #[tokio::test]
@@ -1041,7 +1244,10 @@ async fn auth_rejects_cross_project_access() {
         .await
         .unwrap();
     let status = resp.status().as_u16();
-    assert!(status >= 400, "should reject cross-project access, got {status}");
+    assert!(
+        status >= 400,
+        "should reject cross-project access, got {status}"
+    );
 }
 
 #[tokio::test]
@@ -1052,16 +1258,18 @@ async fn migration_preserves_existing_blocks() {
     // Manually set up a pre-migration project using the store directly
     let store = setup_store(dir.path());
     let auth = LocalAuthStore::new(dir.path().to_path_buf());
-    let created = auth.create_agent_token(lore_core::NewAgentToken {
-        display_name: "mig-agent".to_string(),
-        owner: UserName::new("admin".to_string()).unwrap(),
-        grants: vec![lore_core::ProjectGrant {
-            project: lore_core::ProjectName::new("migrate.proj").unwrap(),
-            permission: lore_core::ProjectPermission::ReadWrite,
-        }],
-        backend: lore_core::AgentBackend::default(),
-        endpoint_id: None,
-    }).unwrap();
+    let created = auth
+        .create_agent_token(lore_core::NewAgentToken {
+            display_name: "mig-agent".to_string(),
+            owner: UserName::new("admin".to_string()).unwrap(),
+            grants: vec![lore_core::ProjectGrant {
+                project: lore_core::ProjectName::new("migrate.proj").unwrap(),
+                permission: lore_core::ProjectPermission::ReadWrite,
+            }],
+            backend: lore_core::AgentBackend::default(),
+            endpoint_id: None,
+        })
+        .unwrap();
     let token = created.token;
 
     // Create a block which auto-creates the project in old style
@@ -1089,7 +1297,10 @@ async fn migration_preserves_existing_blocks() {
     assert_eq!(resp.status(), 200);
     let docs: Value = resp.json().await.unwrap();
     let doc_arr = docs["documents"].as_array().unwrap();
-    assert!(!doc_arr.is_empty(), "migration should create at least a root document: {docs:?}");
+    assert!(
+        !doc_arr.is_empty(),
+        "migration should create at least a root document: {docs:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,53 +1308,32 @@ async fn migration_preserves_existing_blocks() {
 // ---------------------------------------------------------------------------
 
 async fn spawn_mock_llm() -> (SocketAddr, tokio::sync::mpsc::Sender<()>) {
-    use axum::{Router, routing::post, Json};
+    use axum::{Json, Router, routing::post};
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
-    let app = Router::new()
-        .route(
-            "/v1/chat/completions",
-            post(|Json(req): Json<Value>| async move {
-                let empty = vec![];
-                let messages = req["messages"].as_array().unwrap_or(&empty);
-                let last_msg = messages
-                    .last()
-                    .and_then(|m| m["content"].as_str())
-                    .unwrap_or("");
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(req): Json<Value>| async move {
+            let empty = vec![];
+            let messages = req["messages"].as_array().unwrap_or(&empty);
+            let last_msg = messages
+                .last()
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or("");
 
-                let has_tool_calls = req.get("tools").and_then(|t| t.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+            let has_tool_calls = req
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
 
-                let response_content = if last_msg.contains("tool_result") || last_msg.contains("function") {
-                    "I've processed the tool result. The operation was successful."
-                } else if has_tool_calls {
-                    return Json(json!({
-                        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                        "object": "chat.completion",
-                        "model": "mock-model",
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": null,
-                                "tool_calls": [{
-                                    "id": format!("call_{}", uuid::Uuid::new_v4()),
-                                    "type": "function",
-                                    "function": {
-                                        "name": "list_projects",
-                                        "arguments": "{}"
-                                    }
-                                }]
-                            },
-                            "finish_reason": "tool_calls"
-                        }],
-                        "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
-                    }));
-                } else {
-                    "Hello! I'm the mock LLM responding to your message."
-                };
-
-                Json(json!({
+            let response_content = if last_msg.contains("tool_result")
+                || last_msg.contains("function")
+            {
+                "I've processed the tool result. The operation was successful."
+            } else if has_tool_calls {
+                return Json(json!({
                     "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                     "object": "chat.completion",
                     "model": "mock-model",
@@ -1151,20 +1341,48 @@ async fn spawn_mock_llm() -> (SocketAddr, tokio::sync::mpsc::Sender<()>) {
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": response_content
+                            "content": null,
+                            "tool_calls": [{
+                                "id": format!("call_{}", uuid::Uuid::new_v4()),
+                                "type": "function",
+                                "function": {
+                                    "name": "list_projects",
+                                    "arguments": "{}"
+                                }
+                            }]
                         },
-                        "finish_reason": "stop"
+                        "finish_reason": "tool_calls"
                     }],
                     "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
-                }))
-            }),
-        );
+                }));
+            } else {
+                "Hello! I'm the mock LLM responding to your message."
+            };
+
+            Json(json!({
+                "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                "object": "chat.completion",
+                "model": "mock-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_content
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+            }))
+        }),
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async move { shutdown_rx.recv().await; })
+            .with_graceful_shutdown(async move {
+                shutdown_rx.recv().await;
+            })
             .await
             .unwrap();
     });
@@ -1189,7 +1407,12 @@ async fn mock_llm_responds() {
 
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    assert!(body["choices"][0]["message"]["content"].as_str().unwrap().contains("mock LLM"));
+    assert!(
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("mock LLM")
+    );
 }
 
 #[tokio::test]
@@ -1232,7 +1455,8 @@ async fn chat_proxy_completions_with_mock_llm() {
     .await;
 
     // Create agent token with endpoint
-    let token = api_create_agent_token(&client, &addr, "chat-agent", &[("chat.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "chat-agent", &[("chat.proj", "read_write")]).await;
 
     // Seed project
     client
@@ -1290,10 +1514,16 @@ async fn librarian_ask_via_ui_with_mock_llm() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "configure librarian failed: {}", resp.text().await.unwrap_or_default());
+    assert_eq!(
+        resp.status(),
+        200,
+        "configure librarian failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
 
     // Seed a project with content via API
-    let token = api_create_agent_token(&client, &addr, "lib-agent", &[("lib.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "lib-agent", &[("lib.proj", "read_write")]).await;
     let resp = client
         .post(url(&addr, "/v1/blocks"))
         .header("x-lore-key", &token)
@@ -1324,11 +1554,18 @@ async fn librarian_ask_via_ui_with_mock_llm() {
     eprintln!("librarian ask response status={status} body={body_text}");
 
     // The response MUST be JSON with `ok: true`
-    let body: Value = serde_json::from_str(&body_text)
-        .unwrap_or_else(|_| panic!("librarian response was not JSON: status={status} body={body_text}"));
-    assert!(body["ok"].as_bool().unwrap_or(false), "librarian ask failed: {body}");
+    let body: Value = serde_json::from_str(&body_text).unwrap_or_else(|_| {
+        panic!("librarian response was not JSON: status={status} body={body_text}")
+    });
+    assert!(
+        body["ok"].as_bool().unwrap_or(false),
+        "librarian ask failed: {body}"
+    );
     let answer = body["answer"].as_str().unwrap_or("");
-    assert!(!answer.is_empty(), "librarian answer should not be empty: {body}");
+    assert!(
+        !answer.is_empty(),
+        "librarian answer should not be empty: {body}"
+    );
 
     // Also test "All Projects" mode (empty project)
     let resp = client
@@ -1347,9 +1584,13 @@ async fn librarian_ask_via_ui_with_mock_llm() {
     let body_text = resp.text().await.unwrap();
     eprintln!("librarian all-projects response status={status} body={body_text}");
 
-    let body: Value = serde_json::from_str(&body_text)
-        .unwrap_or_else(|_| panic!("all-projects response was not JSON: status={status} body={body_text}"));
-    assert!(body["ok"].as_bool().unwrap_or(false), "all-projects ask failed: {body}");
+    let body: Value = serde_json::from_str(&body_text).unwrap_or_else(|_| {
+        panic!("all-projects response was not JSON: status={status} body={body_text}")
+    });
+    assert!(
+        body["ok"].as_bool().unwrap_or(false),
+        "all-projects ask failed: {body}"
+    );
 }
 
 #[tokio::test]
@@ -1358,11 +1599,19 @@ async fn librarian_ask_without_endpoint_returns_json_error() {
     let (addr, client) = spawn_server(dir.path()).await;
 
     // Seed a project so the librarian has something to work with
-    let token = api_create_agent_token(&client, &addr, "seed-agent", &[("no.ep.proj", "read_write")]).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "seed-agent",
+        &[("no.ep.proj", "read_write")],
+    )
+    .await;
     let resp = client
         .post(url(&addr, "/v1/blocks"))
         .header("x-lore-key", &token)
-        .json(&json!({"project": "no.ep.proj", "block_type": "markdown", "content": "test content"}))
+        .json(
+            &json!({"project": "no.ep.proj", "block_type": "markdown", "content": "test content"}),
+        )
         .send()
         .await
         .unwrap();
@@ -1420,7 +1669,9 @@ async fn librarian_ask_without_endpoint_returns_json_error() {
         .unwrap_or("")
         .to_string();
     let body_text = resp.text().await.unwrap();
-    eprintln!("no-endpoint all-projects response status={status} ct={content_type} body={body_text}");
+    eprintln!(
+        "no-endpoint all-projects response status={status} ct={content_type} body={body_text}"
+    );
 
     assert!(
         content_type.contains("application/json"),
@@ -1457,7 +1708,8 @@ async fn librarian_history_persists_after_ask() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let token = api_create_agent_token(&client, &addr, "hist-agent", &[("hist.proj", "read_write")]).await;
+    let token =
+        api_create_agent_token(&client, &addr, "hist-agent", &[("hist.proj", "read_write")]).await;
     let resp = client
         .post(url(&addr, "/v1/blocks"))
         .header("x-lore-key", &token)
@@ -1492,13 +1744,26 @@ async fn librarian_history_persists_after_ask() {
         .await
         .unwrap();
     let history: Value = resp.json().await.unwrap();
-    let messages = history["messages"].as_array().expect("messages should be an array");
-    assert!(messages.len() >= 2, "history should have at least user + assistant: {history}");
+    let messages = history["messages"]
+        .as_array()
+        .expect("messages should be an array");
+    assert!(
+        messages.len() >= 2,
+        "history should have at least user + assistant: {history}"
+    );
     assert_eq!(messages[0]["role"].as_str().unwrap(), "user");
-    assert!(messages[0]["content"].as_str().unwrap().contains("What is being tested"));
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("What is being tested")
+    );
     assert_eq!(messages[1]["role"].as_str().unwrap(), "assistant");
     let answer = messages[1]["content"].as_str().unwrap();
-    assert!(!answer.is_empty(), "assistant answer in history should not be empty");
+    assert!(
+        !answer.is_empty(),
+        "assistant answer in history should not be empty"
+    );
 
     // Also check "All Projects" history includes the same run
     let resp = client
@@ -1509,7 +1774,10 @@ async fn librarian_history_persists_after_ask() {
         .unwrap();
     let history: Value = resp.json().await.unwrap();
     let messages = history["messages"].as_array().expect("messages array");
-    assert!(messages.len() >= 2, "all-projects history should include the run: {history}");
+    assert!(
+        messages.len() >= 2,
+        "all-projects history should include the run: {history}"
+    );
 }
 
 #[tokio::test]
@@ -1529,13 +1797,8 @@ async fn agent_chat_send_poll_respond() {
     .await;
 
     // Create agent token with a project grant
-    let token = api_create_agent_token(
-        &client,
-        &addr,
-        "chat-bot",
-        &[("chat.proj", "read_write")],
-    )
-    .await;
+    let token =
+        api_create_agent_token(&client, &addr, "chat-bot", &[("chat.proj", "read_write")]).await;
 
     // Seed a project so it exists
     let resp = client
@@ -1555,10 +1818,7 @@ async fn agent_chat_send_poll_respond() {
         .post(url(&addr, &format!("/ui/chat/chat-bot/config")))
         .header("cookie", &cookie)
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "csrf_token={}&endpoint_id={}",
-            csrf, endpoint_id
-        ))
+        .body(format!("csrf_token={}&endpoint_id={}", csrf, endpoint_id))
         .send()
         .await
         .unwrap();
@@ -1572,10 +1832,7 @@ async fn agent_chat_send_poll_respond() {
         .post(url(&addr, &format!("/ui/chat/chat-bot/send")))
         .header("cookie", &cookie)
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "csrf_token={}&message=Hello+agent",
-            csrf
-        ))
+        .body(format!("csrf_token={}&message=Hello+agent", csrf))
         .send()
         .await
         .unwrap();
@@ -1598,10 +1855,18 @@ async fn agent_chat_send_poll_respond() {
     eprintln!("poll status={poll_status} body={poll_body}");
     assert_eq!(poll_status, 200);
 
-    let messages = poll_body["messages"].as_array().expect("messages should be array");
-    assert!(!messages.is_empty(), "poll should return the pending message");
+    let messages = poll_body["messages"]
+        .as_array()
+        .expect("messages should be array");
+    assert!(
+        !messages.is_empty(),
+        "poll should return the pending message"
+    );
     let msg_content = messages[0]["content"].as_str().unwrap_or("");
-    assert!(msg_content.contains("Hello agent"), "message content mismatch: {msg_content}");
+    assert!(
+        msg_content.contains("Hello agent"),
+        "message content mismatch: {msg_content}"
+    );
 
     // Step 3: Agent responds (simulating what the machine does)
     let resp = client
@@ -1629,8 +1894,16 @@ async fn agent_chat_send_poll_respond() {
     let history: Value = resp.json().await.unwrap();
     let hist_msgs = history["messages"].as_array().expect("history messages");
     eprintln!("history messages count={}", hist_msgs.len());
-    let has_user_msg = hist_msgs.iter().any(|m| m["role"] == "user" && m["content"].as_str().unwrap_or("").contains("Hello agent"));
-    let has_agent_msg = hist_msgs.iter().any(|m| m["role"] == "assistant" && m["content"].as_str().unwrap_or("").contains("agent responding"));
+    let has_user_msg = hist_msgs.iter().any(|m| {
+        m["role"] == "user" && m["content"].as_str().unwrap_or("").contains("Hello agent")
+    });
+    let has_agent_msg = hist_msgs.iter().any(|m| {
+        m["role"] == "assistant"
+            && m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("agent responding")
+    });
     assert!(has_user_msg, "history should contain user message");
     assert!(has_agent_msg, "history should contain agent response");
 
@@ -1654,8 +1927,135 @@ async fn agent_chat_send_poll_respond() {
     let proxy_json: Value = serde_json::from_str(&proxy_body)
         .unwrap_or_else(|_| panic!("proxy response not JSON: {proxy_body}"));
     assert!(
-        proxy_json["choices"][0]["message"]["content"].as_str().is_some(),
+        proxy_json["choices"][0]["message"]["content"]
+            .as_str()
+            .is_some(),
         "proxy should return LLM response: {proxy_json}"
+    );
+}
+
+#[tokio::test]
+async fn agent_chat_keeps_follow_up_messages_sent_while_thinking() {
+    let dir = tempdir().unwrap();
+    let (llm_addr, _shutdown) = spawn_mock_llm().await;
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    let endpoint_id = create_endpoint(
+        &client,
+        &addr,
+        "chat-ep",
+        &format!("http://{llm_addr}/v1/chat/completions"),
+        "mock-model",
+    )
+    .await;
+
+    let token =
+        api_create_agent_token(&client, &addr, "chat-bot", &[("chat.proj", "read_write")]).await;
+
+    let resp = client
+        .post(url(&addr, "/v1/blocks"))
+        .header("x-lore-key", &token)
+        .json(&json!({"project": "chat.proj", "block_type": "markdown", "content": "seed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let (cookie, csrf) = admin_login(&client, &addr).await;
+
+    let resp = client
+        .post(url(&addr, "/ui/chat/chat-bot/config"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={}&endpoint_id={}", csrf, endpoint_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(url(&addr, "/ui/chat/chat-bot/send"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={}&message=First+message", csrf))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .get(url(&addr, "/v1/chat/poll"))
+        .header("x-lore-key", &token)
+        .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let msgs = body["messages"]
+        .as_array()
+        .expect("messages should be array");
+    assert_eq!(msgs.len(), 1, "first poll should claim one message: {body}");
+    assert_eq!(
+        msgs[0]["content"].as_str().unwrap_or(""),
+        "First message",
+        "first claimed message mismatch: {body}"
+    );
+
+    let resp = client
+        .post(url(&addr, "/v1/chat/status"))
+        .header("x-lore-key", &token)
+        .json(&json!({ "status": "thinking" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(url(&addr, "/ui/chat/chat-bot/send"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={}&message=Second+message", csrf))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(url(&addr, "/v1/chat/respond"))
+        .header("x-lore-key", &token)
+        .json(&json!({
+            "complete": true,
+            "content": "First reply"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .get(url(&addr, "/v1/chat/poll"))
+        .header("x-lore-key", &token)
+        .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let msgs = body["messages"]
+        .as_array()
+        .expect("messages should be array");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "follow-up poll should claim one queued message: {body}"
+    );
+    assert_eq!(
+        msgs[0]["content"].as_str().unwrap_or(""),
+        "Second message",
+        "queued follow-up should still be pending after the first response: {body}"
     );
 }
 
@@ -1663,7 +2063,13 @@ async fn agent_chat_send_poll_respond() {
 async fn full_mcp_protocol_flow() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
-    let token = api_create_agent_token(&client, &addr, "mcp-full-agent", &[("mcp.full.proj", "read_write")]).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "mcp-full-agent",
+        &[("mcp.full.proj", "read_write")],
+    )
+    .await;
 
     // MCP initialize (requires bearer auth)
     let resp = client
@@ -1685,12 +2091,17 @@ async fn full_mcp_protocol_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let session_id = resp.headers().get("mcp-session-id")
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
         .unwrap_or_default();
     let body: Value = resp.json().await.unwrap();
-    assert!(body["result"]["capabilities"]["tools"].is_object(), "should advertise tool capabilities: {body:?}");
+    assert!(
+        body["result"]["capabilities"]["tools"].is_object(),
+        "should advertise tool capabilities: {body:?}"
+    );
 
     // MCP tools/list (requires session header)
     let resp = client
@@ -1784,7 +2195,11 @@ async fn setup_agent_with_project(
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "provision agent {agent_display_name} failed");
+    assert_eq!(
+        resp.status(),
+        200,
+        "provision agent {agent_display_name} failed"
+    );
     let body: Value = resp.json().await.unwrap();
     body["token"].as_str().unwrap().to_string()
 }
@@ -1797,18 +2212,26 @@ async fn multi_agent_isolation_and_concurrent_execution() {
     // --- Setup: two users, two agents, two projects ---
 
     let token_alpha = setup_agent_with_project(
-        &client, &addr,
-        "role-alpha", "project.alpha",
-        "user-alpha", "pass-alpha-123",
-        "machine-alpha", "agent-alpha",
+        &client,
+        &addr,
+        "role-alpha",
+        "project.alpha",
+        "user-alpha",
+        "pass-alpha-123",
+        "machine-alpha",
+        "agent-alpha",
     )
     .await;
 
     let token_beta = setup_agent_with_project(
-        &client, &addr,
-        "role-beta", "project.beta",
-        "user-beta", "pass-beta-456",
-        "machine-beta", "agent-beta",
+        &client,
+        &addr,
+        "role-beta",
+        "project.beta",
+        "user-beta",
+        "pass-beta-456",
+        "machine-beta",
+        "agent-beta",
     )
     .await;
 
@@ -1850,12 +2273,18 @@ async fn multi_agent_isolation_and_concurrent_execution() {
     // Create blocks in each document concurrently
     let (blk_a, blk_b) = tokio::join!(
         client
-            .post(url(&addr, &format!("/v1/projects/project.alpha/documents/{doc_a_id}/blocks")))
+            .post(url(
+                &addr,
+                &format!("/v1/projects/project.alpha/documents/{doc_a_id}/blocks")
+            ))
             .header("x-lore-key", &token_alpha)
             .json(&json!({"block_type": "markdown", "content": "Alpha confidential notes"}))
             .send(),
         client
-            .post(url(&addr, &format!("/v1/projects/project.beta/documents/{doc_b_id}/blocks")))
+            .post(url(
+                &addr,
+                &format!("/v1/projects/project.beta/documents/{doc_b_id}/blocks")
+            ))
             .header("x-lore-key", &token_beta)
             .json(&json!({"block_type": "markdown", "content": "Beta confidential notes"}))
             .send(),
@@ -1879,7 +2308,9 @@ async fn multi_agent_isolation_and_concurrent_execution() {
         .unwrap()
         .iter()
         .filter_map(|p| {
-            p["project"].as_str().or_else(|| p["project"]["slug"].as_str())
+            p["project"]
+                .as_str()
+                .or_else(|| p["project"]["slug"].as_str())
         })
         .collect();
     assert!(
@@ -1904,7 +2335,9 @@ async fn multi_agent_isolation_and_concurrent_execution() {
         .unwrap()
         .iter()
         .filter_map(|p| {
-            p["project"].as_str().or_else(|| p["project"]["slug"].as_str())
+            p["project"]
+                .as_str()
+                .or_else(|| p["project"]["slug"].as_str())
         })
         .collect();
     assert!(
@@ -1921,12 +2354,18 @@ async fn multi_agent_isolation_and_concurrent_execution() {
     let (cross_a, cross_b) = tokio::join!(
         // Alpha tries to read beta's doc blocks
         client
-            .get(url(&addr, &format!("/v1/projects/project.beta/documents/{doc_b_id}/blocks")))
+            .get(url(
+                &addr,
+                &format!("/v1/projects/project.beta/documents/{doc_b_id}/blocks")
+            ))
             .header("x-lore-key", &token_alpha)
             .send(),
         // Beta tries to read alpha's doc blocks
         client
-            .get(url(&addr, &format!("/v1/projects/project.alpha/documents/{doc_a_id}/blocks")))
+            .get(url(
+                &addr,
+                &format!("/v1/projects/project.alpha/documents/{doc_a_id}/blocks")
+            ))
             .header("x-lore-key", &token_beta)
             .send(),
     );
@@ -2010,7 +2449,10 @@ async fn multi_agent_isolation_and_concurrent_execution() {
     // Cross-project block deletion denied
     // First, get a block ID from each project to attempt deletion
     let own_blocks_a: Value = client
-        .get(url(&addr, &format!("/v1/projects/project.alpha/documents/{doc_a_id}/blocks")))
+        .get(url(
+            &addr,
+            &format!("/v1/projects/project.alpha/documents/{doc_a_id}/blocks"),
+        ))
         .header("x-lore-key", &token_alpha)
         .send()
         .await
@@ -2018,14 +2460,19 @@ async fn multi_agent_isolation_and_concurrent_execution() {
         .json()
         .await
         .unwrap();
-    let block_a_id = own_blocks_a.as_array().unwrap()
+    let block_a_id = own_blocks_a
+        .as_array()
+        .unwrap()
         .iter()
         .find(|b| b["block_type"].as_str() == Some("markdown"))
         .and_then(|b| b["id"].as_str())
         .expect("alpha should have a markdown block");
 
     let own_blocks_b: Value = client
-        .get(url(&addr, &format!("/v1/projects/project.beta/documents/{doc_b_id}/blocks")))
+        .get(url(
+            &addr,
+            &format!("/v1/projects/project.beta/documents/{doc_b_id}/blocks"),
+        ))
         .header("x-lore-key", &token_beta)
         .send()
         .await
@@ -2033,7 +2480,9 @@ async fn multi_agent_isolation_and_concurrent_execution() {
         .json()
         .await
         .unwrap();
-    let block_b_id = own_blocks_b.as_array().unwrap()
+    let block_b_id = own_blocks_b
+        .as_array()
+        .unwrap()
         .iter()
         .find(|b| b["block_type"].as_str() == Some("markdown"))
         .and_then(|b| b["id"].as_str())
@@ -2042,12 +2491,18 @@ async fn multi_agent_isolation_and_concurrent_execution() {
     let (del_cross_a, del_cross_b) = tokio::join!(
         // Alpha tries to delete beta's block
         client
-            .delete(url(&addr, &format!("/v1/blocks/{block_b_id}?project=project.beta")))
+            .delete(url(
+                &addr,
+                &format!("/v1/blocks/{block_b_id}?project=project.beta")
+            ))
             .header("x-lore-key", &token_alpha)
             .send(),
         // Beta tries to delete alpha's block
         client
-            .delete(url(&addr, &format!("/v1/blocks/{block_a_id}?project=project.alpha")))
+            .delete(url(
+                &addr,
+                &format!("/v1/blocks/{block_a_id}?project=project.alpha")
+            ))
             .header("x-lore-key", &token_beta)
             .send(),
     );
@@ -2101,7 +2556,8 @@ async fn multi_agent_isolation_and_concurrent_execution() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake_claude_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&fake_claude_path, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
     }
 
     // Login as each user and get CSRF tokens
@@ -2202,8 +2658,13 @@ async fn multi_agent_isolation_and_concurrent_execution() {
                 .await
                 .expect(&format!("{agent_label} poll failed"));
             let body: Value = resp.json().await.unwrap();
-            let msgs = body["messages"].as_array().expect(&format!("{agent_label} should have messages"));
-            assert!(!msgs.is_empty(), "{agent_label} should have a pending message");
+            let msgs = body["messages"]
+                .as_array()
+                .expect(&format!("{agent_label} should have messages"));
+            assert!(
+                !msgs.is_empty(),
+                "{agent_label} should have a pending message"
+            );
             let msg_content = msgs[0]["content"].as_str().unwrap_or("");
             assert!(
                 msg_content.contains(agent_label),
@@ -2228,7 +2689,9 @@ async fn multi_agent_isolation_and_concurrent_execution() {
             let mut lines = reader.lines();
             let mut response_text = String::new();
             while let Some(line) = lines.next_line().await.unwrap() {
-                if line.trim().is_empty() { continue; }
+                if line.trim().is_empty() {
+                    continue;
+                }
                 if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
                     // Extract text from claude stream-json format
                     if parsed["type"].as_str() == Some("assistant") {
@@ -2245,7 +2708,10 @@ async fn multi_agent_isolation_and_concurrent_execution() {
                 }
             }
             let exit = child.wait().await.unwrap();
-            assert!(exit.success(), "{agent_label} fake backend exited with error");
+            assert!(
+                exit.success(),
+                "{agent_label} fake backend exited with error"
+            );
 
             // Post the response back
             let resp = client
@@ -2308,8 +2774,20 @@ async fn multi_agent_isolation_and_concurrent_execution() {
         .collect::<Vec<_>>()
         .join(" ");
 
-    assert!(a_texts.contains("alpha"), "alpha history should have alpha content");
-    assert!(!a_texts.contains("beta"), "alpha history must NOT contain beta content: {a_texts}");
-    assert!(b_texts.contains("beta"), "beta history should have beta content");
-    assert!(!b_texts.contains("alpha"), "beta history must NOT contain alpha content: {b_texts}");
+    assert!(
+        a_texts.contains("alpha"),
+        "alpha history should have alpha content"
+    );
+    assert!(
+        !a_texts.contains("beta"),
+        "alpha history must NOT contain beta content: {a_texts}"
+    );
+    assert!(
+        b_texts.contains("beta"),
+        "beta history should have beta content"
+    );
+    assert!(
+        !b_texts.contains("alpha"),
+        "beta history must NOT contain alpha content: {b_texts}"
+    );
 }
