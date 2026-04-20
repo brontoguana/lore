@@ -520,6 +520,12 @@ fn run_migrations(conn: &Connection) {
             table: "conversations",
             column: "active_turn_user_id",
         },
+        Migration {
+            version: 6,
+            sql: "ALTER TABLE messages ADD COLUMN client_message_id TEXT",
+            table: "messages",
+            column: "client_message_id",
+        },
     ];
 
     for m in migrations {
@@ -1955,6 +1961,8 @@ pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
     pub timestamp: OffsetDateTime,
+    #[serde(default)]
+    pub client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2077,9 +2085,13 @@ CREATE TABLE IF NOT EXISTS messages (
     id INTEGER NOT NULL,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
+    client_message_id TEXT,
     timestamp TEXT NOT NULL,
     PRIMARY KEY (owner, agent, id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_message_id
+ON messages (owner, agent, client_message_id)
+WHERE client_message_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS pins (
     owner TEXT NOT NULL,
     agent TEXT NOT NULL,
@@ -2219,7 +2231,7 @@ impl ChatStore {
         };
         // Load messages
         let mut stmt = conn.prepare(
-            "SELECT id, role, content, timestamp FROM messages WHERE owner = ?1 AND agent = ?2 ORDER BY id"
+            "SELECT id, role, content, timestamp, client_message_id FROM messages WHERE owner = ?1 AND agent = ?2 ORDER BY id"
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conv.messages = stmt
             .query_map(params![owner, agent], |row| {
@@ -2234,6 +2246,7 @@ impl ChatStore {
                     },
                     content: row.get(2)?,
                     timestamp: parse_dt(&row.get::<_, String>(3)?),
+                    client_message_id: row.get(4)?,
                 })
             })
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?
@@ -2308,8 +2321,8 @@ impl ChatStore {
                 ChatRole::Error => "error",
             };
             conn.execute(
-                "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![owner, agent, msg.id as i64, role_str, msg.content, fmt_dt(&msg.timestamp)],
+                "INSERT INTO messages (owner, agent, id, role, content, client_message_id, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![owner, agent, msg.id as i64, role_str, msg.content, msg.client_message_id, fmt_dt(&msg.timestamp)],
             ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         }
         // Replace pins
@@ -2375,7 +2388,98 @@ impl ChatStore {
             role,
             content,
             timestamp: now,
+            client_message_id: None,
         })
+    }
+
+    fn find_message_by_client_message_id(
+        conn: &Connection,
+        owner: &str,
+        agent: &str,
+        client_message_id: &str,
+    ) -> Result<Option<ChatMessage>> {
+        conn.query_row(
+            "SELECT id, role, content, timestamp, client_message_id FROM messages WHERE owner = ?1 AND agent = ?2 AND client_message_id = ?3 LIMIT 1",
+            params![owner, agent, client_message_id],
+            |row| {
+                Ok(ChatMessage {
+                    id: row.get::<_, i64>(0)? as u64,
+                    role: match row.get::<_, String>(1)?.as_str() {
+                        "assistant" => ChatRole::Assistant,
+                        "tool" => ChatRole::Tool,
+                        "error" => ChatRole::Error,
+                        _ => ChatRole::User,
+                    },
+                    content: row.get(2)?,
+                    timestamp: parse_dt(&row.get::<_, String>(3)?),
+                    client_message_id: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))
+    }
+
+    pub fn append_user_message_idempotent(
+        &self,
+        owner: &str,
+        agent: &str,
+        content: String,
+        client_message_id: Option<&str>,
+    ) -> Result<(ChatMessage, bool)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::ensure_conversation(&conn, owner, agent)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+
+        let normalized_client_message_id = client_message_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        if let Some(ref client_id) = normalized_client_message_id {
+            if let Some(existing) =
+                Self::find_message_by_client_message_id(&conn, owner, agent, client_id)?
+            {
+                if existing.content != content {
+                    return Err(LoreError::Validation(
+                        "client message id reuse with different content".into(),
+                    ));
+                }
+                return Ok((existing, false));
+            }
+        }
+
+        let next_id: i64 = conn
+            .query_row(
+                "SELECT next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+                params![owner, agent],
+                |row| row.get(0),
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let now = OffsetDateTime::now_utc();
+        conn.execute(
+            "INSERT INTO messages (owner, agent, id, role, content, client_message_id, timestamp) VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6)",
+            params![owner, agent, next_id, content, normalized_client_message_id, fmt_dt(&now)],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "UPDATE conversations SET next_id = ?1 WHERE owner = ?2 AND agent = ?3",
+            params![next_id + 1, owner, agent],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok((
+            ChatMessage {
+                id: next_id as u64,
+                role: ChatRole::User,
+                content,
+                timestamp: now,
+                client_message_id: normalized_client_message_id,
+            },
+            true,
+        ))
     }
 
     /// Append a tool-use detail. If the most recent message for this (owner,agent)
@@ -2426,6 +2530,7 @@ impl ChatStore {
                     role: ChatRole::Tool,
                     content: new_content,
                     timestamp: parse_dt(&last_ts),
+                    client_message_id: None,
                 });
             }
         }
@@ -2452,6 +2557,7 @@ impl ChatStore {
             role: ChatRole::Tool,
             content: detail.to_string(),
             timestamp: now,
+            client_message_id: None,
         })
     }
 
@@ -2492,6 +2598,7 @@ impl ChatStore {
                         role: ChatRole::Error,
                         content: new_content,
                         timestamp: parse_dt(&last_ts),
+                        client_message_id: None,
                     });
                 }
             }
@@ -2519,6 +2626,7 @@ impl ChatStore {
             role: ChatRole::Error,
             content: detail.to_string(),
             timestamp: now,
+            client_message_id: None,
         })
     }
 
@@ -2678,6 +2786,7 @@ impl ChatStore {
                     role: ChatRole::User,
                     content: row.get(1)?,
                     timestamp: parse_dt(&row.get::<_, String>(2)?),
+                    client_message_id: None,
                 })
             })
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?

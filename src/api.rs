@@ -10532,15 +10532,14 @@ fn build_chat_agents(
         let owner = agent.owner.as_ref().map(|o| o.as_str()).unwrap_or("");
         let conv = state.chat.load_conversation(owner, &agent.name)?;
         let last_msg = conv.messages.last();
-        let last_user_at = conv
+        let last_user = conv
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == ChatRole::User)
-            .map(|m| m.timestamp)
-            .or_else(|| last_msg.map(|m| m.timestamp));
+            .find(|m| m.role == ChatRole::User);
+        let last_user_at = last_user.map(|m| m.timestamp);
         let snippet = last_msg.map(|m| m.content.chars().take(60).collect::<String>());
-        let time_str = last_msg.map(|m| format_chat_time(m.timestamp));
+        let time_str = last_user_at.map(format_chat_time);
         chat_agents.push((
             last_user_at,
             ChatAgentSummary {
@@ -11241,6 +11240,7 @@ fn librarian_chat_clear_inner(
 struct ChatSendForm {
     csrf_token: String,
     message: String,
+    client_message_id: Option<String>,
 }
 
 async fn chat_send_message(
@@ -11261,35 +11261,66 @@ async fn chat_send_message(
         return Err(LoreError::PermissionDenied.into());
     }
 
-    let msg =
-        state
-            .chat
-            .append_message(owner, &agent_name, ChatRole::User, form.message.clone())?;
-    state
-        .chat_audit
-        .log(&agent_name, owner, "user", &form.message);
+    let client_message_id = form
+        .client_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let valid = value.len() <= 128
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'));
+            if valid {
+                Ok(value.to_string())
+            } else {
+                Err(LoreError::Validation("invalid client message id".into()))
+            }
+        })
+        .transpose()?;
 
-    // Push SSE event to the user
-    push_chat_event(
-        &state,
+    let (msg, inserted) = state.chat.append_user_message_idempotent(
         owner,
-        ChatEvent {
-            event_type: "message".into(),
-            agent: agent_name.clone(),
-            owner: owner.to_string(),
-            data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
-        },
-    );
+        &agent_name,
+        form.message.clone(),
+        client_message_id.as_deref(),
+    )?;
+    if inserted {
+        state
+            .chat_audit
+            .log(&agent_name, owner, "user", &form.message);
 
-    // Notify the machine if it's polling
-    let notifier_key = format!("{owner}_{agent_name}");
-    if let Ok(notifiers) = state.chat_agent_notifiers.lock() {
-        if let Some(notify) = notifiers.get(&notifier_key) {
-            notify.notify_one();
+        // Push SSE event to the user
+        push_chat_event(
+            &state,
+            owner,
+            ChatEvent {
+                event_type: "message".into(),
+                agent: agent_name.clone(),
+                owner: owner.to_string(),
+                data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
+            },
+        );
+
+        // Notify the machine if it's polling
+        let notifier_key = format!("{owner}_{agent_name}");
+        if let Ok(notifiers) = state.chat_agent_notifiers.lock() {
+            if let Some(notify) = notifiers.get(&notifier_key) {
+                notify.notify_one();
+            }
         }
     }
 
-    Ok(StatusCode::OK.into_response())
+    Ok(Json(json!({
+        "ok": true,
+        "inserted": inserted,
+        "message": {
+            "id": msg.id,
+            "role": "user",
+            "content": msg.content,
+        }
+    }))
+    .into_response())
 }
 
 async fn chat_sse_stream(State(state): State<AppState>, headers: HeaderMap) -> UiResult<Response> {
@@ -15192,6 +15223,7 @@ mod tests {
             role: ChatRole::User,
             content: "first".into(),
             timestamp: base + Duration::milliseconds(100),
+            client_message_id: None,
         });
         alpha_conv.next_id = 2;
         state
@@ -15205,6 +15237,7 @@ mod tests {
             role: ChatRole::User,
             content: "second".into(),
             timestamp: base + Duration::milliseconds(900),
+            client_message_id: None,
         });
         bravo_conv.next_id = 2;
         state
@@ -15215,6 +15248,93 @@ mod tests {
         let agents = build_chat_agents(&state, &owner).unwrap();
         let ordered_names: Vec<&str> = agents.iter().map(|agent| agent.name.as_str()).collect();
         assert_eq!(ordered_names, vec!["bravo", "alpha"]);
+    }
+
+    #[test]
+    fn chat_agents_ignore_assistant_timestamps_for_order_and_sidebar_time() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let owner = UserName::new("alice").unwrap();
+        state
+            .auth
+            .bootstrap_admin(owner.clone(), "correct-horse-battery".into())
+            .unwrap();
+
+        for display_name in ["alpha", "bravo"] {
+            state
+                .auth
+                .create_agent_token(NewAgentToken {
+                    display_name: display_name.to_string(),
+                    owner: owner.clone(),
+                    grants: vec![ProjectGrant {
+                        project: ProjectName::new("alpha.docs").unwrap(),
+                        permission: ProjectPermission::ReadWrite,
+                    }],
+                    backend: AgentBackend::Claude,
+                    endpoint_id: None,
+                })
+                .unwrap();
+        }
+
+        let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let alpha_user_at = base + Duration::minutes(2);
+        let bravo_user_at = base + Duration::minutes(3);
+
+        let mut alpha_conv = ChatConversation::default();
+        alpha_conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "alpha user".into(),
+            timestamp: alpha_user_at,
+            client_message_id: None,
+        });
+        alpha_conv.messages.push(ChatMessage {
+            id: 2,
+            role: ChatRole::Assistant,
+            content: "alpha assistant".into(),
+            timestamp: base + Duration::minutes(10),
+            client_message_id: None,
+        });
+        alpha_conv.next_id = 3;
+        state
+            .chat
+            .save_conversation(owner.as_str(), "alpha", &alpha_conv)
+            .unwrap();
+
+        let mut bravo_conv = ChatConversation::default();
+        bravo_conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "bravo user".into(),
+            timestamp: bravo_user_at,
+            client_message_id: None,
+        });
+        bravo_conv.messages.push(ChatMessage {
+            id: 2,
+            role: ChatRole::Assistant,
+            content: "bravo assistant".into(),
+            timestamp: base + Duration::minutes(4),
+            client_message_id: None,
+        });
+        bravo_conv.next_id = 3;
+        state
+            .chat
+            .save_conversation(owner.as_str(), "bravo", &bravo_conv)
+            .unwrap();
+
+        let agents = build_chat_agents(&state, &owner).unwrap();
+        let ordered_names: Vec<&str> = agents.iter().map(|agent| agent.name.as_str()).collect();
+        let expected_bravo_time = super::format_chat_time(bravo_user_at);
+        let expected_alpha_time = super::format_chat_time(alpha_user_at);
+        assert_eq!(ordered_names, vec!["bravo", "alpha"]);
+        assert_eq!(
+            agents[0].last_message_time.as_deref(),
+            Some(expected_bravo_time.as_str())
+        );
+        assert_eq!(
+            agents[1].last_message_time.as_deref(),
+            Some(expected_alpha_time.as_str())
+        );
     }
 
     #[tokio::test]
@@ -15255,6 +15375,100 @@ mod tests {
         assert_eq!(json["selected_agent"], "agent-main");
         assert_eq!(json["agent_status"], "idle");
         assert_eq!(json["messages"][0]["content"], "hello from agent");
+    }
+
+    #[tokio::test]
+    async fn chat_send_returns_persisted_user_message() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let _agent_token =
+            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/agent-main/send")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}&message={}",
+                urlencoding::encode(&csrf_token),
+                urlencoding::encode("hello from user")
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["message"]["role"], "user");
+        assert_eq!(json["message"]["content"], "hello from user");
+        assert!(json["message"]["id"].as_u64().unwrap_or(0) > 0);
+
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].role, ChatRole::User);
+        assert_eq!(conv.messages[0].content, "hello from user");
+    }
+
+    #[tokio::test]
+    async fn chat_send_retries_same_client_message_id_without_duplicates() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let _agent_token =
+            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+        let client_message_id = "retry_send_001";
+        let body = format!(
+            "csrf_token={}&message={}&client_message_id={}",
+            urlencoding::encode(&csrf_token),
+            urlencoding::encode("hello from user"),
+            urlencoding::encode(client_message_id),
+        );
+
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/ui/chat/agent-main/send")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", &session_cookie)
+                .body(Body::from(body.clone()))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_json["inserted"], true);
+
+        let retry = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        let retry_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(retry.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retry_json["inserted"], false);
+        assert_eq!(retry_json["message"]["id"], first_json["message"]["id"]);
+
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].content, "hello from user");
+        assert_eq!(
+            conv.messages[0].client_message_id.as_deref(),
+            Some(client_message_id)
+        );
     }
 
     #[tokio::test]
@@ -18479,12 +18693,14 @@ mod tests {
             role: ChatRole::User,
             content: "hello".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
         conv.messages.push(ChatMessage {
             id: 2,
             role: ChatRole::Assistant,
             content: "done".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);
@@ -18504,12 +18720,14 @@ mod tests {
             role: ChatRole::User,
             content: "hello".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
         conv.messages.push(ChatMessage {
             id: 2,
             role: ChatRole::Assistant,
             content: "done".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);
@@ -18533,12 +18751,14 @@ mod tests {
             role: ChatRole::User,
             content: "hello".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
         conv.messages.push(ChatMessage {
             id: 2,
             role: ChatRole::Assistant,
             content: "partial".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);
@@ -18562,24 +18782,28 @@ mod tests {
             role: ChatRole::User,
             content: "first".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
         conv.messages.push(ChatMessage {
             id: 2,
             role: ChatRole::Assistant,
             content: "working".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
         conv.messages.push(ChatMessage {
             id: 3,
             role: ChatRole::User,
             content: "follow-up".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
         conv.messages.push(ChatMessage {
             id: 4,
             role: ChatRole::Tool,
             content: "tool step".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);
@@ -18603,18 +18827,21 @@ mod tests {
             role: ChatRole::User,
             content: "first".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
         conv.messages.push(ChatMessage {
             id: 2,
             role: ChatRole::Assistant,
             content: "done".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
         conv.messages.push(ChatMessage {
             id: 3,
             role: ChatRole::User,
             content: "follow-up".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);

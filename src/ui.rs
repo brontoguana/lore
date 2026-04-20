@@ -28,7 +28,7 @@ const ICON_STOP: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill=
 const ICON_RESTART: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 const ICON_STATUS_DONE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>"#;
-const ICON_STATUS_WORKING: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>"#;
+const ICON_STATUS_WORKING: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><defs><linearGradient id="status-working-gradient" x1="2" y1="12" x2="22" y2="12" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color='#38bdf8'/><stop offset="0.35" stop-color="var(--accent)"/><stop offset="0.65" stop-color='#dbeafe'/><stop offset="1" stop-color='#38bdf8'/><animateTransform attributeName="gradientTransform" type="translate" from="-18 0" to="18 0" dur="1.35s" repeatCount="indefinite"/></linearGradient></defs><path stroke='url(#status-working-gradient)' d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>"#;
 const ICON_STATUS_STOPPED: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6"/><path d="M15 9l-6 6"/></svg>"#;
 
 fn chat_status_indicator(status: &str) -> (&'static str, &'static str, &'static str) {
@@ -65,7 +65,11 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
   var mode = '{mode}';
   var resyncTimers = [];
   function setResolvedMode(resolved) {{
-    root.setAttribute('data-resolved-color-mode', resolved);
+    if (mode === 'system') {{
+      root.removeAttribute('data-resolved-color-mode');
+    }} else {{
+      root.setAttribute('data-resolved-color-mode', resolved);
+    }}
     root.style.colorScheme = resolved;
   }}
   function clearResyncTimers() {{
@@ -3629,6 +3633,8 @@ var chatResumeRefreshInFlight = false;
 var chatLastResumeRefreshAt = 0;
 var chatLastStreamEventAt = Date.now();
 var chatWasBackgrounded = false;
+var chatSendInFlight = false;
+var chatSendMaxAttempts = 3;
 
 function isMobileChatLayout() {{
   return !!(window.matchMedia && window.matchMedia('(max-width: 860px)').matches);
@@ -3640,6 +3646,10 @@ function currentChatUrl(agent) {{
 
 function chatDraftStorageKey() {{
   return 'lore.chat.drafts:' + chatDraftUser;
+}}
+
+function chatSendTokenStorageKey() {{
+  return 'lore.chat.send-tokens:' + chatDraftUser;
 }}
 
 function readChatDraftStore() {{
@@ -3664,6 +3674,28 @@ function writeChatDraftStore(store) {{
   }} catch (e) {{}}
 }}
 
+function readChatSendTokenStore() {{
+  try {{
+    var raw = localStorage.getItem(chatSendTokenStorageKey());
+    if (!raw) return {{}};
+    var parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {{}};
+  }} catch (e) {{
+    return {{}};
+  }}
+}}
+
+function writeChatSendTokenStore(store) {{
+  try {{
+    var nextStore = store || {{}};
+    if (Object.keys(nextStore).length === 0) {{
+      localStorage.removeItem(chatSendTokenStorageKey());
+      return;
+    }}
+    localStorage.setItem(chatSendTokenStorageKey(), JSON.stringify(nextStore));
+  }} catch (e) {{}}
+}}
+
 function getChatDraft(agent) {{
   if (!agent) return '';
   var store = readChatDraftStore();
@@ -3681,10 +3713,56 @@ function setChatDraft(agent, value) {{
   writeChatDraftStore(store);
 }}
 
+function getChatSendTokenEntry(agent) {{
+  if (!agent) return null;
+  var store = readChatSendTokenStore();
+  var entry = store[agent];
+  if (!entry || typeof entry !== 'object') return null;
+  if (typeof entry.text !== 'string' || typeof entry.token !== 'string' || !entry.token) return null;
+  return entry;
+}}
+
+function setChatSendTokenEntry(agent, text, token) {{
+  if (!agent) return;
+  var store = readChatSendTokenStore();
+  if (text && token) {{
+    store[agent] = {{ text: text, token: token }};
+  }} else {{
+    delete store[agent];
+  }}
+  writeChatSendTokenStore(store);
+}}
+
+function clearChatSendToken(agent) {{
+  setChatSendTokenEntry(agent, '', '');
+}}
+
+function syncChatSendToken(agent, text) {{
+  var entry = getChatSendTokenEntry(agent);
+  if (!entry) return;
+  if (!text || entry.text !== text) clearChatSendToken(agent);
+}}
+
+function generateChatSendToken() {{
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {{
+    return window.crypto.randomUUID().replace(/[^A-Za-z0-9_-]/g, '_');
+  }}
+  return 'chat_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+}}
+
+function resolveChatSendToken(agent, text) {{
+  var entry = getChatSendTokenEntry(agent);
+  if (entry && entry.text === text) return entry.token;
+  var token = generateChatSendToken();
+  setChatSendTokenEntry(agent, text, token);
+  return token;
+}}
+
 function persistCurrentChatDraft() {{
   var input = document.getElementById('chat-input');
   if (!input || !currentAgent) return;
   setChatDraft(currentAgent, input.value || '');
+  syncChatSendToken(currentAgent, input.value || '');
 }}
 
 function clearActiveAgentInList() {{
@@ -3727,8 +3805,8 @@ function updateAgentListPreview(agent, content, timeText) {{
     var normalized = content.replace(/\s+/g, ' ').trim();
     snippetEl.textContent = normalized ? normalized.slice(0, 60) : 'No messages yet';
   }}
-  if (timeEl) {{
-    timeEl.textContent = timeText || sidebarTimeNow();
+  if (timeEl && typeof timeText === 'string') {{
+    timeEl.textContent = timeText;
   }}
 }}
 
@@ -3994,10 +4072,12 @@ function initChatComposer() {{
   var input = document.getElementById('chat-input');
   if (!input) return;
   input.value = getChatDraft(currentAgent);
+  syncChatSendToken(currentAgent, input.value || '');
   if (input.dataset.chatComposerBound !== '1') {{
     input.dataset.chatComposerBound = '1';
     input.addEventListener('input', function() {{
       setChatDraft(currentAgent, input.value || '');
+      syncChatSendToken(currentAgent, input.value || '');
       if (resizeChatInput()) {{
         scheduleChatViewportFix();
       }}
@@ -4433,17 +4513,136 @@ function handleChatKey(e) {{
   return true;
 }}
 
+function setChatSendPending(pending) {{
+  chatSendInFlight = !!pending;
+  var input = document.getElementById('chat-input');
+  var sendBtn = document.querySelector('#chat-input-form .chat-send-btn');
+  if (input) input.disabled = chatSendInFlight;
+  if (sendBtn) sendBtn.disabled = chatSendInFlight;
+}}
+
+function shouldRetryChatSendStatus(status) {{
+  return status === 408 || status === 425 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}}
+
+function insertOrReconcileConfirmedUserMessage(message) {{
+  if (!message || !message.id) return;
+  for (var i = chatMessages.length - 1; i >= 0; i--) {{
+    var userMsg = chatMessages[i];
+    if (!userMsg || userMsg.role !== 'user') continue;
+    if (chatMessageId(userMsg) === message.id) {{
+      userMsg.content = message.content || '';
+      userMsg.queued_follow_up = message.id > activeTurnUserId;
+      return;
+    }}
+    if (!chatMessageId(userMsg) && userMsg.content === (message.content || '')) {{
+      userMsg._id = message.id;
+      userMsg.content = message.content || '';
+      userMsg.queued_follow_up = message.id > activeTurnUserId;
+      return;
+    }}
+  }}
+  insertChatMessage({{
+    role: 'user',
+    content: message.content || '',
+    _id: message.id,
+    queued_follow_up: message.id > activeTurnUserId
+  }});
+}}
+
+function handleChatSendSuccess(agentName, text, message) {{
+  setChatSendPending(false);
+  setChatDraft(agentName, '');
+  clearChatSendToken(agentName);
+  moveAgentItemToTop(agentName);
+  updateAgentListPreview(agentName, text);
+  if (currentAgent === agentName) {{
+    var input = document.getElementById('chat-input');
+    if (input) {{
+      input.value = '';
+      resizeChatInput();
+    }}
+    insertOrReconcileConfirmedUserMessage(message);
+    renderMessages();
+  }}
+}}
+
+function handleChatSendFailure(agentName, text, errorMessage) {{
+  setChatSendPending(false);
+  setChatDraft(agentName, text);
+  if (currentAgent === agentName) {{
+    var input = document.getElementById('chat-input');
+    if (input && input.value !== text) {{
+      input.value = text;
+      resizeChatInput();
+    }}
+    insertChatMessage({{ role: 'system', content: errorMessage }});
+    renderMessages();
+  }}
+}}
+
+function sendMessageRequest(agentName, text, clientMessageId, attempt) {{
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/ui/chat/' + encodeURIComponent(agentName) + '/send');
+  xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+  xhr.timeout = 15000;
+  xhr.onerror = function() {{
+    if (attempt < chatSendMaxAttempts) {{
+      window.setTimeout(function() {{
+        sendMessageRequest(agentName, text, clientMessageId, attempt + 1);
+      }}, attempt * 800);
+      return;
+    }}
+    handleChatSendFailure(agentName, text, 'Failed to send message after retrying (network error)');
+  }};
+  xhr.ontimeout = function() {{
+    if (attempt < chatSendMaxAttempts) {{
+      window.setTimeout(function() {{
+        sendMessageRequest(agentName, text, clientMessageId, attempt + 1);
+      }}, attempt * 800);
+      return;
+    }}
+    handleChatSendFailure(agentName, text, 'Failed to send message after retrying (request timed out)');
+  }};
+  xhr.onload = function() {{
+    if (xhr.status !== 200) {{
+      if (attempt < chatSendMaxAttempts && shouldRetryChatSendStatus(xhr.status)) {{
+        window.setTimeout(function() {{
+          sendMessageRequest(agentName, text, clientMessageId, attempt + 1);
+        }}, attempt * 800);
+        return;
+      }}
+      handleChatSendFailure(agentName, text, 'Failed to send message (HTTP ' + xhr.status + ')');
+      return;
+    }}
+    var message = null;
+    try {{
+      var resp = JSON.parse(xhr.responseText);
+      if (resp && resp.message) message = resp.message;
+    }} catch (err) {{}}
+    handleChatSendSuccess(agentName, text, message);
+  }};
+  xhr.send(
+    'csrf_token=' + encodeURIComponent(csrfToken) +
+    '&message=' + encodeURIComponent(text) +
+    '&client_message_id=' + encodeURIComponent(clientMessageId)
+  );
+}}
+
 function sendMessage(e) {{
   e.preventDefault();
+  if (chatSendInFlight) return false;
+  var agentName = currentAgent;
   var input = document.getElementById('chat-input');
+  if (!input) return false;
   var text = input.value.trim();
   if (!text) return false;
-  setChatDraft(currentAgent, '');
-  input.value = '';
-  resizeChatInput();
 
   // Slash commands go to the command endpoint
   if (text.startsWith('/')) {{
+    setChatDraft(currentAgent, '');
+    input.value = '';
+    resizeChatInput();
     chatFollowScroll = true;
     insertChatMessage({{ role: 'user', content: text }});
     moveAgentItemToTop(currentAgent);
@@ -4469,29 +4668,8 @@ function sendMessage(e) {{
   }}
 
   chatFollowScroll = true;
-  insertChatMessage({{
-    role: 'user',
-    content: text,
-    queued_follow_up: agentStatus === 'thinking' || hasQueuedFollowUpUserMessages()
-  }});
-  moveAgentItemToTop(currentAgent);
-  updateAgentListPreview(currentAgent, text);
-  renderMessages();
-
-  var xhr = new XMLHttpRequest();
-  xhr.open('POST', '/ui/chat/' + encodeURIComponent(currentAgent) + '/send');
-  xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-  xhr.onerror = function() {{
-    insertChatMessage({{ role: 'system', content: 'Failed to send message (network error)' }});
-    renderMessages();
-  }};
-  xhr.onload = function() {{
-    if (xhr.status !== 200) {{
-      insertChatMessage({{ role: 'system', content: 'Failed to send message (HTTP ' + xhr.status + ')' }});
-      renderMessages();
-    }}
-  }};
-  xhr.send('csrf_token=' + encodeURIComponent(csrfToken) + '&message=' + encodeURIComponent(text));
+  setChatSendPending(true);
+  sendMessageRequest(agentName, text, resolveChatSendToken(agentName, text), 1);
   return false;
 }}
 
@@ -4527,7 +4705,7 @@ function updateAgentListStatus(agent, status) {{
     glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>';
   }} else if (status === 'thinking') {{
     glyph.title = 'Working';
-    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>';
+    glyph.innerHTML = "<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><defs><linearGradient id=\"status-working-gradient\" x1=\"2\" y1=\"12\" x2=\"22\" y2=\"12\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color='#38bdf8'/><stop offset=\"0.35\" stop-color=\"var(--accent)\"/><stop offset=\"0.65\" stop-color='#dbeafe'/><stop offset=\"1\" stop-color='#38bdf8'/><animateTransform attributeName=\"gradientTransform\" type=\"translate\" from=\"-18 0\" to=\"18 0\" dur=\"1.35s\" repeatCount=\"indefinite\"/></linearGradient></defs><path stroke='url(#status-working-gradient)' d=\"M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z\"/></svg>";
   }} else if (status === 'restarting') {{
     glyph.title = 'Restarting';
     glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>';
@@ -4659,32 +4837,13 @@ function connectSSE() {{
       var evt = JSON.parse(e.data);
       if (evt.event_type === 'message_sent' || (evt.event_type === 'message' && evt.data && evt.data.role === 'user')) {{
         moveAgentItemToTop(evt.agent);
-        updateAgentListPreview(evt.agent, evt.data && evt.data.content ? evt.data.content : '');
+        updateAgentListPreview(
+          evt.agent,
+          evt.data && evt.data.content ? evt.data.content : '',
+          sidebarTimeNow()
+        );
         if (evt.agent === currentAgent && evt.data) {{
-          var reconciled = false;
-          for (var ui = chatMessages.length - 1; ui >= 0; ui--) {{
-            var userMsg = chatMessages[ui];
-            if (userMsg.role !== 'user') continue;
-            if (userMsg._id === evt.data.id) {{
-              userMsg.queued_follow_up = evt.data.id > activeTurnUserId;
-              reconciled = true;
-              break;
-            }}
-            if (!userMsg._id && userMsg.content === (evt.data.content || '')) {{
-              userMsg._id = evt.data.id;
-              userMsg.queued_follow_up = evt.data.id > activeTurnUserId;
-              reconciled = true;
-              break;
-            }}
-          }}
-          if (!reconciled) {{
-            insertChatMessage({{
-              role: 'user',
-              content: evt.data.content || '',
-              _id: evt.data.id,
-              queued_follow_up: evt.data.id > activeTurnUserId
-            }});
-          }}
+          insertOrReconcileConfirmedUserMessage(evt.data);
           renderMessages();
         }}
       }} else if (evt.event_type === 'response_complete') {{
@@ -8583,7 +8742,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
             let light = theme_palette(theme, false);
             let dark = theme_palette(theme, true);
             format!(
-                "    :root,\n    :root[data-resolved-color-mode=\"light\"] {{\n      {light_vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    :root[data-resolved-color-mode=\"dark\"] {{\n      {dark_vars}\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root:not([data-resolved-color-mode=\"light\"]) {{\n        {dark_vars}\n      }}\n    }}",
+                "    :root {{\n      {light_vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root {{\n        {dark_vars}\n      }}\n    }}",
                 light_vars = palette_css_vars(&light),
                 dark_vars = palette_css_vars(&dark)
             )
@@ -11149,6 +11308,8 @@ mod tests {
             html.contains(r#"window.addEventListener('pageshow', scheduleResolvedModeResync);"#)
         );
         assert!(html.contains(r#"document.addEventListener('visibilitychange', function() {"#));
-        assert!(html.contains(r#":root[data-resolved-color-mode="dark"] {"#));
+        assert!(html.contains(r#"if (mode === 'system') {"#));
+        assert!(html.contains(r#"root.removeAttribute('data-resolved-color-mode');"#));
+        assert!(html.contains(r#"@media (prefers-color-scheme: dark) {"#));
     }
 }
