@@ -10,6 +10,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
 use time::OffsetDateTime;
@@ -197,7 +198,7 @@ enum DocsCommand {
     List,
     /// Read a document as a single text with block markers
     Read(DocReadArgs),
-    /// Write a document from marker-format text (reads from stdin)
+    /// Write a document from block-marker text
     Write(DocWriteArgs),
     /// Create a new document
     Create(DocCreateArgs),
@@ -220,12 +221,21 @@ struct DocReadArgs {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Marker format:\n  @@block id=<id> type=<type>\n  ...content...\n  @@end\n\nRound-trip example:\n  lore docs read <doc-id> > /tmp/doc.txt\n  lore docs write <doc-id> --file /tmp/doc.txt\n\nSafety:\n  Empty input is rejected unless you pass --allow-empty."
+)]
 struct DocWriteArgs {
     /// Document ID (UUID)
     doc_id: String,
     /// Read content from this file instead of stdin
     #[arg(long)]
     file: Option<String>,
+    /// Read content from stdin explicitly
+    #[arg(long)]
+    stdin: bool,
+    /// Permit empty input (otherwise empty stdin/file is rejected)
+    #[arg(long)]
+    allow_empty: bool,
 }
 
 #[derive(Args)]
@@ -312,32 +322,53 @@ struct AroundArgs {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Content sources:\n  lore blocks create --doc <doc-id> 'Text'\n  lore blocks create --doc <doc-id> --file /tmp/block.md\n  lore blocks create --doc <doc-id> --stdin < /tmp/block.md\n\nPlacement modes:\n  --position append (default)\n  --position start\n  --position after --after <block-id>"
+)]
 struct BlockCreateArgs {
     /// Block content
-    content: String,
+    content: Option<String>,
     /// Document ID (UUID)
     #[arg(long)]
     doc: String,
     /// Block type
     #[arg(long = "type", value_enum, default_value_t = CliBlockType::Markdown)]
     block_type: CliBlockType,
-    /// Place after this block ID (omit for start of document)
+    /// Read content from this file
+    #[arg(long)]
+    file: Option<String>,
+    /// Read content from stdin
+    #[arg(long)]
+    stdin: bool,
+    /// Explicit placement mode (default: append)
+    #[arg(long, value_enum)]
+    position: Option<BlockInsertPosition>,
+    /// Place after this block ID (required with --position after)
     #[arg(long)]
     after: Option<String>,
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Content sources:\n  lore blocks update <block-id> --doc <doc-id> 'Text'\n  lore blocks update <block-id> --doc <doc-id> --file /tmp/block.md\n  lore blocks update <block-id> --doc <doc-id> --stdin < /tmp/block.md"
+)]
 struct BlockUpdateArgs {
     /// Block ID (UUID)
     id: String,
     /// New content
-    content: String,
+    content: Option<String>,
     /// Document ID (UUID)
     #[arg(long)]
     doc: String,
     /// Block type (only if changing)
     #[arg(long = "type", value_enum)]
     block_type: Option<CliBlockType>,
+    /// Read content from this file
+    #[arg(long)]
+    file: Option<String>,
+    /// Read content from stdin
+    #[arg(long)]
+    stdin: bool,
 }
 
 #[derive(Args)]
@@ -553,6 +584,13 @@ impl From<CliBlockType> for BlockType {
             CliBlockType::Image => BlockType::Image,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum BlockInsertPosition {
+    Start,
+    Append,
+    After,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1066,15 +1104,7 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
             println!("{}", text);
         }
         DocsCommand::Write(args) => {
-            let content = match &args.file {
-                Some(file_path) => std::fs::read_to_string(file_path)
-                    .map_err(|e| io::Error::other(format!("reading {}: {}", file_path, e)))?,
-                None => {
-                    let mut buf = String::new();
-                    io::Read::read_to_string(&mut io::stdin(), &mut buf)?;
-                    buf
-                }
-            };
+            let content = load_doc_write_content(&args)?;
             let path = format!(
                 "/v1/projects/{}/documents/{}/text",
                 project.as_str(),
@@ -1235,6 +1265,13 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             }
         }
         BlocksCommand::Create(args) => {
+            let content = load_cli_text_input(
+                args.content.as_ref(),
+                args.file.as_ref(),
+                args.stdin,
+                "blocks create",
+            )?;
+            let after_block_id = resolve_block_create_after(context, &project, &args).await?;
             let path = format!(
                 "/v1/projects/{}/documents/{}/blocks",
                 project.as_str(),
@@ -1246,21 +1283,27 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                     &path,
                     &serde_json::json!({
                         "block_type": block_type_api_label(args.block_type),
-                        "content": args.content,
-                        "after_block_id": args.after
+                        "content": content,
+                        "after_block_id": after_block_id
                     }),
                 )
                 .await?;
             println!("Created block {}.", block.id);
         }
         BlocksCommand::Update(args) => {
+            let content = load_cli_text_input(
+                args.content.as_ref(),
+                args.file.as_ref(),
+                args.stdin,
+                "blocks update",
+            )?;
             let path = format!(
                 "/v1/projects/{}/documents/{}/blocks/{}",
                 project.as_str(),
                 args.doc,
                 args.id
             );
-            let mut body = serde_json::json!({ "content": args.content });
+            let mut body = serde_json::json!({ "content": content });
             if let Some(bt) = args.block_type {
                 body["block_type"] = serde_json::json!(block_type_api_label(bt));
             }
@@ -3252,6 +3295,118 @@ async fn run_manager_endpoint(
     Ok(text)
 }
 
+fn read_text_from_stdin() -> io::Result<String> {
+    let mut buf = String::new();
+    io::Read::read_to_string(&mut io::stdin(), &mut buf)?;
+    Ok(buf)
+}
+
+fn load_cli_text_input(
+    content: Option<&String>,
+    file: Option<&String>,
+    stdin: bool,
+    command_name: &str,
+) -> CliResult<String> {
+    let source_count =
+        usize::from(content.is_some()) + usize::from(file.is_some()) + usize::from(stdin);
+    if source_count == 0 {
+        return Err(format!(
+            "{command_name} requires exactly one content source: positional content, --file, or --stdin"
+        )
+        .into());
+    }
+    if source_count > 1 {
+        return Err(format!(
+            "{command_name} accepts only one content source: positional content, --file, or --stdin"
+        )
+        .into());
+    }
+
+    if let Some(value) = content {
+        return Ok(value.clone());
+    }
+    if let Some(path) = file {
+        return Ok(fs::read_to_string(path)
+            .map_err(|e| io::Error::other(format!("reading {}: {}", path, e)))?);
+    }
+    if io::stdin().is_terminal() {
+        return Err(format!(
+            "{command_name} cannot read from an interactive TTY; pipe data or use --file"
+        )
+        .into());
+    }
+    Ok(read_text_from_stdin()?)
+}
+
+fn load_doc_write_content(args: &DocWriteArgs) -> CliResult<String> {
+    if args.file.is_some() && args.stdin {
+        return Err("docs write accepts only one input source: --file or --stdin".into());
+    }
+
+    let content = match (&args.file, args.stdin) {
+        (Some(file_path), false) => fs::read_to_string(file_path)
+            .map_err(|e| io::Error::other(format!("reading {}: {}", file_path, e)))?,
+        (None, true) => {
+            if io::stdin().is_terminal() {
+                return Err(
+                    "docs write cannot read from an interactive TTY; pipe data or use --file"
+                        .into(),
+                );
+            }
+            read_text_from_stdin()?
+        }
+        (None, false) => {
+            if io::stdin().is_terminal() {
+                return Err(
+                    "docs write requires --file or piped stdin; use --stdin to make stdin explicit"
+                        .into(),
+                );
+            }
+            read_text_from_stdin()?
+        }
+        (Some(_), true) => unreachable!(),
+    };
+
+    if content.trim().is_empty() && !args.allow_empty {
+        return Err(
+            "docs write refused empty input; pass --allow-empty if you intentionally want an empty document"
+                .into(),
+        );
+    }
+
+    Ok(content)
+}
+
+async fn resolve_block_create_after(
+    context: &CliContext,
+    project: &ProjectName,
+    args: &BlockCreateArgs,
+) -> CliResult<Option<String>> {
+    match (args.position, args.after.as_ref()) {
+        (Some(BlockInsertPosition::Start), Some(_)) => {
+            return Err("blocks create does not allow --after with --position start".into());
+        }
+        (Some(BlockInsertPosition::Append), Some(_)) => {
+            return Err("blocks create does not allow --after with --position append".into());
+        }
+        (Some(BlockInsertPosition::After), None) => {
+            return Err("blocks create requires --after when --position after is used".into());
+        }
+        (Some(BlockInsertPosition::Start), None) => return Ok(None),
+        (Some(BlockInsertPosition::After), Some(after)) => return Ok(Some(after.clone())),
+        (None, Some(after)) => return Ok(Some(after.clone())),
+        (Some(BlockInsertPosition::Append), None) | (None, None) => {}
+    }
+
+    let path = format!(
+        "/v1/projects/{}/documents/{}/blocks",
+        project.as_str(),
+        args.doc
+    );
+    let blocks: Vec<Block> = context.get_json(&path).await?;
+    Ok(blocks.last().map(|block| block.id.as_str().to_string()))
+}
+
 // --- Shared agent system prompt ---
 
 fn build_lore_system_instructions(
@@ -3314,8 +3469,8 @@ Project info:
 
 Documents:
   lore docs list                         List documents (shows doc tree with IDs)
-  lore docs read <doc-id> [--from <block-id>] [--to <block-id>]   Read entire document as text with block markers
-  lore docs write <doc-id> [--file <path>]   Write document from marker-format text (reads stdin if no --file)
+  lore docs read <doc-id> [--from <block-id>] [--to <block-id>]   Read entire document as text with @@block markers
+  lore docs write <doc-id> [--file <path>|--stdin] [--allow-empty]   Write document from block-marker text
   lore docs create <name> [--parent <doc-id>]   Create a new document
   lore docs rename <doc-id> <new-name>   Rename a document
   lore docs delete <doc-id> --yes        Delete a document and all its contents
@@ -3326,8 +3481,8 @@ Blocks (reading):
   lore blocks around <id> [--before N] [--after N]   Read a block with surrounding context
 
 Blocks (writing):
-  lore blocks create --doc <doc-id> <content> [--type markdown|html|svg|image] [--after <id>]
-  lore blocks update <id> --doc <doc-id> <content> [--type markdown|html|svg|image]
+  lore blocks create --doc <doc-id> [<content>|--file <path>|--stdin] [--type markdown|html|svg|image] [--position start|append|after] [--after <id>]
+  lore blocks update <id> --doc <doc-id> [<content>|--file <path>|--stdin] [--type markdown|html|svg|image]
   lore blocks edit <id> --doc <doc-id> --old <text> --new <text>
   lore blocks move <id> --doc <doc-id> [--after <id>]
   lore blocks delete <id> --doc <doc-id> --yes
@@ -6034,11 +6189,14 @@ async fn service_handle_create_agent(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_assistant_segment, append_new_stream_text, history_messages_excluding_pending,
+        DocWriteArgs, append_assistant_segment, append_new_stream_text,
+        history_messages_excluding_pending, load_cli_text_input, load_doc_write_content,
         parse_codex_line,
     };
     use serde_json::json;
     use std::collections::HashSet;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn append_new_stream_text_converts_snapshots_to_deltas() {
@@ -6181,5 +6339,60 @@ mod tests {
         let ids: Vec<u64> = recent.iter().filter_map(|msg| msg["id"].as_u64()).collect();
 
         assert_eq!(ids, vec![3, 4]);
+    }
+
+    #[test]
+    fn load_cli_text_input_accepts_positional_content() {
+        let content = "hello".to_string();
+        let loaded = load_cli_text_input(Some(&content), None, false, "blocks create").unwrap();
+        assert_eq!(loaded, "hello");
+    }
+
+    #[test]
+    fn load_cli_text_input_accepts_file_content() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "from file").unwrap();
+        let path = file.path().display().to_string();
+        let loaded = load_cli_text_input(None, Some(&path), false, "blocks create").unwrap();
+        assert_eq!(loaded, "from file");
+    }
+
+    #[test]
+    fn load_doc_write_content_rejects_empty_file_without_override() {
+        let file = NamedTempFile::new().unwrap();
+        let args = DocWriteArgs {
+            doc_id: "doc".into(),
+            file: Some(file.path().display().to_string()),
+            stdin: false,
+            allow_empty: false,
+        };
+        let err = load_doc_write_content(&args).unwrap_err();
+        assert!(err.to_string().contains("refused empty input"));
+    }
+
+    #[test]
+    fn load_doc_write_content_allows_empty_file_with_override() {
+        let file = NamedTempFile::new().unwrap();
+        let args = DocWriteArgs {
+            doc_id: "doc".into(),
+            file: Some(file.path().display().to_string()),
+            stdin: false,
+            allow_empty: true,
+        };
+        let loaded = load_doc_write_content(&args).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_doc_write_content_rejects_multiple_sources() {
+        let file = NamedTempFile::new().unwrap();
+        let args = DocWriteArgs {
+            doc_id: "doc".into(),
+            file: Some(file.path().display().to_string()),
+            stdin: true,
+            allow_empty: false,
+        };
+        let err = load_doc_write_content(&args).unwrap_err();
+        assert!(err.to_string().contains("only one input source"));
     }
 }

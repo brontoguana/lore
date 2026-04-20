@@ -2930,7 +2930,7 @@ async fn list_agent_tokens(
         .auth
         .list_agent_tokens()?
         .into_iter()
-        .map(agent_token_summary)
+        .map(|token| agent_token_summary(&state, token))
         .collect();
     Ok(Json(tokens))
 }
@@ -2975,7 +2975,7 @@ async fn create_agent_token(
     )?;
     Ok(Json(json!({
         "token": created.token,
-        "summary": agent_token_summary(created.stored),
+        "summary": agent_token_summary(&state, created.stored),
     })))
 }
 
@@ -3018,7 +3018,7 @@ async fn rotate_agent_token(
     )?;
     Ok(Json(json!({
         "token": created.token,
-        "summary": agent_token_summary(created.stored),
+        "summary": agent_token_summary(&state, created.stored),
     })))
 }
 
@@ -3990,7 +3990,7 @@ async fn admin_page(
         user_agents
             .entry(owner_key)
             .or_default()
-            .push(agent_token_summary(token));
+            .push(agent_token_summary(&state, token));
     }
     let all_machines = state.auth.list_all_machines()?;
     let mut user_machines: std::collections::HashMap<String, Vec<StoredMachine>> =
@@ -4045,7 +4045,7 @@ async fn agents_page(
         .auth
         .list_agent_tokens_for_user(&session.user.username)?
         .into_iter()
-        .map(agent_token_summary)
+        .map(|token| agent_token_summary(&state, token))
         .collect();
     let mut machines = state.auth.list_machines_for_user(&session.user.username)?;
     for m in &mut machines {
@@ -4063,6 +4063,11 @@ async fn agents_page(
                     for a in agent_list {
                         if a["name"].as_str() == Some(&agent.name) {
                             agent.process_status = a["status"].as_str().map(|s| s.to_string());
+                            if agent.process_status.as_deref() == Some("restarting") {
+                                agent.status = "restarting".to_string();
+                            } else if agent.process_status.as_deref() == Some("stopped") {
+                                agent.status = "offline".to_string();
+                            }
                         }
                     }
                 }
@@ -6730,20 +6735,31 @@ fn block_matches_filters(block: &Block, filters: &BlockFilterOptions) -> bool {
     true
 }
 
-fn agent_token_summary(token: StoredAgentToken) -> AgentTokenSummary {
+fn agent_token_summary(state: &AppState, token: StoredAgentToken) -> AgentTokenSummary {
     let display_name = token
         .display_name
         .clone()
         .unwrap_or_else(|| token.name.clone());
+    let owner = token.owner.as_ref().map(|u| u.as_str().to_string());
+    let status = state
+        .chat
+        .load_conversation(owner.as_deref().unwrap_or(""), &token.name)
+        .map(|conv| match conv.agent_status {
+            AgentChatStatus::Idle => "idle".to_string(),
+            AgentChatStatus::Thinking => "thinking".to_string(),
+            AgentChatStatus::Offline => "offline".to_string(),
+        })
+        .unwrap_or_else(|_| "offline".to_string());
     AgentTokenSummary {
         name: token.name,
         display_name,
-        owner: token.owner.map(|u| u.as_str().to_string()),
+        owner,
         grants: token.grants,
         backend: token.backend.to_string(),
         endpoint_id: token.endpoint_id,
         machine_name: token.machine_name,
         process_status: None,
+        status,
         created_at: token.created_at,
     }
 }
@@ -10049,7 +10065,7 @@ fn mcp_tools() -> Vec<Value> {
                     "document_id": { "type": "string", "description": "Document UUID" },
                     "block_type": { "type": "string", "enum": ["markdown", "html", "svg", "image"], "description": "Block type (default: markdown)" },
                     "content": { "type": "string", "description": "Block content" },
-                    "after_block_id": { "type": ["string", "null"], "description": "Place after this block (null = at start)" }
+                    "after_block_id": { "type": ["string", "null"], "description": "Place after this block (null = at start; CLI append mode resolves this automatically)" }
                 },
                 "required": ["project", "document_id", "content"]
             }
@@ -10131,7 +10147,7 @@ fn mcp_tools() -> Vec<Value> {
         json!({
             "name": "read_document",
             "title": "Read Document",
-            "description": "Read all blocks in a document (or a range) as a single text with block boundary markers. Each block is wrapped in <<<< block:ID type:TYPE >>>> ... <<<< end:ID >>>>. Use for reading an entire document like a file. For surgical reads, prefer read_block.",
+            "description": "Read all blocks in a document (or a range) as a single text with block boundary markers. Each block is wrapped in @@block id=ID type=TYPE ... @@end id=ID. Use for reading an entire document like a file. For surgical reads, prefer read_block.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -10152,7 +10168,7 @@ fn mcp_tools() -> Vec<Value> {
                 "properties": {
                     "project": { "type": "string", "description": "Lore project name" },
                     "document_id": { "type": "string", "description": "Document UUID" },
-                    "content": { "type": "string", "description": "Full document in marker format (<<<< block:ID type:TYPE >>>> ... <<<< end:ID >>>>)" }
+                    "content": { "type": "string", "description": "Full document in marker format (@@block id=ID type=TYPE ... @@end id=ID)" }
                 },
                 "required": ["project", "document_id", "content"]
             }
@@ -10441,17 +10457,26 @@ struct ChatPageQuery {
     project: Option<String>,
 }
 
-fn chat_messages_value(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|m| {
-            json!({
-                "id": m.id,
-                "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
-                "content": m.content,
-            })
-        })
-        .collect()
+fn is_pending_follow_up_user_message(conv: &ChatConversation, msg: &ChatMessage) -> bool {
+    matches!(msg.role, ChatRole::User) && msg.id > conv.active_turn_user_id
+}
+
+fn chat_messages_value_ordered(conv: &ChatConversation) -> (Vec<Value>, Vec<Value>) {
+    let mut main = Vec::new();
+    let mut pending = Vec::new();
+    for msg in &conv.messages {
+        let value = json!({
+            "id": msg.id,
+            "role": match msg.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
+            "content": msg.content,
+        });
+        if is_pending_follow_up_user_message(conv, msg) {
+            pending.push(value);
+        } else {
+            main.push(value);
+        }
+    }
+    (main, pending)
 }
 
 fn should_append_finished_message(conv: &ChatConversation) -> bool {
@@ -10474,14 +10499,19 @@ fn should_append_finished_message(conv: &ChatConversation) -> bool {
 }
 
 fn chat_messages_value_for_panel(conv: &ChatConversation) -> Vec<Value> {
-    let mut messages = chat_messages_value(&conv.messages);
+    let (mut messages, pending_follow_ups) = chat_messages_value_ordered(conv);
     if should_append_finished_message(conv) {
         messages.push(json!({
             "role": "system",
             "content": "✅ Finished",
         }));
     }
+    messages.extend(pending_follow_ups);
     messages
+}
+
+fn active_turn_user_id_for_ui(conv: &ChatConversation) -> u64 {
+    conv.active_turn_user_id
 }
 
 fn build_chat_agents(
@@ -10545,10 +10575,10 @@ fn load_chat_panel_data(
     state: &AppState,
     owner: &str,
     selected_agent: Option<&str>,
-) -> Result<(Vec<Value>, Option<String>, Option<String>), LoreError> {
+) -> Result<(Vec<Value>, Option<String>, Option<String>, u64), LoreError> {
     if let Some(agent_name) = selected_agent {
         if agent_name == "librarian" {
-            Ok((Vec::new(), Some("librarian".to_string()), None))
+            Ok((Vec::new(), Some("librarian".to_string()), None, 0))
         } else {
             let conv = state.chat.load_conversation(owner, agent_name)?;
             let agent_status = match conv.agent_status {
@@ -10560,10 +10590,11 @@ fn load_chat_panel_data(
                 chat_messages_value_for_panel(&conv),
                 Some(agent_name.to_string()),
                 Some(agent_status.to_string()),
+                active_turn_user_id_for_ui(&conv),
             ))
         }
     } else {
-        Ok((Vec::new(), None, None))
+        Ok((Vec::new(), None, None, 0))
     }
 }
 
@@ -10583,7 +10614,7 @@ async fn chat_page(
         .map(|p| (p.slug.as_str().to_string(), p.display_name.clone()))
         .collect();
 
-    let (messages, selected_owned, _selected_status) = load_chat_panel_data(
+    let (messages, selected_owned, _selected_status, active_turn_user_id) = load_chat_panel_data(
         &state,
         session.user.username.as_str(),
         query.agent.as_deref(),
@@ -10600,6 +10631,7 @@ async fn chat_page(
         &chat_agents,
         selected,
         &messages_json,
+        active_turn_user_id,
         None,
         &projects_for_ui,
     )))
@@ -10629,7 +10661,7 @@ async fn chat_panel_inner(
         .filter(|p| session.user.is_admin || session.user.can_read(&p.slug))
         .map(|p| (p.slug.as_str().to_string(), p.display_name.clone()))
         .collect();
-    let (messages, selected_owned, selected_status) = load_chat_panel_data(
+    let (messages, selected_owned, selected_status, active_turn_user_id) = load_chat_panel_data(
         state,
         session.user.username.as_str(),
         query.agent.as_deref(),
@@ -10654,6 +10686,7 @@ async fn chat_panel_inner(
         "panel_html": panel_html,
         "messages": messages,
         "agent_status": selected_status,
+        "active_turn_user_id": active_turn_user_id,
         "profile_url": profile_url,
     }))
 }
@@ -11234,10 +11267,10 @@ async fn chat_send_message(
         &state,
         owner,
         ChatEvent {
-            event_type: "message_sent".into(),
+            event_type: "message".into(),
             agent: agent_name.clone(),
             owner: owner.to_string(),
-            data: json!({ "id": msg.id, "content": msg.content }),
+            data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
         },
     );
 
@@ -11347,16 +11380,22 @@ async fn chat_agent_poll(
 
     // Push current persisted status to the UI (include cwd/branch so UI updates live).
     // Polling is only a heartbeat and must not synthesize a completed state on its own.
-    let current_status = state
-        .chat
-        .load_conversation(owner_str, &agent.name)
+    let loaded_conv = state.chat.load_conversation(owner_str, &agent.name).ok();
+    let current_status = loaded_conv
+        .as_ref()
         .map(|conv| match conv.agent_status {
             AgentChatStatus::Idle => "idle",
             AgentChatStatus::Thinking => "thinking",
             AgentChatStatus::Offline => "offline",
         })
         .unwrap_or("offline");
-    let mut status_data = json!({ "status": current_status });
+    let mut status_data = json!({
+        "status": current_status,
+        "active_turn_user_id": loaded_conv
+            .as_ref()
+            .map(|conv| conv.active_turn_user_id)
+            .unwrap_or(0),
+    });
     if let Some(ref cwd) = cwd_val {
         status_data["cwd"] = json!(cwd);
     }
@@ -11634,6 +11673,11 @@ async fn chat_agent_update_status(
     state
         .chat
         .update_agent_status(owner_str, &agent.name, status)?;
+    let active_turn_user_id = state
+        .chat
+        .load_conversation(owner_str, &agent.name)
+        .map(|conv| conv.active_turn_user_id)
+        .unwrap_or(0);
 
     push_chat_event(
         &state,
@@ -11642,7 +11686,10 @@ async fn chat_agent_update_status(
             event_type: "status".into(),
             agent: agent.name.clone(),
             owner: owner_str.to_string(),
-            data: json!({ "status": body.status }),
+            data: json!({
+                "status": body.status,
+                "active_turn_user_id": active_turn_user_id,
+            }),
         },
     );
 
@@ -12976,6 +13023,11 @@ fn finalize_agent_turn(state: &AppState, owner: &str, agent_name: &str) {
     let _ = state
         .chat
         .update_agent_status(owner, agent_name, AgentChatStatus::Idle);
+    let active_turn_user_id = state
+        .chat
+        .load_conversation(owner, agent_name)
+        .map(|conv| conv.active_turn_user_id)
+        .unwrap_or(0);
     push_chat_event(
         state,
         owner,
@@ -12983,7 +13035,10 @@ fn finalize_agent_turn(state: &AppState, owner: &str, agent_name: &str) {
             event_type: "status".into(),
             agent: agent_name.to_string(),
             owner: owner.to_string(),
-            data: json!({ "status": "idle" }),
+            data: json!({
+                "status": "idle",
+                "active_turn_user_id": active_turn_user_id,
+            }),
         },
     );
 }
@@ -18485,6 +18540,82 @@ mod tests {
             messages.last().unwrap()["content"].as_str(),
             Some("✅ Finished")
         );
+    }
+
+    #[test]
+    fn chat_panel_moves_follow_up_user_messages_after_active_turn_output() {
+        let mut conv = ChatConversation {
+            agent_status: AgentChatStatus::Thinking,
+            active_turn_user_id: 1,
+            last_delivered_user_id: 0,
+            ..Default::default()
+        };
+        conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "first".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+        conv.messages.push(ChatMessage {
+            id: 2,
+            role: ChatRole::Assistant,
+            content: "working".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+        conv.messages.push(ChatMessage {
+            id: 3,
+            role: ChatRole::User,
+            content: "follow-up".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+        conv.messages.push(ChatMessage {
+            id: 4,
+            role: ChatRole::Tool,
+            content: "tool step".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+
+        let messages = super::chat_messages_value_for_panel(&conv);
+        let contents: Vec<&str> = messages
+            .iter()
+            .map(|msg| msg["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(contents, vec!["first", "working", "tool step", "follow-up"]);
+    }
+
+    #[test]
+    fn chat_panel_places_finished_marker_before_pending_follow_up_messages() {
+        let mut conv = ChatConversation {
+            agent_status: AgentChatStatus::Idle,
+            active_turn_user_id: 1,
+            last_delivered_user_id: 1,
+            ..Default::default()
+        };
+        conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "first".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+        conv.messages.push(ChatMessage {
+            id: 2,
+            role: ChatRole::Assistant,
+            content: "done".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+        conv.messages.push(ChatMessage {
+            id: 3,
+            role: ChatRole::User,
+            content: "follow-up".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+
+        let messages = super::chat_messages_value_for_panel(&conv);
+        let contents: Vec<&str> = messages
+            .iter()
+            .map(|msg| msg["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(contents, vec!["first", "done", "✅ Finished", "follow-up"]);
     }
 
     #[test]

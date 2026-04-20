@@ -365,6 +365,7 @@ pub struct AgentTokenSummary {
     pub endpoint_id: Option<String>,
     pub machine_name: Option<String>,
     pub process_status: Option<String>,
+    pub status: String,
     pub created_at: time::OffsetDateTime,
 }
 
@@ -2176,12 +2177,8 @@ pub fn render_agents_page(
                 } else {
                     format!("{grant_count} projects")
                 };
-                let status_badge = match agent.process_status.as_deref() {
-                    Some("running") => r#"<span class="agent-status-badge running" title="Running">&#x25cf;</span>"#,
-                    Some("restarting") => r#"<span class="agent-status-badge restarting" title="Restarting">&#x25cf;</span>"#,
-                    Some("stopped") => r#"<span class="agent-status-badge stopped" title="Stopped">&#x25cf;</span>"#,
-                    _ => "",
-                };
+                let (status_class, status_title, status_icon) =
+                    chat_status_indicator(&agent.status);
                 let machine_controls = if agent.machine_name.is_some() && agent.process_status.is_some() {
                     let mname = agent.machine_name.as_deref().unwrap_or("");
                     let is_running = agent.process_status.as_deref() == Some("running");
@@ -2206,7 +2203,7 @@ pub fn render_agents_page(
                 format!(
                     r#"<a href="/ui/agents?selected={}" class="sel-item{}">
                       <div style="display:flex; align-items:center; gap:var(--s-2); min-width:0;">
-                        {status_badge}
+                        <span class="chat-status-glyph {status_class}" title="{status_title}">{status_icon}</span>
                         <div style="min-width:0;">
                           <span class="sel-item-name">{}</span>
                           <span class="sel-item-meta">{} &middot; {}</span>
@@ -2219,7 +2216,9 @@ pub fn render_agents_page(
                     escape_text(&agent.display_name),
                     escape_text(&grant_label),
                     escape_text(&agent.backend),
-                    status_badge = status_badge,
+                    status_class = status_class,
+                    status_title = status_title,
+                    status_icon = status_icon,
                     machine_controls = machine_controls,
                 )
             })
@@ -3422,6 +3421,7 @@ pub fn render_chat_page(
     agents: &[ChatAgentSummary],
     selected_agent: Option<&str>,
     messages_json: &str,
+    active_turn_user_id: u64,
     flash: Option<&str>,
     projects: &[(String, String)],
 ) -> String {
@@ -3551,6 +3551,7 @@ var eventSource = null;
 var streamingContent = '';
 var agentConfig = {{ backend: '', model: '', effort: '' }};
 var agentStatus = {selected_agent_status_js};
+var activeTurnUserId = {active_turn_user_id};
 var isLibrarian = currentAgent === 'librarian';
 var libProject = '';
 var chatFollowScroll = true;
@@ -3689,6 +3690,7 @@ function loadDesktopChatPanel(agent, pushHistory) {{
       currentAgent = data.selected_agent || null;
       chatMessages = data.messages || [];
       agentStatus = data.agent_status || '';
+      activeTurnUserId = data.active_turn_user_id || 0;
       agentProfileUrl = data.profile_url || null;
       if (currentAgent) {{
         localStorage.setItem('lastChatAgent', currentAgent);
@@ -3735,6 +3737,7 @@ function refreshChatOnResume(force) {{
       currentAgent = data.selected_agent || null;
       chatMessages = data.messages || [];
       agentStatus = data.agent_status || '';
+      activeTurnUserId = data.active_turn_user_id || 0;
       agentProfileUrl = data.profile_url || null;
       if (currentAgent) {{
         localStorage.setItem('lastChatAgent', currentAgent);
@@ -3974,6 +3977,7 @@ function resizeAndUpload(file, agent, el) {{
 function renderMessages() {{
   var container = document.getElementById('chat-messages');
   if (!container) return;
+  normalizeChatMessageOrder();
   var anchor = null;
   var preservedScrollTop = container.scrollTop;
   var shouldFollow = chatShouldFollow(container, chatFollowScroll);
@@ -3991,7 +3995,7 @@ function renderMessages() {{
     }} else if (msg.role === 'error') {{
       html += '<div class="chat-msg-content chat-msg-error-content"><svg class="chat-msg-error-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><span>' + escapeHtml(msg.content) + '</span></div>';
     }} else if (msg.role === 'tool') {{
-      html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
+      html += renderToolMessage(msg, i);
     }} else {{
       html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
     }}
@@ -4006,6 +4010,49 @@ function renderMessages() {{
     restoreChatViewportAnchor(container, anchor, preservedScrollTop);
   }}
   updateChatJumpButton();
+}}
+
+function chatToolLines(msg) {{
+  if (!msg || typeof msg.content !== 'string' || !msg.content) return [];
+  return msg.content.split('\n').filter(function(line) {{ return !!line; }});
+}}
+
+function renderToolMessage(msg, index) {{
+  var lines = chatToolLines(msg);
+  if (!lines.length) {{
+    return '<div class="chat-msg-content"></div>';
+  }}
+  var latest = lines[lines.length - 1];
+  var expanded = !!msg.tool_expanded;
+  var html = '<div class="chat-msg-content">';
+  html += '<div class="chat-tool-summary">';
+  if (lines.length > 1) {{
+    var title = expanded ? 'Collapse tool runs' : 'Expand tool runs';
+    var ariaLabel = expanded ? 'Collapse tool runs' : 'Expand tool runs';
+    var icon = expanded
+      ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
+      : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>';
+    html += '<button type="button" class="btn-sm chat-tool-toggle" onclick="toggleToolMessage(' + index + '); return false;" title="' + title + '" aria-label="' + ariaLabel + '">' + icon + '</button>';
+  }}
+  html += '<span class="chat-tool-line">' + escapeHtml(latest) + '</span>';
+  if (lines.length > 1) {{
+    html += '<span class="chat-tool-count">' + lines.length + ' runs</span>';
+  }}
+  html += '</div>';
+  if (expanded && lines.length > 1) {{
+    html += '<div class="chat-tool-lines">' + escapeHtml(lines.join('\n')) + '</div>';
+  }}
+  html += '</div>';
+  return html;
+}}
+
+function toggleToolMessage(index) {{
+  var msg = chatMessages[index];
+  if (!msg || msg.role !== 'tool') return false;
+  if (chatToolLines(msg).length < 2) return false;
+  msg.tool_expanded = !msg.tool_expanded;
+  renderMessages();
+  return false;
 }}
 
 function chatDistanceFromBottom(container) {{
@@ -4273,7 +4320,7 @@ function sendMessage(e) {{
   // Slash commands go to the command endpoint
   if (text.startsWith('/')) {{
     chatFollowScroll = true;
-    chatMessages.push({{ role: 'user', content: text }});
+    insertChatMessage({{ role: 'user', content: text }});
     moveAgentItemToTop(currentAgent);
     updateAgentListPreview(currentAgent, text);
     renderMessages();
@@ -4287,7 +4334,7 @@ function sendMessage(e) {{
           chatMessages = [];
           renderMessages();
         }} else if (resp.response) {{
-          chatMessages.push({{ role: 'system', content: resp.response }});
+          insertChatMessage({{ role: 'system', content: resp.response }});
           renderMessages();
         }}
       }} catch(err) {{}}
@@ -4297,7 +4344,11 @@ function sendMessage(e) {{
   }}
 
   chatFollowScroll = true;
-  chatMessages.push({{ role: 'user', content: text }});
+  insertChatMessage({{
+    role: 'user',
+    content: text,
+    queued_follow_up: agentStatus === 'thinking' || hasQueuedFollowUpUserMessages()
+  }});
   moveAgentItemToTop(currentAgent);
   updateAgentListPreview(currentAgent, text);
   renderMessages();
@@ -4306,12 +4357,12 @@ function sendMessage(e) {{
   xhr.open('POST', '/ui/chat/' + encodeURIComponent(currentAgent) + '/send');
   xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
   xhr.onerror = function() {{
-    chatMessages.push({{ role: 'system', content: 'Failed to send message (network error)' }});
+    insertChatMessage({{ role: 'system', content: 'Failed to send message (network error)' }});
     renderMessages();
   }};
   xhr.onload = function() {{
     if (xhr.status !== 200) {{
-      chatMessages.push({{ role: 'system', content: 'Failed to send message (HTTP ' + xhr.status + ')' }});
+      insertChatMessage({{ role: 'system', content: 'Failed to send message (HTTP ' + xhr.status + ')' }});
       renderMessages();
     }}
   }};
@@ -4362,16 +4413,20 @@ function updateAgentListStatus(agent, status) {{
 }}
 
 function maybeAppendFinishedMessage() {{
-  var lastMsg = chatMessages[chatMessages.length - 1];
-  if (lastMsg && lastMsg.role === 'system' && lastMsg.content === '\u2705 Finished') return;
-  chatMessages.push({{ role: 'system', content: '\u2705 Finished' }});
-  renderMessages();
+  var lastIdx = findLastNonQueuedMessageIndex();
+  var lastMsg = lastIdx >= 0 ? chatMessages[lastIdx] : null;
+  if (lastMsg && lastMsg.role === 'system' && lastMsg.content === '\u2705 Finished') return false;
+  insertChatMessage({{ role: 'system', content: '\u2705 Finished' }});
+  return true;
 }}
 
 function maybeRemoveFinishedMessage() {{
-  var lastMsg = chatMessages[chatMessages.length - 1];
-  if (lastMsg && lastMsg.role === 'system' && lastMsg.content === '\u2705 Finished') {{
-    chatMessages.pop();
+  for (var i = chatMessages.length - 1; i >= 0; i--) {{
+    var msg = chatMessages[i];
+    if (msg.role === 'system' && msg.content === '\u2705 Finished') {{
+      chatMessages.splice(i, 1);
+      break;
+    }}
   }}
 }}
 
@@ -4384,6 +4439,91 @@ function markAgentActivity(agent) {{
   }}
 }}
 
+function chatMessageId(msg) {{
+  if (!msg) return 0;
+  var id = msg._id || msg.id || 0;
+  if (typeof id === 'string') id = parseInt(id, 10);
+  return Number.isFinite(id) ? id : 0;
+}}
+
+function isQueuedFollowUpUserMessage(msg) {{
+  if (!msg || msg.role !== 'user') return false;
+  var id = chatMessageId(msg);
+  if (id > 0) return id > activeTurnUserId;
+  return !!msg.queued_follow_up;
+}}
+
+function hasQueuedFollowUpUserMessages() {{
+  for (var i = 0; i < chatMessages.length; i++) {{
+    if (isQueuedFollowUpUserMessage(chatMessages[i])) return true;
+  }}
+  return false;
+}}
+
+function syncQueuedFollowUpFlags(promoteOptimisticQueued) {{
+  if (!chatMessages || !chatMessages.length) return false;
+  var changed = false;
+  for (var i = 0; i < chatMessages.length; i++) {{
+    var msg = chatMessages[i];
+    if (!msg || msg.role !== 'user') continue;
+    var id = chatMessageId(msg);
+    var nextQueued = id > 0 ? id > activeTurnUserId : (!!msg.queued_follow_up && !promoteOptimisticQueued);
+    if (!!msg.queued_follow_up !== nextQueued) {{
+      msg.queued_follow_up = nextQueued;
+      changed = true;
+    }}
+  }}
+  return changed;
+}}
+
+function insertChatMessage(msg) {{
+  var insertAt = chatMessages.length;
+  if (!isQueuedFollowUpUserMessage(msg)) {{
+    while (insertAt > 0 && isQueuedFollowUpUserMessage(chatMessages[insertAt - 1])) {{
+      insertAt -= 1;
+    }}
+  }}
+  chatMessages.splice(insertAt, 0, msg);
+  return msg;
+}}
+
+function findLastNonQueuedMessageIndex() {{
+  for (var i = chatMessages.length - 1; i >= 0; i--) {{
+    if (!isQueuedFollowUpUserMessage(chatMessages[i])) return i;
+  }}
+  return -1;
+}}
+
+function normalizeChatMessageOrder() {{
+  if (!chatMessages || !chatMessages.length) return;
+  var main = [];
+  var pending = [];
+  var finished = null;
+  for (var i = 0; i < chatMessages.length; i++) {{
+    var msg = chatMessages[i];
+    if (msg.role === 'system' && msg.content === '\u2705 Finished') {{
+      finished = msg;
+      continue;
+    }}
+    if (isQueuedFollowUpUserMessage(msg)) {{
+      pending.push(msg);
+    }} else {{
+      main.push(msg);
+    }}
+  }}
+  pending.sort(function(a, b) {{
+    var aId = chatMessageId(a);
+    var bId = chatMessageId(b);
+    if (aId > 0 && bId > 0 && aId !== bId) return aId - bId;
+    if (aId > 0 && bId === 0) return -1;
+    if (aId === 0 && bId > 0) return 1;
+    return 0;
+  }});
+  chatMessages = main;
+  if (finished) chatMessages.push(finished);
+  Array.prototype.push.apply(chatMessages, pending);
+}}
+
 function connectSSE() {{
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/ui/chat/stream');
@@ -4392,9 +4532,36 @@ function connectSSE() {{
     try {{
       markChatStreamAlive();
       var evt = JSON.parse(e.data);
-      if (evt.event_type === 'message_sent') {{
+      if (evt.event_type === 'message_sent' || (evt.event_type === 'message' && evt.data && evt.data.role === 'user')) {{
         moveAgentItemToTop(evt.agent);
         updateAgentListPreview(evt.agent, evt.data && evt.data.content ? evt.data.content : '');
+        if (evt.agent === currentAgent && evt.data) {{
+          var reconciled = false;
+          for (var ui = chatMessages.length - 1; ui >= 0; ui--) {{
+            var userMsg = chatMessages[ui];
+            if (userMsg.role !== 'user') continue;
+            if (userMsg._id === evt.data.id) {{
+              userMsg.queued_follow_up = evt.data.id > activeTurnUserId;
+              reconciled = true;
+              break;
+            }}
+            if (!userMsg._id && userMsg.content === (evt.data.content || '')) {{
+              userMsg._id = evt.data.id;
+              userMsg.queued_follow_up = evt.data.id > activeTurnUserId;
+              reconciled = true;
+              break;
+            }}
+          }}
+          if (!reconciled) {{
+            insertChatMessage({{
+              role: 'user',
+              content: evt.data.content || '',
+              _id: evt.data.id,
+              queued_follow_up: evt.data.id > activeTurnUserId
+            }});
+          }}
+          renderMessages();
+        }}
       }} else if (evt.event_type === 'response_complete') {{
         updateAgentListPreview(evt.agent, evt.data && evt.data.content ? evt.data.content : '');
       }} else if (evt.event_type === 'status') {{
@@ -4412,24 +4579,26 @@ function connectSSE() {{
           }}
         }}
         if (!updated) {{
-          chatMessages.push({{ role: 'error', content: evt.data.content, _id: evt.data.id }});
+          insertChatMessage({{ role: 'error', content: evt.data.content, _id: evt.data.id }});
         }}
         renderMessages();
         if (typeof refreshErrorsPanel === 'function') refreshErrorsPanel();
       }} else if (evt.event_type === 'message' && evt.data && evt.data.role === 'assistant') {{
         markAgentActivity(evt.agent);
-        var lastMsg = chatMessages[chatMessages.length - 1];
+        var lastIdx = findLastNonQueuedMessageIndex();
+        var lastMsg = lastIdx >= 0 ? chatMessages[lastIdx] : null;
         if (lastMsg && lastMsg.role === 'assistant' && lastMsg.streaming) {{
           lastMsg.streaming = false;
-          if (!lastMsg.content) chatMessages.pop();
+          if (!lastMsg.content) chatMessages.splice(lastIdx, 1);
         }}
         streamingContent = '';
-        chatMessages.push({{ role: 'assistant', content: evt.data.content || '', _id: evt.data.id }});
+        insertChatMessage({{ role: 'assistant', content: evt.data.content || '', _id: evt.data.id }});
         renderMessages();
       }} else if (evt.event_type === 'tool_use') {{
         markAgentActivity(evt.agent);
         var detail = '\u{{1F527}} ' + evt.data.detail;
-        var lastMsg = chatMessages[chatMessages.length - 1];
+        var lastIdx = findLastNonQueuedMessageIndex();
+        var lastMsg = lastIdx >= 0 ? chatMessages[lastIdx] : null;
         if (lastMsg && lastMsg.role === 'tool') {{
           var lines = lastMsg.content.split('\n');
           var prevLine = lines[lines.length - 1];
@@ -4442,33 +4611,34 @@ function connectSSE() {{
             lastMsg.content += '\n' + detail;
           }}
         }} else {{
-          chatMessages.push({{ role: 'tool', content: detail }});
+          insertChatMessage({{ role: 'tool', content: detail }});
         }}
         renderMessages();
       }} else if (evt.event_type === 'chunk') {{
         markAgentActivity(evt.agent);
         streamingContent += evt.data.text || '';
-        var lastMsg = chatMessages[chatMessages.length - 1];
+        var lastIdx = findLastNonQueuedMessageIndex();
+        var lastMsg = lastIdx >= 0 ? chatMessages[lastIdx] : null;
         if (lastMsg && lastMsg.role === 'assistant' && lastMsg.streaming) {{
           lastMsg.content = streamingContent;
         }} else {{
-          chatMessages.push({{ role: 'assistant', content: streamingContent, streaming: true }});
+          insertChatMessage({{ role: 'assistant', content: streamingContent, streaming: true }});
         }}
         renderMessages();
       }} else if (evt.event_type === 'response_complete') {{
-        var lastMsg = chatMessages[chatMessages.length - 1];
+        var lastIdx = findLastNonQueuedMessageIndex();
+        var lastMsg = lastIdx >= 0 ? chatMessages[lastIdx] : null;
         if (lastMsg && lastMsg.streaming) {{
           lastMsg.streaming = false;
           lastMsg.content = evt.data.content || lastMsg.content;
         }}
         streamingContent = '';
-        maybeAppendFinishedMessage();
         renderMessages();
       }} else if (evt.event_type === 'auto_message') {{
-        chatMessages.push({{ role: 'user', content: evt.data.content }});
+        insertChatMessage({{ role: 'user', content: evt.data.content }});
         renderMessages();
       }} else if (evt.event_type === 'command_response') {{
-        chatMessages.push({{ role: 'system', content: evt.data.response }});
+        insertChatMessage({{ role: 'system', content: evt.data.response }});
         renderMessages();
       }} else if (evt.event_type === 'config_info') {{
         agentConfig.backend = evt.data.backend || '';
@@ -4476,8 +4646,27 @@ function connectSSE() {{
         agentConfig.effort = evt.data.effort || '';
         updateHeaderStatus();
       }} else if (evt.event_type === 'status') {{
+        var prevStatus = agentStatus;
+        var prevActiveTurnUserId = activeTurnUserId;
         agentStatus = evt.data.status || '';
+        if (evt.data && typeof evt.data.active_turn_user_id !== 'undefined') {{
+          activeTurnUserId = evt.data.active_turn_user_id || 0;
+        }}
+        var activeTurnAdvancedWhileThinking =
+          agentStatus === 'thinking' && activeTurnUserId > prevActiveTurnUserId;
+        var queueStateChanged = syncQueuedFollowUpFlags(activeTurnAdvancedWhileThinking);
         updateHeaderStatus();
+        if (agentStatus === 'idle') {{
+          var appendedFinished = maybeAppendFinishedMessage();
+          if (queueStateChanged || prevStatus !== agentStatus || prevActiveTurnUserId !== activeTurnUserId || appendedFinished) {{
+            renderMessages();
+          }}
+        }} else {{
+          maybeRemoveFinishedMessage();
+          if (queueStateChanged || prevStatus !== agentStatus || prevActiveTurnUserId !== activeTurnUserId) {{
+            renderMessages();
+          }}
+        }}
         if (evt.data.cwd) {{
           var cwdEl = document.getElementById('chat-agent-cwd');
           if (cwdEl) {{
@@ -8646,15 +8835,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border-bottom: none !important;
     }
 
-    .agent-status-badge {
-      font-size: 0.7rem;
-      flex-shrink: 0;
-    }
-    .agent-status-badge.running { color: var(--success, #22c55e); }
-    .agent-status-badge.restarting { color: #f59e0b; }
-    .agent-status-badge.stopped { color: var(--fg-muted); }
-    }
-
     /* Chat pages: page header fixed at top, shell fixed below it to bottom. */
     body:has(.chat-layout) {
       margin: 0;
@@ -8769,7 +8949,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       padding: var(--s-3) var(--s-4);
       border-bottom: 1px solid var(--line);
       display: flex;
-      align-items: center;
+      align-items: baseline;
       gap: var(--s-3);
       flex-shrink: 0;
       background: var(--panel);
@@ -8778,8 +8958,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-header-name {
       font-weight: 600;
       font-size: 1rem;
-      align-self: baseline;
-      line-height: 1.2;
+      display: block;
+      line-height: 1.3;
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -8788,15 +8968,15 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-header-status {
       font-size: 0.82rem;
       color: var(--fg-muted);
-      align-self: baseline;
-      line-height: 1.2;
+      display: block;
+      line-height: 1.3;
     }
     .chat-header-cwd {
       margin-left: auto;
       font-size: 0.82rem;
       color: var(--fg-muted);
-      align-self: baseline;
-      line-height: 1.2;
+      display: block;
+      line-height: 1.3;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -8853,6 +9033,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       min-height: auto;
       border-radius: 6px;
       flex-shrink: 0;
+      align-self: center;
     }
     .chat-header-icon {
       display: inline-flex;
@@ -8865,6 +9046,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: var(--accent);
       box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
       flex-shrink: 0;
+      align-self: center;
+    }
+    .chat-header .chat-avatar-header,
+    .chat-header .btn-sm {
+      align-self: center;
     }
     .chat-config-panel {
       flex: 1;
@@ -9005,6 +9191,45 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       padding: var(--s-1) var(--s-3);
       font-family: var(--font-mono);
       max-width: 100%;
+    }
+    .chat-tool-summary {
+      display: flex;
+      align-items: center;
+      gap: var(--s-2);
+      min-width: 0;
+    }
+    .chat-tool-toggle {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--fg-muted);
+      flex-shrink: 0;
+    }
+    .chat-tool-toggle:hover {
+      background: var(--surface-hover);
+      color: var(--fg);
+    }
+    .chat-tool-line {
+      min-width: 0;
+      flex: 1 1 auto;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .chat-tool-count {
+      flex-shrink: 0;
+      color: var(--fg-dim, var(--fg-muted));
+      font-size: 0.75rem;
+      white-space: nowrap;
+    }
+    .chat-tool-lines {
+      margin: var(--s-2) 0 0 36px;
+      padding: var(--s-2) var(--s-3);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--bg-subtle, #f5f5f5);
     }
     .chat-msg-error {
       align-self: stretch;
@@ -10672,6 +10897,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ColorMode, ExternalScheme, ServerConfig, UiTheme};
     use crate::model::{BlockType, NewBlock};
     use crate::store::FileBlockStore;
     use tempfile::tempdir;
@@ -10709,5 +10935,62 @@ mod tests {
         let html = r#"<a href="lore://00000000-0000-0000-0000-000000000000">gone</a>"#;
         let resolved = resolve_lore_links_in_html(html, &store);
         assert!(resolved.contains("lore-link-broken"));
+    }
+
+    #[test]
+    fn agents_page_uses_chat_status_icons() {
+        let config = ServerConfig::new(
+            ExternalScheme::Https,
+            "example.com".into(),
+            443,
+            UiTheme::Parchment,
+        )
+        .unwrap();
+        let agents = vec![
+            AgentTokenSummary {
+                name: "worker".into(),
+                display_name: "Worker".into(),
+                owner: Some("admin".into()),
+                grants: Vec::new(),
+                backend: "codex".into(),
+                endpoint_id: None,
+                machine_name: Some("desk".into()),
+                process_status: Some("running".into()),
+                status: "thinking".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+            AgentTokenSummary {
+                name: "done".into(),
+                display_name: "Done".into(),
+                owner: Some("admin".into()),
+                grants: Vec::new(),
+                backend: "codex".into(),
+                endpoint_id: None,
+                machine_name: Some("desk".into()),
+                process_status: Some("running".into()),
+                status: "idle".into(),
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+        ];
+        let html = render_agents_page(
+            &config,
+            "admin",
+            true,
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "csrf",
+            &agents,
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+        );
+
+        assert!(html.contains(r#"title="Working""#));
+        assert!(html.contains(r#"chat-status-working"#));
+        assert!(html.contains(r#"title="Finished""#));
+        assert!(html.contains(r#"chat-status-running"#));
+        assert!(!html.contains("agent-status-badge"));
     }
 }

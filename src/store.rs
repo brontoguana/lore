@@ -1451,9 +1451,9 @@ impl FileBlockStore {
     /// block boundary markers.  The marker format is:
     ///
     /// ```text
-    /// <<<< block:<ID> type:<TYPE> >>>>
+    /// @@block id=<ID> type=<TYPE>
     /// content
-    /// <<<< end:<ID> >>>>
+    /// @@end
     /// ```
     ///
     /// Image blocks have empty content between the markers.
@@ -2428,10 +2428,7 @@ pub fn serialize_blocks_to_text(blocks: &[Block]) -> String {
             BlockType::Svg => "svg",
             BlockType::Image => "image",
         };
-        out.push_str(&format!(
-            "<<<< block:{} type:{} >>>>\n",
-            block.id, type_label
-        ));
+        out.push_str(&format!("@@block id={} type={}\n", block.id, type_label));
         if block.block_type != BlockType::Image {
             if !block.content.is_empty() {
                 out.push_str(&block.content);
@@ -2440,12 +2437,115 @@ pub fn serialize_blocks_to_text(blocks: &[Block]) -> String {
                 }
             }
         }
-        out.push_str(&format!("<<<< end:{} >>>>", block.id));
+        out.push_str("@@end");
         if i + 1 < blocks.len() {
             out.push('\n');
         }
     }
     out
+}
+
+fn parse_document_block_type(type_str: &str, line_num: usize) -> crate::error::Result<BlockType> {
+    use crate::error::LoreError;
+
+    match type_str {
+        "markdown" => Ok(BlockType::Markdown),
+        "html" => Ok(BlockType::Html),
+        "svg" => Ok(BlockType::Svg),
+        "image" => Ok(BlockType::Image),
+        other => Err(LoreError::Validation(format!(
+            "line {}: unknown block type '{}'",
+            line_num, other
+        ))),
+    }
+}
+
+fn parse_document_start_marker(
+    line: &str,
+    line_num: usize,
+) -> crate::error::Result<Option<(String, BlockType)>> {
+    use crate::error::LoreError;
+
+    if let Some(rest) = line.strip_prefix("@@block ") {
+        let mut id = None;
+        let mut block_type = None;
+        for field in rest.split_whitespace() {
+            if let Some(value) = field.strip_prefix("id=") {
+                id = Some(value.to_string());
+            } else if let Some(value) = field.strip_prefix("type=") {
+                block_type = Some(parse_document_block_type(value, line_num)?);
+            } else {
+                return Err(LoreError::Validation(format!(
+                    "line {}: malformed block start marker",
+                    line_num
+                )));
+            }
+        }
+        let id = id
+            .ok_or_else(|| LoreError::Validation(format!("line {}: missing block id", line_num)))?;
+        let block_type = block_type.ok_or_else(|| {
+            LoreError::Validation(format!("line {}: missing type in block marker", line_num))
+        })?;
+        return Ok(Some((id, block_type)));
+    }
+
+    if let Some(rest) = line.strip_prefix("<<<< block:") {
+        let rest = rest.strip_suffix(" >>>>").ok_or_else(|| {
+            LoreError::Validation(format!("line {}: malformed block start marker", line_num))
+        })?;
+        let mut parts = rest.splitn(2, " type:");
+        let id = parts
+            .next()
+            .ok_or_else(|| LoreError::Validation(format!("line {}: missing block id", line_num)))?
+            .to_string();
+        let type_str = parts.next().ok_or_else(|| {
+            LoreError::Validation(format!("line {}: missing type in block marker", line_num))
+        })?;
+        return Ok(Some((id, parse_document_block_type(type_str, line_num)?)));
+    }
+
+    Ok(None)
+}
+
+enum DocumentEndMarker {
+    Any,
+    Id(String),
+}
+
+fn parse_document_end_marker(
+    line: &str,
+    line_num: usize,
+) -> crate::error::Result<Option<DocumentEndMarker>> {
+    use crate::error::LoreError;
+
+    if let Some(rest) = line.strip_prefix("@@end") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Ok(Some(DocumentEndMarker::Any));
+        }
+        if let Some(value) = rest.strip_prefix("id=") {
+            if value.is_empty() {
+                return Err(LoreError::Validation(format!(
+                    "line {}: missing block id in end marker",
+                    line_num
+                )));
+            }
+            return Ok(Some(DocumentEndMarker::Id(value.to_string())));
+        }
+        return Err(LoreError::Validation(format!(
+            "line {}: malformed end marker",
+            line_num
+        )));
+    }
+
+    if let Some(rest) = line.strip_prefix("<<<< end:") {
+        let end_id = rest.strip_suffix(" >>>>").ok_or_else(|| {
+            LoreError::Validation(format!("line {}: malformed end marker", line_num))
+        })?;
+        return Ok(Some(DocumentEndMarker::Id(end_id.to_string())));
+    }
+
+    Ok(None)
 }
 
 /// Parse the marker text format into a vec of write entries.
@@ -2461,54 +2561,22 @@ pub fn parse_document_text(text: &str) -> crate::error::Result<Vec<DocumentWrite
     let mut content_lines: Vec<&str> = Vec::new();
 
     for (line_num, line) in text.lines().enumerate() {
-        if let Some(rest) = line.strip_prefix("<<<< block:") {
+        if let Some((id, block_type)) = parse_document_start_marker(line, line_num + 1)? {
             if current_id.is_some() {
                 return Err(LoreError::Validation(format!(
                     "line {}: nested block marker (previous block not closed)",
                     line_num + 1
                 )));
             }
-            let rest = rest.strip_suffix(" >>>>").ok_or_else(|| {
-                LoreError::Validation(format!(
-                    "line {}: malformed block start marker",
-                    line_num + 1
-                ))
-            })?;
-            let mut parts = rest.splitn(2, " type:");
-            let id = parts
-                .next()
-                .ok_or_else(|| {
-                    LoreError::Validation(format!("line {}: missing block id", line_num + 1))
-                })?
-                .to_string();
-            let type_str = parts.next().ok_or_else(|| {
-                LoreError::Validation(format!(
-                    "line {}: missing type in block marker",
-                    line_num + 1
-                ))
-            })?;
-            let block_type = match type_str {
-                "markdown" => BlockType::Markdown,
-                "html" => BlockType::Html,
-                "svg" => BlockType::Svg,
-                "image" => BlockType::Image,
-                other => {
-                    return Err(LoreError::Validation(format!(
-                        "line {}: unknown block type '{}'",
-                        line_num + 1,
-                        other
-                    )));
-                }
-            };
             current_id = Some(id);
             current_type = Some(block_type);
             content_lines.clear();
-        } else if let Some(rest) = line.strip_prefix("<<<< end:") {
-            let end_id = rest.strip_suffix(" >>>>").ok_or_else(|| {
-                LoreError::Validation(format!("line {}: malformed end marker", line_num + 1))
-            })?;
+        } else if let Some(end_marker) = parse_document_end_marker(line, line_num + 1)? {
             match &current_id {
-                Some(id) if id == end_id => {
+                Some(id)
+                    if matches!(&end_marker, DocumentEndMarker::Any)
+                        || matches!(&end_marker, DocumentEndMarker::Id(end_id) if id == end_id) =>
+                {
                     let content = if content_lines.is_empty() {
                         String::new()
                     } else {
@@ -2530,6 +2598,10 @@ pub fn parse_document_text(text: &str) -> crate::error::Result<Vec<DocumentWrite
                     content_lines.clear();
                 }
                 Some(id) => {
+                    let end_id = match &end_marker {
+                        DocumentEndMarker::Any => "@@end".to_string(),
+                        DocumentEndMarker::Id(end_id) => end_id.clone(),
+                    };
                     return Err(LoreError::Validation(format!(
                         "line {}: end marker id '{}' does not match open block '{}'",
                         line_num + 1,
@@ -3540,6 +3612,8 @@ mod tests {
 
         let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
         let text = serialize_blocks_to_text(&blocks);
+        assert!(text.contains("@@block id="));
+        assert!(text.contains("@@end"));
         let parsed = parse_document_text(&text).unwrap();
 
         assert_eq!(parsed.len(), 1);
@@ -3619,7 +3693,7 @@ mod tests {
 
         let blocks = store.list_doc_blocks(&project.slug, &doc.id).unwrap();
         let text = serialize_blocks_to_text(&blocks);
-        assert!(text.contains("type:svg"));
+        assert!(text.contains("type=svg"));
         let parsed = parse_document_text(&text).unwrap();
         assert_eq!(parsed[0].block_type, BlockType::Svg);
         assert_eq!(parsed[0].content, svg);
@@ -3634,6 +3708,26 @@ mod tests {
         let text = "<<<< block:abc type:markdown >>>>\n<<<< block:def type:markdown >>>>\ncontent\n<<<< end:def >>>>\n<<<< end:abc >>>>";
         let err = parse_document_text(text).unwrap_err();
         assert!(matches!(err, LoreError::Validation(_)));
+    }
+
+    #[test]
+    fn parse_accepts_new_marker_format() {
+        let text =
+            "@@block id=abc type=markdown\nhello\n@@end\n\n@@block id=def type=svg\n<svg/>\n@@end";
+        let parsed = parse_document_text(text).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "abc");
+        assert_eq!(parsed[0].content, "hello");
+        assert_eq!(parsed[1].block_type, BlockType::Svg);
+    }
+
+    #[test]
+    fn parse_accepts_legacy_marker_format() {
+        let text = "<<<< block:abc type:markdown >>>>\nhello\n<<<< end:abc >>>>";
+        let parsed = parse_document_text(text).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "abc");
+        assert_eq!(parsed[0].content, "hello");
     }
 
     #[test]
@@ -3693,6 +3787,8 @@ mod tests {
         let text = store
             .read_document_text(&project, &doc_id, None, None)
             .unwrap();
+        assert!(text.contains("@@block id="));
+        assert!(text.contains("@@end"));
         let parsed = parse_document_text(&text).unwrap();
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].id, ids[0].as_str());
