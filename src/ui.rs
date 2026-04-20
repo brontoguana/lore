@@ -3534,16 +3534,6 @@ function isMobileChatLayout() {{
   return !!(window.matchMedia && window.matchMedia('(max-width: 860px)').matches);
 }}
 
-function scheduleMobileLastChatNavigation(agent) {{
-  requestAnimationFrame(function() {{
-    requestAnimationFrame(function() {{
-      setTimeout(function() {{
-        window.location.href = currentChatUrl(agent);
-      }}, 80);
-    }});
-  }});
-}}
-
 function currentChatUrl(agent) {{
   return agent ? ('/ui/chat?agent=' + encodeURIComponent(agent)) : '/ui/chat';
 }}
@@ -3605,6 +3595,7 @@ function initializeChatPanel() {{
     eventSource = null;
   }}
   connectSSE();
+  initChatComposer();
 
   if (isLibrarian) {{
     var params = new URLSearchParams(window.location.search);
@@ -3682,12 +3673,6 @@ function loadDesktopChatPanel(agent, pushHistory) {{
 
 if (currentAgent) {{
   localStorage.setItem('lastChatAgent', currentAgent);
-}} else {{
-  var last = localStorage.getItem('lastChatAgent');
-  if (last && isMobileChatLayout() && !(history.state && history.state.mobileAutoOpenedLastChat)) {{
-    history.replaceState({{mobileAutoOpenedLastChat: true}}, '', '/ui/chat');
-    scheduleMobileLastChatNavigation(last);
-  }}
 }}
 
 function selectAgent(name) {{
@@ -3775,6 +3760,39 @@ function scheduleChatViewportFix() {{
   }});
 }}
 
+function resizeChatInput() {{
+  var input = document.getElementById('chat-input');
+  if (!input) return;
+  var form = document.getElementById('chat-input-form');
+  var header = document.querySelector('.chat-header');
+  var viewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  var headerBottom = 0;
+  if (header) {{
+    var headerRect = header.getBoundingClientRect();
+    headerBottom = Math.max(0, headerRect.bottom);
+  }}
+  input.style.height = 'auto';
+  var formChrome = form ? Math.max(0, form.offsetHeight - input.offsetHeight) : 0;
+  var minHeight = 38;
+  var maxHeight = Math.max(120, Math.floor(viewportHeight - headerBottom - formChrome - 16));
+  var nextHeight = Math.max(minHeight, Math.min(input.scrollHeight, maxHeight));
+  input.style.height = nextHeight + 'px';
+  input.style.overflowY = input.scrollHeight > maxHeight ? 'auto' : 'hidden';
+}}
+
+function initChatComposer() {{
+  var input = document.getElementById('chat-input');
+  if (!input) return;
+  if (input.dataset.chatComposerBound !== '1') {{
+    input.dataset.chatComposerBound = '1';
+    input.addEventListener('input', function() {{
+      resizeChatInput();
+      scheduleChatViewportFix();
+    }});
+  }}
+  resizeChatInput();
+}}
+
 if (window.visualViewport) {{
   var _lastVVH = window.visualViewport.height;
   window.visualViewport.addEventListener('resize', function() {{
@@ -3782,20 +3800,26 @@ if (window.visualViewport) {{
     if (h > _lastVVH) {{
       window.scrollTo(0, 0);
     }}
+    resizeChatInput();
     applyChatViewportFix();
     _lastVVH = h;
   }});
-  window.visualViewport.addEventListener('scroll', applyChatViewportFix);
+  window.visualViewport.addEventListener('scroll', function() {{
+    resizeChatInput();
+    applyChatViewportFix();
+  }});
 }}
 
 document.addEventListener('focusin', function(e) {{
   if (e.target && e.target.id === 'chat-input') {{
+    resizeChatInput();
     scheduleChatViewportFix();
   }}
 }});
 
 document.addEventListener('focusout', function(e) {{
   if (e.target && e.target.id === 'chat-input') {{
+    resizeChatInput();
     setTimeout(applyChatViewportFix, 0);
     setTimeout(applyChatViewportFix, 120);
   }}
@@ -4054,11 +4078,6 @@ document.addEventListener('keydown', function(e) {{
 }});
 
 function handleChatKey(e) {{
-  if (e.key === 'Enter' && !e.shiftKey) {{
-    e.preventDefault();
-    if (isLibrarian) {{ sendLibrarianMessage(e); }} else {{ sendMessage(e); }}
-    return false;
-  }}
   return true;
 }}
 
@@ -4068,6 +4087,7 @@ function sendMessage(e) {{
   var text = input.value.trim();
   if (!text) return false;
   input.value = '';
+  resizeChatInput();
 
   // Slash commands go to the command endpoint
   if (text.startsWith('/')) {{
@@ -4757,6 +4777,7 @@ function sendLibrarianMessage(e) {{
   var text = input.value.trim();
   if (!text) return false;
   input.value = '';
+  resizeChatInput();
 
   if (text.startsWith('/')) {{
     chatMessages.push({{ role: 'user', content: text }});
@@ -4861,6 +4882,16 @@ function toggleLibOption(opt) {{
 initializeChatPanel();
 
 window.addEventListener('pageshow', function(e) {{
+  if (isMobileChatLayout() && e.persisted) {{
+    closeAllPanels();
+    setActiveAgentInList(currentAgent);
+    var shell = document.querySelector('.shell');
+    if (shell && !currentAgent) {{
+      shell.style.bottom = '';
+    }}
+    document.querySelectorAll('.svg-overlay').forEach(function(ov) {{ ov.remove(); }});
+    applyChatViewportFix();
+  }}
   if (e.persisted && chatConfigOpen) loadChatConfig();
 }});
 
@@ -8962,7 +8993,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-size: 1rem;
       resize: none;
       min-height: 38px;
-      max-height: 120px;
+      max-height: 50vh;
+      overflow-y: hidden;
     }
     .chat-send-btn {
       background: var(--accent);
