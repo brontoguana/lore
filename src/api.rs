@@ -10486,7 +10486,12 @@ fn should_append_finished_message(conv: &ChatConversation) -> bool {
     if conv.active_turn_user_id == 0 || conv.last_delivered_user_id != conv.active_turn_user_id {
         return false;
     }
-    let Some(last_msg) = conv.messages.last() else {
+    let Some(last_msg) = conv
+        .messages
+        .iter()
+        .rev()
+        .find(|msg| !is_pending_follow_up_user_message(conv, msg))
+    else {
         return false;
     };
     if last_msg.id <= conv.active_turn_user_id {
