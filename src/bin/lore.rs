@@ -2904,14 +2904,15 @@ async fn agent_poll_and_process(
             for event in parse_backend_line(backend, &parsed) {
                 match event {
                     BackendEvent::Text(text) => {
-                        response.push_str(&text);
-                        let _ = context
-                            .client
-                            .post(format!("{}/v1/chat/respond", context.url))
-                            .header("x-lore-key", token)
-                            .json(&serde_json::json!({ "text": text }))
-                            .send()
-                            .await;
+                        if let Some(delta) = append_new_stream_text(&mut response, &text) {
+                            let _ = context
+                                .client
+                                .post(format!("{}/v1/chat/respond", context.url))
+                                .header("x-lore-key", token)
+                                .json(&serde_json::json!({ "text": delta }))
+                                .send()
+                                .await;
+                        }
                     }
                     BackendEvent::ToolUse(detail) => {
                         let _ = context
@@ -3155,7 +3156,9 @@ async fn run_manager_cli(
             };
             for event in parse_backend_line(backend, &parsed) {
                 match event {
-                    BackendEvent::Text(text) => full_response.push_str(&text),
+                    BackendEvent::Text(text) => {
+                        let _ = append_new_stream_text(&mut full_response, &text);
+                    }
                     BackendEvent::Result(text) => {
                         if full_response.is_empty() && !text.is_empty() {
                             full_response = text;
@@ -4555,6 +4558,44 @@ enum BackendEvent {
     Skip,
 }
 
+fn append_new_stream_text(accumulated: &mut String, next: &str) -> Option<String> {
+    if next.is_empty() {
+        return None;
+    }
+    if accumulated.is_empty() {
+        accumulated.push_str(next);
+        return Some(next.to_string());
+    }
+    if next.starts_with(accumulated.as_str()) {
+        let delta = &next[accumulated.len()..];
+        if delta.is_empty() {
+            return None;
+        }
+        accumulated.clear();
+        accumulated.push_str(next);
+        return Some(delta.to_string());
+    }
+    if accumulated.ends_with(next) {
+        return None;
+    }
+    let max_overlap = accumulated.len().min(next.len());
+    for overlap in (1..=max_overlap).rev() {
+        if accumulated.is_char_boundary(accumulated.len() - overlap)
+            && next.is_char_boundary(overlap)
+            && accumulated[accumulated.len() - overlap..] == next[..overlap]
+        {
+            let delta = &next[overlap..];
+            if delta.is_empty() {
+                return None;
+            }
+            accumulated.push_str(delta);
+            return Some(delta.to_string());
+        }
+    }
+    accumulated.push_str(next);
+    Some(next.to_string())
+}
+
 fn short_path(p: &str) -> String {
     let path = std::path::Path::new(p);
     let file = path
@@ -4688,17 +4729,74 @@ fn format_tool_use_gemini(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-fn format_tool_use_codex(item: &serde_json::Value) -> String {
+fn format_tool_use_codex(item: &serde_json::Value) -> Option<String> {
     if item["type"].as_str() == Some("command_execution") {
         let cmd = item["command"]
             .as_str()
             .unwrap_or("")
             .trim_start_matches("/bin/bash -lc ");
         let truncated: String = cmd.chars().take(120).collect();
-        format!("Bash: {truncated}")
-    } else {
-        item["type"].as_str().unwrap_or("unknown").to_string()
+        return Some(format!("Bash: {truncated}"));
     }
+
+    let tool_name = item
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| item.get("tool_name").and_then(|v| v.as_str()))
+        .or_else(|| item.get("call_name").and_then(|v| v.as_str()))
+        .or_else(|| {
+            item.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+        })?;
+
+    let parse_args = |value: Option<&serde_json::Value>| -> serde_json::Value {
+        match value {
+            Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map.clone()),
+            Some(serde_json::Value::String(text)) => {
+                serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({}))
+            }
+            _ => serde_json::json!({}),
+        }
+    };
+
+    let args = parse_args(item.get("arguments"))
+        .as_object()
+        .map(|_| parse_args(item.get("arguments")))
+        .unwrap_or_else(|| {
+            let input_args = parse_args(item.get("input"));
+            if input_args.is_object() {
+                input_args
+            } else {
+                parse_args(item.get("args"))
+            }
+        });
+
+    let detail = match tool_name {
+        "read_file" | "write_file" | "edit_file" | "bash" | "grep" | "glob" | "list_directory" => {
+            format_local_tool_display(tool_name, &args)
+        }
+        "functions.exec_command" | "exec_command" => {
+            let cmd = args
+                .get("cmd")
+                .or_else(|| args.get("command"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let truncated: String = cmd.chars().take(120).collect();
+            format!("Bash: {truncated}")
+        }
+        "functions.apply_patch" | "apply_patch" => "Edit files".to_string(),
+        "functions.view_image" | "view_image" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if path.is_empty() {
+                "View image".to_string()
+            } else {
+                format!("View image {}", short_path(path))
+            }
+        }
+        _ => tool_name.to_string(),
+    };
+    Some(detail)
 }
 
 async fn spawn_backend(
@@ -4883,8 +4981,8 @@ fn parse_codex_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
                             return vec![BackendEvent::Text(text.to_string())];
                         }
                     }
-                } else if item["type"].as_str() == Some("command_execution") {
-                    return vec![BackendEvent::ToolUse(format_tool_use_codex(item))];
+                } else if let Some(detail) = format_tool_use_codex(item) {
+                    return vec![BackendEvent::ToolUse(detail)];
                 }
             }
             vec![BackendEvent::Skip]
@@ -4944,7 +5042,9 @@ async fn run_compaction(
                 };
                 for event in parse_backend_line(backend, &parsed) {
                     match event {
-                        BackendEvent::Text(text) => result.push_str(&text),
+                        BackendEvent::Text(text) => {
+                            let _ = append_new_stream_text(&mut result, &text);
+                        }
                         BackendEvent::Result(text) => {
                             if result.is_empty() && !text.is_empty() {
                                 result = text;
@@ -5915,9 +6015,103 @@ async fn service_handle_create_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::history_messages_excluding_pending;
+    use super::{append_new_stream_text, history_messages_excluding_pending, parse_codex_line};
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[test]
+    fn append_new_stream_text_converts_snapshots_to_deltas() {
+        let mut accumulated = String::new();
+
+        assert_eq!(
+            append_new_stream_text(&mut accumulated, "First"),
+            Some("First".to_string())
+        );
+        assert_eq!(accumulated, "First");
+
+        assert_eq!(
+            append_new_stream_text(&mut accumulated, "First second"),
+            Some(" second".to_string())
+        );
+        assert_eq!(accumulated, "First second");
+    }
+
+    #[test]
+    fn append_new_stream_text_ignores_exact_repeats() {
+        let mut accumulated = "First second".to_string();
+
+        assert_eq!(
+            append_new_stream_text(&mut accumulated, "First second"),
+            None
+        );
+        assert_eq!(accumulated, "First second");
+    }
+
+    #[test]
+    fn append_new_stream_text_passes_through_real_deltas() {
+        let mut accumulated = String::new();
+
+        assert_eq!(
+            append_new_stream_text(&mut accumulated, "First"),
+            Some("First".to_string())
+        );
+        assert_eq!(
+            append_new_stream_text(&mut accumulated, " second"),
+            Some(" second".to_string())
+        );
+        assert_eq!(accumulated, "First second");
+    }
+
+    #[test]
+    fn append_new_stream_text_merges_partial_overlap_without_duplication() {
+        let mut accumulated = "First second".to_string();
+
+        assert_eq!(
+            append_new_stream_text(&mut accumulated, " second third"),
+            Some(" third".to_string())
+        );
+        assert_eq!(accumulated, "First second third");
+    }
+
+    #[test]
+    fn parse_codex_line_surfaces_structured_file_reads() {
+        let events = parse_codex_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "type": "custom_tool_call",
+                "name": "read_file",
+                "arguments": {
+                    "path": "/tmp/example.txt"
+                }
+            }
+        }));
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            super::BackendEvent::ToolUse(detail) => assert_eq!(detail, "Read tmp/example.txt"),
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn parse_codex_line_surfaces_apply_patch_edits() {
+        let events = parse_codex_line(&json!({
+            "type": "item.completed",
+            "item": {
+                "type": "custom_tool_call",
+                "name": "functions.apply_patch",
+                "arguments": {
+                    "patch": "*** Begin Patch\n*** End Patch\n"
+                }
+            }
+        }));
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            super::BackendEvent::ToolUse(detail) => assert_eq!(detail, "Edit files"),
+            _ => panic!("unexpected event"),
+        }
+    }
 
     #[test]
     fn history_messages_excluding_pending_excludes_current_unread_batch() {

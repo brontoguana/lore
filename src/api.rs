@@ -10458,9 +10458,18 @@ fn should_append_finished_message(conv: &ChatConversation) -> bool {
     if conv.agent_status != AgentChatStatus::Idle {
         return false;
     }
+    if conv.active_turn_user_id == 0 || conv.last_delivered_user_id != conv.active_turn_user_id {
+        return false;
+    }
+    let Some(last_msg) = conv.messages.last() else {
+        return false;
+    };
+    if last_msg.id <= conv.active_turn_user_id {
+        return false;
+    }
     matches!(
-        conv.messages.last().map(|m| m.role),
-        Some(ChatRole::Assistant | ChatRole::Tool | ChatRole::Error)
+        last_msg.role,
+        ChatRole::Assistant | ChatRole::Tool | ChatRole::Error
     )
 }
 
@@ -11234,13 +11243,10 @@ async fn chat_send_message(
 
     // Notify the machine if it's polling
     let notifier_key = format!("{owner}_{agent_name}");
-    if let Some(notify) = state
-        .chat_agent_notifiers
-        .lock()
-        .unwrap()
-        .get(&notifier_key)
-    {
-        notify.notify_one();
+    if let Ok(notifiers) = state.chat_agent_notifiers.lock() {
+        if let Some(notify) = notifiers.get(&notifier_key) {
+            notify.notify_one();
+        }
     }
 
     Ok(StatusCode::OK.into_response())
@@ -14375,9 +14381,10 @@ async fn chat_slash_command(
 }
 
 fn push_chat_event(state: &AppState, owner: &str, event: ChatEvent) {
-    let senders = state.chat_senders.lock().unwrap();
-    if let Some(sender) = senders.get(owner) {
-        let _ = sender.send(event);
+    if let Ok(senders) = state.chat_senders.lock() {
+        if let Some(sender) = senders.get(owner) {
+            let _ = sender.send(event);
+        }
     }
 }
 
@@ -18351,6 +18358,8 @@ mod tests {
     fn chat_panel_appends_finished_message_for_idle_completed_turn() {
         let mut conv = ChatConversation {
             agent_status: AgentChatStatus::Idle,
+            active_turn_user_id: 1,
+            last_delivered_user_id: 1,
             ..Default::default()
         };
         conv.messages.push(ChatMessage {
@@ -18373,9 +18382,38 @@ mod tests {
     }
 
     #[test]
+    fn chat_panel_skips_finished_message_without_completed_turn_marker() {
+        let mut conv = ChatConversation {
+            agent_status: AgentChatStatus::Idle,
+            ..Default::default()
+        };
+        conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "hello".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+        conv.messages.push(ChatMessage {
+            id: 2,
+            role: ChatRole::Assistant,
+            content: "done".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+
+        let messages = super::chat_messages_value_for_panel(&conv);
+        assert_eq!(messages.len(), 2);
+        assert_ne!(
+            messages.last().unwrap()["content"].as_str(),
+            Some("✅ Finished")
+        );
+    }
+
+    #[test]
     fn chat_panel_skips_finished_message_while_agent_is_thinking() {
         let mut conv = ChatConversation {
             agent_status: AgentChatStatus::Thinking,
+            active_turn_user_id: 1,
+            last_delivered_user_id: 1,
             ..Default::default()
         };
         conv.messages.push(ChatMessage {

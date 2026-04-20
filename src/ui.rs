@@ -27,6 +27,18 @@ use time::format_description::well_known::Rfc3339;
 const ICON_STOP: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>"#;
 const ICON_RESTART: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
+const ICON_STATUS_DONE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>"#;
+const ICON_STATUS_WORKING: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>"#;
+const ICON_STATUS_STOPPED: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6"/><path d="M15 9l-6 6"/></svg>"#;
+
+fn chat_status_indicator(status: &str) -> (&'static str, &'static str, &'static str) {
+    match status {
+        "idle" => ("chat-status-running", "Finished", ICON_STATUS_DONE),
+        "thinking" => ("chat-status-working", "Working", ICON_STATUS_WORKING),
+        "restarting" => ("chat-status-restarting", "Restarting", ICON_RESTART),
+        _ => ("chat-status-stopped", "Stopped", ICON_STATUS_STOPPED),
+    }
+}
 
 pub struct PageShell<'a> {
     pub title: &'a str,
@@ -3424,17 +3436,22 @@ pub fn render_chat_page(
     } else {
         ""
     };
+    let (librarian_status_class, librarian_status_title, librarian_status_icon) =
+        chat_status_indicator("thinking");
     let librarian_entry = format!(
         r#"<div class="chat-agent-item{active_class}" data-agent="librarian" onclick="selectAgent('librarian')">
   <div class="chat-agent-header">
     <div class="chat-avatar-sm-wrap chat-avatar-empty chat-avatar-librarian"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></div>
     <span class="chat-agent-name">Librarian</span>
-    <span class="chat-status-dot chat-status-running"></span>
+    <span class="chat-status-glyph {status_class}" title="{status_title}">{status_icon}</span>
   </div>
   <div class="chat-agent-snippet">Ask questions about your projects</div>
   <div class="chat-agent-time"></div>
 </div>"#,
         active_class = librarian_active_class,
+        status_class = librarian_status_class,
+        status_title = librarian_status_title,
+        status_icon = librarian_status_icon,
     );
 
     let agent_list_html: String = agents
@@ -3445,12 +3462,7 @@ pub fn render_chat_page(
             } else {
                 ""
             };
-            let status_class = match agent.status.as_str() {
-                "idle" => "chat-status-running",
-                "thinking" => "chat-status-working",
-                "restarting" => "chat-status-restarting",
-                _ => "chat-status-stopped",
-            };
+            let (status_class, status_title, status_icon) = chat_status_indicator(&agent.status);
             let snippet = agent
                 .last_message
                 .as_deref()
@@ -3478,7 +3490,7 @@ pub fn render_chat_page(
                 r#"<div class="chat-agent-item{active_class}" data-agent="{name}" onclick="selectAgent('{name}')">
   <div class="chat-agent-header">
     {avatar_html}<span class="chat-agent-name">{display_name}</span>
-    <span class="chat-status-dot {status_class}"></span>
+    <span class="chat-status-glyph {status_class}" title="{status_title}">{status_icon}</span>
   </div>
   <div class="chat-agent-snippet">{snippet_escaped}</div>
   <div class="chat-agent-time">{time_str}</div>
@@ -3488,6 +3500,8 @@ pub fn render_chat_page(
                 avatar_html = avatar_html,
                 display_name = escape_text(&agent.display_name),
                 status_class = status_class,
+                status_title = status_title,
+                status_icon = status_icon,
                 snippet_escaped = snippet_escaped,
                 time_str = escape_text(time_str),
             )
@@ -3808,7 +3822,7 @@ function applyChatViewportFix() {{
   var inputRect = input.getBoundingClientRect();
   var targetBottom = viewportBottom - 12;
   var overlap = Math.max(formRect.bottom - targetBottom, inputRect.bottom - targetBottom);
-  if (overlap > 0) {{
+  if (overlap > 0 && chatShouldFollow(messages, chatFollowScroll)) {{
     messages.scrollTop += overlap;
   }}
 }}
@@ -3846,7 +3860,9 @@ function resizeChatInput() {{
   var nextOverflow = input.scrollHeight > maxHeight ? 'auto' : 'hidden';
   input.style.height = nextHeight + 'px';
   input.style.overflowY = nextOverflow;
-  return Math.abs(nextHeight - prevHeight) > 1 || prevOverflow !== nextOverflow;
+  var changed = Math.abs(nextHeight - prevHeight) > 1 || prevOverflow !== nextOverflow;
+  if (changed) updateChatJumpButton();
+  return changed;
 }}
 
 function initChatComposer() {{
@@ -3958,14 +3974,18 @@ function resizeAndUpload(file, agent, el) {{
 function renderMessages() {{
   var container = document.getElementById('chat-messages');
   if (!container) return;
-  var bottomOffset = container.scrollHeight - container.scrollTop;
-  var shouldFollow = chatFollowScroll;
+  var anchor = null;
+  var preservedScrollTop = container.scrollTop;
+  var shouldFollow = chatShouldFollow(container, chatFollowScroll);
+  if (!shouldFollow) {{
+    anchor = captureChatViewportAnchor(container);
+  }}
   var html = '';
   for (var i = 0; i < chatMessages.length; i++) {{
     var msg = chatMessages[i];
     var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : msg.role === 'config' ? 'chat-msg-config' : msg.role === 'tool' ? 'chat-msg-tool' : msg.role === 'error' ? 'chat-msg-error' : 'chat-msg-assistant';
     if (msg._thinking) cls += ' chat-msg-thinking';
-    html += '<div class="chat-msg ' + cls + '">';
+    html += '<div class="chat-msg ' + cls + '" data-chat-idx="' + i + '">';
     if (msg.role === 'assistant') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
     }} else if (msg.role === 'error') {{
@@ -3982,14 +4002,57 @@ function renderMessages() {{
     chatFollowScroll = true;
     container.scrollTop = container.scrollHeight;
   }} else {{
-    container.scrollTop = Math.max(0, container.scrollHeight - bottomOffset);
+    chatFollowScroll = false;
+    restoreChatViewportAnchor(container, anchor, preservedScrollTop);
   }}
   updateChatJumpButton();
 }}
 
-function chatIsNearBottom(container) {{
+function chatDistanceFromBottom(container) {{
   if (!container) return true;
-  return container.scrollHeight - container.clientHeight - container.scrollTop <= 2;
+  return Math.max(0, container.scrollHeight - container.clientHeight - container.scrollTop);
+}}
+
+function chatIsNearBottom(container, threshold) {{
+  if (!container) return true;
+  return chatDistanceFromBottom(container) <= (threshold || 0);
+}}
+
+function chatShouldFollow(container, wasFollowing) {{
+  if (!container) return true;
+  return chatIsNearBottom(container, wasFollowing ? 72 : 16);
+}}
+
+function captureChatViewportAnchor(container) {{
+  if (!container) return null;
+  var containerTop = container.getBoundingClientRect().top;
+  var children = container.children;
+  for (var i = 0; i < children.length; i++) {{
+    var child = children[i];
+    var rect = child.getBoundingClientRect();
+    if (rect.bottom > containerTop) {{
+      return {{
+        index: child.getAttribute('data-chat-idx'),
+        offset: rect.top - containerTop
+      }};
+    }}
+  }}
+  return null;
+}}
+
+function restoreChatViewportAnchor(container, anchor, fallbackScrollTop) {{
+  if (!container) return;
+  if (anchor && anchor.index !== null) {{
+    var selector = '[data-chat-idx="' + anchor.index + '"]';
+    var child = container.querySelector(selector);
+    if (child) {{
+      var containerTop = container.getBoundingClientRect().top;
+      var rect = child.getBoundingClientRect();
+      container.scrollTop += rect.top - containerTop - anchor.offset;
+      return;
+    }}
+  }}
+  container.scrollTop = Math.max(0, fallbackScrollTop);
 }}
 
 function updateChatJumpButton() {{
@@ -4001,7 +4064,7 @@ function updateChatJumpButton() {{
     return;
   }}
   var hasOverflow = container.scrollHeight > container.clientHeight + 8;
-  button.style.display = (!chatFollowScroll && hasOverflow) ? 'inline-flex' : 'none';
+  button.style.display = (!chatIsNearBottom(container, 16) && hasOverflow) ? 'inline-flex' : 'none';
 }}
 
 function bindChatScrollState() {{
@@ -4010,10 +4073,11 @@ function bindChatScrollState() {{
   if (container.dataset.scrollBound !== '1') {{
     container.dataset.scrollBound = '1';
     container.addEventListener('scroll', function() {{
-      chatFollowScroll = chatIsNearBottom(container);
+      chatFollowScroll = chatShouldFollow(container, chatFollowScroll);
       updateChatJumpButton();
     }});
   }}
+  chatFollowScroll = chatShouldFollow(container, chatFollowScroll);
   updateChatJumpButton();
 }}
 
@@ -4277,14 +4341,27 @@ function updateAgentListStatus(agent, status) {{
   if (!agent) return;
   var item = document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(agent) + '"]');
   if (!item) return;
-  var dot = item.querySelector('.chat-status-dot');
-  if (!dot) return;
-  dot.classList.remove('chat-status-running', 'chat-status-working', 'chat-status-restarting', 'chat-status-stopped');
-  dot.classList.add(chatStatusClass(status));
+  var glyph = item.querySelector('.chat-status-glyph');
+  if (!glyph) return;
+  glyph.classList.remove('chat-status-running', 'chat-status-working', 'chat-status-restarting', 'chat-status-stopped');
+  var statusClass = chatStatusClass(status);
+  glyph.classList.add(statusClass);
+  if (status === 'idle') {{
+    glyph.title = 'Finished';
+    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+  }} else if (status === 'thinking') {{
+    glyph.title = 'Working';
+    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>';
+  }} else if (status === 'restarting') {{
+    glyph.title = 'Restarting';
+    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>';
+  }} else {{
+    glyph.title = 'Stopped';
+    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6"/><path d="M15 9l-6 6"/></svg>';
+  }}
 }}
 
-function maybeAppendFinishedMessage(nextStatus) {{
-  if (agentStatus !== 'thinking' || nextStatus === 'thinking') return;
+function maybeAppendFinishedMessage() {{
   var lastMsg = chatMessages[chatMessages.length - 1];
   if (lastMsg && lastMsg.role === 'system' && lastMsg.content === '\u2705 Finished') return;
   chatMessages.push({{ role: 'system', content: '\u2705 Finished' }});
@@ -4356,6 +4433,7 @@ function connectSSE() {{
           lastMsg.content = evt.data.content || lastMsg.content;
         }}
         streamingContent = '';
+        maybeAppendFinishedMessage();
         renderMessages();
       }} else if (evt.event_type === 'auto_message') {{
         chatMessages.push({{ role: 'user', content: evt.data.content }});
@@ -4369,7 +4447,6 @@ function connectSSE() {{
         agentConfig.effort = evt.data.effort || '';
         updateHeaderStatus();
       }} else if (evt.event_type === 'status') {{
-        maybeAppendFinishedMessage(evt.data && evt.data.status ? evt.data.status : '');
         agentStatus = evt.data.status || '';
         updateHeaderStatus();
         if (evt.data.cwd) {{
@@ -8618,16 +8695,23 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-weight: 600;
       font-size: 0.9rem;
     }
-    .chat-status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      display: inline-block;
+    .chat-status-glyph {
+      width: 14px;
+      height: 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
     }
-    .chat-status-running { background: #22c55e; }
-    .chat-status-working { background: var(--accent); }
-    .chat-status-restarting { background: #f59e0b; }
-    .chat-status-stopped { background: var(--fg-muted); }
+    .chat-status-glyph svg {
+      width: 14px;
+      height: 14px;
+      display: block;
+    }
+    .chat-status-running { color: #22c55e; }
+    .chat-status-working { color: var(--accent); }
+    .chat-status-restarting { color: #f59e0b; }
+    .chat-status-stopped { color: var(--fg-muted); }
     .chat-agent-snippet {
       font-size: 0.82rem;
       color: var(--fg-muted);
