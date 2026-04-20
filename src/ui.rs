@@ -1,12 +1,16 @@
 use crate::audit::{AuditActor, AuditActorKind};
 use crate::auth::{ProjectGrant, ProjectPermission, StoredMachine, StoredRole};
-use crate::config::{ColorMode, ExternalAuthConfig, ExternalScheme, OidcConfig, ServerConfig, UiTheme};
+use crate::config::{
+    ColorMode, ExternalAuthConfig, ExternalScheme, OidcConfig, ServerConfig, UiTheme,
+};
 use crate::librarian::{
     Endpoint, LibrarianActor, LibrarianActorKind, LibrarianConfig, LibrarianRunKind,
     LibrarianRunStatus, ProjectLibrarianOperationType, ProviderCheckResult,
     StoredLibrarianOperation,
 };
-use crate::model::{Block, BlockId, BlockType, ProjectName, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW};
+use crate::model::{
+    Block, BlockId, BlockType, ProjectName, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW,
+};
 use crate::store::{DocumentInfo, FileBlockStore, ProjectInfo};
 use crate::updater::{AutoUpdateConfig, AutoUpdateStatus, ReleaseStream};
 use crate::versioning::{
@@ -36,7 +40,8 @@ pub struct PageShell<'a> {
 
 pub fn render_shell(shell: PageShell, content: String) -> String {
     let flash_html = flash_message(shell.flash);
-    let csrf_hidden = shell.csrf_token
+    let csrf_hidden = shell
+        .csrf_token
         .map(|t| format!(r#"<input type="hidden" name="csrf_token" value="{}">"#, t))
         .unwrap_or_default();
     let nav_html = if let Some(username) = shell.username {
@@ -452,16 +457,8 @@ pub fn render_login_page(
     oidc_enabled: bool,
     flash: Option<&str>,
 ) -> String {
-    let title = if has_users {
-        "Sign in to Lore"
-    } else {
-        "Lore"
-    };
-    let subtitle = if has_users {
-        ""
-    } else {
-        ""
-    };
+    let title = if has_users { "Sign in to Lore" } else { "Lore" };
+    let subtitle = if has_users { "" } else { "" };
     let action = "/login";
     let button = "Sign in";
     let no_users_html = if !has_users {
@@ -521,7 +518,11 @@ pub fn render_login_page(
       {form_html}
     </section>"#,
         title = escape_text(title),
-        subtitle_html = if subtitle.is_empty() { String::new() } else { format!("<p class=\"subtitle\">{}</p>", escape_text(subtitle)) },
+        subtitle_html = if subtitle.is_empty() {
+            String::new()
+        } else {
+            format!("<p class=\"subtitle\">{}</p>", escape_text(subtitle))
+        },
         form_html = form_html,
     );
 
@@ -968,7 +969,8 @@ fn render_project_tree(
             String::new()
         };
 
-        format!(r#"<ul class="tree-list" data-parent="{lp}">{top_drop}{items}</ul>"#,
+        format!(
+            r#"<ul class="tree-list" data-parent="{lp}">{top_drop}{items}</ul>"#,
             lp = escape_attribute(list_parent),
             top_drop = top_drop,
             items = items.join(""),
@@ -1158,7 +1160,11 @@ pub fn render_admin_page(
         .join("");
 
     let librarian_endpoint_options: String = {
-        let none_selected = if librarian_config.endpoint_id.is_none() { " selected" } else { "" };
+        let none_selected = if librarian_config.endpoint_id.is_none() {
+            " selected"
+        } else {
+            ""
+        };
         let mut opts = format!(r#"<option value=""{none_selected}>-- none --</option>"#);
         for ep in endpoints {
             let sel = if librarian_config.endpoint_id.as_deref() == Some(&ep.id) {
@@ -2160,6 +2166,7 @@ pub fn render_agents_page(
                 };
                 let status_badge = match agent.process_status.as_deref() {
                     Some("running") => r#"<span class="agent-status-badge running" title="Running">&#x25cf;</span>"#,
+                    Some("restarting") => r#"<span class="agent-status-badge restarting" title="Restarting">&#x25cf;</span>"#,
                     Some("stopped") => r#"<span class="agent-status-badge stopped" title="Stopped">&#x25cf;</span>"#,
                     _ => "",
                 };
@@ -2414,7 +2421,11 @@ pub fn render_agents_page(
                 let cli_backends = ["claude", "gemini", "codex"];
                 let mut cli_opts = String::new();
                 for b in &cli_backends {
-                    let sel = if agent.endpoint_id.is_none() && agent.backend.to_string() == *b { " selected" } else { "" };
+                    let sel = if agent.endpoint_id.is_none() && agent.backend.to_string() == *b {
+                        " selected"
+                    } else {
+                        ""
+                    };
                     let label = {
                         let mut c = b.chars();
                         match c.next() {
@@ -2426,11 +2437,17 @@ pub fn render_agents_page(
                 }
                 let mut ep_opts = String::new();
                 for ep in endpoints {
-                    let sel = if agent.endpoint_id.as_deref() == Some(&ep.id) { " selected" } else { "" };
+                    let sel = if agent.endpoint_id.as_deref() == Some(&ep.id) {
+                        " selected"
+                    } else {
+                        ""
+                    };
                     ep_opts.push_str(&format!(
                         r#"<option value="ep:{}"{}>{} ({})</option>"#,
-                        escape_attribute(&ep.id), sel,
-                        escape_text(&ep.name), escape_text(&ep.model),
+                        escape_attribute(&ep.id),
+                        sel,
+                        escape_text(&ep.name),
+                        escape_text(&ep.model),
                     ));
                 }
                 let ep_group = if !ep_opts.is_empty() {
@@ -3047,11 +3064,8 @@ pub fn render_settings_page(
     </script>"#,
         csrf_token = escape_attribute(csrf_token),
         current_theme_value = escape_attribute(selected_theme.map(|t| t.as_str()).unwrap_or("")),
-        current_mode_value = escape_attribute(
-            selected_color_mode
-                .map(|m| m.as_str())
-                .unwrap_or("system")
-        ),
+        current_mode_value =
+            escape_attribute(selected_color_mode.map(|m| m.as_str()).unwrap_or("system")),
         preference_label = escape_text(preference_label),
         mode_label = escape_text(mode_label),
         server_default_label = escape_text(server_default_theme.display_name()),
@@ -3086,6 +3100,189 @@ pub struct ChatAgentSummary {
     pub profile_url: Option<String>,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
+}
+
+pub fn render_chat_main_panel(
+    agents: &[ChatAgentSummary],
+    selected_agent: Option<&str>,
+    csrf_token: &str,
+    projects: &[(String, String)],
+) -> String {
+    let is_librarian = selected_agent == Some("librarian");
+
+    if is_librarian {
+        let project_options: String = projects
+            .iter()
+            .map(|(slug, display_name)| {
+                format!(
+                    r#"<option value="{}">{}</option>"#,
+                    escape_attribute(slug),
+                    escape_text(display_name),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        return format!(
+            r#"<div class="chat-header">
+  <button class="chat-back-btn" onclick="showAgentList()">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
+  </button>
+  <span class="chat-header-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></span>
+  <span class="chat-header-name">Librarian</span>
+  <select id="lib-project" class="chat-config-select" style="margin-left:var(--s-3);max-width:200px;" onchange="onLibProjectChange()">
+    <option value="">All Projects</option>
+    {project_options}
+  </select>
+  <button type="button" class="btn-sm button-link lib-toggle" id="lib-toggle-history" style="margin-left:auto;" onclick="toggleLibOption('history')" title="Include history"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></button>
+  <button type="button" class="btn-sm button-link lib-toggle" id="lib-toggle-edits" style="margin-left:var(--s-1);" onclick="toggleLibOption('edits')" title="Allow edits"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+</div>
+<div class="chat-messages" id="chat-messages"></div>
+<form class="chat-input-form" id="chat-input-form" onsubmit="return sendLibrarianMessage(event)">
+  <input type="hidden" name="csrf_token" value="{csrf_token}">
+  <textarea class="chat-input" id="chat-input" placeholder="Ask the librarian..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
+  <button type="submit" class="chat-send-btn">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+  </button>
+</form>"#,
+            csrf_token = escape_attribute(csrf_token),
+            project_options = project_options,
+        );
+    }
+
+    if let Some(agent_name) = selected_agent {
+        let selected_agent_data = agents.iter().find(|a| a.name == agent_name);
+        let display = selected_agent_data
+            .map(|a| a.display_name.as_str())
+            .unwrap_or(agent_name);
+        let header_avatar = selected_agent_data
+            .and_then(|a| a.profile_url.as_ref())
+            .map(|url| {
+                format!(
+                    r#"<img class="chat-avatar-header" src="{}" alt="">"#,
+                    escape_attribute(url)
+                )
+            })
+            .unwrap_or_default();
+        let cwd_html = {
+            let cwd_short = selected_agent_data
+                .and_then(|a| a.cwd.as_ref())
+                .map(|cwd| {
+                    let parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
+                    if parts.len() > 3 {
+                        format!(".../{}", parts[parts.len() - 3..].join("/"))
+                    } else {
+                        parts.join("/")
+                    }
+                })
+                .unwrap_or_default();
+            let branch = selected_agent_data
+                .and_then(|a| a.git_branch.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let mut label = cwd_short;
+            if !branch.is_empty() {
+                if !label.is_empty() {
+                    label = format!("{} ({})", label, branch);
+                } else {
+                    label = format!("({})", branch);
+                }
+            }
+            if label.is_empty() {
+                r#"<span class="chat-header-cwd" id="chat-agent-cwd"></span>"#.to_string()
+            } else {
+                format!(
+                    r#"<span class="chat-header-cwd" id="chat-agent-cwd">{}</span>"#,
+                    escape_text(&label)
+                )
+            }
+        };
+        return format!(
+            r#"<div class="chat-header">
+  <button class="chat-back-btn" onclick="showAgentList()">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
+  </button>
+  {header_avatar}<span class="chat-header-name">{display_name}</span>
+  <span class="chat-header-status" id="chat-agent-status"></span>
+  {cwd_html}
+  <button type="button" class="btn-sm button-link" id="chat-manage-btn" style="margin-left:auto;" onclick="toggleManagePanel()" title="Manage"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>
+  <button type="button" class="btn-sm button-link" id="chat-config-btn" style="margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
+</div>
+<div class="chat-messages" id="chat-messages"></div>
+<div class="chat-config-panel" id="chat-config-panel" style="display:none;">
+  <div class="chat-config-inner">
+    <div class="chat-config-field">
+      <label class="chat-config-label">Backend</label>
+      <select id="cfg-backend" class="chat-config-select" onchange="onBackendChange()"></select>
+    </div>
+    <div class="chat-config-field">
+      <label class="chat-config-label">Model</label>
+      <select id="cfg-model" class="chat-config-select" onchange="onConfigChange()"></select>
+    </div>
+    <div class="chat-config-field" id="cfg-effort-field">
+      <label class="chat-config-label">Effort</label>
+      <select id="cfg-effort" class="chat-config-select" onchange="onConfigChange()"></select>
+    </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Pinned Context</label>
+      <textarea id="cfg-pinned-context" class="chat-config-textarea" placeholder="Context sent with every message to this agent..." oninput="onPinnedContextChange()"></textarea>
+    </div>
+    <div class="chat-config-field" id="cfg-project-context-field" style="flex:1;display:flex;flex-direction:column;display:none;">
+      <label class="chat-config-label">Project Context</label>
+      <textarea id="cfg-project-context" class="chat-config-textarea" readonly placeholder="No project context set."></textarea>
+    </div>
+    <div class="chat-config-field" id="cfg-errors-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Error Log <span id="cfg-errors-count" style="color:var(--fg-muted);font-weight:normal;"></span></label>
+      <div id="cfg-errors-list" class="chat-errors-list"></div>
+    </div>
+  </div>
+</div>
+<div class="chat-config-panel" id="chat-manage-panel" style="display:none;">
+  <div class="chat-config-inner">
+    <div class="chat-config-field">
+      <label class="chat-config-label">Manager Backend</label>
+      <select id="mgr-backend" class="chat-config-select" onchange="onManageChange()"></select>
+    </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Goals</label>
+      <textarea id="mgr-goals" class="chat-config-textarea" placeholder="What should the agent accomplish?" oninput="onManageFieldChange()"></textarea>
+    </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Stopping Point</label>
+      <textarea id="mgr-stopping" class="chat-config-textarea" placeholder="When should the manager stop the agent?" oninput="onManageFieldChange()"></textarea>
+    </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Periodic Checks</label>
+      <textarea id="mgr-checks" class="chat-config-textarea" placeholder="What should the agent verify every few turns?" oninput="onManageFieldChange()"></textarea>
+    </div>
+    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
+      <label class="chat-config-label">Red Flags</label>
+      <textarea id="mgr-redflags" class="chat-config-textarea" placeholder="What should cause the manager to halt the agent?" oninput="onManageFieldChange()"></textarea>
+    </div>
+    <div class="chat-config-field">
+      <button type="button" class="btn-lg" id="mgr-toggle" onclick="toggleManageMode()">Enable</button>
+      <span id="mgr-status" style="margin-left:var(--s-2);font-size:0.85em;color:var(--fg-muted);"></span>
+    </div>
+  </div>
+</div>
+<form class="chat-input-form" id="chat-input-form" onsubmit="return sendMessage(event)">
+  <input type="hidden" name="csrf_token" value="{csrf_token}">
+  <textarea class="chat-input" id="chat-input" placeholder="Type a message..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
+  <button type="submit" class="chat-send-btn">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+  </button>
+</form>"#,
+            header_avatar = header_avatar,
+            display_name = escape_text(display),
+            cwd_html = cwd_html,
+            settings_icon = ICON_SETTINGS,
+            csrf_token = escape_attribute(csrf_token),
+        );
+    }
+
+    r#"<div class="chat-empty">
+  <div class="chat-empty-text">Select an agent to start chatting</div>
+</div>"#
+        .to_string()
 }
 
 pub fn render_agent_guide_page(
@@ -3212,13 +3409,17 @@ pub fn render_chat_page(
 ) -> String {
     let is_librarian = selected_agent == Some("librarian");
 
-    let librarian_active_class = if is_librarian { " chat-agent-active" } else { "" };
+    let librarian_active_class = if is_librarian {
+        " chat-agent-active"
+    } else {
+        ""
+    };
     let librarian_entry = format!(
         r#"<div class="chat-agent-item{active_class}" data-agent="librarian" onclick="selectAgent('librarian')">
   <div class="chat-agent-header">
     <div class="chat-avatar-sm-wrap chat-avatar-empty chat-avatar-librarian"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></div>
     <span class="chat-agent-name">Librarian</span>
-    <span class="chat-status-dot chat-status-online"></span>
+    <span class="chat-status-dot chat-status-running"></span>
   </div>
   <div class="chat-agent-snippet">Ask questions about your projects</div>
   <div class="chat-agent-time"></div>
@@ -3235,9 +3436,10 @@ pub fn render_chat_page(
                 ""
             };
             let status_class = match agent.status.as_str() {
-                "idle" => "chat-status-online",
-                "thinking" => "chat-status-thinking",
-                _ => "chat-status-offline",
+                "idle" => "chat-status-running",
+                "thinking" => "chat-status-working",
+                "restarting" => "chat-status-restarting",
+                _ => "chat-status-stopped",
             };
             let snippet = agent
                 .last_message
@@ -3284,177 +3486,7 @@ pub fn render_chat_page(
         .join("\n");
     let agent_list_html = format!("{}\n{}", librarian_entry, agent_list_html);
 
-    let chat_area_html = if is_librarian {
-        let project_options: String = projects
-            .iter()
-            .map(|(slug, display_name)| {
-                format!(
-                    r#"<option value="{}">{}</option>"#,
-                    escape_attribute(slug),
-                    escape_text(display_name),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        format!(
-            r#"<div class="chat-header">
-  <button class="chat-back-btn" onclick="showAgentList()">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
-  </button>
-  <span class="chat-header-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg></span>
-  <span class="chat-header-name">Librarian</span>
-  <select id="lib-project" class="chat-config-select" style="margin-left:var(--s-3);max-width:200px;" onchange="onLibProjectChange()">
-    <option value="">All Projects</option>
-    {project_options}
-  </select>
-  <button type="button" class="btn-sm button-link lib-toggle" id="lib-toggle-history" style="margin-left:auto;" onclick="toggleLibOption('history')" title="Include history"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></button>
-  <button type="button" class="btn-sm button-link lib-toggle" id="lib-toggle-edits" style="margin-left:var(--s-1);" onclick="toggleLibOption('edits')" title="Allow edits"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
-</div>
-<div class="chat-messages" id="chat-messages"></div>
-<form class="chat-input-form" id="chat-input-form" onsubmit="return sendLibrarianMessage(event)">
-  <input type="hidden" name="csrf_token" value="{csrf_token}">
-  <textarea class="chat-input" id="chat-input" placeholder="Ask the librarian..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
-  <button type="submit" class="chat-send-btn">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-  </button>
-</form>"#,
-            csrf_token = escape_attribute(csrf_token),
-            project_options = project_options,
-        )
-    } else if let Some(agent_name) = selected_agent {
-        let selected_agent_data = agents
-            .iter()
-            .find(|a| a.name == agent_name);
-        let display = selected_agent_data
-            .map(|a| a.display_name.as_str())
-            .unwrap_or(agent_name);
-        let header_avatar = selected_agent_data
-            .and_then(|a| a.profile_url.as_ref())
-            .map(|url| format!(
-                r#"<img class="chat-avatar-header" src="{}" alt="">"#,
-                escape_attribute(url)
-            ))
-            .unwrap_or_default();
-        let cwd_html = {
-            let cwd_short = selected_agent_data
-                .and_then(|a| a.cwd.as_ref())
-                .map(|cwd| {
-                    let parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
-                    if parts.len() > 3 {
-                        format!(".../{}", parts[parts.len()-3..].join("/"))
-                    } else {
-                        parts.join("/")
-                    }
-                })
-                .unwrap_or_default();
-            let branch = selected_agent_data
-                .and_then(|a| a.git_branch.as_ref())
-                .cloned()
-                .unwrap_or_default();
-            let mut label = cwd_short;
-            if !branch.is_empty() {
-                if !label.is_empty() {
-                    label = format!("{} ({})", label, branch);
-                } else {
-                    label = format!("({})", branch);
-                }
-            }
-            if label.is_empty() {
-                r#"<span class="chat-header-cwd" id="chat-agent-cwd"></span>"#.to_string()
-            } else {
-                format!(
-                    r#"<span class="chat-header-cwd" id="chat-agent-cwd">{}</span>"#,
-                    escape_text(&label)
-                )
-            }
-        };
-        format!(
-            r#"<div class="chat-header">
-  <button class="chat-back-btn" onclick="showAgentList()">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
-  </button>
-  {header_avatar}<span class="chat-header-name">{display_name}</span>
-  <span class="chat-header-status" id="chat-agent-status"></span>
-  {cwd_html}
-  <button type="button" class="btn-sm button-link" id="chat-manage-btn" style="margin-left:auto;" onclick="toggleManagePanel()" title="Manage"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>
-  <button type="button" class="btn-sm button-link" id="chat-config-btn" style="margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
-</div>
-<div class="chat-messages" id="chat-messages"></div>
-<div class="chat-config-panel" id="chat-config-panel" style="display:none;">
-  <div class="chat-config-inner">
-    <div class="chat-config-field">
-      <label class="chat-config-label">Backend</label>
-      <select id="cfg-backend" class="chat-config-select" onchange="onBackendChange()"></select>
-    </div>
-    <div class="chat-config-field">
-      <label class="chat-config-label">Model</label>
-      <select id="cfg-model" class="chat-config-select" onchange="onConfigChange()"></select>
-    </div>
-    <div class="chat-config-field" id="cfg-effort-field">
-      <label class="chat-config-label">Effort</label>
-      <select id="cfg-effort" class="chat-config-select" onchange="onConfigChange()"></select>
-    </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Pinned Context</label>
-      <textarea id="cfg-pinned-context" class="chat-config-textarea" placeholder="Context sent with every message to this agent..." oninput="onPinnedContextChange()"></textarea>
-    </div>
-    <div class="chat-config-field" id="cfg-project-context-field" style="flex:1;display:flex;flex-direction:column;display:none;">
-      <label class="chat-config-label">Project Context</label>
-      <textarea id="cfg-project-context" class="chat-config-textarea" readonly placeholder="No project context set."></textarea>
-    </div>
-    <div class="chat-config-field" id="cfg-errors-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Error Log <span id="cfg-errors-count" style="color:var(--fg-muted);font-weight:normal;"></span></label>
-      <div id="cfg-errors-list" class="chat-errors-list"></div>
-    </div>
-  </div>
-</div>
-<div class="chat-config-panel" id="chat-manage-panel" style="display:none;">
-  <div class="chat-config-inner">
-    <div class="chat-config-field">
-      <label class="chat-config-label">Manager Backend</label>
-      <select id="mgr-backend" class="chat-config-select" onchange="onManageChange()"></select>
-    </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Goals</label>
-      <textarea id="mgr-goals" class="chat-config-textarea" placeholder="What should the agent accomplish?" oninput="onManageFieldChange()"></textarea>
-    </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Stopping Point</label>
-      <textarea id="mgr-stopping" class="chat-config-textarea" placeholder="When should the manager stop the agent?" oninput="onManageFieldChange()"></textarea>
-    </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Periodic Checks</label>
-      <textarea id="mgr-checks" class="chat-config-textarea" placeholder="What should the agent verify every few turns?" oninput="onManageFieldChange()"></textarea>
-    </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Red Flags</label>
-      <textarea id="mgr-redflags" class="chat-config-textarea" placeholder="What should cause the manager to halt the agent?" oninput="onManageFieldChange()"></textarea>
-    </div>
-    <div class="chat-config-field">
-      <button type="button" class="btn-lg" id="mgr-toggle" onclick="toggleManageMode()">Enable</button>
-      <span id="mgr-status" style="margin-left:var(--s-2);font-size:0.85em;color:var(--fg-muted);"></span>
-    </div>
-  </div>
-</div>
-<form class="chat-input-form" id="chat-input-form" onsubmit="return sendMessage(event)">
-  <input type="hidden" name="csrf_token" value="{csrf_token}">
-  <textarea class="chat-input" id="chat-input" placeholder="Type a message..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
-  <button type="submit" class="chat-send-btn">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-  </button>
-</form>"#,
-            header_avatar = header_avatar,
-            display_name = escape_text(display),
-            cwd_html = cwd_html,
-            settings_icon = ICON_SETTINGS,
-            csrf_token = escape_attribute(csrf_token),
-        )
-    } else {
-        r#"<div class="chat-empty">
-  <div class="chat-empty-text">Select an agent to start chatting</div>
-</div>"#
-            .to_string()
-    };
+    let chat_area_html = render_chat_main_panel(agents, selected_agent, csrf_token, projects);
 
     let selected_agent_js = selected_agent
         .map(|a| format!("'{}'", escape_attribute(a)))
@@ -3506,10 +3538,146 @@ function scheduleMobileLastChatNavigation(agent) {{
   requestAnimationFrame(function() {{
     requestAnimationFrame(function() {{
       setTimeout(function() {{
-        window.location.href = '/ui/chat?agent=' + encodeURIComponent(agent);
+        window.location.href = currentChatUrl(agent);
       }}, 80);
     }});
   }});
+}}
+
+function currentChatUrl(agent) {{
+  return agent ? ('/ui/chat?agent=' + encodeURIComponent(agent)) : '/ui/chat';
+}}
+
+function clearActiveAgentInList() {{
+  document.querySelectorAll('.chat-agent-item.chat-agent-active').forEach(function(item) {{
+    item.classList.remove('chat-agent-active');
+  }});
+}}
+
+function setActiveAgentInList(agent) {{
+  clearActiveAgentInList();
+  if (!agent) return;
+  var item = document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(agent) + '"]');
+  if (item) item.classList.add('chat-agent-active');
+}}
+
+function moveAgentItemToTop(agent) {{
+  if (!agent || agent === 'librarian') return;
+  var list = document.querySelector('.chat-agent-list');
+  var item = document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(agent) + '"]');
+  if (!list || !item) return;
+  var librarian = list.querySelector('.chat-agent-item[data-agent="librarian"]');
+  if (librarian) {{
+    list.insertBefore(item, librarian.nextSibling);
+  }} else {{
+    list.insertBefore(item, list.firstChild);
+  }}
+}}
+
+function sidebarTimeNow() {{
+  return new Date().toLocaleTimeString([], {{ hour: 'numeric', minute: '2-digit' }});
+}}
+
+function updateAgentListPreview(agent, content, timeText) {{
+  if (!agent || agent === 'librarian') return;
+  var item = document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(agent) + '"]');
+  if (!item) return;
+  var snippetEl = item.querySelector('.chat-agent-snippet');
+  var timeEl = item.querySelector('.chat-agent-time');
+  if (snippetEl && typeof content === 'string') {{
+    var normalized = content.replace(/\s+/g, ' ').trim();
+    snippetEl.textContent = normalized ? normalized.slice(0, 60) : 'No messages yet';
+  }}
+  if (timeEl) {{
+    timeEl.textContent = timeText || sidebarTimeNow();
+  }}
+}}
+
+function initializeChatPanel() {{
+  isLibrarian = currentAgent === 'librarian';
+  streamingContent = '';
+  agentConfig = {{ backend: '', model: '', effort: '' }};
+  agentStatus = '';
+  closeAllPanels();
+  setActiveAgentInList(currentAgent);
+  if (eventSource) {{
+    eventSource.close();
+    eventSource = null;
+  }}
+  connectSSE();
+
+  if (isLibrarian) {{
+    var params = new URLSearchParams(window.location.search);
+    var qProject = params.get('project');
+    var saved = localStorage.getItem('libProject');
+    var projSel = document.getElementById('lib-project');
+    if (qProject && projSel) {{
+      projSel.value = qProject;
+      libProject = qProject;
+    }} else if (saved && projSel) {{
+      projSel.value = saved;
+      libProject = saved;
+      if (!projSel.value) {{ libProject = ''; }}
+    }} else {{
+      libProject = '';
+    }}
+    loadLibrarianHistory();
+    return;
+  }}
+
+  if (!currentAgent) {{
+    renderMessages();
+    return;
+  }}
+
+  renderMessages();
+  var configAgent = currentAgent;
+  fetch('/ui/chat/' + encodeURIComponent(configAgent) + '/config', {{ cache: 'no-store' }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      if (currentAgent !== configAgent) return;
+      if (data.endpoint_id && data.endpoints) {{
+        var ep = data.endpoints.find(function(e) {{ return e.id === data.endpoint_id; }});
+        if (ep) {{
+          agentConfig.backend = ep.name;
+          agentConfig.model = ep.model;
+          agentConfig.effort = '';
+          updateHeaderStatus();
+          return;
+        }}
+      }}
+      agentConfig.backend = data.backend || '';
+      var prefs = data.prefs && data.prefs[data.backend];
+      agentConfig.model = (prefs && prefs.model) || '';
+      agentConfig.effort = (prefs && prefs.effort) || '';
+      updateHeaderStatus();
+    }});
+}}
+
+function loadDesktopChatPanel(agent, pushHistory) {{
+  var url = '/ui/chat/panel';
+  if (agent) url += '?agent=' + encodeURIComponent(agent);
+  fetch(url, {{ cache: 'no-store' }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      if (!data || !data.ok) return;
+      var main = document.getElementById('chat-main');
+      if (!main) return;
+      main.innerHTML = data.panel_html || '';
+      currentAgent = data.selected_agent || null;
+      chatMessages = data.messages || [];
+      agentProfileUrl = data.profile_url || null;
+      if (currentAgent) {{
+        localStorage.setItem('lastChatAgent', currentAgent);
+      }} else {{
+        localStorage.removeItem('lastChatAgent');
+      }}
+      if (pushHistory) {{
+        history.pushState({{ agent: currentAgent }}, '', currentChatUrl(currentAgent));
+      }}
+      initializeChatPanel();
+      applyChatViewportFix();
+    }});
 }}
 
 if (currentAgent) {{
@@ -3524,12 +3692,24 @@ if (currentAgent) {{
 
 function selectAgent(name) {{
   localStorage.setItem('lastChatAgent', name);
-  window.location.href = '/ui/chat?agent=' + encodeURIComponent(name);
+  if (isMobileChatLayout()) {{
+    window.location.href = currentChatUrl(name);
+    return;
+  }}
+  if (currentAgent === name) {{
+    setActiveAgentInList(name);
+    return;
+  }}
+  loadDesktopChatPanel(name, true);
 }}
 
 function showAgentList() {{
   localStorage.removeItem('lastChatAgent');
-  window.location.href = '/ui/chat';
+  if (isMobileChatLayout()) {{
+    window.location.href = '/ui/chat';
+    return;
+  }}
+  loadDesktopChatPanel(null, true);
 }}
 
 /* Fix mobile keyboard: on dismiss, browser sometimes leaves page scrolled
@@ -3693,7 +3873,7 @@ function renderMessages() {{
     if (msg.role === 'assistant') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
     }} else if (msg.role === 'error') {{
-      html += '<div class="chat-msg-content"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:var(--s-1);"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>' + escapeHtmlRaw(msg.content.replace(/\n.*$/s, '')) + '</div>';
+      html += '<div class="chat-msg-content chat-msg-error-content"><svg class="chat-msg-error-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><span>' + escapeHtml(msg.content) + '</span></div>';
     }} else if (msg.role === 'tool') {{
       html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
     }} else {{
@@ -3892,6 +4072,8 @@ function sendMessage(e) {{
   // Slash commands go to the command endpoint
   if (text.startsWith('/')) {{
     chatMessages.push({{ role: 'user', content: text }});
+    moveAgentItemToTop(currentAgent);
+    updateAgentListPreview(currentAgent, text);
     renderMessages();
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/ui/chat/' + encodeURIComponent(currentAgent) + '/command');
@@ -3913,6 +4095,8 @@ function sendMessage(e) {{
   }}
 
   chatMessages.push({{ role: 'user', content: text }});
+  moveAgentItemToTop(currentAgent);
+  updateAgentListPreview(currentAgent, text);
   renderMessages();
 
   var xhr = new XMLHttpRequest();
@@ -3943,15 +4127,50 @@ function updateHeaderStatus() {{
   el.textContent = parts.join(' \u00b7 ');
 }}
 
+function chatStatusClass(status) {{
+  if (status === 'idle') return 'chat-status-running';
+  if (status === 'thinking') return 'chat-status-working';
+  if (status === 'restarting') return 'chat-status-restarting';
+  return 'chat-status-stopped';
+}}
+
+function updateAgentListStatus(agent, status) {{
+  if (!agent) return;
+  var item = document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(agent) + '"]');
+  if (!item) return;
+  var dot = item.querySelector('.chat-status-dot');
+  if (!dot) return;
+  dot.classList.remove('chat-status-running', 'chat-status-working', 'chat-status-restarting', 'chat-status-stopped');
+  dot.classList.add(chatStatusClass(status));
+}}
+
 function connectSSE() {{
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/ui/chat/stream');
   eventSource.onmessage = function(e) {{
     try {{
       var evt = JSON.parse(e.data);
+      if (evt.event_type === 'message_sent') {{
+        moveAgentItemToTop(evt.agent);
+        updateAgentListPreview(evt.agent, evt.data && evt.data.content ? evt.data.content : '');
+      }} else if (evt.event_type === 'response_complete') {{
+        updateAgentListPreview(evt.agent, evt.data && evt.data.content ? evt.data.content : '');
+      }} else if (evt.event_type === 'status') {{
+        updateAgentListStatus(evt.agent, evt.data && evt.data.status ? evt.data.status : '');
+      }}
       if (evt.agent !== currentAgent) return;
       if (evt.event_type === 'message' && evt.data && evt.data.role === 'error') {{
-        chatMessages.push({{ role: 'error', content: evt.data.content, _id: evt.data.id }});
+        var updated = false;
+        for (var mi = chatMessages.length - 1; mi >= 0; mi--) {{
+          if (chatMessages[mi]._id === evt.data.id) {{
+            chatMessages[mi].content = evt.data.content;
+            updated = true;
+            break;
+          }}
+        }}
+        if (!updated) {{
+          chatMessages.push({{ role: 'error', content: evt.data.content, _id: evt.data.id }});
+        }}
         renderMessages();
         if (typeof refreshErrorsPanel === 'function') refreshErrorsPanel();
       }} else if (evt.event_type === 'tool_use') {{
@@ -4639,46 +4858,17 @@ function toggleLibOption(opt) {{
   btn.classList.toggle('active');
 }}
 
-if (isLibrarian) {{
+initializeChatPanel();
+
+window.addEventListener('pageshow', function(e) {{
+  if (e.persisted && chatConfigOpen) loadChatConfig();
+}});
+
+window.addEventListener('popstate', function() {{
+  if (isMobileChatLayout()) return;
   var params = new URLSearchParams(window.location.search);
-  var qProject = params.get('project');
-  var saved = localStorage.getItem('libProject');
-  var projSel = document.getElementById('lib-project');
-  if (qProject && projSel) {{
-    projSel.value = qProject;
-    libProject = qProject;
-  }} else if (saved && projSel) {{
-    projSel.value = saved;
-    libProject = saved;
-    if (!projSel.value) {{ libProject = ''; }}
-  }}
-  loadLibrarianHistory();
-}} else if (currentAgent) {{
-  renderMessages();
-  connectSSE();
-  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/config', {{ cache: 'no-store' }})
-    .then(function(r) {{ return r.json(); }})
-    .then(function(data) {{
-      if (data.endpoint_id && data.endpoints) {{
-        var ep = data.endpoints.find(function(e) {{ return e.id === data.endpoint_id; }});
-        if (ep) {{
-          agentConfig.backend = ep.name;
-          agentConfig.model = ep.model;
-          agentConfig.effort = '';
-          updateHeaderStatus();
-          return;
-        }}
-      }}
-      agentConfig.backend = data.backend || '';
-      var prefs = data.prefs && data.prefs[data.backend];
-      agentConfig.model = (prefs && prefs.model) || '';
-      agentConfig.effort = (prefs && prefs.effort) || '';
-      updateHeaderStatus();
-    }});
-  window.addEventListener('pageshow', function(e) {{
-    if (e.persisted && chatConfigOpen) loadChatConfig();
-  }});
-}}
+  loadDesktopChatPanel(params.get('agent'), false);
+}});
 </script>"#,
         layout_class = layout_class,
         agent_list_html = agent_list_html,
@@ -4698,6 +4888,62 @@ if (isLibrarian) {{
             color_mode,
             csrf_token: Some(csrf_token),
             flash,
+        },
+        content,
+    )
+}
+
+pub fn render_chat_attachment_view_page(
+    theme: UiTheme,
+    color_mode: ColorMode,
+    username: &str,
+    is_admin: bool,
+    file_name: &str,
+    raw_url: &str,
+    download_url: &str,
+    is_svg: bool,
+) -> String {
+    let media_html = if is_svg {
+        format!(
+            r#"<img class="chat-media-viewer-image" src="{}" alt="{}">"#,
+            escape_attribute(raw_url),
+            escape_attribute(file_name),
+        )
+    } else {
+        format!(
+            r#"<img class="chat-media-viewer-image" src="{}" alt="{}">"#,
+            escape_attribute(raw_url),
+            escape_attribute(file_name),
+        )
+    };
+
+    let content = format!(
+        r#"<div class="panel chat-media-viewer-panel">
+  <div class="chat-media-viewer-header">
+    <div>
+      <h1 class="page-title" style="margin:0;">{}</h1>
+      <p class="subtitle">Open in a separate tab for pinch zoom and full-size viewing.</p>
+    </div>
+    <a class="btn-lg button-link chat-media-viewer-download" href="{}">Download</a>
+  </div>
+  <div class="chat-media-viewer-stage">
+    {}
+  </div>
+</div>"#,
+        escape_text(file_name),
+        escape_attribute(download_url),
+        media_html,
+    );
+
+    render_shell(
+        PageShell {
+            title: file_name,
+            username: Some(username),
+            is_admin,
+            theme,
+            color_mode,
+            csrf_token: None,
+            flash: None,
         },
         content,
     )
@@ -5111,9 +5357,7 @@ pub fn render_project_page(
 
     let reserved_html: String = reserved_blocks
         .iter()
-        .map(|block| {
-            render_reserved_block_panel(project, block, can_write, csrf_token)
-        })
+        .map(|block| render_reserved_block_panel(project, block, can_write, csrf_token))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -5242,7 +5486,10 @@ fn render_reserved_block_panel(
     };
 
     let rendered_body = if content.trim().is_empty() {
-        format!("<span class=\"hint\">No {} set</span>", label.to_lowercase())
+        format!(
+            "<span class=\"hint\">No {} set</span>",
+            label.to_lowercase()
+        )
     } else {
         render_markdown(content)
     };
@@ -5261,11 +5508,7 @@ fn render_reserved_block_panel(
     )
 }
 
-fn render_doc_tree_items(
-    project: &ProjectName,
-    docs: &[DocumentInfo],
-    depth: usize,
-) -> String {
+fn render_doc_tree_items(project: &ProjectName, docs: &[DocumentInfo], depth: usize) -> String {
     let project_slug = escape_attribute(project.as_str());
     docs.iter()
         .map(|doc| {
@@ -5360,14 +5603,32 @@ pub fn render_document_page(
     } else {
         let mut html = String::new();
         if can_write {
-            html.push_str(&render_doc_block_inserter(project, doc_id, None, csrf_token, &project_infos));
+            html.push_str(&render_doc_block_inserter(
+                project,
+                doc_id,
+                None,
+                csrf_token,
+                &project_infos,
+            ));
         }
         for (i, block) in blocks.iter().enumerate() {
             html.push_str(&render_doc_block(
-                project, doc_id, block, can_write, &project_infos, csrf_token, i,
+                project,
+                doc_id,
+                block,
+                can_write,
+                &project_infos,
+                csrf_token,
+                i,
             ));
             if can_write {
-                html.push_str(&render_doc_block_inserter(project, doc_id, Some(&block.id), csrf_token, &project_infos));
+                html.push_str(&render_doc_block_inserter(
+                    project,
+                    doc_id,
+                    Some(&block.id),
+                    csrf_token,
+                    &project_infos,
+                ));
             }
         }
         html
@@ -5569,8 +5830,16 @@ fn render_doc_block(
   </button>"##,
     );
 
-    let pin_title = if block.pinned { "Unpin (allow agent edits)" } else { "Pin (block agent edits)" };
-    let pin_class = if block.pinned { "block-header-btn pinned" } else { "block-header-btn" };
+    let pin_title = if block.pinned {
+        "Unpin (allow agent edits)"
+    } else {
+        "Pin (block agent edits)"
+    };
+    let pin_class = if block.pinned {
+        "block-header-btn pinned"
+    } else {
+        "block-header-btn"
+    };
 
     let header_actions = if can_write {
         format!(
@@ -5597,9 +5866,7 @@ fn render_doc_block(
 </div>"##,
         )
     } else {
-        format!(
-            r##"<div class="block-header-actions">{copy_link_btn}</div>"##,
-        )
+        format!(r##"<div class="block-header-actions">{copy_link_btn}</div>"##,)
     };
 
     let block_type_label = format!("{:?}", block.block_type).to_lowercase();
@@ -5609,7 +5876,9 @@ fn render_doc_block(
         let content_escaped = escape_text(&block.content);
         let media_replace = match block.block_type {
             crate::model::BlockType::Markdown | crate::model::BlockType::Html => "",
-            _ => r#"<label class="image-upload-label">Replace media <input type="file" name="image_file" accept="image/*,.svg"></label>"#,
+            _ => {
+                r#"<label class="image-upload-label">Replace media <input type="file" name="image_file" accept="image/*,.svg"></label>"#
+            }
         };
         format!(
             r#"<div class="block-edit-panel" id="edit-{block_id}" style="display:none;">
@@ -6282,7 +6551,12 @@ fn render_role_card(role: &StoredRole, csrf_token: &str, projects: &[ProjectInfo
     )
 }
 
-fn render_user_detail(user: &UiUserSummary, agents: &[AgentTokenSummary], machines: &[StoredMachine], csrf_token: &str) -> String {
+fn render_user_detail(
+    user: &UiUserSummary,
+    agents: &[AgentTokenSummary],
+    machines: &[StoredMachine],
+    csrf_token: &str,
+) -> String {
     let roles = if user.role_names.is_empty() {
         "<li>No assigned roles</li>".to_string()
     } else {
@@ -6294,7 +6568,8 @@ fn render_user_detail(user: &UiUserSummary, agents: &[AgentTokenSummary], machin
     };
 
     let agents_html = if agents.is_empty() {
-        r#"<p style="font-size:0.85rem; color:var(--fg-muted); margin:0;">No agents</p>"#.to_string()
+        r#"<p style="font-size:0.85rem; color:var(--fg-muted); margin:0;">No agents</p>"#
+            .to_string()
     } else {
         let items: Vec<String> = agents
             .iter()
@@ -6322,7 +6597,8 @@ fn render_user_detail(user: &UiUserSummary, agents: &[AgentTokenSummary], machin
     };
 
     let machines_html = if machines.is_empty() {
-        r#"<p style="font-size:0.85rem; color:var(--fg-muted); margin:0;">No machines</p>"#.to_string()
+        r#"<p style="font-size:0.85rem; color:var(--fg-muted); margin:0;">No machines</p>"#
+            .to_string()
     } else {
         let items: Vec<String> = machines
             .iter()
@@ -6384,7 +6660,11 @@ fn render_user_detail(user: &UiUserSummary, agents: &[AgentTokenSummary], machin
         machines_html = machines_html,
         csrf = escape_attribute(csrf_token),
         action = if user.disabled { "enable" } else { "disable" },
-        action_label = if user.disabled { "Enable user" } else { "Disable user" },
+        action_label = if user.disabled {
+            "Enable user"
+        } else {
+            "Disable user"
+        },
     )
 }
 
@@ -6627,7 +6907,11 @@ fn render_block(
     } else {
         "editline-band-odd"
     };
-    let band_pinned = if block.pinned { " editline-band-pinned" } else { "" };
+    let band_pinned = if block.pinned {
+        " editline-band-pinned"
+    } else {
+        ""
+    };
 
     let band_html = if can_write {
         format!(
@@ -6954,8 +7238,7 @@ fn is_allowed_svg_element(lower: &str) -> bool {
 fn is_allowed_svg_attribute(lower: &str) -> bool {
     matches!(
         lower,
-        "id"
-            | "class"
+        "id" | "class"
             | "style"
             | "x"
             | "y"
@@ -7583,7 +7866,11 @@ fn accent_foreground(hex: &str) -> &'static str {
             _ => 0,
         } as f64;
         let v = (hi * 16.0 + lo) / 255.0;
-        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
     };
     let lum = 0.2126 * parse2(0) + 0.7152 * parse2(2) + 0.0722 * parse2(4);
     if lum > 0.36 { "#111" } else { "#fff" }
@@ -8062,6 +8349,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       flex-shrink: 0;
     }
     .agent-status-badge.running { color: var(--success, #22c55e); }
+    .agent-status-badge.restarting { color: #f59e0b; }
     .agent-status-badge.stopped { color: var(--fg-muted); }
     }
 
@@ -8143,9 +8431,10 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border-radius: 50%;
       display: inline-block;
     }
-    .chat-status-online { background: #22c55e; }
-    .chat-status-thinking { background: #eab308; }
-    .chat-status-offline { background: var(--fg-muted); }
+    .chat-status-running { background: #22c55e; }
+    .chat-status-working { background: var(--accent); }
+    .chat-status-restarting { background: #f59e0b; }
+    .chat-status-stopped { background: var(--fg-muted); }
     .chat-agent-snippet {
       font-size: 0.82rem;
       color: var(--fg-muted);
@@ -8386,17 +8675,28 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border: 1px solid rgba(220, 38, 38, 0.35);
       border-radius: var(--radius-sm);
       font-size: 0.82rem;
-      padding: var(--s-1) var(--s-3);
+      padding: var(--s-2) var(--s-3);
       font-family: var(--font-mono);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
       max-width: 100%;
     }
     .chat-msg-error .chat-msg-content {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      min-width: 0;
+    }
+    .chat-msg-error-content {
+      display: flex;
+      gap: var(--s-2);
+      align-items: flex-start;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .chat-msg-error-content span {
+      min-width: 0;
+      flex: 1;
+    }
+    .chat-msg-error-icon {
+      flex-shrink: 0;
+      margin-top: 0.15rem;
     }
     .chat-errors-list {
       display: flex;
@@ -9296,6 +9596,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     select option {
       background: var(--panel-strong);
       color: var(--ink);
+    }
+
+    select optgroup {
+      background: var(--panel-strong);
+      color: var(--muted);
     }
 
     input:not([type="checkbox"]):focus, select:focus, textarea:focus {

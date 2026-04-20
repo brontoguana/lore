@@ -93,11 +93,6 @@ impl NewAgentToken {
         validate_agent_display_name(&self.display_name)?;
         let slug = self.slug();
         validate_agent_token_name(&slug)?;
-        if self.grants.is_empty() {
-            return Err(LoreError::Validation(
-                "agent token must grant at least one project permission".into(),
-            ));
-        }
         let mut seen = std::collections::BTreeSet::new();
         for grant in &self.grants {
             if !seen.insert(grant.project.clone()) {
@@ -440,9 +435,9 @@ fn parse_dt(s: &str) -> OffsetDateTime {
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
-/// Parse a tool-use line into (base, repeat_count). A trailing " (xN)" is
-/// treated as a repeat marker. Mirrors the UI aggregation in chat_stream.
-fn parse_tool_repeat(line: &str) -> (&str, Option<u32>) {
+/// Parse a line into (base, repeat_count). A trailing " (xN)" is treated as a
+/// repeat marker.
+fn parse_repeat_marker(line: &str) -> (&str, Option<u32>) {
     if let Some(open) = line.rfind(" (x") {
         if line.ends_with(')') {
             let inner = &line[open + 3..line.len() - 1];
@@ -452,6 +447,12 @@ fn parse_tool_repeat(line: &str) -> (&str, Option<u32>) {
         }
     }
     (line, None)
+}
+
+/// Parse a tool-use line into (base, repeat_count). Mirrors the UI
+/// aggregation in chat_stream.
+fn parse_tool_repeat(line: &str) -> (&str, Option<u32>) {
+    parse_repeat_marker(line)
 }
 
 /// Check whether a column exists on a table.
@@ -2080,6 +2081,61 @@ impl ChatStore {
         })
     }
 
+    /// Append an error detail. If the most recent message is already an Error
+    /// message with the same content, extend it with an x-count instead of
+    /// inserting another row.
+    pub fn append_or_extend_error(&self, owner: &str, agent: &str, detail: &str) -> Result<ChatMessage> {
+        let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::ensure_conversation(&conn, owner, agent)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+
+        let last: Option<(i64, String, String, String)> = conn.query_row(
+            "SELECT id, role, content, timestamp FROM messages WHERE owner = ?1 AND agent = ?2 ORDER BY id DESC LIMIT 1",
+            params![owner, agent],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+
+        if let Some((last_id, last_role, last_content, last_ts)) = last {
+            if last_role == "error" {
+                let (prev_base, prev_count) = parse_repeat_marker(&last_content);
+                if prev_base == detail {
+                    let new_count = prev_count.unwrap_or(1) + 1;
+                    let new_content = format!("{detail} (x{new_count})");
+                    conn.execute(
+                        "UPDATE messages SET content = ?1 WHERE owner = ?2 AND agent = ?3 AND id = ?4",
+                        params![new_content, owner, agent, last_id],
+                    ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+                    return Ok(ChatMessage {
+                        id: last_id as u64,
+                        role: ChatRole::Error,
+                        content: new_content,
+                        timestamp: parse_dt(&last_ts),
+                    });
+                }
+            }
+        }
+
+        let next_id: i64 = conn.query_row(
+            "SELECT next_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+            params![owner, agent], |row| row.get(0),
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let now = OffsetDateTime::now_utc();
+        conn.execute(
+            "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, 'error', ?4, ?5)",
+            params![owner, agent, next_id, detail, fmt_dt(&now)],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "UPDATE conversations SET next_id = ?1 WHERE owner = ?2 AND agent = ?3",
+            params![next_id + 1, owner, agent],
+        ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(ChatMessage {
+            id: next_id as u64,
+            role: ChatRole::Error,
+            content: detail.to_string(),
+            timestamp: now,
+        })
+    }
+
     pub fn update_agent_status(&self, owner: &str, agent: &str, status: AgentChatStatus) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         Self::ensure_conversation(&conn, owner, agent)
@@ -2385,7 +2441,7 @@ fn dir_is_empty(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentBackend, LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant,
+        AgentBackend, ChatStore, LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant,
         ProjectPermission, RoleName, UserName,
     };
     use crate::config::{ColorMode, UiTheme};
@@ -2580,6 +2636,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_tokens_can_default_to_no_access() {
+        let dir = tempdir().unwrap();
+        let auth = LocalAuthStore::new(dir.path());
+        auth.bootstrap_admin(
+            UserName::new("admin".to_string()).unwrap(),
+            "correct-horse-battery".into(),
+        )
+        .unwrap();
+
+        let created = auth
+            .create_agent_token(NewAgentToken {
+                display_name: "no-access-agent".into(),
+                owner: UserName::new("admin").unwrap(),
+                grants: Vec::new(),
+                backend: AgentBackend::default(),
+                endpoint_id: None,
+            })
+            .unwrap();
+
+        let agent = auth.authenticate_agent_token(&created.token).unwrap();
+        assert!(!agent.can_read(&ProjectName::new("alpha.docs").unwrap()));
+        assert!(!agent.can_write(&ProjectName::new("alpha.docs").unwrap()));
+    }
+
+    #[test]
     fn cannot_disable_last_admin() {
         let dir = tempdir().unwrap();
         let auth = LocalAuthStore::new(dir.path());
@@ -2612,5 +2693,32 @@ mod tests {
         .unwrap();
         auth.set_user_disabled(&UserName::new("admin1".to_string()).unwrap(), true)
             .unwrap();
+    }
+
+    #[test]
+    fn chat_store_coalesces_identical_consecutive_errors() {
+        let dir = tempdir().unwrap();
+        let chat = ChatStore::new(dir.path());
+
+        let first = chat
+            .append_or_extend_error("alice", "krasis", "CLI: spawn codex failed: No such file or directory")
+            .unwrap();
+        let second = chat
+            .append_or_extend_error("alice", "krasis", "CLI: spawn codex failed: No such file or directory")
+            .unwrap();
+        let third = chat
+            .append_or_extend_error("alice", "krasis", "CLI: spawn codex failed: No such file or directory")
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.id, third.id);
+        assert_eq!(
+            third.content,
+            "CLI: spawn codex failed: No such file or directory (x3)"
+        );
+
+        let conv = chat.load_conversation("alice", "krasis").unwrap();
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].content, third.content);
     }
 }

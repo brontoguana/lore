@@ -1777,7 +1777,10 @@ async fn setup_agent_with_project(
     let resp = client
         .post(url(addr, "/v1/agents/provision"))
         .header("x-lore-key", &machine_token)
-        .json(&json!({"name": agent_display_name}))
+        .json(&json!({
+            "name": agent_display_name,
+            "grants": [{"project": project, "permission": "read_write"}]
+        }))
         .send()
         .await
         .unwrap();

@@ -19,6 +19,51 @@ type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const CLI_SELF_UPDATE_SKIP_ENV: &str = "LORE_SKIP_CLI_SELF_UPDATE";
 const CLI_AUTO_UPDATE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
+fn resolve_executable_path(executable: &str, fallback_relative_paths: &[&str]) -> PathBuf {
+    if executable.contains(std::path::MAIN_SEPARATOR) {
+        return PathBuf::from(executable);
+    }
+
+    if let Some(path) = env::var_os("PATH") {
+        for dir in env::split_paths(&path) {
+            let candidate = dir.join(executable);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        for relative in fallback_relative_paths {
+            let candidate = home.join(relative);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    PathBuf::from(executable)
+}
+
+fn resolve_backend_executable(backend: AgentBackend) -> PathBuf {
+    match backend {
+        AgentBackend::Claude => resolve_executable_path(
+            "claude",
+            &[".local/bin/claude", ".npm-global/bin/claude"],
+        ),
+        AgentBackend::Gemini => resolve_executable_path(
+            "gemini",
+            &[".local/bin/gemini", ".npm-global/bin/gemini"],
+        ),
+        AgentBackend::Codex => resolve_executable_path(
+            "codex",
+            &[".local/bin/codex", ".npm-global/bin/codex"],
+        ),
+        AgentBackend::OpenAi => PathBuf::from("openai"),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "lore")]
 #[command(about = "Lore CLI")]
@@ -2222,6 +2267,7 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
             .json(&serde_json::json!({
                 "name": args.name,
                 "backend": backend_str,
+                "inherit_owner_grants": true,
             }))
             .send()
             .await?;
@@ -4294,7 +4340,7 @@ async fn spawn_backend(
                 args.push("--effort".to_string());
                 args.push(e.to_string());
             }
-            let mut cmd = tokio::process::Command::new("claude");
+            let mut cmd = tokio::process::Command::new(resolve_backend_executable(AgentBackend::Claude));
             cmd.args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
@@ -4317,7 +4363,7 @@ async fn spawn_backend(
             }
             args.push("-p".to_string());
             args.push(String::new());
-            let mut cmd = tokio::process::Command::new("gemini");
+            let mut cmd = tokio::process::Command::new(resolve_backend_executable(AgentBackend::Gemini));
             cmd.args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
@@ -4338,7 +4384,7 @@ async fn spawn_backend(
                 args.push("--model".to_string());
                 args.push(m.to_string());
             }
-            let mut cmd = tokio::process::Command::new("codex");
+            let mut cmd = tokio::process::Command::new(resolve_backend_executable(AgentBackend::Codex));
             cmd.args(&args)
                 .current_dir(&cwd)
                 .stdin(std::process::Stdio::piped())
@@ -4453,7 +4499,7 @@ async fn run_compaction(context: &CliContext, backend: AgentBackend, prompt: &st
         AgentBackend::Claude => {
             // Claude without --output-format returns plain text
             use tokio::io::AsyncWriteExt;
-            let mut cmd = tokio::process::Command::new("claude");
+            let mut cmd = tokio::process::Command::new(resolve_backend_executable(AgentBackend::Claude));
             cmd.args(["-p", "--model", "sonnet", "--no-session-persistence"])
                 .current_dir(&agent_cwd())
                 .stdin(std::process::Stdio::piped())
