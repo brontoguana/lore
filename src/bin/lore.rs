@@ -2637,7 +2637,7 @@ async fn agent_poll_and_process(
                     .client
                     .post(format!("{}/v1/chat/respond", context.url))
                     .header("x-lore-key", token)
-                    .json(&serde_json::json!({ "text": err_msg, "done": true }))
+                    .json(&serde_json::json!({ "text": err_msg, "complete": true }))
                     .send()
                     .await;
                 return Ok(AgentPollAction::Continue);
@@ -2649,7 +2649,7 @@ async fn agent_poll_and_process(
                 .client
                 .post(format!("{}/v1/chat/respond", context.url))
                 .header("x-lore-key", token)
-                .json(&serde_json::json!({ "text": err_msg, "done": true }))
+                .json(&serde_json::json!({ "text": err_msg, "complete": true }))
                 .send()
                 .await;
             return Ok(AgentPollAction::Continue);
@@ -2836,7 +2836,7 @@ async fn agent_poll_and_process(
 
     let user_context = prompt_parts.join("\n\n");
 
-    let full_response = if has_endpoint {
+    let (full_response, emitted_assistant_messages) = if has_endpoint {
         // API mode: run local agentic loop, proxy LLM calls through the server
         eprintln!("[agent] Using API endpoint mode");
         let model_override = history["model"].as_str().map(|s| s.to_string());
@@ -2891,6 +2891,7 @@ async fn agent_poll_and_process(
         let reader = tokio::io::BufReader::new(stdout);
         let mut lines = reader.lines();
         let mut response = String::new();
+        let mut emitted_assistant_messages = false;
 
         while let Some(line) = lines.next_line().await? {
             let line = line.trim().to_string();
@@ -2904,12 +2905,13 @@ async fn agent_poll_and_process(
             for event in parse_backend_line(backend, &parsed) {
                 match event {
                     BackendEvent::Text(text) => {
-                        if let Some(delta) = append_new_stream_text(&mut response, &text) {
+                        if append_assistant_segment(&mut response, &text).is_some() {
+                            emitted_assistant_messages = true;
                             let _ = context
                                 .client
                                 .post(format!("{}/v1/chat/respond", context.url))
                                 .header("x-lore-key", token)
-                                .json(&serde_json::json!({ "text": delta }))
+                                .json(&serde_json::json!({ "message": text }))
                                 .send()
                                 .await;
                         }
@@ -2933,18 +2935,19 @@ async fn agent_poll_and_process(
             }
         }
         let _ = child.wait().await;
-        response
+        (response, emitted_assistant_messages)
     };
 
     // Send the complete response
+    let mut complete_body = serde_json::json!({ "complete": true });
+    if !emitted_assistant_messages {
+        complete_body["content"] = serde_json::json!(full_response);
+    }
     let _ = context
         .client
         .post(format!("{}/v1/chat/respond", context.url))
         .header("x-lore-key", token)
-        .json(&serde_json::json!({
-            "complete": true,
-            "content": full_response,
-        }))
+        .json(&complete_body)
         .send()
         .await;
 
@@ -3574,7 +3577,7 @@ async fn run_api_agent_turn(
     recent_activity: &str,
     model_override: Option<&str>,
     endpoint_id: Option<&str>,
-) -> CliResult<String> {
+) -> CliResult<(String, bool)> {
     let endpoint_id_owned = endpoint_id.map(|s| s.to_string());
     let token = context.token.as_deref().ok_or("no token configured")?;
     let mut tools = build_local_tools();
@@ -3617,6 +3620,7 @@ async fn run_api_agent_turn(
     ];
 
     let mut accumulated_text = String::new();
+    let mut emitted_assistant_messages = false;
     let mut rate_limit_retried = false;
     let mut timeout_retries = 0usize;
 
@@ -3741,13 +3745,13 @@ async fn run_api_agent_turn(
             .unwrap_or("");
         let tool_calls = message.and_then(|m| m["tool_calls"].as_array()).cloned();
 
-        if !content.is_empty() {
-            accumulated_text.push_str(&content);
+        if append_assistant_segment(&mut accumulated_text, &content).is_some() {
+            emitted_assistant_messages = true;
             let _ = context
                 .client
                 .post(format!("{}/v1/chat/respond", context.url))
                 .header("x-lore-key", token)
-                .json(&serde_json::json!({ "text": &content }))
+                .json(&serde_json::json!({ "message": content }))
                 .send()
                 .await;
         }
@@ -3863,7 +3867,7 @@ async fn run_api_agent_turn(
         let _ = fs::write(lore_dir.join("api_context.txt"), &debug);
     }
 
-    Ok(accumulated_text)
+    Ok((accumulated_text, emitted_assistant_messages))
 }
 
 fn trim_api_context(messages: &mut Vec<serde_json::Value>) {
@@ -4594,6 +4598,20 @@ fn append_new_stream_text(accumulated: &mut String, next: &str) -> Option<String
     }
     accumulated.push_str(next);
     Some(next.to_string())
+}
+
+fn append_assistant_segment(accumulated: &mut String, next: &str) -> Option<String> {
+    if next.is_empty() {
+        return None;
+    }
+    let chunk =
+        if !accumulated.is_empty() && !accumulated.ends_with('\n') && !next.starts_with('\n') {
+            format!("\n\n{next}")
+        } else {
+            next.to_string()
+        };
+    accumulated.push_str(&chunk);
+    Some(chunk)
 }
 
 fn short_path(p: &str) -> String {
@@ -6015,7 +6033,10 @@ async fn service_handle_create_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::{append_new_stream_text, history_messages_excluding_pending, parse_codex_line};
+    use super::{
+        append_assistant_segment, append_new_stream_text, history_messages_excluding_pending,
+        parse_codex_line,
+    };
     use serde_json::json;
     use std::collections::HashSet;
 
@@ -6071,6 +6092,21 @@ mod tests {
             Some(" third".to_string())
         );
         assert_eq!(accumulated, "First second third");
+    }
+
+    #[test]
+    fn append_assistant_segment_inserts_blank_line_between_turns() {
+        let mut accumulated = String::new();
+
+        assert_eq!(
+            append_assistant_segment(&mut accumulated, "First update"),
+            Some("First update".to_string())
+        );
+        assert_eq!(
+            append_assistant_segment(&mut accumulated, "Second update"),
+            Some("\n\nSecond update".to_string())
+        );
+        assert_eq!(accumulated, "First update\n\nSecond update");
     }
 
     #[test]

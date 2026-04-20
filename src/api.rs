@@ -11296,7 +11296,9 @@ async fn chat_sse_stream(State(state): State<AppState>, headers: HeaderMap) -> U
 #[derive(Debug, Deserialize)]
 struct ChatRespondBody {
     text: Option<String>,
+    message: Option<String>,
     tool_use: Option<String>,
+    #[serde(alias = "done")]
     complete: Option<bool>,
     content: Option<String>,
 }
@@ -11343,13 +11345,18 @@ async fn chat_agent_poll(
             .update_cwd(owner_str, &agent.name, cwd, branch_val.as_deref());
     }
 
-    // Update status to idle
-    let _ = state
+    // Push current persisted status to the UI (include cwd/branch so UI updates live).
+    // Polling is only a heartbeat and must not synthesize a completed state on its own.
+    let current_status = state
         .chat
-        .update_agent_status(owner_str, &agent.name, AgentChatStatus::Idle);
-
-    // Push status update to user (include cwd/branch so UI updates live)
-    let mut status_data = json!({ "status": "idle" });
+        .load_conversation(owner_str, &agent.name)
+        .map(|conv| match conv.agent_status {
+            AgentChatStatus::Idle => "idle",
+            AgentChatStatus::Thinking => "thinking",
+            AgentChatStatus::Offline => "offline",
+        })
+        .unwrap_or("offline");
+    let mut status_data = json!({ "status": current_status });
     if let Some(ref cwd) = cwd_val {
         status_data["cwd"] = json!(cwd);
     }
@@ -11491,13 +11498,7 @@ async fn chat_agent_respond(
         );
     }
 
-    if body.complete.unwrap_or(false) {
-        // Full response — store the message
-        let content = body
-            .content
-            .clone()
-            .or(body.text.clone())
-            .unwrap_or_default();
+    if let Some(content) = &body.message {
         let msg = state.chat.append_message(
             owner_str,
             &agent.name,
@@ -11506,35 +11507,61 @@ async fn chat_agent_respond(
         )?;
         state
             .chat_audit
-            .log(&agent.name, owner_str, "agent", &content);
-
-        let _ = state.chat.complete_active_turn(owner_str, &agent.name);
-
+            .log(&agent.name, owner_str, "agent", content);
         push_chat_event(
             &state,
             owner_str,
             ChatEvent {
-                event_type: "response_complete".into(),
+                event_type: "message".into(),
                 agent: agent.name.clone(),
                 owner: owner_str.to_string(),
-                data: json!({ "id": msg.id, "content": content }),
+                data: json!({ "id": msg.id, "role": "assistant", "content": content }),
             },
         );
+    }
 
-        // Update status back to idle
-        let _ = state
-            .chat
-            .update_agent_status(owner_str, &agent.name, AgentChatStatus::Idle);
-        push_chat_event(
-            &state,
-            owner_str,
-            ChatEvent {
-                event_type: "status".into(),
-                agent: agent.name.clone(),
-                owner: owner_str.to_string(),
-                data: json!({ "status": "idle" }),
-            },
-        );
+    if body.complete.unwrap_or(false) {
+        // Full response — store the message
+        let content = body
+            .content
+            .clone()
+            .or(body.text.clone())
+            .unwrap_or_default();
+        if !content.is_empty() {
+            let msg = state.chat.append_message(
+                owner_str,
+                &agent.name,
+                ChatRole::Assistant,
+                content.clone(),
+            )?;
+            state
+                .chat_audit
+                .log(&agent.name, owner_str, "agent", &content);
+
+            push_chat_event(
+                &state,
+                owner_str,
+                ChatEvent {
+                    event_type: "response_complete".into(),
+                    agent: agent.name.clone(),
+                    owner: owner_str.to_string(),
+                    data: json!({ "id": msg.id, "content": content }),
+                },
+            );
+        } else {
+            push_chat_event(
+                &state,
+                owner_str,
+                ChatEvent {
+                    event_type: "response_complete".into(),
+                    agent: agent.name.clone(),
+                    owner: owner_str.to_string(),
+                    data: json!({}),
+                },
+            );
+        }
+
+        finalize_agent_turn(&state, owner_str, &agent.name);
 
         // Auto-repeat: if set AND manage mode is not active, queue the auto_message
         let state2 = state.clone();
@@ -12941,6 +12968,11 @@ fn finish_api_agent(state: &AppState, owner: &str, agent_name: &str, content: &s
         );
     }
 
+    finalize_agent_turn(state, owner, agent_name);
+}
+
+fn finalize_agent_turn(state: &AppState, owner: &str, agent_name: &str) {
+    let _ = state.chat.complete_active_turn(owner, agent_name);
     let _ = state
         .chat
         .update_agent_status(owner, agent_name, AgentChatStatus::Idle);
@@ -13489,19 +13521,7 @@ async fn run_api_btw(
         );
     }
 
-    let _ = state
-        .chat
-        .update_agent_status(&owner, &agent_name, AgentChatStatus::Idle);
-    push_chat_event(
-        &state,
-        &owner,
-        ChatEvent {
-            event_type: "status".into(),
-            agent: agent_name.clone(),
-            owner: owner.clone(),
-            data: json!({ "status": "idle" }),
-        },
-    );
+    finalize_agent_turn(&state, &owner, &agent_name);
 }
 
 // --- Chat completions proxy ---
@@ -15173,6 +15193,36 @@ mod tests {
         assert_eq!(json["selected_agent"], "agent-main");
         assert_eq!(json["agent_status"], "idle");
         assert_eq!(json["messages"][0]["content"], "hello from agent");
+    }
+
+    #[tokio::test]
+    async fn chat_poll_preserves_thinking_status() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let agent_token =
+            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        state
+            .chat
+            .update_agent_status("admin", "agent-main", AgentChatStatus::Thinking)
+            .unwrap();
+        state
+            .chat
+            .append_message("admin", "agent-main", ChatRole::User, "follow-up".into())
+            .unwrap();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/chat/poll")
+            .header(API_KEY_HEADER, &agent_token)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert_eq!(conv.agent_status, AgentChatStatus::Thinking);
     }
 
     #[derive(Clone)]
@@ -18435,6 +18485,50 @@ mod tests {
             messages.last().unwrap()["content"].as_str(),
             Some("✅ Finished")
         );
+    }
+
+    #[test]
+    fn finish_api_agent_preserves_only_follow_up_message_as_pending() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+
+        let first = state
+            .chat
+            .append_message("admin", "agent-main", ChatRole::User, "first".into())
+            .unwrap();
+        let claimed = state
+            .chat
+            .claim_pending_user_messages("admin", "agent-main")
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, first.id);
+
+        let second = state
+            .chat
+            .append_message("admin", "agent-main", ChatRole::User, "second".into())
+            .unwrap();
+
+        super::finish_api_agent(&state, "admin", "agent-main", "done");
+
+        let pending = state
+            .chat
+            .claim_pending_user_messages("admin", "agent-main")
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, second.id);
+        assert_eq!(pending[0].content, "second");
+    }
+
+    #[test]
+    fn chat_respond_body_accepts_legacy_done_flag() {
+        let body: super::ChatRespondBody = serde_json::from_value(json!({
+            "text": "fallback",
+            "done": true
+        }))
+        .unwrap();
+
+        assert_eq!(body.text.as_deref(), Some("fallback"));
+        assert_eq!(body.complete, Some(true));
     }
 
     #[tokio::test]

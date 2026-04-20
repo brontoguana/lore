@@ -27,7 +27,7 @@ use time::format_description::well_known::Rfc3339;
 const ICON_STOP: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>"#;
 const ICON_RESTART: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
-const ICON_STATUS_DONE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>"#;
+const ICON_STATUS_DONE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>"#;
 const ICON_STATUS_WORKING: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>"#;
 const ICON_STATUS_STOPPED: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6"/><path d="M15 9l-6 6"/></svg>"#;
 
@@ -3437,7 +3437,7 @@ pub fn render_chat_page(
         ""
     };
     let (librarian_status_class, librarian_status_title, librarian_status_icon) =
-        chat_status_indicator("thinking");
+        chat_status_indicator("idle");
     let librarian_entry = format!(
         r#"<div class="chat-agent-item{active_class}" data-agent="librarian" onclick="selectAgent('librarian')">
   <div class="chat-agent-header">
@@ -4348,7 +4348,7 @@ function updateAgentListStatus(agent, status) {{
   glyph.classList.add(statusClass);
   if (status === 'idle') {{
     glyph.title = 'Finished';
-    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>';
   }} else if (status === 'thinking') {{
     glyph.title = 'Working';
     glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>';
@@ -4366,6 +4366,22 @@ function maybeAppendFinishedMessage() {{
   if (lastMsg && lastMsg.role === 'system' && lastMsg.content === '\u2705 Finished') return;
   chatMessages.push({{ role: 'system', content: '\u2705 Finished' }});
   renderMessages();
+}}
+
+function maybeRemoveFinishedMessage() {{
+  var lastMsg = chatMessages[chatMessages.length - 1];
+  if (lastMsg && lastMsg.role === 'system' && lastMsg.content === '\u2705 Finished') {{
+    chatMessages.pop();
+  }}
+}}
+
+function markAgentActivity(agent) {{
+  maybeRemoveFinishedMessage();
+  updateAgentListStatus(agent, 'thinking');
+  if (agent === currentAgent) {{
+    agentStatus = 'thinking';
+    updateHeaderStatus();
+  }}
 }}
 
 function connectSSE() {{
@@ -4386,6 +4402,7 @@ function connectSSE() {{
       }}
       if (evt.agent !== currentAgent) return;
       if (evt.event_type === 'message' && evt.data && evt.data.role === 'error') {{
+        markAgentActivity(evt.agent);
         var updated = false;
         for (var mi = chatMessages.length - 1; mi >= 0; mi--) {{
           if (chatMessages[mi]._id === evt.data.id) {{
@@ -4399,7 +4416,18 @@ function connectSSE() {{
         }}
         renderMessages();
         if (typeof refreshErrorsPanel === 'function') refreshErrorsPanel();
+      }} else if (evt.event_type === 'message' && evt.data && evt.data.role === 'assistant') {{
+        markAgentActivity(evt.agent);
+        var lastMsg = chatMessages[chatMessages.length - 1];
+        if (lastMsg && lastMsg.role === 'assistant' && lastMsg.streaming) {{
+          lastMsg.streaming = false;
+          if (!lastMsg.content) chatMessages.pop();
+        }}
+        streamingContent = '';
+        chatMessages.push({{ role: 'assistant', content: evt.data.content || '', _id: evt.data.id }});
+        renderMessages();
       }} else if (evt.event_type === 'tool_use') {{
+        markAgentActivity(evt.agent);
         var detail = '\u{{1F527}} ' + evt.data.detail;
         var lastMsg = chatMessages[chatMessages.length - 1];
         if (lastMsg && lastMsg.role === 'tool') {{
@@ -4418,7 +4446,8 @@ function connectSSE() {{
         }}
         renderMessages();
       }} else if (evt.event_type === 'chunk') {{
-        streamingContent += evt.data.text;
+        markAgentActivity(evt.agent);
+        streamingContent += evt.data.text || '';
         var lastMsg = chatMessages[chatMessages.length - 1];
         if (lastMsg && lastMsg.role === 'assistant' && lastMsg.streaming) {{
           lastMsg.content = streamingContent;
@@ -5001,6 +5030,7 @@ function sendLibrarianMessage(e) {{
   }}
 
   chatFollowScroll = true;
+  updateAgentListStatus('librarian', 'thinking');
   chatMessages.push({{ role: 'user', content: text }});
   chatMessages.push({{ role: 'assistant', content: 'Thinking\u2026', _thinking: true }});
   renderMessages();
@@ -5016,6 +5046,7 @@ function sendLibrarianMessage(e) {{
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
     body: body
   }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    updateAgentListStatus('librarian', 'idle');
     chatMessages = chatMessages.filter(function(m) {{ return !m._thinking; }});
     if (data.ok) {{
       var content = data.answer || data.error || 'No response.';
@@ -5026,6 +5057,7 @@ function sendLibrarianMessage(e) {{
     }}
     renderMessages();
   }}).catch(function() {{
+    updateAgentListStatus('librarian', 'idle');
     chatMessages = chatMessages.filter(function(m) {{ return !m._thinking; }});
     chatMessages.push({{ role: 'system', content: 'Failed to send (network error)' }});
     renderMessages();
@@ -8896,6 +8928,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       height: 100%;
       min-height: 0;
       overflow-y: auto;
+      overflow-x: hidden;
       overscroll-behavior: none;
       overflow-anchor: none;
       padding: var(--s-4);
@@ -8921,6 +8954,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-size: 0.92rem;
       line-height: 1.5;
       word-wrap: break-word;
+      min-width: 0;
+      box-sizing: border-box;
     }
     .chat-msg-user {
       align-self: flex-end;
@@ -8934,6 +8969,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       gap: var(--s-2);
       align-items: flex-start;
+      min-width: 0;
+      max-width: 100%;
     }
     .chat-msg-system {
       align-self: center;
@@ -9112,6 +9149,21 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .chat-msg-user .chat-msg-content,
     .chat-msg-system .chat-msg-content { white-space: pre-wrap; }
+    .chat-msg-content {
+      min-width: 0;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
+    }
+    .chat-msg-assistant .chat-msg-content {
+      min-width: 0;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .chat-msg-assistant .chat-msg-content > * {
+      max-width: 100%;
+    }
     .chat-msg-assistant .chat-msg-content p { margin: 0.3em 0; }
     .chat-msg-assistant .chat-msg-content p:first-child { margin-top: 0; }
     .chat-msg-assistant .chat-msg-content p:last-child { margin-bottom: 0; }
@@ -9150,6 +9202,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border-radius: 4px;
       padding: 0.5em 0.7em;
       overflow-x: auto;
+      max-width: 100%;
+      box-sizing: border-box;
       font-family: var(--font-mono);
       font-size: 0.85em;
       margin: 0.4em 0;
@@ -9164,6 +9218,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: var(--code-ink);
       border-radius: 3px;
       padding: 0.1em 0.3em;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .chat-msg-assistant .chat-msg-content a {
       color: var(--accent);
@@ -9172,6 +9229,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-table-wrap {
       overflow-x: auto;
       margin: 0.4em 0;
+      max-width: 100%;
     }
     .chat-table-wrap table {
       border-collapse: collapse;
@@ -9191,6 +9249,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       cursor: pointer;
       margin: 0.4em 0;
       width: 100%;
+      max-width: 100%;
       border-radius: 4px;
       border: 1px solid var(--line);
       padding: 0.5em;
@@ -10570,8 +10629,18 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-header .chat-avatar-header { margin: 0; }
       .chat-header-cwd { display: none; }
       .chat-header-status { display: none; }
-      .chat-messages { overflow-y: scroll; }
+      .chat-messages {
+        overflow-y: scroll;
+        overflow-x: hidden;
+      }
       .chat-msg { max-width: 90%; }
+      .chat-msg-assistant,
+      .chat-msg-content,
+      .chat-table-wrap,
+      .chat-svg-wrap {
+        max-width: 100%;
+        min-width: 0;
+      }
 
       .tree-perm { display: none; }
       .tree-doc-add { opacity: 1; }
