@@ -222,7 +222,7 @@ struct DocReadArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Marker format:\n  @@block id=<id> type=<type>\n  ...content...\n  @@end\n\nRound-trip example:\n  lore docs read <doc-id> > /tmp/doc.txt\n  lore docs write <doc-id> --file /tmp/doc.txt\n\nSafety:\n  Empty input is rejected unless you pass --allow-empty."
+    after_help = "Marker format:\n  Existing block from `docs read`:\n    @@block id=550e8400-e29b-41d4-a716-446655440000 type=markdown\n    Hello from Lore.\n    @@end\n\n  New block to create during `docs write`:\n    @@block id=intro type=markdown\n    This block will get a real UUID when written.\n    @@end\n\nRound-trip example:\n  lore docs read <doc-id> > /tmp/doc.txt\n  lore docs write <doc-id> --file /tmp/doc.txt\n\nNotes:\n  Existing blocks must keep their real UUID in `id=`.\n  New blocks must still include `id=`, but it can be any non-UUID placeholder.\n\nSafety:\n  Empty input is rejected unless you pass --allow-empty."
 )]
 struct DocWriteArgs {
     /// Document ID (UUID)
@@ -3469,8 +3469,8 @@ Project info:
 
 Documents:
   lore docs list                         List documents (shows doc tree with IDs)
-  lore docs read <doc-id> [--from <block-id>] [--to <block-id>]   Read entire document as text with @@block markers
-  lore docs write <doc-id> [--file <path>|--stdin] [--allow-empty]   Write document from block-marker text
+  lore docs read <doc-id> [--from <block-id>] [--to <block-id>]   Read entire document as text with markers like @@block id=<id> type=<type>
+  lore docs write <doc-id> [--file <path>|--stdin] [--allow-empty]   Write document from that marker format; new blocks still need id=<placeholder>
   lore docs create <name> [--parent <doc-id>]   Create a new document
   lore docs rename <doc-id> <new-name>   Rename a document
   lore docs delete <doc-id> --yes        Delete a document and all its contents

@@ -63,18 +63,25 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
         r#"(function() {{
   var root = document.documentElement;
   var mode = '{mode}';
+  function setResolvedMode(resolved) {{
+    root.setAttribute('data-resolved-color-mode', resolved);
+    root.style.colorScheme = resolved;
+  }}
   root.setAttribute('data-color-mode', mode);
   if (mode !== 'system') {{
-    root.setAttribute('data-resolved-color-mode', mode);
+    setResolvedMode(mode);
     return;
   }}
   if (!window.matchMedia) {{
-    root.setAttribute('data-resolved-color-mode', 'light');
+    setResolvedMode('light');
     return;
   }}
   var query = window.matchMedia('(prefers-color-scheme: dark)');
+  function detectResolvedMode() {{
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }}
   function applyResolvedMode() {{
-    root.setAttribute('data-resolved-color-mode', query.matches ? 'dark' : 'light');
+    setResolvedMode(detectResolvedMode());
   }}
   applyResolvedMode();
   if (typeof query.addEventListener === 'function') {{
@@ -82,6 +89,11 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
   }} else if (typeof query.addListener === 'function') {{
     query.addListener(applyResolvedMode);
   }}
+  window.addEventListener('pageshow', applyResolvedMode);
+  window.addEventListener('focus', applyResolvedMode);
+  document.addEventListener('visibilitychange', function() {{
+    if (!document.hidden) applyResolvedMode();
+  }});
 }})();"#,
         mode = mode.as_str()
     )
@@ -10940,8 +10952,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         max-width: 100%;
         overflow: hidden;
       }
-      .chat-back-btn { display: flex; margin: 0 4px 0 6px; }
-      .chat-header { gap: 4px; padding: 8px 8px 8px 0; }
+      .chat-back-btn { display: flex; margin: 0; }
+      .chat-header { align-items: center; gap: var(--s-2); padding: var(--s-2); }
       .chat-header,
       .chat-messages-wrap,
       .chat-messages,
@@ -11113,9 +11125,12 @@ mod tests {
 
         assert!(html.contains(r#"<meta name="color-scheme" content="light dark">"#));
         assert!(html.contains(r#"root.setAttribute('data-color-mode', mode);"#));
+        assert!(html.contains(r#"root.style.colorScheme = resolved;"#));
         assert!(html.contains(
-            r#"root.setAttribute('data-resolved-color-mode', query.matches ? 'dark' : 'light');"#
+            r#"return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';"#
         ));
+        assert!(html.contains(r#"window.addEventListener('pageshow', applyResolvedMode);"#));
+        assert!(html.contains(r#"document.addEventListener('visibilitychange', function() {"#));
         assert!(html.contains(r#":root[data-resolved-color-mode="dark"] {"#));
     }
 }
