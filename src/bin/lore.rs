@@ -5,6 +5,7 @@ use lore_core::{
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -2083,6 +2084,22 @@ fn format_relative_time(timestamp_str: &str, now: OffsetDateTime) -> String {
     }
 }
 
+fn history_messages_excluding_pending<'a>(
+    messages: Option<&'a Vec<serde_json::Value>>,
+    pending_ids: &HashSet<u64>,
+) -> Vec<&'a serde_json::Value> {
+    let Some(messages) = messages else {
+        return Vec::new();
+    };
+    messages
+        .iter()
+        .filter(|msg| {
+            let id = msg["id"].as_u64().unwrap_or(0);
+            id == 0 || !pending_ids.contains(&id)
+        })
+        .collect()
+}
+
 fn one_line_preview(value: &str, max_chars: usize) -> String {
     let trimmed = value.lines().next().unwrap_or("").trim();
     truncate_chars(trimmed, max_chars)
@@ -2531,6 +2548,7 @@ async fn agent_poll_and_process(
 
     // Check for slash commands from the server
     let mut regular_messages: Vec<&str> = Vec::new();
+    let mut current_message_ids: Vec<u64> = Vec::new();
     for msg in messages {
         if let Some(content) = msg["content"].as_str() {
             let trimmed = content.trim();
@@ -2551,6 +2569,9 @@ async fn agent_poll_and_process(
                 return Ok(AgentPollAction::Restart);
             } else {
                 regular_messages.push(content);
+                if let Some(id) = msg["id"].as_u64() {
+                    current_message_ids.push(id);
+                }
             }
         }
     }
@@ -2789,8 +2810,10 @@ async fn agent_poll_and_process(
 
     // Previous conversation with relative timestamps
     if let Some(msgs) = hist_messages {
-        let start = msgs.len().saturating_sub(window_size);
-        let recent = &msgs[start..];
+        let pending_ids: HashSet<u64> = current_message_ids.iter().copied().collect();
+        let filtered = history_messages_excluding_pending(Some(msgs), &pending_ids);
+        let start = filtered.len().saturating_sub(window_size);
+        let recent = &filtered[start..];
         if !recent.is_empty() {
             prompt_parts.push("## Previous Conversation\nThe following is recent conversation history. This is context only \u{2014} do not respond to these messages. Only respond to the new message the user sends.\n".to_string());
             for msg in recent {
@@ -5888,4 +5911,45 @@ async fn service_handle_create_agent(
         "folder": managed.folder,
         "pid": std::process::id(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::history_messages_excluding_pending;
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    #[test]
+    fn history_messages_excluding_pending_excludes_current_unread_batch() {
+        let messages = vec![
+            json!({ "id": 1, "role": "user", "content": "older 1" }),
+            json!({ "id": 2, "role": "assistant", "content": "older 2" }),
+            json!({ "id": 3, "role": "user", "content": "new unread 1" }),
+            json!({ "id": 4, "role": "user", "content": "new unread 2" }),
+        ];
+
+        let pending_ids: HashSet<u64> = [3, 4].into_iter().collect();
+        let recent = history_messages_excluding_pending(Some(&messages), &pending_ids);
+        let ids: Vec<u64> = recent.iter().filter_map(|msg| msg["id"].as_u64()).collect();
+
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn history_messages_excluding_pending_keeps_remaining_order_for_windowing() {
+        let messages = vec![
+            json!({ "id": 1, "role": "user", "content": "m1" }),
+            json!({ "id": 2, "role": "assistant", "content": "m2" }),
+            json!({ "id": 3, "role": "user", "content": "m3" }),
+            json!({ "id": 4, "role": "assistant", "content": "m4" }),
+            json!({ "id": 5, "role": "user", "content": "current unread" }),
+        ];
+
+        let pending_ids: HashSet<u64> = [5].into_iter().collect();
+        let filtered = history_messages_excluding_pending(Some(&messages), &pending_ids);
+        let recent = &filtered[filtered.len().saturating_sub(2)..];
+        let ids: Vec<u64> = recent.iter().filter_map(|msg| msg["id"].as_u64()).collect();
+
+        assert_eq!(ids, vec![3, 4]);
+    }
 }
