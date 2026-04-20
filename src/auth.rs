@@ -562,6 +562,8 @@ pub fn open_lore_db(root: &Path) -> Arc<Mutex<Connection>> {
     conn.execute_batch(CHAT_SCHEMA)
         .expect("failed to create chat schema");
     run_migrations(&conn);
+    conn.execute_batch(CHAT_INDEXES)
+        .expect("failed to create chat indexes");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2089,9 +2091,6 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp TEXT NOT NULL,
     PRIMARY KEY (owner, agent, id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_message_id
-ON messages (owner, agent, client_message_id)
-WHERE client_message_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS pins (
     owner TEXT NOT NULL,
     agent TEXT NOT NULL,
@@ -2107,6 +2106,12 @@ CREATE TABLE IF NOT EXISTS backend_preferences (
     effort TEXT,
     PRIMARY KEY (owner, backend)
 );
+";
+
+const CHAT_INDEXES: &str = "
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_message_id
+ON messages (owner, agent, client_message_id)
+WHERE client_message_id IS NOT NULL;
 ";
 
 impl ChatStore {
@@ -3153,10 +3158,11 @@ fn dir_is_empty(path: &Path) -> bool {
 mod tests {
     use super::{
         AgentBackend, ChatStore, LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant,
-        ProjectPermission, RoleName, UserName,
+        ProjectPermission, RoleName, UserName, AUTH_SCHEMA,
     };
     use crate::config::{ColorMode, UiTheme};
     use crate::model::ProjectName;
+    use rusqlite::Connection;
     use tempfile::tempdir;
 
     #[test]
@@ -3404,6 +3410,69 @@ mod tests {
         .unwrap();
         auth.set_user_disabled(&UserName::new("admin1".to_string()).unwrap(), true)
             .unwrap();
+    }
+
+    #[test]
+    fn chat_store_migrates_legacy_messages_before_creating_client_id_index() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("lore.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(AUTH_SCHEMA).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            CREATE TABLE conversations (
+                owner TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                agent_status TEXT NOT NULL DEFAULT 'offline',
+                last_seen TEXT,
+                summary TEXT NOT NULL DEFAULT '',
+                window_size INTEGER NOT NULL DEFAULT 22,
+                cwd TEXT,
+                git_branch TEXT,
+                model TEXT,
+                effort TEXT,
+                profile_url TEXT,
+                auto_message TEXT,
+                next_id INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (owner, agent)
+            );
+            CREATE TABLE messages (
+                owner TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (owner, agent, id)
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let chat = ChatStore::new(dir.path());
+        let conv = chat.load_conversation("alice", "legacy-agent").unwrap();
+        assert!(conv.messages.is_empty());
+
+        let conn = Connection::open(&db_path).unwrap();
+        let has_client_message_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'client_message_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_client_message_id, 1);
+
+        let has_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_client_message_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1);
     }
 
     #[test]
