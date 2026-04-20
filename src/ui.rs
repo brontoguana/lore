@@ -50,12 +50,51 @@ pub struct PageShell<'a> {
     pub flash: Option<&'a str>,
 }
 
+fn shell_color_scheme_meta(mode: ColorMode) -> &'static str {
+    match mode {
+        ColorMode::System => "light dark",
+        ColorMode::Light => "light",
+        ColorMode::Dark => "dark",
+    }
+}
+
+fn shell_theme_bootstrap(mode: ColorMode) -> String {
+    format!(
+        r#"(function() {{
+  var root = document.documentElement;
+  var mode = '{mode}';
+  root.setAttribute('data-color-mode', mode);
+  if (mode !== 'system') {{
+    root.setAttribute('data-resolved-color-mode', mode);
+    return;
+  }}
+  if (!window.matchMedia) {{
+    root.setAttribute('data-resolved-color-mode', 'light');
+    return;
+  }}
+  var query = window.matchMedia('(prefers-color-scheme: dark)');
+  function applyResolvedMode() {{
+    root.setAttribute('data-resolved-color-mode', query.matches ? 'dark' : 'light');
+  }}
+  applyResolvedMode();
+  if (typeof query.addEventListener === 'function') {{
+    query.addEventListener('change', applyResolvedMode);
+  }} else if (typeof query.addListener === 'function') {{
+    query.addListener(applyResolvedMode);
+  }}
+}})();"#,
+        mode = mode.as_str()
+    )
+}
+
 pub fn render_shell(shell: PageShell, content: String) -> String {
     let flash_html = flash_message(shell.flash);
     let csrf_hidden = shell
         .csrf_token
         .map(|t| format!(r#"<input type="hidden" name="csrf_token" value="{}">"#, t))
         .unwrap_or_default();
+    let color_scheme_meta = shell_color_scheme_meta(shell.color_mode);
+    let theme_bootstrap = shell_theme_bootstrap(shell.color_mode);
     let nav_html = if let Some(username) = shell.username {
         let admin_link = if shell.is_admin {
             r#"<a href="/ui/admin">Admin</a>"#.to_string()
@@ -102,7 +141,9 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="{color_scheme_meta}">
   <title>{title}</title>
+  <script>{theme_bootstrap}</script>
   <style>{styles}</style>
 </head>
 <body>
@@ -340,6 +381,8 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
 </body>
 </html>"#,
         title = escape_text(shell.title),
+        color_scheme_meta = color_scheme_meta,
+        theme_bootstrap = theme_bootstrap,
         styles = shared_styles(shell.theme, shell.color_mode),
         nav_html = nav_html,
         flash_html = flash_html,
@@ -3521,6 +3564,7 @@ pub fn render_chat_page(
         .and_then(|a| a.profile_url.as_ref())
         .map(|url| format!("'{}'", escape_attribute(url)))
         .unwrap_or_else(|| "null".to_string());
+    let username_js = escape_attribute(username);
 
     let layout_class = if selected_agent.is_some() {
         "chat-layout chat-has-agent"
@@ -3545,6 +3589,7 @@ pub fn render_chat_page(
 <script>
 var currentAgent = {selected_agent_js};
 var csrfToken = '{csrf_token}';
+var chatDraftUser = '{username_js}';
 var chatMessages = {messages_json};
 var agentProfileUrl = {profile_url_js};
 var eventSource = null;
@@ -3566,6 +3611,55 @@ function isMobileChatLayout() {{
 
 function currentChatUrl(agent) {{
   return agent ? ('/ui/chat?agent=' + encodeURIComponent(agent)) : '/ui/chat';
+}}
+
+function chatDraftStorageKey() {{
+  return 'lore.chat.drafts:' + chatDraftUser;
+}}
+
+function readChatDraftStore() {{
+  try {{
+    var raw = localStorage.getItem(chatDraftStorageKey());
+    if (!raw) return {{}};
+    var parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {{}};
+  }} catch (e) {{
+    return {{}};
+  }}
+}}
+
+function writeChatDraftStore(store) {{
+  try {{
+    var nextStore = store || {{}};
+    if (Object.keys(nextStore).length === 0) {{
+      localStorage.removeItem(chatDraftStorageKey());
+      return;
+    }}
+    localStorage.setItem(chatDraftStorageKey(), JSON.stringify(nextStore));
+  }} catch (e) {{}}
+}}
+
+function getChatDraft(agent) {{
+  if (!agent) return '';
+  var store = readChatDraftStore();
+  return typeof store[agent] === 'string' ? store[agent] : '';
+}}
+
+function setChatDraft(agent, value) {{
+  if (!agent) return;
+  var store = readChatDraftStore();
+  if (value) {{
+    store[agent] = value;
+  }} else {{
+    delete store[agent];
+  }}
+  writeChatDraftStore(store);
+}}
+
+function persistCurrentChatDraft() {{
+  var input = document.getElementById('chat-input');
+  if (!input || !currentAgent) return;
+  setChatDraft(currentAgent, input.value || '');
 }}
 
 function clearActiveAgentInList() {{
@@ -3678,6 +3772,7 @@ function initializeChatPanel() {{
 }}
 
 function loadDesktopChatPanel(agent, pushHistory) {{
+  persistCurrentChatDraft();
   var url = '/ui/chat/panel';
   if (agent) url += '?agent=' + encodeURIComponent(agent);
   fetch(url, {{ cache: 'no-store' }})
@@ -3758,6 +3853,7 @@ if (currentAgent) {{
 }}
 
 function selectAgent(name) {{
+  persistCurrentChatDraft();
   localStorage.setItem('lastChatAgent', name);
   if (isMobileChatLayout()) {{
     window.location.href = currentChatUrl(name);
@@ -3771,6 +3867,7 @@ function selectAgent(name) {{
 }}
 
 function showAgentList() {{
+  persistCurrentChatDraft();
   localStorage.removeItem('lastChatAgent');
   if (isMobileChatLayout()) {{
     window.location.href = '/ui/chat';
@@ -3871,9 +3968,11 @@ function resizeChatInput() {{
 function initChatComposer() {{
   var input = document.getElementById('chat-input');
   if (!input) return;
+  input.value = getChatDraft(currentAgent);
   if (input.dataset.chatComposerBound !== '1') {{
     input.dataset.chatComposerBound = '1';
     input.addEventListener('input', function() {{
+      setChatDraft(currentAgent, input.value || '');
       if (resizeChatInput()) {{
         scheduleChatViewportFix();
       }}
@@ -4314,6 +4413,7 @@ function sendMessage(e) {{
   var input = document.getElementById('chat-input');
   var text = input.value.trim();
   if (!text) return false;
+  setChatDraft(currentAgent, '');
   input.value = '';
   resizeChatInput();
 
@@ -5340,6 +5440,7 @@ document.addEventListener('visibilitychange', function() {{
 }});
 
 window.addEventListener('pagehide', function() {{
+  persistCurrentChatDraft();
   chatWasBackgrounded = true;
 }});
 
@@ -5358,6 +5459,7 @@ window.addEventListener('popstate', function() {{
         chat_area_html = chat_area_html,
         selected_agent_js = selected_agent_js,
         csrf_token = escape_attribute(csrf_token),
+        username_js = username_js,
         messages_json = messages_json,
         profile_url_js = profile_url_js,
     );
@@ -8456,7 +8558,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
             let light = theme_palette(theme, false);
             let dark = theme_palette(theme, true);
             format!(
-                "    :root {{\n      {light_vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root {{\n        {dark_vars}\n      }}\n    }}",
+                "    :root,\n    :root[data-resolved-color-mode=\"light\"] {{\n      {light_vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    :root[data-resolved-color-mode=\"dark\"] {{\n      {dark_vars}\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root:not([data-resolved-color-mode=\"light\"]) {{\n        {dark_vars}\n      }}\n    }}",
                 light_vars = palette_css_vars(&light),
                 dark_vars = palette_css_vars(&dark)
             )
@@ -10992,5 +11094,28 @@ mod tests {
         assert!(html.contains(r#"title="Finished""#));
         assert!(html.contains(r#"chat-status-running"#));
         assert!(!html.contains("agent-status-badge"));
+    }
+
+    #[test]
+    fn shell_bootstraps_system_color_mode_for_mobile_clients() {
+        let html = render_shell(
+            PageShell {
+                title: "Lore",
+                username: None,
+                is_admin: false,
+                theme: UiTheme::Parchment,
+                color_mode: ColorMode::System,
+                csrf_token: None,
+                flash: None,
+            },
+            "<p>content</p>".into(),
+        );
+
+        assert!(html.contains(r#"<meta name="color-scheme" content="light dark">"#));
+        assert!(html.contains(r#"root.setAttribute('data-color-mode', mode);"#));
+        assert!(html.contains(
+            r#"root.setAttribute('data-resolved-color-mode', query.matches ? 'dark' : 'light');"#
+        ));
+        assert!(html.contains(r#":root[data-resolved-color-mode="dark"] {"#));
     }
 }
