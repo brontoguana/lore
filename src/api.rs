@@ -1,9 +1,9 @@
 use crate::audit::{AuditActor, AuditActorKind, AuditStore, StoredAuditEvent};
 use crate::auth::{
     AgentBackend, AgentChatStatus, AuthenticatedAgent, AuthenticatedUser, ChatAuditLog,
-    ChatMessage, ChatRole, ChatStore, CreatedAgentToken, LocalAuthStore, ManageConfig,
-    NewAgentToken, NewRole, NewSession, NewUser, PinnedChatItem, ProjectGrant, ProjectPermission,
-    RoleName, StoredAgentToken, StoredMachine, UserName, hash_agent_token,
+    ChatConversation, ChatMessage, ChatRole, ChatStore, CreatedAgentToken, LocalAuthStore,
+    ManageConfig, NewAgentToken, NewRole, NewSession, NewUser, PinnedChatItem, ProjectGrant,
+    ProjectPermission, RoleName, StoredAgentToken, StoredMachine, UserName, hash_agent_token,
 };
 use crate::config::{
     ColorMode, ExternalAuthSecretUpdate, ExternalAuthStore, ExternalScheme, OidcConfig,
@@ -10454,6 +10454,27 @@ fn chat_messages_value(messages: &[ChatMessage]) -> Vec<Value> {
         .collect()
 }
 
+fn should_append_finished_message(conv: &ChatConversation) -> bool {
+    if conv.agent_status != AgentChatStatus::Idle {
+        return false;
+    }
+    matches!(
+        conv.messages.last().map(|m| m.role),
+        Some(ChatRole::Assistant | ChatRole::Tool | ChatRole::Error)
+    )
+}
+
+fn chat_messages_value_for_panel(conv: &ChatConversation) -> Vec<Value> {
+    let mut messages = chat_messages_value(&conv.messages);
+    if should_append_finished_message(conv) {
+        messages.push(json!({
+            "role": "system",
+            "content": "✅ Finished",
+        }));
+    }
+    messages
+}
+
 fn build_chat_agents(
     state: &AppState,
     username: &UserName,
@@ -10515,19 +10536,25 @@ fn load_chat_panel_data(
     state: &AppState,
     owner: &str,
     selected_agent: Option<&str>,
-) -> Result<(Vec<Value>, Option<String>), LoreError> {
+) -> Result<(Vec<Value>, Option<String>, Option<String>), LoreError> {
     if let Some(agent_name) = selected_agent {
         if agent_name == "librarian" {
-            Ok((Vec::new(), Some("librarian".to_string())))
+            Ok((Vec::new(), Some("librarian".to_string()), None))
         } else {
             let conv = state.chat.load_conversation(owner, agent_name)?;
+            let agent_status = match conv.agent_status {
+                AgentChatStatus::Idle => "idle",
+                AgentChatStatus::Thinking => "thinking",
+                AgentChatStatus::Offline => "offline",
+            };
             Ok((
-                chat_messages_value(&conv.messages),
+                chat_messages_value_for_panel(&conv),
                 Some(agent_name.to_string()),
+                Some(agent_status.to_string()),
             ))
         }
     } else {
-        Ok((Vec::new(), None))
+        Ok((Vec::new(), None, None))
     }
 }
 
@@ -10547,7 +10574,7 @@ async fn chat_page(
         .map(|p| (p.slug.as_str().to_string(), p.display_name.clone()))
         .collect();
 
-    let (messages, selected_owned) = load_chat_panel_data(
+    let (messages, selected_owned, _selected_status) = load_chat_panel_data(
         &state,
         session.user.username.as_str(),
         query.agent.as_deref(),
@@ -10593,7 +10620,7 @@ async fn chat_panel_inner(
         .filter(|p| session.user.is_admin || session.user.can_read(&p.slug))
         .map(|p| (p.slug.as_str().to_string(), p.display_name.clone()))
         .collect();
-    let (messages, selected_owned) = load_chat_panel_data(
+    let (messages, selected_owned, selected_status) = load_chat_panel_data(
         state,
         session.user.username.as_str(),
         query.agent.as_deref(),
@@ -10617,6 +10644,7 @@ async fn chat_panel_inner(
         "is_librarian": selected == Some("librarian"),
         "panel_html": panel_html,
         "messages": messages,
+        "agent_status": selected_status,
         "profile_url": profile_url,
     }))
 }
@@ -14998,7 +15026,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use super::{finalize_pending_stream_tool_call, merge_pending_stream_tool_call};
-    use crate::auth::{ChatConversation, ChatMessage, ChatRole};
+    use crate::auth::{AgentChatStatus, ChatConversation, ChatMessage, ChatRole};
     use crate::librarian::{
         AnswerLibrarianClient, Endpoint, LibrarianAnswer, LibrarianConfig, LibrarianRequest,
         ProjectLibrarianOperation, ProjectLibrarianPlan, ProjectLibrarianRequest,
@@ -15098,6 +15126,46 @@ mod tests {
         let agents = build_chat_agents(&state, &owner).unwrap();
         let ordered_names: Vec<&str> = agents.iter().map(|agent| agent.name.as_str()).collect();
         assert_eq!(ordered_names, vec!["bravo", "alpha"]);
+    }
+
+    #[tokio::test]
+    async fn chat_panel_includes_selected_agent_status() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, _) = bootstrap_admin_session(&app, dir.path()).await;
+        let _agent_token =
+            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        state
+            .chat
+            .append_message(
+                "admin",
+                "agent-main",
+                ChatRole::Assistant,
+                "hello from agent".into(),
+            )
+            .unwrap();
+        state
+            .chat
+            .update_agent_status("admin", "agent-main", AgentChatStatus::Idle)
+            .unwrap();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ui/chat/panel?agent=agent-main")
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["selected_agent"], "agent-main");
+        assert_eq!(json["agent_status"], "idle");
+        assert_eq!(json["messages"][0]["content"], "hello from agent");
     }
 
     #[derive(Clone)]
@@ -18276,6 +18344,58 @@ mod tests {
         assert_eq!(
             args.get("block_id").and_then(|v| v.as_str()),
             Some("_block123")
+        );
+    }
+
+    #[test]
+    fn chat_panel_appends_finished_message_for_idle_completed_turn() {
+        let mut conv = ChatConversation {
+            agent_status: AgentChatStatus::Idle,
+            ..Default::default()
+        };
+        conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "hello".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+        conv.messages.push(ChatMessage {
+            id: 2,
+            role: ChatRole::Assistant,
+            content: "done".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+
+        let messages = super::chat_messages_value_for_panel(&conv);
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"].as_str(), Some("system"));
+        assert_eq!(last["content"].as_str(), Some("✅ Finished"));
+    }
+
+    #[test]
+    fn chat_panel_skips_finished_message_while_agent_is_thinking() {
+        let mut conv = ChatConversation {
+            agent_status: AgentChatStatus::Thinking,
+            ..Default::default()
+        };
+        conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "hello".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+        conv.messages.push(ChatMessage {
+            id: 2,
+            role: ChatRole::Assistant,
+            content: "partial".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+        });
+
+        let messages = super::chat_messages_value_for_panel(&conv);
+        assert_eq!(messages.len(), 2);
+        assert_ne!(
+            messages.last().unwrap()["content"].as_str(),
+            Some("✅ Finished")
         );
     }
 

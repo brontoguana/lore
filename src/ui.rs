@@ -3414,6 +3414,10 @@ pub fn render_chat_page(
     projects: &[(String, String)],
 ) -> String {
     let is_librarian = selected_agent == Some("librarian");
+    let selected_agent_status_js = selected_agent
+        .and_then(|name| agents.iter().find(|agent| agent.name == name))
+        .map(|agent| format!("'{}'", escape_attribute(&agent.status)))
+        .unwrap_or_else(|| "''".to_string());
 
     let librarian_active_class = if is_librarian {
         " chat-agent-active"
@@ -3532,7 +3536,7 @@ var agentProfileUrl = {profile_url_js};
 var eventSource = null;
 var streamingContent = '';
 var agentConfig = {{ backend: '', model: '', effort: '' }};
-var agentStatus = '';
+var agentStatus = {selected_agent_status_js};
 var isLibrarian = currentAgent === 'librarian';
 var libProject = '';
 var chatFollowScroll = true;
@@ -3598,7 +3602,7 @@ function initializeChatPanel() {{
   isLibrarian = currentAgent === 'librarian';
   streamingContent = '';
   agentConfig = {{ backend: '', model: '', effort: '' }};
-  agentStatus = '';
+  if (isLibrarian || !currentAgent) agentStatus = '';
   chatFollowScroll = true;
   closeAllPanels();
   setActiveAgentInList(currentAgent);
@@ -3670,6 +3674,7 @@ function loadDesktopChatPanel(agent, pushHistory) {{
       main.innerHTML = data.panel_html || '';
       currentAgent = data.selected_agent || null;
       chatMessages = data.messages || [];
+      agentStatus = data.agent_status || '';
       agentProfileUrl = data.profile_url || null;
       if (currentAgent) {{
         localStorage.setItem('lastChatAgent', currentAgent);
@@ -3715,6 +3720,7 @@ function refreshChatOnResume(force) {{
       main.innerHTML = data.panel_html || '';
       currentAgent = data.selected_agent || null;
       chatMessages = data.messages || [];
+      agentStatus = data.agent_status || '';
       agentProfileUrl = data.profile_url || null;
       if (currentAgent) {{
         localStorage.setItem('lastChatAgent', currentAgent);
