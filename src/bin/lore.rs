@@ -844,17 +844,7 @@ async fn run() -> CliResult<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
 
-            let log_file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)?;
-            let child = std::process::Command::new(&exe)
-                .args(["--url", &url, "--token", &token, "service", "--fg"])
-                .env(LORE_SERVICE_DAEMON_ENV, "1")
-                .stdout(log_file.try_clone()?)
-                .stderr(log_file)
-                .stdin(std::process::Stdio::null())
-                .spawn()?;
+            let child = spawn_service_daemon(&exe, &url, &token, &log_path)?;
             let pid = child.id();
             fs::write(&pid_path, pid.to_string())?;
             println!("Service started (pid {})", pid);
@@ -2030,6 +2020,38 @@ fn relaunch_cli(executable_path: &Path) -> ! {
             }
         }
     }
+}
+
+fn spawn_service_daemon(
+    exe: &Path,
+    url: &str,
+    token: &str,
+    log_path: &Path,
+) -> CliResult<std::process::Child> {
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["--url", url, "--token", token, "service", "--fg"])
+        .env(LORE_SERVICE_DAEMON_ENV, "1")
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    Ok(command.spawn()?)
 }
 
 fn print_update_check(check: &lore_core::updater::UpdateCheck) {
@@ -5699,25 +5721,8 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        let log_file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
         let exe = resolved_current_exe()?;
-        let child = std::process::Command::new(&exe)
-            .args([
-                "--url",
-                &context.url,
-                "--token",
-                machine_token,
-                "service",
-                "--fg",
-            ])
-            .env(LORE_SERVICE_DAEMON_ENV, "1")
-            .stdout(log_file.try_clone()?)
-            .stderr(log_file)
-            .stdin(std::process::Stdio::null())
-            .spawn()?;
+        let child = spawn_service_daemon(&exe, &context.url, machine_token, &log_path)?;
         let pid = child.id();
         fs::write(&pid_path, pid.to_string())?;
         println!("Lore service started (pid {})", pid);
@@ -5837,45 +5842,19 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                                 .join("lore-service");
                             let log_path = lore_dir.join("service.log");
                             let pid_path = lore_dir.join("service.pid");
-                            let log_file = fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&log_path);
-                            match log_file {
-                                Ok(log_file) => {
-                                    match std::process::Command::new(&exe)
-                                        .args([
-                                            "--url",
-                                            &context.url,
-                                            "--token",
-                                            machine_token,
-                                            "service",
-                                            "--fg",
-                                        ])
-                                        .env(LORE_SERVICE_DAEMON_ENV, "1")
-                                        .stdout(log_file.try_clone().unwrap_or_else(|_| {
-                                            log_file.try_clone().expect("log clone")
-                                        }))
-                                        .stderr(log_file)
-                                        .stdin(std::process::Stdio::null())
-                                        .spawn()
-                                    {
-                                        Ok(child) => {
-                                            let _ = fs::write(&pid_path, child.id().to_string());
-                                            eprintln!(
-                                                "[service] New service started (pid {}), exiting old.",
-                                                child.id()
-                                            );
-                                            std::process::exit(0);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[service] Failed to spawn new service: {e}");
-                                            // Fall through to restart agents on old binary
-                                        }
-                                    }
+                            match spawn_service_daemon(&exe, &context.url, machine_token, &log_path)
+                            {
+                                Ok(child) => {
+                                    let _ = fs::write(&pid_path, child.id().to_string());
+                                    eprintln!(
+                                        "[service] New service started (pid {}), exiting old.",
+                                        child.id()
+                                    );
+                                    std::process::exit(0);
                                 }
                                 Err(e) => {
-                                    eprintln!("[service] Failed to open log file: {e}");
+                                    eprintln!("[service] Failed to spawn new service: {e}");
+                                    // Fall through to restart agents on old binary
                                 }
                             }
                             // If spawn failed, restart agents on old binary and keep running

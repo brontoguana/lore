@@ -63,9 +63,15 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
         r#"(function() {{
   var root = document.documentElement;
   var mode = '{mode}';
+  var resyncTimers = [];
   function setResolvedMode(resolved) {{
     root.setAttribute('data-resolved-color-mode', resolved);
     root.style.colorScheme = resolved;
+  }}
+  function clearResyncTimers() {{
+    while (resyncTimers.length) {{
+      clearTimeout(resyncTimers.pop());
+    }}
   }}
   root.setAttribute('data-color-mode', mode);
   if (mode !== 'system') {{
@@ -83,16 +89,23 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
   function applyResolvedMode() {{
     setResolvedMode(detectResolvedMode());
   }}
+  function scheduleResolvedModeResync() {{
+    clearResyncTimers();
+    applyResolvedMode();
+    [80, 240, 600, 1200].forEach(function(delay) {{
+      resyncTimers.push(setTimeout(applyResolvedMode, delay));
+    }});
+  }}
   applyResolvedMode();
   if (typeof query.addEventListener === 'function') {{
-    query.addEventListener('change', applyResolvedMode);
+    query.addEventListener('change', scheduleResolvedModeResync);
   }} else if (typeof query.addListener === 'function') {{
-    query.addListener(applyResolvedMode);
+    query.addListener(scheduleResolvedModeResync);
   }}
-  window.addEventListener('pageshow', applyResolvedMode);
-  window.addEventListener('focus', applyResolvedMode);
+  window.addEventListener('pageshow', scheduleResolvedModeResync);
+  window.addEventListener('focus', scheduleResolvedModeResync);
   document.addEventListener('visibilitychange', function() {{
-    if (!document.hidden) applyResolvedMode();
+    if (!document.hidden) scheduleResolvedModeResync();
   }});
 }})();"#,
         mode = mode.as_str()
@@ -11129,7 +11142,12 @@ mod tests {
         assert!(html.contains(
             r#"return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';"#
         ));
-        assert!(html.contains(r#"window.addEventListener('pageshow', applyResolvedMode);"#));
+        assert!(html.contains(r#"var resyncTimers = [];"#));
+        assert!(html.contains(r#"function scheduleResolvedModeResync() {"#));
+        assert!(html.contains(r#"[80, 240, 600, 1200].forEach(function(delay) {"#));
+        assert!(
+            html.contains(r#"window.addEventListener('pageshow', scheduleResolvedModeResync);"#)
+        );
         assert!(html.contains(r#"document.addEventListener('visibilitychange', function() {"#));
         assert!(html.contains(r#":root[data-resolved-color-mode="dark"] {"#));
     }
