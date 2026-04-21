@@ -58,6 +58,14 @@ fn shell_color_scheme_meta(mode: ColorMode) -> &'static str {
     }
 }
 
+fn shell_root_attrs(mode: ColorMode) -> String {
+    let mut attrs = format!(r#" data-color-mode="{}""#, mode.as_str());
+    if mode != ColorMode::System {
+        attrs.push_str(&format!(r#" data-resolved-color-mode="{}""#, mode.as_str()));
+    }
+    attrs
+}
+
 fn shell_theme_bootstrap(mode: ColorMode) -> String {
     format!(
         r#"(function() {{
@@ -132,6 +140,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
         .map(|t| format!(r#"<input type="hidden" name="csrf_token" value="{}">"#, t))
         .unwrap_or_default();
     let color_scheme_meta = shell_color_scheme_meta(shell.color_mode);
+    let root_attrs = shell_root_attrs(shell.color_mode);
     let theme_bootstrap = shell_theme_bootstrap(shell.color_mode);
     let nav_html = if let Some(username) = shell.username {
         let admin_link = if shell.is_admin {
@@ -175,7 +184,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
 
     format!(
         r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="en"{root_attrs}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -420,6 +429,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
 </html>"#,
         title = escape_text(shell.title),
         color_scheme_meta = color_scheme_meta,
+        root_attrs = root_attrs,
         theme_bootstrap = theme_bootstrap,
         styles = shared_styles(shell.theme, shell.color_mode),
         nav_html = nav_html,
@@ -8787,7 +8797,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
             let light = theme_palette(theme, false);
             let dark = theme_palette(theme, true);
             format!(
-                "    :root {{\n      {light_vars}\n\n      --system-color-mode: light;\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    :root[data-resolved-color-mode=\"light\"] {{\n      {light_vars}\n    }}\n    :root[data-resolved-color-mode=\"dark\"] {{\n      {dark_vars}\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root {{\n        --system-color-mode: dark;\n        {dark_vars}\n      }}\n    }}",
+                "    :root {{\n      {light_vars}\n\n      --system-color-mode: light;\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    :root[data-color-mode=\"system\"][data-resolved-color-mode=\"light\"] {{\n      {light_vars}\n    }}\n    :root[data-color-mode=\"system\"][data-resolved-color-mode=\"dark\"] {{\n      {dark_vars}\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root[data-color-mode=\"system\"] {{\n        --system-color-mode: dark;\n        {dark_vars}\n      }}\n    }}",
                 light_vars = palette_css_vars(&light),
                 dark_vars = palette_css_vars(&dark)
             )
@@ -11420,6 +11430,7 @@ mod tests {
             "<p>content</p>".into(),
         );
 
+        assert!(html.contains(r#"<html lang="en" data-color-mode="system">"#));
         assert!(html.contains(r#"<meta name="color-scheme" content="light dark">"#));
         assert!(html.contains(r#"root.setAttribute('data-color-mode', mode);"#));
         assert!(html.contains(r#"root.style.colorScheme = resolved;"#));
@@ -11444,8 +11455,13 @@ mod tests {
         assert!(html.contains(r#"root.setAttribute('data-resolved-color-mode', resolved);"#));
         assert!(html.contains(r#"--system-color-mode: light;"#));
         assert!(html.contains(r#"--system-color-mode: dark;"#));
-        assert!(html.contains(r#":root[data-resolved-color-mode="light"] {"#));
-        assert!(html.contains(r#":root[data-resolved-color-mode="dark"] {"#));
+        assert!(
+            html.contains(r#":root[data-color-mode="system"][data-resolved-color-mode="light"] {"#)
+        );
+        assert!(
+            html.contains(r#":root[data-color-mode="system"][data-resolved-color-mode="dark"] {"#)
+        );
+        assert!(html.contains(r#":root[data-color-mode="system"] {"#));
         assert!(html.contains(r#"@media (prefers-color-scheme: dark) {"#));
     }
 
