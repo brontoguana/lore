@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -19,6 +20,7 @@ use tokio::io::AsyncBufReadExt;
 type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const CLI_SELF_UPDATE_SKIP_ENV: &str = "LORE_SKIP_CLI_SELF_UPDATE";
 const CLI_AUTO_UPDATE_INTERVAL_SECS: i64 = 24 * 60 * 60;
+const STOP_POLL_INTERVAL_MS: u64 = 200;
 
 fn resolve_executable_path(executable: &str, fallback_relative_paths: &[&str]) -> PathBuf {
     if executable.contains(std::path::MAIN_SEPARATOR) {
@@ -2345,6 +2347,15 @@ fn kill_process(pid: u32) {
         .status();
 }
 
+#[cfg(unix)]
+fn kill_process_tree(pid: u32) {
+    let pgid = -(pid as i32);
+    let rc = unsafe { libc::kill(pgid, libc::SIGKILL) };
+    if rc == -1 {
+        kill_process(pid);
+    }
+}
+
 #[cfg(windows)]
 fn is_process_running(pid: u32) -> bool {
     std::process::Command::new("tasklist")
@@ -2359,6 +2370,37 @@ fn kill_process(pid: u32) {
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
         .status();
+}
+
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
+}
+
+#[cfg(unix)]
+fn configure_child_process_group(command: &mut tokio::process::Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_command: &mut tokio::process::Command) {}
+
+async fn terminate_child_process_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        kill_process_tree(pid);
+    } else {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
 }
 
 fn get_hostname() -> String {
@@ -2589,6 +2631,42 @@ async fn take_stop_request(context: &CliContext) -> bool {
         },
         Err(_) => false,
     }
+}
+
+async fn wait_for_stop_request(context: &CliContext) {
+    loop {
+        if take_stop_request(context).await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(STOP_POLL_INTERVAL_MS)).await;
+    }
+}
+
+enum StopAware<T> {
+    Completed(T),
+    Stopped,
+}
+
+async fn race_with_stop<T, F>(context: &CliContext, future: F) -> StopAware<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        output = future => StopAware::Completed(output),
+        _ = wait_for_stop_request(context) => StopAware::Stopped,
+    }
+}
+
+async fn report_stop_acknowledged(context: &CliContext, token: &str) {
+    let _ = context
+        .client
+        .post(format!("{}/v1/chat/respond", context.url))
+        .header("x-lore-key", token)
+        .json(&serde_json::json!({
+            "tool_use": "control command acknowledged: /stop"
+        }))
+        .send()
+        .await;
 }
 
 async fn agent_poll_and_process(
@@ -3044,9 +3122,6 @@ async fn agent_poll_and_process(
         let mut response = String::new();
         let mut emitted_assistant_messages = false;
 
-        let mut stop_interval = tokio::time::interval(std::time::Duration::from_millis(500));
-        stop_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         loop {
             tokio::select! {
                 line = lines.next_line() => {
@@ -3093,14 +3168,11 @@ async fn agent_poll_and_process(
                         }
                     }
                 }
-                _ = stop_interval.tick() => {
-                    if take_stop_request(context).await {
-                        eprintln!("[agent] Stop requested during backend run; terminating child");
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        let _ = acknowledge_control_command("/stop").await;
-                        return Ok(AgentPollAction::Stop);
-                    }
+                _ = wait_for_stop_request(context) => {
+                    eprintln!("[agent] Stop requested during backend run; terminating child tree");
+                    terminate_child_process_tree(&mut child).await;
+                    let _ = acknowledge_control_command("/stop").await;
+                    return Ok(AgentPollAction::Stop);
                 }
             }
         }
@@ -3352,8 +3424,8 @@ async fn run_manager_cli(
             record_agent_error(context, agent_name, rec).await;
         }
         Err(_) => {
-            eprintln!("[manager] CLI timed out after 5 minutes, killing process");
-            let _ = child.kill().await;
+            eprintln!("[manager] CLI timed out after 5 minutes, killing process tree");
+            terminate_child_process_tree(&mut child).await;
             let rec =
                 AgentErrorRecord::new("manager", format!("{} cli timed out after 300s", backend));
             record_agent_error(context, agent_name, rec).await;
@@ -3907,6 +3979,11 @@ async fn run_api_agent_turn(
     let mut timeout_retries = 0usize;
 
     for turn in 0..API_AGENT_MAX_TURNS {
+        if take_stop_request(context).await {
+            report_stop_acknowledged(context, token).await;
+            return Ok((String::new(), false));
+        }
+
         trim_api_context(&mut messages);
 
         let mut body = serde_json::json!({
@@ -3919,14 +3996,24 @@ async fn run_api_agent_turn(
             body["model"] = serde_json::json!(m);
         }
 
-        let resp = context
-            .client
-            .post(format!("{}/v1/chat/completions", context.url))
-            .header("x-lore-key", token)
-            .timeout(std::time::Duration::from_secs(120))
-            .json(&body)
-            .send()
-            .await;
+        let resp = match race_with_stop(
+            context,
+            context
+                .client
+                .post(format!("{}/v1/chat/completions", context.url))
+                .header("x-lore-key", token)
+                .timeout(std::time::Duration::from_secs(120))
+                .json(&body)
+                .send(),
+        )
+        .await
+        {
+            StopAware::Completed(resp) => resp,
+            StopAware::Stopped => {
+                report_stop_acknowledged(context, token).await;
+                return Ok((String::new(), false));
+            }
+        };
 
         let resp = match resp {
             Ok(r) => {
@@ -3953,8 +4040,19 @@ async fn run_api_agent_turn(
             }
         };
 
+        if take_stop_request(context).await {
+            report_stop_acknowledged(context, token).await;
+            return Ok((String::new(), false));
+        }
+
         let status = resp.status();
-        let resp_text = resp.text().await.unwrap_or_default();
+        let resp_text = match race_with_stop(context, resp.text()).await {
+            StopAware::Completed(text) => text.unwrap_or_default(),
+            StopAware::Stopped => {
+                report_stop_acknowledged(context, token).await;
+                return Ok((String::new(), false));
+            }
+        };
         let resp_body: serde_json::Value =
             serde_json::from_str(&resp_text).unwrap_or(serde_json::Value::Null);
 
@@ -3977,10 +4075,20 @@ async fn run_api_agent_turn(
                     .header("x-lore-key", token)
                     .json(&serde_json::json!({ "tool_use": format!("\u{23f3} Rate limited, retrying in {API_AGENT_RATE_LIMIT_WAIT_SECS}s...") }))
                     .send().await;
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    API_AGENT_RATE_LIMIT_WAIT_SECS,
-                ))
-                .await;
+                match race_with_stop(
+                    context,
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        API_AGENT_RATE_LIMIT_WAIT_SECS,
+                    )),
+                )
+                .await
+                {
+                    StopAware::Completed(()) => {}
+                    StopAware::Stopped => {
+                        report_stop_acknowledged(context, token).await;
+                        return Ok((String::new(), false));
+                    }
+                }
                 continue;
             }
 
@@ -4047,6 +4155,11 @@ async fn run_api_agent_turn(
                 }));
 
                 for tc in tcs {
+                    if take_stop_request(context).await {
+                        report_stop_acknowledged(context, token).await;
+                        return Ok((accumulated_text.clone(), emitted_assistant_messages));
+                    }
+
                     let tool_id = tc["id"].as_str().unwrap_or("").to_string();
                     let func = tc.get("function");
                     let tool_name = func.and_then(|f| f["name"].as_str()).unwrap_or("");
@@ -4082,13 +4195,19 @@ async fn run_api_agent_turn(
                         .await;
 
                     let result_text = if parse_error {
-                        "Error: Failed to parse tool arguments (malformed JSON). Retry with valid JSON.".to_string()
+                        Some(
+                            "Error: Failed to parse tool arguments (malformed JSON). Retry with valid JSON.".to_string(),
+                        )
                     } else if is_lore_tool {
-                        let raw = execute_lore_tool(context, tool_name, &tool_args).await;
-                        truncate_local_tool_result(&raw)
+                        execute_lore_tool(context, tool_name, &tool_args).await
                     } else {
-                        let raw = execute_local_tool(tool_name, &tool_args).await;
-                        truncate_local_tool_result(&raw)
+                        execute_local_tool(context, tool_name, &tool_args).await
+                    };
+
+                    let Some(result_text) = result_text.map(|raw| truncate_local_tool_result(&raw))
+                    else {
+                        report_stop_acknowledged(context, token).await;
+                        return Ok((accumulated_text.clone(), emitted_assistant_messages));
                     };
 
                     messages.push(serde_json::json!({
@@ -4261,31 +4380,90 @@ async fn fetch_lore_tools(context: &CliContext) -> Vec<serde_json::Value> {
     }
 }
 
-async fn execute_lore_tool(context: &CliContext, name: &str, args: &serde_json::Value) -> String {
+async fn execute_lore_tool(
+    context: &CliContext,
+    name: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
     let token = match context.token.as_deref() {
         Some(t) => t,
-        None => return "Error: no token configured".to_string(),
+        None => return Some("Error: no token configured".to_string()),
     };
-    let resp = context
-        .client
-        .post(format!("{}/v1/chat/lore-tools", context.url))
-        .header("x-lore-key", token)
-        .timeout(std::time::Duration::from_secs(30))
-        .json(&serde_json::json!({ "name": name, "arguments": args }))
-        .send()
-        .await;
+    let resp = match race_with_stop(
+        context,
+        context
+            .client
+            .post(format!("{}/v1/chat/lore-tools", context.url))
+            .header("x-lore-key", token)
+            .timeout(std::time::Duration::from_secs(30))
+            .json(&serde_json::json!({ "name": name, "arguments": args }))
+            .send(),
+    )
+    .await
+    {
+        StopAware::Completed(resp) => resp,
+        StopAware::Stopped => return None,
+    };
     match resp {
-        Ok(r) => {
-            if let Ok(body) = r.json::<serde_json::Value>().await {
+        Ok(r) => match race_with_stop(context, r.json::<serde_json::Value>()).await {
+            StopAware::Completed(Ok(body)) => Some(
                 body["result"]
                     .as_str()
                     .unwrap_or("(empty result)")
-                    .to_string()
-            } else {
-                "Error: failed to parse server response".to_string()
+                    .to_string(),
+            ),
+            StopAware::Completed(Err(_)) => {
+                Some("Error: failed to parse server response".to_string())
             }
+            StopAware::Stopped => None,
+        },
+        Err(e) => Some(format!("Error calling Lore tool: {e}")),
+    }
+}
+
+async fn execute_local_tool(
+    context: &CliContext,
+    name: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    match name {
+        "read_file" => Some(execute_read_file(args).await),
+        "write_file" => Some(execute_write_file(args).await),
+        "edit_file" => Some(execute_edit_file(args).await),
+        "bash" => execute_bash(context, args).await,
+        "grep" => execute_grep(context, args).await,
+        "glob" => execute_glob(context, args).await,
+        "list_directory" => Some(execute_list_directory(args).await),
+        _ => Some(format!("Unknown tool: {name}")),
+    }
+}
+
+async fn wait_for_child_output(
+    child: tokio::process::Child,
+    timeout: std::time::Duration,
+    timeout_message: &'static str,
+    context: &CliContext,
+) -> Option<Result<std::process::Output, io::Error>> {
+    let pid = child.id();
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
+
+    tokio::select! {
+        output = &mut wait => Some(output),
+        _ = tokio::time::sleep(timeout) => {
+            if let Some(pid) = pid {
+                kill_process_tree(pid);
+            }
+            let _ = wait.await;
+            Some(Err(io::Error::new(io::ErrorKind::TimedOut, timeout_message)))
         }
-        Err(e) => format!("Error calling Lore tool: {e}"),
+        _ = wait_for_stop_request(context) => {
+            if let Some(pid) = pid {
+                kill_process_tree(pid);
+            }
+            let _ = wait.await;
+            None
+        }
     }
 }
 
@@ -4432,19 +4610,6 @@ fn build_local_tools() -> Vec<serde_json::Value> {
     ]
 }
 
-async fn execute_local_tool(name: &str, args: &serde_json::Value) -> String {
-    match name {
-        "read_file" => execute_read_file(args).await,
-        "write_file" => execute_write_file(args).await,
-        "edit_file" => execute_edit_file(args).await,
-        "bash" => execute_bash(args).await,
-        "grep" => execute_grep(args).await,
-        "glob" => execute_glob(args).await,
-        "list_directory" => execute_list_directory(args).await,
-        _ => format!("Unknown tool: {name}"),
-    }
-}
-
 async fn execute_read_file(args: &serde_json::Value) -> String {
     let path = match args["path"].as_str() {
         Some(p) => p.to_string(),
@@ -4540,23 +4705,30 @@ async fn execute_edit_file(args: &serde_json::Value) -> String {
     }).await.unwrap_or_else(|e| format!("Error: task failed: {e}"))
 }
 
-async fn execute_bash(args: &serde_json::Value) -> String {
+async fn execute_bash(context: &CliContext, args: &serde_json::Value) -> Option<String> {
     let command = match args["command"].as_str() {
         Some(c) => c,
-        None => return "Error: command is required".to_string(),
+        None => return Some("Error: command is required".to_string()),
     };
-    let result = tokio::time::timeout(
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.args(["-lc", command])
+        .current_dir(&agent_cwd())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    configure_child_process_group(&mut cmd);
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return Some(format!("Error running command: {e}")),
+    };
+    let result = wait_for_child_output(
+        child,
         std::time::Duration::from_secs(120),
-        tokio::process::Command::new("bash")
-            .args(["-lc", command])
-            .current_dir(&agent_cwd())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output(),
+        "command timed out after 120 seconds",
+        context,
     )
     .await;
     match result {
-        Ok(Ok(output)) => {
+        Some(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let exit_code = output.status.code().unwrap_or(-1);
@@ -4574,20 +4746,21 @@ async fn execute_bash(args: &serde_json::Value) -> String {
                 r.push_str(&format!("\n(exit code: {exit_code})"));
             }
             if r.is_empty() {
-                format!("(no output, exit code: {exit_code})")
+                Some(format!("(no output, exit code: {exit_code})"))
             } else {
-                r
+                Some(r)
             }
         }
-        Ok(Err(e)) => format!("Error running command: {e}"),
-        Err(_) => "Error: command timed out after 120 seconds".to_string(),
+        Some(Err(e)) if e.kind() == io::ErrorKind::TimedOut => Some(format!("Error: {e}")),
+        Some(Err(e)) => Some(format!("Error running command: {e}")),
+        None => None,
     }
 }
 
-async fn execute_grep(args: &serde_json::Value) -> String {
+async fn execute_grep(context: &CliContext, args: &serde_json::Value) -> Option<String> {
     let pattern = match args["pattern"].as_str() {
         Some(p) => p,
-        None => return "Error: pattern is required".to_string(),
+        None => return Some("Error: pattern is required".to_string()),
     };
     let path = args["path"].as_str().unwrap_or(".");
     let resolved = resolve_agent_path(path);
@@ -4601,24 +4774,37 @@ async fn execute_grep(args: &serde_json::Value) -> String {
     cmd.current_dir(&agent_cwd());
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
-        Ok(Ok(output)) => {
+    configure_child_process_group(&mut cmd);
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return Some(format!("Error: {e}")),
+    };
+    match wait_for_child_output(
+        child,
+        std::time::Duration::from_secs(30),
+        "grep timed out",
+        context,
+    )
+    .await
+    {
+        Some(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.is_empty() {
-                "No matches found".to_string()
+                Some("No matches found".to_string())
             } else {
-                stdout.to_string()
+                Some(stdout.to_string())
             }
         }
-        Ok(Err(e)) => format!("Error: {e}"),
-        Err(_) => "Error: grep timed out".to_string(),
+        Some(Err(e)) if e.kind() == io::ErrorKind::TimedOut => Some(format!("Error: {e}")),
+        Some(Err(e)) => Some(format!("Error: {e}")),
+        None => None,
     }
 }
 
-async fn execute_glob(args: &serde_json::Value) -> String {
+async fn execute_glob(context: &CliContext, args: &serde_json::Value) -> Option<String> {
     let pattern = match args["pattern"].as_str() {
         Some(p) => p,
-        None => return "Error: pattern is required".to_string(),
+        None => return Some("Error: pattern is required".to_string()),
     };
     let path = args["path"].as_str().unwrap_or(".");
     let resolved = resolve_agent_path(path);
@@ -4627,17 +4813,30 @@ async fn execute_glob(args: &serde_json::Value) -> String {
     cmd.current_dir(&agent_cwd());
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    match tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await {
-        Ok(Ok(output)) => {
+    configure_child_process_group(&mut cmd);
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return Some(format!("Error: {e}")),
+    };
+    match wait_for_child_output(
+        child,
+        std::time::Duration::from_secs(15),
+        "glob search timed out",
+        context,
+    )
+    .await
+    {
+        Some(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.is_empty() {
-                "No files found".to_string()
+                Some("No files found".to_string())
             } else {
-                stdout.to_string()
+                Some(stdout.to_string())
             }
         }
-        Ok(Err(e)) => format!("Error: {e}"),
-        Err(_) => "Error: glob search timed out".to_string(),
+        Some(Err(e)) if e.kind() == io::ErrorKind::TimedOut => Some(format!("Error: {e}")),
+        Some(Err(e)) => Some(format!("Error: {e}")),
+        None => None,
     }
 }
 
@@ -5149,6 +5348,7 @@ async fn spawn_backend(
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .env_remove("CLAUDECODE");
+            configure_child_process_group(&mut cmd);
             if let Some(token) = agent_token {
                 cmd.env("LORE_AGENT_TOKEN", token);
             }
@@ -5173,6 +5373,7 @@ async fn spawn_backend(
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            configure_child_process_group(&mut cmd);
             if let Some(token) = agent_token {
                 cmd.env("LORE_AGENT_TOKEN", token);
             }
@@ -5197,6 +5398,7 @@ async fn spawn_backend(
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            configure_child_process_group(&mut cmd);
             if let Some(token) = agent_token {
                 cmd.env("LORE_AGENT_TOKEN", token);
             }

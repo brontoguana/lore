@@ -15523,6 +15523,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_stop_command_is_not_persisted_as_chat_message() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let _agent_token =
+            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        state
+            .chat
+            .update_auto_message("admin", "agent-main", Some("repeat this".into()))
+            .unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/agent-main/command")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}&command={}",
+                urlencoding::encode(&csrf_token),
+                urlencoding::encode("/stop")
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["response"], "Stop requested. Auto-repeat cleared.");
+
+        let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert!(conv.messages.is_empty());
+        assert!(conv.auto_message.is_none());
+    }
+
+    #[tokio::test]
     async fn chat_send_retries_same_client_message_id_without_duplicates() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));

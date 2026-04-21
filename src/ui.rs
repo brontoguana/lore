@@ -71,63 +71,17 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
         r#"(function() {{
   var root = document.documentElement;
   var mode = '{mode}';
-  var resyncTimers = [];
-  function readCssResolvedMode() {{
-    if (!window.getComputedStyle) return null;
-    var probe = window.getComputedStyle(root).getPropertyValue('--system-color-mode');
-    if (!probe) return null;
-    probe = probe.trim().replace(/^['"]|['"]$/g, '');
-    return probe === 'dark' ? 'dark' : probe === 'light' ? 'light' : null;
-  }}
   function setResolvedMode(resolved) {{
     root.setAttribute('data-resolved-color-mode', resolved);
-    root.style.colorScheme = mode === 'system' ? 'light dark' : resolved;
-  }}
-  function clearResyncTimers() {{
-    while (resyncTimers.length) {{
-      clearTimeout(resyncTimers.pop());
-    }}
   }}
   root.setAttribute('data-color-mode', mode);
-  if (mode !== 'system') {{
-    setResolvedMode(mode);
+  if (mode === 'system') {{
+    root.removeAttribute('data-resolved-color-mode');
+    root.style.colorScheme = 'light dark';
     return;
   }}
-  if (!window.matchMedia) {{
-    setResolvedMode(readCssResolvedMode() || 'light');
-    return;
-  }}
-  var query = window.matchMedia('(prefers-color-scheme: dark)');
-  function detectResolvedMode() {{
-    return readCssResolvedMode() || (query.matches ? 'dark' : 'light');
-  }}
-  function applyResolvedMode() {{
-    setResolvedMode(detectResolvedMode());
-  }}
-  function scheduleResolvedModeResync() {{
-    clearResyncTimers();
-    applyResolvedMode();
-    [80, 240, 600, 1200].forEach(function(delay) {{
-      resyncTimers.push(setTimeout(applyResolvedMode, delay));
-    }});
-  }}
-  applyResolvedMode();
-  if (typeof query.addEventListener === 'function') {{
-    query.addEventListener('change', scheduleResolvedModeResync);
-  }} else if (typeof query.addListener === 'function') {{
-    query.addListener(scheduleResolvedModeResync);
-  }}
-  window.addEventListener('pageshow', scheduleResolvedModeResync);
-  window.addEventListener('load', scheduleResolvedModeResync);
-  window.addEventListener('focus', scheduleResolvedModeResync);
-  document.addEventListener('visibilitychange', function() {{
-    if (!document.hidden) scheduleResolvedModeResync();
-  }});
-  if (window.requestAnimationFrame) {{
-    window.requestAnimationFrame(function() {{
-      window.requestAnimationFrame(applyResolvedMode);
-    }});
-  }}
+  setResolvedMode(mode);
+  root.style.colorScheme = mode;
 }})();"#,
         mode = mode.as_str()
     )
@@ -4092,10 +4046,12 @@ function resizeChatInput() {{
   if (!input) return false;
   var form = document.getElementById('chat-input-form');
   var header = document.querySelector('.chat-header');
+  var messages = document.getElementById('chat-messages');
   var viewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
   var headerBottom = 0;
   var prevHeight = input.offsetHeight;
   var prevOverflow = input.style.overflowY;
+  var wasFollowing = chatShouldFollow(messages, chatFollowScroll);
   if (header) {{
     var headerRect = header.getBoundingClientRect();
     headerBottom = Math.max(0, headerRect.bottom);
@@ -4109,6 +4065,10 @@ function resizeChatInput() {{
   input.style.height = nextHeight + 'px';
   input.style.overflowY = nextOverflow;
   var changed = Math.abs(nextHeight - prevHeight) > 1 || prevOverflow !== nextOverflow;
+  if (changed && messages && wasFollowing) {{
+    chatFollowScroll = true;
+    messages.scrollTop = messages.scrollHeight;
+  }}
   if (changed) updateChatJumpButton();
   return changed;
 }}
@@ -4689,10 +4649,8 @@ function sendMessage(e) {{
     input.value = '';
     resizeChatInput();
     chatFollowScroll = true;
-    insertChatMessage({{ role: 'user', content: text }});
     moveAgentItemToTop(currentAgent);
     updateAgentListPreview(currentAgent, text);
-    renderMessages();
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/ui/chat/' + encodeURIComponent(currentAgent) + '/command');
     xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
@@ -11462,7 +11420,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_bootstraps_system_color_mode_for_mobile_clients() {
+    fn shell_uses_css_only_system_color_mode_bootstrap() {
         let html = render_shell(
             PageShell {
                 title: "Lore",
@@ -11479,34 +11437,19 @@ mod tests {
         assert!(html.contains(r#"<html lang="en" data-color-mode="system">"#));
         assert!(html.contains(r#"<meta name="color-scheme" content="light dark">"#));
         assert!(html.contains(r#"root.setAttribute('data-color-mode', mode);"#));
-        assert!(
-            html.contains(
-                r#"root.style.colorScheme = mode === 'system' ? 'light dark' : resolved;"#
-            )
-        );
-        assert!(html.contains(r#"function readCssResolvedMode() {"#));
-        assert!(
-            html.contains(
-                r#"window.getComputedStyle(root).getPropertyValue('--system-color-mode');"#
-            )
-        );
-        assert!(
-            html.contains(r#"return readCssResolvedMode() || (query.matches ? 'dark' : 'light');"#)
-        );
-        assert!(html.contains(r#"var resyncTimers = [];"#));
-        assert!(html.contains(r#"function scheduleResolvedModeResync() {"#));
-        assert!(html.contains(r#"[80, 240, 600, 1200].forEach(function(delay) {"#));
-        assert!(
-            html.contains(r#"window.addEventListener('pageshow', scheduleResolvedModeResync);"#)
-        );
-        assert!(html.contains(r#"window.addEventListener('load', scheduleResolvedModeResync);"#));
-        assert!(html.contains(r#"document.addEventListener('visibilitychange', function() {"#));
-        assert!(html.contains(r#"window.requestAnimationFrame(function() {"#));
-        assert!(html.contains(r#"root.setAttribute('data-resolved-color-mode', resolved);"#));
+        assert!(html.contains(r#"if (mode === 'system') {"#));
+        assert!(html.contains(r#"root.removeAttribute('data-resolved-color-mode');"#));
+        assert!(html.contains(r#"root.style.colorScheme = 'light dark';"#));
         assert!(html.contains(r#"--system-color-mode: light;"#));
         assert!(html.contains(r#"--system-color-mode: dark;"#));
         assert!(html.contains(r#":root[data-color-mode="system"] {"#));
         assert!(html.contains(r#"@media (prefers-color-scheme: dark) {"#));
+        assert!(!html.contains(r#"window.matchMedia('(prefers-color-scheme: dark)')"#));
+        assert!(
+            !html.contains(
+                r#"window.getComputedStyle(root).getPropertyValue('--system-color-mode');"#
+            )
+        );
         assert!(!html.contains(r#"data-resolved-color-mode="light"] {"#));
         assert!(!html.contains(r#"data-resolved-color-mode="dark"] {"#));
     }

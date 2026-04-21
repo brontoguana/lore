@@ -1390,6 +1390,51 @@ async fn spawn_mock_llm() -> (SocketAddr, tokio::sync::mpsc::Sender<()>) {
     (addr, shutdown_tx)
 }
 
+async fn spawn_blocking_mock_llm() -> (
+    SocketAddr,
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+) {
+    use axum::{Json, Router, routing::post};
+
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let started_for_handler = started.clone();
+    let release_for_handler = release.clone();
+
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let started = started_for_handler.clone();
+            let release = release_for_handler.clone();
+            async move {
+                started.notify_one();
+                release.notified().await;
+                Json(json!({
+                    "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                    "object": "chat.completion",
+                    "model": "mock-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "late response"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    (addr, started, release)
+}
+
 #[tokio::test]
 async fn mock_llm_responds() {
     let (llm_addr, _shutdown) = spawn_mock_llm().await;
@@ -2057,6 +2102,321 @@ async fn agent_chat_keeps_follow_up_messages_sent_while_thinking() {
         "Second message",
         "queued follow-up should still be pending after the first response: {body}"
     );
+}
+
+#[tokio::test]
+async fn simulated_api_agent_observes_stop_and_aborts_inflight_request() {
+    let dir = tempdir().unwrap();
+    let (llm_addr, llm_started, llm_release) = spawn_blocking_mock_llm().await;
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    let endpoint_id = create_endpoint(
+        &client,
+        &addr,
+        "stop-endpoint",
+        &format!("http://{llm_addr}/v1/chat/completions"),
+        "mock-model",
+    )
+    .await;
+
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "stop-api-agent",
+        &[("chat.proj", "read_write")],
+    )
+    .await;
+
+    let resp = client
+        .post(url(&addr, "/v1/blocks"))
+        .header("x-lore-key", &token)
+        .json(&json!({"project": "chat.proj", "block_type": "markdown", "content": "seed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let (cookie, csrf) = admin_login(&client, &addr).await;
+    let resp = client
+        .post(url(&addr, "/ui/chat/stop-api-agent/config"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={}&endpoint_id={}", csrf, endpoint_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(url(&addr, "/ui/chat/stop-api-agent/send"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={}&message=Please+work", csrf))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let client_for_agent = client.clone();
+    let token_for_agent = token.clone();
+    let agent_task = tokio::spawn(async move {
+        let resp = client_for_agent
+            .get(url(&addr, "/v1/chat/poll"))
+            .header("x-lore-key", &token_for_agent)
+            .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let msgs = body["messages"]
+            .as_array()
+            .expect("messages should be array");
+        assert_eq!(msgs.len(), 1, "poll should claim one message: {body}");
+
+        let resp = client_for_agent
+            .post(url(&addr, "/v1/chat/status"))
+            .header("x-lore-key", &token_for_agent)
+            .json(&json!({ "status": "thinking" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let provider_client = reqwest::Client::new();
+        let provider_task = tokio::spawn(async move {
+            provider_client
+                .post(format!("http://{llm_addr}/v1/chat/completions"))
+                .json(&json!({
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": "Please work"}],
+                    "stream": false
+                }))
+                .send()
+                .await
+        });
+
+        loop {
+            let resp = client_for_agent
+                .get(url(&addr, "/v1/chat/stop-requested"))
+                .header("x-lore-key", &token_for_agent)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            if body["stop_requested"] == true {
+                provider_task.abort();
+                let join = provider_task.await.unwrap_err();
+                assert!(join.is_cancelled(), "provider request should be cancelled");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), llm_started.notified())
+        .await
+        .expect("simulated API backend never started its provider request");
+
+    let resp = client
+        .post(url(&addr, "/ui/chat/stop-api-agent/command"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "csrf_token={}&command={}",
+            urlencoding::encode(&csrf),
+            urlencoding::encode("/stop")
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["response"], "Stop requested. Auto-repeat cleared.");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent_task)
+        .await
+        .expect("simulated API agent did not stop promptly")
+        .unwrap();
+
+    llm_release.notify_waiters();
+
+    let resp = client
+        .get(url(&addr, "/v1/chat/history"))
+        .header("x-lore-key", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let history: Value = resp.json().await.unwrap();
+    let messages = history["messages"].as_array().expect("history messages");
+    assert_eq!(messages.len(), 1, "stop should prevent an assistant reply");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "Please work");
+}
+
+#[tokio::test]
+async fn simulated_cli_agent_observes_stop_and_kills_fake_backend() {
+    let dir = tempdir().unwrap();
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "stop-cli-agent",
+        &[("chat.proj", "read_write")],
+    )
+    .await;
+
+    let resp = client
+        .post(url(&addr, "/v1/blocks"))
+        .header("x-lore-key", &token)
+        .json(&json!({"project": "chat.proj", "block_type": "markdown", "content": "seed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let (cookie, csrf) = admin_login(&client, &addr).await;
+    let resp = client
+        .post(url(&addr, "/ui/chat/stop-cli-agent/send"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={}&message=Run+the+CLI+job", csrf))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let fake_bin_dir = dir.path().join("fake-bin-stop");
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let fake_claude_path = fake_bin_dir.join("fake-claude-stop");
+    std::fs::write(
+        &fake_claude_path,
+        concat!(
+            "#!/bin/sh\n",
+            "cat > /dev/null\n",
+            "sleep 10\n",
+            "echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"too late\"}]}}'\n",
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_claude_path, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+
+    let backend_started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let backend_started_for_task = backend_started.clone();
+    let client_for_agent = client.clone();
+    let token_for_agent = token.clone();
+    let fake_claude_for_agent = fake_claude_path.clone();
+    let agent_task = tokio::spawn(async move {
+        let resp = client_for_agent
+            .get(url(&addr, "/v1/chat/poll"))
+            .header("x-lore-key", &token_for_agent)
+            .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let msgs = body["messages"]
+            .as_array()
+            .expect("messages should be array");
+        assert_eq!(msgs.len(), 1, "poll should claim one message: {body}");
+
+        let resp = client_for_agent
+            .post(url(&addr, "/v1/chat/status"))
+            .header("x-lore-key", &token_for_agent)
+            .json(&json!({ "status": "thinking" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let start = std::time::Instant::now();
+        let mut child = tokio::process::Command::new(&fake_claude_for_agent)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn fake CLI backend");
+        drop(child.stdin.take());
+        backend_started_for_task.notify_one();
+
+        loop {
+            let resp = client_for_agent
+                .get(url(&addr, "/v1/chat/stop-requested"))
+                .header("x-lore-key", &token_for_agent)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            if body["stop_requested"] == true {
+                child.start_kill().expect("failed to kill fake CLI backend");
+                let exit = child.wait().await.unwrap();
+                assert!(
+                    !exit.success(),
+                    "stopped fake CLI backend should not exit successfully"
+                );
+                return start.elapsed();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        backend_started.notified(),
+    )
+    .await
+    .expect("simulated CLI backend never started");
+
+    let resp = client
+        .post(url(&addr, "/ui/chat/stop-cli-agent/command"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "csrf_token={}&command={}",
+            urlencoding::encode(&csrf),
+            urlencoding::encode("/stop")
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["response"], "Stop requested. Auto-repeat cleared.");
+
+    let elapsed = tokio::time::timeout(std::time::Duration::from_secs(3), agent_task)
+        .await
+        .expect("simulated CLI agent did not stop promptly")
+        .unwrap();
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "stop should kill the fake CLI backend well before its 10s sleep, got {:?}",
+        elapsed
+    );
+
+    let resp = client
+        .get(url(&addr, "/v1/chat/history"))
+        .header("x-lore-key", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let history: Value = resp.json().await.unwrap();
+    let messages = history["messages"].as_array().expect("history messages");
+    assert_eq!(messages.len(), 1, "stop should prevent an assistant reply");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "Run the CLI job");
 }
 
 #[tokio::test]
