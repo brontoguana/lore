@@ -18,6 +18,7 @@ TAG_CREATED=0
 REMOTE_BINARY_SWAPPED=0
 REMOTE_BACKUP_CREATED=0
 DEPLOY_VERIFIED=0
+CLIENT_TARGET="$(rustc -vV | sed -n 's/^host: //p' | head -1)"
 
 cleanup() {
     local exit_code=$?
@@ -240,9 +241,13 @@ REMOTE_BINARY_SWAPPED=1
 
 # --- Stage client binary for machine self-update (direct download, no GitHub release needed) ---
 echo "Staging client binary for machine updates..."
+if [ -z "$CLIENT_TARGET" ]; then
+    echo "Could not determine local Rust host target"
+    exit 1
+fi
 ssh "$SERVER" "mkdir -p /home/lore/lore/updates"
 scp -q target/release/lore "${SERVER}:${REMOTE_CLIENT_UPLOAD}"
-ssh "$SERVER" "chmod +x '${REMOTE_CLIENT_UPLOAD}' && mv '${REMOTE_CLIENT_UPLOAD}' /home/lore/lore/updates/lore"
+ssh "$SERVER" "chmod +x '${REMOTE_CLIENT_UPLOAD}' && mv '${REMOTE_CLIENT_UPLOAD}' '/home/lore/lore/updates/lore-${CLIENT_TARGET}' && ln -sfn 'lore-${CLIENT_TARGET}' /home/lore/lore/updates/lore"
 
 # --- Restart service ---
 echo "Restarting..."

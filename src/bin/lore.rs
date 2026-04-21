@@ -1905,37 +1905,66 @@ async fn apply_cli_update_to_target(
 /// Download the lore binary directly from the server's staged binary endpoint.
 /// Returns Ok(true) if updated, Ok(false) if not available, Err on failure.
 async fn download_binary_from_server(context: &CliContext, machine_token: &str) -> CliResult<bool> {
-    let url = format!("{}/v1/machines/binary", context.url);
     eprintln!("[service] Trying direct binary download from server...");
-    let resp = context
-        .client
-        .get(&url)
-        .header("x-lore-key", machine_token)
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await;
-    let resp = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[service] Server binary download failed: {e}");
-            return Ok(false);
+    let target = match service_update_target() {
+        Ok(target) => Some(target),
+        Err(err) => {
+            eprintln!("[service] Could not determine target-specific update path: {err}");
+            None
         }
     };
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        eprintln!("[service] No staged binary on server, will try GitHub");
-        return Ok(false);
+    let mut urls = Vec::new();
+    if let Some(ref target) = target {
+        urls.push(format!("{}/v1/machines/binary/{target}", context.url));
     }
-    if !resp.status().is_success() {
-        eprintln!(
-            "[service] Server binary download returned {}",
-            resp.status()
+    urls.push(format!("{}/v1/machines/binary", context.url));
+
+    let mut bytes = None;
+    for (index, url) in urls.iter().enumerate() {
+        let resp = context
+            .client
+            .get(url)
+            .header("x-lore-key", machine_token)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[service] Server binary download failed: {e}");
+                if index + 1 == urls.len() {
+                    return Ok(false);
+                }
+                continue;
+            }
+        };
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            if index + 1 == urls.len() {
+                eprintln!("[service] No staged binary on server, will try GitHub");
+                return Ok(false);
+            }
+            continue;
+        }
+        if !resp.status().is_success() {
+            eprintln!(
+                "[service] Server binary download returned {}",
+                resp.status()
+            );
+            if index + 1 == urls.len() {
+                return Ok(false);
+            }
+            continue;
+        }
+        bytes = Some(
+            resp.bytes()
+                .await
+                .map_err(|e| io::Error::other(format!("failed to read binary response: {e}")))?,
         );
-        return Ok(false);
+        break;
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| io::Error::other(format!("failed to read binary response: {e}")))?;
+    let Some(bytes) = bytes else {
+        return Ok(false);
+    };
     if bytes.len() < 1024 {
         eprintln!(
             "[service] Server binary too small ({}b), ignoring",
@@ -1961,6 +1990,28 @@ async fn download_binary_from_server(context: &CliContext, machine_token: &str) 
     fs::rename(&temp_path, &executable_path)?;
     eprintln!("[service] Binary replaced successfully");
     Ok(true)
+}
+
+fn service_update_target() -> io::Result<String> {
+    let arch = match env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => {
+            return Err(io::Error::other(format!(
+                "unsupported architecture for direct server update: {other}"
+            )));
+        }
+    };
+    let os = match env::consts::OS {
+        "linux" => "unknown-linux-gnu",
+        "macos" => "apple-darwin",
+        other => {
+            return Err(io::Error::other(format!(
+                "unsupported operating system for direct server update: {other}"
+            )));
+        }
+    };
+    Ok(format!("{arch}-{os}"))
 }
 
 async fn apply_cli_update_with_source(
@@ -6491,6 +6542,7 @@ mod tests {
         DocWriteArgs, append_assistant_segment, append_new_stream_text, count_history_exchanges,
         history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
         load_doc_write_content, parse_codex_line, recent_history_exchange_tail,
+        service_update_target,
     };
     use serde_json::json;
     use std::collections::HashSet;
@@ -6564,6 +6616,18 @@ mod tests {
             Some("\n\nSecond update".to_string())
         );
         assert_eq!(accumulated, "First update\n\nSecond update");
+    }
+
+    #[test]
+    fn service_update_target_matches_supported_runtime_targets() {
+        let target = service_update_target().unwrap();
+        assert!(matches!(
+            target.as_str(),
+            "x86_64-unknown-linux-gnu"
+                | "aarch64-unknown-linux-gnu"
+                | "x86_64-apple-darwin"
+                | "aarch64-apple-darwin"
+        ));
     }
 
     #[test]

@@ -1624,6 +1624,10 @@ pub fn render_admin_page(
         <div style="padding:0 var(--s-5) var(--s-5)">
           <button type="button" id="update-all-machines-btn" data-csrf="{csrf_token}">Update all machines</button>
         </div>
+        <label class="toggle" style="padding:0 var(--s-5) var(--s-5);">
+          <input type="checkbox" id="auto-update-machines-toggle" data-csrf="{csrf_token}"{auto_update_machines_checked}>
+          <span>Automatically update machines when the server comes online on a new version</span>
+        </label>
 
         <div class="panel-header" style="margin-top:var(--s-5)">
           <h2>Auto Update</h2>
@@ -1802,14 +1806,19 @@ pub fn render_admin_page(
 
       var autoCb = document.getElementById('auto-update-toggle');
       var autoStream = document.getElementById('auto-update-stream');
+      var autoMachinesCb = document.getElementById('auto-update-machines-toggle');
       function saveAutoUpdateSettings() {{
-        if (!autoCb) return;
-        var csrf = autoCb.getAttribute('data-csrf');
+        var source = autoCb || autoMachinesCb;
+        if (!source) return;
+        var csrf = source.getAttribute('data-csrf');
         var stream = autoStream ? autoStream.value : 'stable';
         fetch('/ui/admin/auto-update/toggle-json', {{
           method: 'POST',
           headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-          body: 'csrf_token=' + encodeURIComponent(csrf) + '&enabled=' + autoCb.checked + '&release_stream=' + encodeURIComponent(stream)
+          body: 'csrf_token=' + encodeURIComponent(csrf)
+            + '&enabled=' + encodeURIComponent(autoCb ? String(autoCb.checked) : 'false')
+            + '&release_stream=' + encodeURIComponent(stream)
+            + '&auto_update_machines=' + encodeURIComponent(autoMachinesCb ? String(autoMachinesCb.checked) : 'false')
         }});
       }}
       if (autoCb) {{
@@ -1819,6 +1828,11 @@ pub fn render_admin_page(
       }}
       if (autoStream) {{
         autoStream.addEventListener('change', function() {{
+          saveAutoUpdateSettings();
+        }});
+      }}
+      if (autoMachinesCb) {{
+        autoMachinesCb.addEventListener('change', function() {{
           saveAutoUpdateSettings();
         }});
       }}
@@ -2041,6 +2055,11 @@ pub fn render_admin_page(
             oidc_config.callback_path
         )),
         auto_update_enabled_checked = if auto_update_config.enabled {
+            " checked"
+        } else {
+            ""
+        },
+        auto_update_machines_checked = if auto_update_config.auto_update_machines {
             " checked"
         } else {
             ""

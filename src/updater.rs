@@ -11,6 +11,14 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const DEFAULT_UPDATE_REPO: &str = "brontoguana/lore";
+pub const SERVER_RELEASE_CLI_TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+];
+pub const LEGACY_MACHINE_BINARY_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +45,10 @@ pub struct AutoUpdateConfig {
     pub github_repo: String,
     #[serde(default)]
     pub release_stream: ReleaseStream,
+    #[serde(default)]
+    pub auto_update_machines: bool,
+    #[serde(default)]
+    pub last_machine_rollout_version: Option<String>,
     pub updated_at: OffsetDateTime,
 }
 
@@ -46,16 +58,26 @@ impl AutoUpdateConfig {
             enabled: false,
             github_repo: default_update_repo(),
             release_stream: ReleaseStream::Stable,
+            auto_update_machines: false,
+            last_machine_rollout_version: None,
             updated_at: OffsetDateTime::now_utc(),
         }
     }
 
-    pub fn new(enabled: bool, github_repo: String, release_stream: ReleaseStream) -> Result<Self> {
+    pub fn new(
+        enabled: bool,
+        github_repo: String,
+        release_stream: ReleaseStream,
+        auto_update_machines: bool,
+        last_machine_rollout_version: Option<String>,
+    ) -> Result<Self> {
         validate_github_repo(&github_repo)?;
         Ok(Self {
             enabled,
             github_repo,
             release_stream,
+            auto_update_machines,
+            last_machine_rollout_version,
             updated_at: OffsetDateTime::now_utc(),
         })
     }
@@ -94,8 +116,33 @@ impl AutoUpdateConfigStore {
         enabled: bool,
         github_repo: String,
         release_stream: ReleaseStream,
+        auto_update_machines: bool,
     ) -> Result<AutoUpdateConfig> {
-        let config = AutoUpdateConfig::new(enabled, github_repo, release_stream)?;
+        let current = self.load()?;
+        let config = AutoUpdateConfig::new(
+            enabled,
+            github_repo,
+            release_stream,
+            auto_update_machines,
+            current.last_machine_rollout_version,
+        )?;
+        self.ensure_layout()?;
+        write_json_atomic(self.config_path(), &config)?;
+        Ok(config)
+    }
+
+    pub fn set_last_machine_rollout_version(
+        &self,
+        version: Option<String>,
+    ) -> Result<AutoUpdateConfig> {
+        let current = self.load()?;
+        let config = AutoUpdateConfig::new(
+            current.enabled,
+            current.github_repo,
+            current.release_stream,
+            current.auto_update_machines,
+            version,
+        )?;
         self.ensure_layout()?;
         write_json_atomic(self.config_path(), &config)?;
         Ok(config)
@@ -360,6 +407,74 @@ pub async fn apply_update_to_version(
     }))
 }
 
+pub async fn sync_release_binaries_to_directory(
+    client: &reqwest::Client,
+    binary_name: &str,
+    target_version: &str,
+    github_repo: &str,
+    output_dir: &Path,
+) -> Result<Vec<String>> {
+    validate_github_repo(github_repo)?;
+    let target_version = normalize_version_tag(target_version);
+    fs::create_dir_all(output_dir)?;
+    if release_binaries_are_current(binary_name, output_dir, &target_version) {
+        ensure_legacy_machine_binary_link(output_dir, binary_name)?;
+        return Ok(SERVER_RELEASE_CLI_TARGETS
+            .iter()
+            .map(|target| (*target).to_string())
+            .collect());
+    }
+
+    let tag = format!("v{target_version}");
+    let release = fetch_release_by_tag(client, github_repo, &tag).await?;
+    let staging_dir = output_dir.join(format!(".sync-{}", Uuid::new_v4()));
+    fs::create_dir_all(&staging_dir)?;
+
+    for target in SERVER_RELEASE_CLI_TARGETS {
+        let archive_name = format!("{binary_name}-{target}.tar.gz");
+        let checksum_name = format!("{archive_name}.sha256");
+        let archive_url = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == archive_name)
+            .map(|asset| asset.browser_download_url.clone())
+            .ok_or_else(|| {
+                LoreError::ExternalService(format!("release {tag} missing asset: {archive_name}"))
+            })?;
+        let checksum_url = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == checksum_name)
+            .map(|asset| asset.browser_download_url.clone())
+            .ok_or_else(|| {
+                LoreError::ExternalService(format!("release {tag} missing asset: {checksum_name}"))
+            })?;
+        let archive = fetch_bytes(client, &archive_url).await?;
+        let checksum = fetch_text(client, &checksum_url).await?;
+        verify_checksum(&archive, &checksum)?;
+        let extracted = extract_binary(binary_name, &archive)?;
+        write_binary_atomic(
+            &staging_dir.join(release_binary_filename(binary_name, target)),
+            &extracted,
+        )?;
+    }
+
+    for target in SERVER_RELEASE_CLI_TARGETS {
+        let filename = release_binary_filename(binary_name, target);
+        fs::rename(staging_dir.join(&filename), output_dir.join(&filename))?;
+    }
+    let _ = fs::remove_dir(&staging_dir);
+    fs::write(
+        output_dir.join(format!("{binary_name}-release-version.txt")),
+        target_version.as_bytes(),
+    )?;
+    ensure_legacy_machine_binary_link(output_dir, binary_name)?;
+    Ok(SERVER_RELEASE_CLI_TARGETS
+        .iter()
+        .map(|target| (*target).to_string())
+        .collect())
+}
+
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -534,7 +649,10 @@ fn extract_binary(binary_name: &str, archive_bytes: &[u8]) -> Result<Vec<u8>> {
         let path = entry
             .path()
             .map_err(|err| LoreError::ExternalService(err.to_string()))?;
-        if path.file_name().and_then(|value| value.to_str()) == Some(binary_name) {
+        if matches!(
+            path.file_name().and_then(|value| value.to_str()),
+            Some(name) if name == binary_name || name == format!("{binary_name}.exe")
+        ) {
             let mut bytes = Vec::new();
             entry
                 .read_to_end(&mut bytes)
@@ -698,11 +816,70 @@ fn write_json_atomic(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(
     Ok(())
 }
 
+fn release_binary_filename(binary_name: &str, target: &str) -> String {
+    format!("{binary_name}-{target}")
+}
+
+fn release_binaries_are_current(
+    binary_name: &str,
+    output_dir: &Path,
+    target_version: &str,
+) -> bool {
+    let marker = output_dir.join(format!("{binary_name}-release-version.txt"));
+    let recorded_version = match fs::read_to_string(marker) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if normalize_version_tag(recorded_version.trim()) != target_version {
+        return false;
+    }
+    SERVER_RELEASE_CLI_TARGETS.iter().all(|target| {
+        output_dir
+            .join(release_binary_filename(binary_name, target))
+            .exists()
+    })
+}
+
+fn ensure_legacy_machine_binary_link(output_dir: &Path, binary_name: &str) -> Result<()> {
+    let legacy_path = output_dir.join(binary_name);
+    let legacy_target = release_binary_filename(binary_name, LEGACY_MACHINE_BINARY_TARGET);
+    let target_path = output_dir.join(&legacy_target);
+    if !target_path.exists() {
+        return Err(LoreError::ExternalService(format!(
+            "missing legacy machine binary target {}",
+            target_path.display()
+        )));
+    }
+    let _ = fs::remove_file(&legacy_path);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&legacy_target, &legacy_path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::copy(&target_path, &legacy_path)?;
+    }
+    Ok(())
+}
+
+fn write_binary_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    fs::write(&tmp_path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
+    }
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream, compare_versions,
-        normalize_version_tag,
+        AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, LEGACY_MACHINE_BINARY_TARGET, ReleaseStream,
+        SERVER_RELEASE_CLI_TARGETS, compare_versions, ensure_legacy_machine_binary_link,
+        normalize_version_tag, release_binary_filename,
     };
 
     #[test]
@@ -713,6 +890,34 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.github_repo, DEFAULT_UPDATE_REPO);
         assert_eq!(config.release_stream, ReleaseStream::Stable);
+        assert!(!config.auto_update_machines);
+        assert_eq!(config.last_machine_rollout_version, None);
+    }
+
+    #[test]
+    fn updating_auto_update_config_preserves_rollout_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AutoUpdateConfigStore::new(dir.path());
+        store
+            .set_last_machine_rollout_version(Some("0.1.65-rc100".to_string()))
+            .unwrap();
+
+        let config = store
+            .update(
+                true,
+                DEFAULT_UPDATE_REPO.to_string(),
+                ReleaseStream::Prerelease,
+                true,
+            )
+            .unwrap();
+
+        assert!(config.enabled);
+        assert_eq!(config.release_stream, ReleaseStream::Prerelease);
+        assert!(config.auto_update_machines);
+        assert_eq!(
+            config.last_machine_rollout_version.as_deref(),
+            Some("0.1.65-rc100")
+        );
     }
 
     #[test]
@@ -737,5 +942,37 @@ mod tests {
         assert!(compare_versions("0.1.65", "0.1.65-rc13").is_gt());
         assert!(compare_versions("0.1.65-rc13", "0.1.65").is_lt());
         assert!(compare_versions("0.1.66", "0.1.65-rc13").is_gt());
+    }
+
+    #[test]
+    fn legacy_machine_binary_link_points_at_linux_x86_64_target() {
+        let dir = tempfile::tempdir().unwrap();
+        for target in SERVER_RELEASE_CLI_TARGETS {
+            std::fs::write(
+                dir.path().join(release_binary_filename("lore", target)),
+                target.as_bytes(),
+            )
+            .unwrap();
+        }
+
+        ensure_legacy_machine_binary_link(dir.path(), "lore").unwrap();
+
+        let legacy_path = dir.path().join("lore");
+        #[cfg(unix)]
+        {
+            let target = std::fs::read_link(&legacy_path).unwrap();
+            assert_eq!(
+                target,
+                std::path::PathBuf::from(release_binary_filename(
+                    "lore",
+                    LEGACY_MACHINE_BINARY_TARGET
+                ))
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let bytes = std::fs::read(&legacy_path).unwrap();
+            assert_eq!(bytes, LEGACY_MACHINE_BINARY_TARGET.as_bytes());
+        }
     }
 }

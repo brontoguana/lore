@@ -37,7 +37,8 @@ use crate::ui::{
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
-    ReleaseStream, check_for_update, maybe_apply_self_update,
+    ReleaseStream, SERVER_RELEASE_CLI_TARGETS, check_for_update, maybe_apply_self_update,
+    sync_release_binaries_to_directory,
 };
 use crate::versioning::{
     GitExportConfig, GitExportConfigStore, GitExportStatus, GitExportStatusStore,
@@ -447,7 +448,7 @@ impl AppState {
                 }
             }
         }
-        Self {
+        let state = Self {
             store: Arc::new(store),
             auth: Arc::new(auth),
             auth_audit: Arc::new(AuditStore::new(root.clone())),
@@ -493,7 +494,9 @@ impl AppState {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             agent_recent_activity: Arc::new(Mutex::new(HashMap::new())),
             machine_update_timestamps: Arc::new(Mutex::new(HashMap::new())),
-        }
+        };
+        let _ = maybe_mark_machine_auto_update_rollout(&state);
+        state
     }
 }
 
@@ -587,6 +590,10 @@ fn build_app_with_librarian(
         .route("/v1/machines/register", post(register_machine))
         .route("/v1/machines/poll", post(machine_service_poll))
         .route("/v1/machines/binary", get(machine_binary_download))
+        .route(
+            "/v1/machines/binary/{target}",
+            get(machine_binary_download_for_target),
+        )
         .route(
             "/v1/machines/command/{id}/result",
             post(machine_command_result),
@@ -937,6 +944,7 @@ fn build_app_with_librarian(
 
     let state = AppState::with_librarian(store, librarian_client);
     spawn_error_file_sweeper(state.clone());
+    spawn_release_binary_sync(state.clone());
     router.with_state(state)
 }
 
@@ -948,6 +956,33 @@ fn spawn_error_file_sweeper(state: AppState) {
         loop {
             interval.tick().await;
             sweep_agent_error_files(&state);
+        }
+    });
+}
+
+fn spawn_release_binary_sync(state: AppState) {
+    if env!("CARGO_PKG_VERSION").contains('-') {
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        let github_repo = state
+            .auto_update_config
+            .load()
+            .map(|config| config.github_repo)
+            .unwrap_or_else(|_| crate::updater::DEFAULT_UPDATE_REPO.to_string());
+        if let Err(err) = sync_release_binaries_to_directory(
+            &reqwest::Client::new(),
+            "lore",
+            env!("CARGO_PKG_VERSION"),
+            &github_repo,
+            &state.store.root().join("updates"),
+        )
+        .await
+        {
+            eprintln!("warning: failed to sync CLI release binaries: {err}");
         }
     });
 }
@@ -1555,6 +1590,8 @@ struct UpdateAutoUpdateConfigRequest {
     github_repo: String,
     #[serde(default)]
     release_stream: Option<ReleaseStream>,
+    #[serde(default)]
+    auto_update_machines: Option<bool>,
     confirm_password: Option<String>,
 }
 
@@ -1564,6 +1601,7 @@ struct UpdateAutoUpdateUiForm {
     enabled: Option<String>,
     github_repo: String,
     release_stream: Option<ReleaseStream>,
+    auto_update_machines: Option<String>,
     confirm_password: Option<String>,
 }
 
@@ -1737,6 +1775,8 @@ struct AutoUpdateConfigSummary {
     enabled: bool,
     github_repo: String,
     release_stream: String,
+    auto_update_machines: bool,
+    last_machine_rollout_version: Option<String>,
     configured: bool,
     updated_at: time::OffsetDateTime,
 }
@@ -3608,6 +3648,9 @@ async fn update_auto_update_config(
     let release_stream = payload
         .release_stream
         .unwrap_or(current_config.release_stream);
+    let auto_update_machines = payload
+        .auto_update_machines
+        .unwrap_or(current_config.auto_update_machines);
     if payload.github_repo != current_config.github_repo {
         let password = payload.confirm_password.as_deref().unwrap_or("");
         state
@@ -3620,10 +3663,12 @@ async fn update_auto_update_config(
                 )
             })?;
     }
-    let config =
-        state
-            .auto_update_config
-            .update(payload.enabled, payload.github_repo, release_stream)?;
+    let config = state.auto_update_config.update(
+        payload.enabled,
+        payload.github_repo,
+        release_stream,
+        auto_update_machines,
+    )?;
     let repo_changed = config.github_repo != current_config.github_repo;
     append_audit_event(
         &state,
@@ -3638,10 +3683,11 @@ async fn update_auto_update_config(
         },
         None,
         Some(format!(
-            "enabled={} repo={} stream={}",
+            "enabled={} repo={} stream={} auto_update_machines={}",
             config.enabled,
             config.github_repo,
-            config.release_stream.as_str()
+            config.release_stream.as_str(),
+            config.auto_update_machines,
         )),
     )?;
     Ok(Json(auto_update_config_summary(&config)))
@@ -4004,6 +4050,13 @@ async fn admin_page(
             .or_default()
             .push(machine);
     }
+    for (username, machines) in &mut user_machines {
+        for machine in machines {
+            let key = format!("{}_{}", username, machine.name);
+            machine.pending_update =
+                machine_update_requested(&state, &key, machine.cli_version.as_deref())?;
+        }
+    }
     Ok(Html(render_admin_page(
         resolved_theme(&session.user, &config),
         resolved_color_mode(&session.user),
@@ -4053,7 +4106,7 @@ async fn agents_page(
     let mut machines = state.auth.list_machines_for_user(&session.user.username)?;
     for m in &mut machines {
         let key = format!("{}_{}", session.user.username, m.name);
-        m.pending_update = is_machine_pending_update(&state, &key);
+        m.pending_update = machine_update_requested(&state, &key, m.cli_version.as_deref())?;
     }
 
     // Enrich agents with process status from machine service reports
@@ -5342,9 +5395,16 @@ async fn toggle_auto_update_json(
         .get("release_stream")
         .and_then(|value| parse_release_stream(value))
         .unwrap_or(current.release_stream);
-    state
-        .auto_update_config
-        .update(enabled, current.github_repo, release_stream)?;
+    let auto_update_machines = form
+        .get("auto_update_machines")
+        .map(|s| s == "true")
+        .unwrap_or(current.auto_update_machines);
+    state.auto_update_config.update(
+        enabled,
+        current.github_repo,
+        release_stream,
+        auto_update_machines,
+    )?;
     Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
@@ -5357,6 +5417,7 @@ async fn update_auto_update_from_ui(
     verify_csrf(&session, &form.csrf_token)?;
     let current_config = state.auto_update_config.load()?;
     let release_stream = form.release_stream.unwrap_or(current_config.release_stream);
+    let auto_update_machines = form.auto_update_machines.as_deref() == Some("true");
     if form.github_repo != current_config.github_repo {
         let password = form.confirm_password.as_deref().unwrap_or("");
         state
@@ -5373,6 +5434,7 @@ async fn update_auto_update_from_ui(
         form.enabled.as_deref() == Some("true"),
         form.github_repo,
         release_stream,
+        auto_update_machines,
     )?;
     let repo_changed = config.github_repo != current_config.github_repo;
     append_audit_event(
@@ -5388,10 +5450,11 @@ async fn update_auto_update_from_ui(
         },
         None,
         Some(format!(
-            "enabled={} repo={} stream={}",
+            "enabled={} repo={} stream={} auto_update_machines={}",
             config.enabled,
             config.github_repo,
-            config.release_stream.as_str()
+            config.release_stream.as_str(),
+            config.auto_update_machines,
         )),
     )?;
     Ok(Redirect::to("/ui/admin?flash=Auto%20update%20saved"))
@@ -6860,6 +6923,8 @@ fn auto_update_config_summary(config: &AutoUpdateConfig) -> AutoUpdateConfigSumm
         enabled: config.enabled,
         github_repo: config.github_repo.clone(),
         release_stream: config.release_stream.as_str().to_string(),
+        auto_update_machines: config.auto_update_machines,
+        last_machine_rollout_version: config.last_machine_rollout_version.clone(),
         configured: !config.github_repo.trim().is_empty(),
         updated_at: config.updated_at,
     }
@@ -11485,20 +11550,16 @@ async fn chat_agent_poll(
 
     // Check if machine has a pending update (transient, auto-expires after 3 min)
     let server_version = env!("CARGO_PKG_VERSION");
-    let update_to = machine_name.as_ref().and_then(|mname| {
+    let update_to = if let Some(mname) = machine_name.as_ref() {
         let machine_key = format!("{}_{}", owner, mname);
-        if let Some(ver) = &cli_version {
-            if ver.trim_start_matches('v') == server_version {
-                clear_machine_pending_update(&state, &machine_key);
-                return None;
-            }
-        }
-        if is_machine_pending_update(&state, &machine_key) {
+        if machine_update_requested(&state, &machine_key, cli_version.as_deref())? {
             Some(server_version.to_string())
         } else {
             None
         }
-    });
+    } else {
+        None
+    };
     let update_config = if update_to.is_some() {
         state.auto_update_config.load().ok()
     } else {
@@ -14808,7 +14869,7 @@ async fn machine_status_json(
         let version = m.cli_version.as_deref().unwrap_or("unknown");
         let up_to_date = version.trim_start_matches('v') == server_version;
         let machine_key = format!("{}_{}", session.user.username, name);
-        let pending = is_machine_pending_update(&state, &machine_key);
+        let pending = machine_update_requested(&state, &machine_key, m.cli_version.as_deref())?;
         Ok(Json(serde_json::json!({
             "version": version,
             "pending_update": pending,
@@ -14859,18 +14920,10 @@ async fn machine_service_poll(
     // Check if machine should self-update (transient, auto-expires after 3 min)
     let server_version = env!("CARGO_PKG_VERSION");
     let reported_version = headers.get("x-lore-version").and_then(|v| v.to_str().ok());
-    let update_to = {
-        if reported_version
-            .map(|v| v.trim_start_matches('v') == server_version)
-            .unwrap_or(false)
-        {
-            clear_machine_pending_update(&state, &machine_key);
-            None
-        } else if is_machine_pending_update(&state, &machine_key) {
-            Some(server_version.to_string())
-        } else {
-            None
-        }
+    let update_to = if machine_update_requested(&state, &machine_key, reported_version)? {
+        Some(server_version.to_string())
+    } else {
+        None
     };
     let update_config = if update_to.is_some() {
         state.auto_update_config.load().ok()
@@ -15018,6 +15071,48 @@ async fn queue_machine_command_and_wait(
 
 const MACHINE_UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
 
+fn machine_auto_update_rollout_active_for_current_version(
+    state: &AppState,
+) -> Result<bool, LoreError> {
+    let config = state.auto_update_config.load()?;
+    Ok(config.auto_update_machines
+        && config.last_machine_rollout_version.as_deref() == Some(env!("CARGO_PKG_VERSION")))
+}
+
+fn machine_update_requested(
+    state: &AppState,
+    machine_key: &str,
+    reported_version: Option<&str>,
+) -> Result<bool, LoreError> {
+    let server_version = env!("CARGO_PKG_VERSION");
+    if reported_version
+        .map(|v| v.trim_start_matches('v') == server_version)
+        .unwrap_or(false)
+    {
+        clear_machine_pending_update(state, machine_key);
+        return Ok(false);
+    }
+    if is_machine_pending_update(state, machine_key) {
+        return Ok(true);
+    }
+    machine_auto_update_rollout_active_for_current_version(state)
+}
+
+fn maybe_mark_machine_auto_update_rollout(state: &AppState) -> Result<(), LoreError> {
+    let config = state.auto_update_config.load()?;
+    if !config.auto_update_machines {
+        return Ok(());
+    }
+    let current_version = env!("CARGO_PKG_VERSION");
+    if config.last_machine_rollout_version.as_deref() == Some(current_version) {
+        return Ok(());
+    }
+    let _ = state
+        .auto_update_config
+        .set_last_machine_rollout_version(Some(current_version.to_string()))?;
+    Ok(())
+}
+
 fn is_machine_pending_update(state: &AppState, machine_key: &str) -> bool {
     let mut map = state.machine_update_timestamps.lock().unwrap();
     if let Some(started) = map.get(machine_key) {
@@ -15065,14 +15160,32 @@ async fn machine_binary_download(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    // Authenticate with machine token
+    machine_binary_download_inner(&state, &headers, None).await
+}
+
+async fn machine_binary_download_for_target(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(target): Path<String>,
+) -> Result<Response, ApiError> {
+    machine_binary_download_inner(&state, &headers, Some(target.as_str())).await
+}
+
+async fn machine_binary_download_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    target: Option<&str>,
+) -> Result<Response, ApiError> {
     let machine_token = headers
         .get(API_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     state.auth.authenticate_machine_token(machine_token)?;
 
-    let binary_path = state.store.root().join("updates").join("lore");
+    let binary_path = match machine_binary_path(state, target) {
+        Some(path) => path,
+        None => return Ok(axum::http::StatusCode::NOT_FOUND.into_response()),
+    };
     if !binary_path.exists() {
         return Ok(axum::http::StatusCode::NOT_FOUND.into_response());
     }
@@ -15084,6 +15197,17 @@ async fn machine_binary_download(
         bytes,
     )
         .into_response())
+}
+
+fn machine_binary_path(state: &AppState, target: Option<&str>) -> Option<std::path::PathBuf> {
+    let updates_dir = state.store.root().join("updates");
+    match target {
+        None => Some(updates_dir.join("lore")),
+        Some(target) if SERVER_RELEASE_CLI_TARGETS.contains(&target) => {
+            Some(updates_dir.join(format!("lore-{target}")))
+        }
+        Some(_) => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -15243,6 +15367,7 @@ mod tests {
     use base64::Engine;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use time::{Duration, OffsetDateTime};
@@ -15256,6 +15381,7 @@ mod tests {
         ProviderCheckResult, RATE_LIMIT_REQUESTS,
     };
     use crate::store::FileBlockStore;
+    use crate::updater::{AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream};
     use crate::{
         AgentBackend, BlockType, LocalAuthStore, NewAgentToken, ProjectGrant, ProjectName,
         ProjectPermission, UserName,
@@ -16910,6 +17036,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_binary_target_endpoint_serves_requested_artifact() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let machine_token = register_machine_token(&app, dir.path()).await;
+        fs::create_dir_all(dir.path().join("updates")).unwrap();
+        fs::write(
+            dir.path().join("updates").join("lore-aarch64-apple-darwin"),
+            b"mac-arm64",
+        )
+        .unwrap();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/machines/binary/aarch64-apple-darwin")
+            .header("x-lore-key", machine_token)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"mac-arm64");
+    }
+
+    #[tokio::test]
+    async fn machine_binary_legacy_endpoint_uses_compat_link() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let machine_token = register_machine_token(&app, dir.path()).await;
+        let updates_dir = dir.path().join("updates");
+        fs::create_dir_all(&updates_dir).unwrap();
+        fs::write(
+            updates_dir.join("lore-x86_64-unknown-linux-gnu"),
+            b"linux-amd64",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("lore-x86_64-unknown-linux-gnu", updates_dir.join("lore"))
+            .unwrap();
+        #[cfg(not(unix))]
+        fs::write(updates_dir.join("lore"), b"linux-amd64").unwrap();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/machines/binary")
+            .header("x-lore-key", machine_token)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"linux-amd64");
+    }
+
+    #[tokio::test]
     async fn machine_provision_can_opt_into_owner_grants() {
         let dir = tempdir().unwrap();
         let store = FileBlockStore::new(dir.path());
@@ -18227,6 +18411,33 @@ mod tests {
         json["token"].as_str().unwrap().to_string()
     }
 
+    async fn register_machine_token<S>(app: &S, dir: &std::path::Path) -> String
+    where
+        S: tower::Service<
+                Request<Body>,
+                Response = axum::response::Response,
+                Error = std::convert::Infallible,
+            > + Clone,
+        S::Future: Send,
+    {
+        ensure_test_admin(dir);
+        let register = Request::builder()
+            .method("POST")
+            .uri("/v1/machines/register")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"username":"admin","password":"correct-horse-battery","machine_name":"desk"}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(register).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        json["token"].as_str().unwrap().to_string()
+    }
+
     async fn bootstrap_admin_with_role_and_user<S>(
         app: &S,
         dir: &std::path::Path,
@@ -18568,6 +18779,91 @@ mod tests {
             .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auto_update_config_api_exposes_machine_rollout_settings() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        ensure_test_admin(dir.path());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/auto-update-config")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                basic_auth("admin", "correct-horse-battery"),
+            )
+            .body(Body::from(format!(
+                r#"{{"enabled":true,"github_repo":"{}","release_stream":"prerelease","auto_update_machines":true}}"#,
+                crate::updater::DEFAULT_UPDATE_REPO
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["auto_update_machines"], json!(true));
+        assert_eq!(json["release_stream"], json!("prerelease"));
+        assert_eq!(json["last_machine_rollout_version"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn machine_poll_uses_global_auto_update_rollout_for_current_server_version() {
+        let dir = tempdir().unwrap();
+        ensure_test_admin(dir.path());
+        AutoUpdateConfigStore::new(dir.path())
+            .update(
+                false,
+                DEFAULT_UPDATE_REPO.to_string(),
+                ReleaseStream::Stable,
+                true,
+            )
+            .unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+
+        let register = Request::builder()
+            .method("POST")
+            .uri("/v1/machines/register")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"username":"admin","password":"correct-horse-battery","machine_name":"desk"}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(register).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let machine_token = json["token"].as_str().unwrap();
+
+        let poll = Request::builder()
+            .method("POST")
+            .uri("/v1/machines/poll")
+            .header("content-type", "application/json")
+            .header(API_KEY_HEADER, machine_token)
+            .header("x-lore-version", "0.0.1")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = app.clone().oneshot(poll).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["update_to"], json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(json["update_repo"], json!(DEFAULT_UPDATE_REPO));
+        assert_eq!(json["update_stream"], json!("stable"));
+
+        let config = AutoUpdateConfigStore::new(dir.path()).load().unwrap();
+        assert_eq!(
+            config.last_machine_rollout_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
