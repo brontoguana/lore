@@ -73,6 +73,36 @@ run_step() {
     "$@"
 }
 
+wait_for_remote_service_state() {
+    local service=$1
+    local expected=$2
+    local attempts=${3:-15}
+    local delay=${4:-1}
+    local state
+
+    for _ in $(seq 1 "$attempts"); do
+        state=$(ssh "$SERVER" "systemctl is-active '${service}' 2>/dev/null || true")
+        if [ "$state" = "$expected" ]; then
+            return 0
+        fi
+        sleep "$delay"
+    done
+
+    return 1
+}
+
+show_remote_proxy_status() {
+    ssh "$SERVER" '
+echo "lore-caddy state:"
+systemctl is-active lore-caddy 2>/dev/null || true
+systemctl show lore-caddy --property=ActiveState --property=SubState --property=Result --no-pager 2>/dev/null || true
+echo "caddy processes:"
+pgrep -afu "$(id -u)" -f "[/]caddy .* run --config " || true
+echo "recent lore-caddy journal:"
+journalctl -u lore-caddy -n 20 --no-pager 2>/dev/null || true
+' || true
+}
+
 restart_remote_service() {
     if ssh "$SERVER" "sudo -n systemctl restart lore-server" 2>/dev/null; then
         echo "Restarted via systemd"
@@ -83,12 +113,29 @@ restart_remote_service() {
 }
 
 restart_remote_proxy() {
-    if ssh "$SERVER" "sudo -n systemctl restart lore-caddy" 2>/dev/null; then
-        echo "Restarted lore-caddy via systemd"
-        return 0
-    fi
+    local attempt
 
-    echo "lore-caddy restart unavailable without sudo"
+    for attempt in 1 2 3; do
+        echo "Proxy recovery attempt ${attempt}..."
+
+        if ssh "$SERVER" "timeout 20s sudo -n systemctl restart lore-caddy" 2>/dev/null; then
+            if wait_for_remote_service_state "lore-caddy" "active" 20 1; then
+                echo "Restarted lore-caddy via systemd"
+                return 0
+            fi
+        fi
+
+        echo "lore-caddy did not become active; inspecting and clearing stale caddy processes..."
+        show_remote_proxy_status
+        ssh "$SERVER" '
+pkill -TERM -u "$(id -u)" -f "[/]caddy .* run --config " || true
+sleep 2
+pkill -KILL -u "$(id -u)" -f "[/]caddy .* run --config " || true
+' >/dev/null 2>&1 || true
+        sleep 2
+    done
+
+    echo "lore-caddy restart unavailable or recovery failed"
     return 1
 }
 
@@ -202,7 +249,9 @@ echo "Restarting..."
 restart_remote_service
 
 echo "Ensuring public proxy is up..."
-ssh "$SERVER" "systemctl is-active lore-caddy >/dev/null 2>&1" || restart_remote_proxy || true
+if ! wait_for_remote_service_state "lore-caddy" "active" 5 1; then
+    restart_remote_proxy || true
+fi
 
 # --- Verify ---
 echo "Verifying remote binary..."
@@ -216,7 +265,7 @@ echo "Health check HTTP status: ${HEALTH_STATUS}"
 echo "Checking public health..."
 PUBLIC_STATUS=$(check_public_health) || {
     echo "Public health check failed: https://lore.simplehelp.io/ is unreachable"
-    ssh "$SERVER" "systemctl status lore-caddy --no-pager -n 20 || true" || true
+    show_remote_proxy_status
     exit 1
 }
 echo "Public health HTTP status: ${PUBLIC_STATUS}"

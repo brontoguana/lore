@@ -2165,6 +2165,49 @@ fn history_messages_excluding_pending<'a>(
         .collect()
 }
 
+fn history_exchange_boundaries(messages: &[&serde_json::Value]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, msg)| msg["role"].as_str() == Some("user"))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn count_history_exchanges(messages: &[&serde_json::Value]) -> usize {
+    history_exchange_boundaries(messages).len()
+}
+
+fn recent_history_exchange_tail<'a>(
+    messages: &'a [&'a serde_json::Value],
+    exchange_limit: usize,
+) -> &'a [&'a serde_json::Value] {
+    if exchange_limit == 0 || messages.is_empty() {
+        return &messages[messages.len()..];
+    }
+    let boundaries = history_exchange_boundaries(messages);
+    if boundaries.len() <= exchange_limit {
+        return messages;
+    }
+    &messages[boundaries[boundaries.len() - exchange_limit]..]
+}
+
+fn history_compaction_split_index(
+    messages: &[&serde_json::Value],
+    window_size: usize,
+) -> Option<usize> {
+    let boundaries = history_exchange_boundaries(messages);
+    let exchanges = boundaries.len();
+    if exchanges < window_size || exchanges <= 2 {
+        return None;
+    }
+
+    let target = window_size / 2;
+    let keep_count = target.min(exchanges - 1);
+    let keep_from_exchange = boundaries.len().saturating_sub(keep_count);
+    boundaries.get(keep_from_exchange).copied()
+}
+
 fn one_line_preview(value: &str, max_chars: usize) -> String {
     let trimmed = value.lines().next().unwrap_or("").trim();
     truncate_chars(trimmed, max_chars)
@@ -2528,6 +2571,26 @@ enum AgentPollAction {
     UpdateAvailable,
 }
 
+async fn take_stop_request(context: &CliContext) -> bool {
+    let Some(token) = context.token.as_deref() else {
+        return false;
+    };
+    match context
+        .client
+        .get(format!("{}/v1/chat/stop-requested", context.url))
+        .header("x-lore-key", token)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(body) => body["stop_requested"].as_bool().unwrap_or(false),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
 async fn agent_poll_and_process(
     context: &CliContext,
     agent_name: &str,
@@ -2603,6 +2666,28 @@ async fn agent_poll_and_process(
             .unwrap_or(AgentBackend::Claude)
     });
 
+    let acknowledge_control_command = |command: &str| {
+        let command = command.to_string();
+        async move {
+            context
+                .client
+                .post(format!("{}/v1/chat/respond", context.url))
+                .header("x-lore-key", token)
+                .json(&serde_json::json!({
+                    "complete": true,
+                    "tool_use": format!("control command acknowledged: {command}")
+                }))
+                .send()
+                .await
+        }
+    };
+
+    if body["stop_requested"].as_bool().unwrap_or(false) {
+        eprintln!("[agent] Received /stop command");
+        let _ = acknowledge_control_command("/stop").await;
+        return Ok(AgentPollAction::Stop);
+    }
+
     let messages = body["messages"].as_array();
 
     if messages.is_none() || messages.unwrap().is_empty() {
@@ -2628,9 +2713,11 @@ async fn agent_poll_and_process(
                 return Ok(AgentPollAction::Continue);
             } else if trimmed == "/stop" {
                 eprintln!("[agent] Received /stop command");
+                let _ = acknowledge_control_command("/stop").await;
                 return Ok(AgentPollAction::Stop);
             } else if trimmed == "/restart" {
                 eprintln!("[agent] Received /restart — restarting");
+                let _ = acknowledge_control_command("/restart").await;
                 return Ok(AgentPollAction::Restart);
             } else {
                 regular_messages.push(content);
@@ -2877,8 +2964,7 @@ async fn agent_poll_and_process(
     if let Some(msgs) = hist_messages {
         let pending_ids: HashSet<u64> = current_message_ids.iter().copied().collect();
         let filtered = history_messages_excluding_pending(Some(msgs), &pending_ids);
-        let start = filtered.len().saturating_sub(window_size);
-        let recent = &filtered[start..];
+        let recent = recent_history_exchange_tail(&filtered, window_size);
         if !recent.is_empty() {
             prompt_parts.push("## Previous Conversation\nThe following is recent conversation history. This is context only \u{2014} do not respond to these messages. Only respond to the new message the user sends.\n".to_string());
             for msg in recent {
@@ -2958,44 +3044,63 @@ async fn agent_poll_and_process(
         let mut response = String::new();
         let mut emitted_assistant_messages = false;
 
-        while let Some(line) = lines.next_line().await? {
-            let line = line.trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-            let parsed: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for event in parse_backend_line(backend, &parsed) {
-                match event {
-                    BackendEvent::Text(text) => {
-                        if append_assistant_segment(&mut response, &text).is_some() {
-                            emitted_assistant_messages = true;
-                            let _ = context
-                                .client
-                                .post(format!("{}/v1/chat/respond", context.url))
-                                .header("x-lore-key", token)
-                                .json(&serde_json::json!({ "message": text }))
-                                .send()
-                                .await;
+        let mut stop_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        stop_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = line? else {
+                        break;
+                    };
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let parsed: serde_json::Value = match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    for event in parse_backend_line(backend, &parsed) {
+                        match event {
+                            BackendEvent::Text(text) => {
+                                if append_assistant_segment(&mut response, &text).is_some() {
+                                    emitted_assistant_messages = true;
+                                    let _ = context
+                                        .client
+                                        .post(format!("{}/v1/chat/respond", context.url))
+                                        .header("x-lore-key", token)
+                                        .json(&serde_json::json!({ "message": text }))
+                                        .send()
+                                        .await;
+                                }
+                            }
+                            BackendEvent::ToolUse(detail) => {
+                                let _ = context
+                                    .client
+                                    .post(format!("{}/v1/chat/respond", context.url))
+                                    .header("x-lore-key", token)
+                                    .json(&serde_json::json!({ "tool_use": detail }))
+                                    .send()
+                                    .await;
+                            }
+                            BackendEvent::Result(text) => {
+                                if response.is_empty() && !text.is_empty() {
+                                    response = text;
+                                }
+                            }
+                            BackendEvent::Skip => {}
                         }
                     }
-                    BackendEvent::ToolUse(detail) => {
-                        let _ = context
-                            .client
-                            .post(format!("{}/v1/chat/respond", context.url))
-                            .header("x-lore-key", token)
-                            .json(&serde_json::json!({ "tool_use": detail }))
-                            .send()
-                            .await;
+                }
+                _ = stop_interval.tick() => {
+                    if take_stop_request(context).await {
+                        eprintln!("[agent] Stop requested during backend run; terminating child");
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = acknowledge_control_command("/stop").await;
+                        return Ok(AgentPollAction::Stop);
                     }
-                    BackendEvent::Result(text) => {
-                        if response.is_empty() && !text.is_empty() {
-                            response = text;
-                        }
-                    }
-                    BackendEvent::Skip => {}
                 }
             }
         }
@@ -4631,7 +4736,7 @@ async fn maybe_auto_compact(
 
 async fn do_compact(
     context: &CliContext,
-    agent_name: &str,
+    _agent_name: &str,
     aggressive: bool,
     backend: AgentBackend,
 ) -> CliResult<()> {
@@ -4653,30 +4758,21 @@ async fn do_compact(
         Some(m) => m,
         None => return Ok(()),
     };
+    let messages: Vec<&serde_json::Value> = messages.iter().collect();
 
-    // Count unpinned messages (message pairs = user+assistant grouped)
-    // For simplicity, count all messages and check against window threshold
-    let msg_count = messages.len();
-    if msg_count < window_size {
+    let exchange_count = count_history_exchanges(&messages);
+    let Some(compact_count) = history_compaction_split_index(&messages, window_size) else {
         return Ok(());
-    }
-
-    let target = if aggressive {
-        window_size / 2
-    } else {
-        window_size.saturating_sub(7).max(1)
     };
-    let compact_count = msg_count
-        .saturating_sub(target)
-        .max(1)
-        .min(msg_count.saturating_sub(1));
 
     let to_compact = &messages[..compact_count];
     let to_keep = &messages[compact_count..];
+    let kept_exchanges = count_history_exchanges(to_keep);
+    let summarized_exchanges = exchange_count.saturating_sub(kept_exchanges);
 
     eprintln!(
-        "[agent] Compacting {compact_count} messages (total {msg_count}, window {window_size}{})",
-        if aggressive { ", aggressive" } else { "" }
+        "[agent] Compacting {summarized_exchanges} exchanges (total {exchange_count}, keeping {kept_exchanges}, window {window_size}{})",
+        if aggressive { ", aggressive" } else { "" },
     );
 
     // Build compaction input
@@ -6190,9 +6286,9 @@ async fn service_handle_create_agent(
 #[cfg(test)]
 mod tests {
     use super::{
-        DocWriteArgs, append_assistant_segment, append_new_stream_text,
-        history_messages_excluding_pending, load_cli_text_input, load_doc_write_content,
-        parse_codex_line,
+        DocWriteArgs, append_assistant_segment, append_new_stream_text, count_history_exchanges,
+        history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
+        load_doc_write_content, parse_codex_line, recent_history_exchange_tail,
     };
     use serde_json::json;
     use std::collections::HashSet;
@@ -6392,6 +6488,42 @@ mod tests {
         let ids: Vec<u64> = recent.iter().filter_map(|msg| msg["id"].as_u64()).collect();
 
         assert_eq!(ids, vec![3, 4]);
+    }
+
+    #[test]
+    fn recent_history_exchange_tail_uses_exchange_count_not_message_count() {
+        let messages = vec![
+            json!({ "id": 1, "role": "user", "content": "u1" }),
+            json!({ "id": 2, "role": "assistant", "content": "a1-1" }),
+            json!({ "id": 3, "role": "assistant", "content": "a1-2" }),
+            json!({ "id": 4, "role": "user", "content": "u2" }),
+            json!({ "id": 5, "role": "assistant", "content": "a2" }),
+            json!({ "id": 6, "role": "user", "content": "u3" }),
+            json!({ "id": 7, "role": "assistant", "content": "a3" }),
+        ];
+
+        let refs: Vec<&serde_json::Value> = messages.iter().collect();
+        let recent = recent_history_exchange_tail(&refs, 2);
+        let ids: Vec<u64> = recent.iter().filter_map(|msg| msg["id"].as_u64()).collect();
+
+        assert_eq!(ids, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn history_compaction_split_index_keeps_half_the_window_in_exchanges() {
+        let mut messages = Vec::new();
+        for i in 1..=22u64 {
+            messages.push(json!({ "id": (i * 2) - 1, "role": "user", "content": format!("u{i}") }));
+            messages.push(json!({ "id": i * 2, "role": "assistant", "content": format!("a{i}") }));
+        }
+
+        let refs: Vec<&serde_json::Value> = messages.iter().collect();
+        let split_idx = history_compaction_split_index(&refs, 22).unwrap();
+        let to_keep = &refs[split_idx..];
+
+        assert_eq!(count_history_exchanges(&refs), 22);
+        assert_eq!(count_history_exchanges(to_keep), 11);
+        assert_eq!(to_keep.first().and_then(|msg| msg["id"].as_u64()), Some(23));
     }
 
     #[test]

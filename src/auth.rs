@@ -526,6 +526,12 @@ fn run_migrations(conn: &Connection) {
             table: "messages",
             column: "client_message_id",
         },
+        Migration {
+            version: 7,
+            sql: "ALTER TABLE conversations ADD COLUMN summary_until_id INTEGER NOT NULL DEFAULT 0",
+            table: "conversations",
+            column: "summary_until_id",
+        },
     ];
 
     for m in migrations {
@@ -2008,6 +2014,8 @@ pub struct ChatConversation {
     pub pins: Vec<PinnedChatItem>,
     pub pinned_context: String,
     pub summary: String,
+    #[serde(default)]
+    pub summary_until_id: u64,
     pub window_size: usize,
     pub next_id: u64,
     #[serde(default)]
@@ -2035,6 +2043,7 @@ impl Default for ChatConversation {
             pins: Vec::new(),
             pinned_context: String::new(),
             summary: String::new(),
+            summary_until_id: 0,
             window_size: 22,
             next_id: 1,
             last_delivered_user_id: 0,
@@ -2068,6 +2077,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     agent_status TEXT NOT NULL DEFAULT 'offline',
     last_seen TEXT,
     summary TEXT NOT NULL DEFAULT '',
+    summary_until_id INTEGER NOT NULL DEFAULT 0,
     window_size INTEGER NOT NULL DEFAULT 22,
     cwd TEXT,
     git_branch TEXT,
@@ -2201,30 +2211,31 @@ impl ChatStore {
             .lock()
             .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
         let conv = conn.query_row(
-            "SELECT agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config, last_delivered_user_id, active_turn_user_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+            "SELECT agent_status, last_seen, summary, summary_until_id, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config, last_delivered_user_id, active_turn_user_id FROM conversations WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
             |row| {
-                let mc_json: Option<String> = row.get(10)?;
+                let mc_json: Option<String> = row.get(11)?;
                 let manage_config = mc_json.and_then(|s| serde_json::from_str::<ManageConfig>(&s).ok());
                 Ok(ChatConversation {
                     messages: Vec::new(),
                     pins: Vec::new(),
-                    pinned_context: row.get::<_, String>(9)?,
+                    pinned_context: row.get::<_, String>(10)?,
                     summary: row.get::<_, String>(2)?,
-                    window_size: row.get::<_, i64>(3)? as usize,
-                    next_id: row.get::<_, i64>(8)? as u64,
-                    last_delivered_user_id: row.get::<_, i64>(11)? as u64,
-                    active_turn_user_id: row.get::<_, i64>(12)? as u64,
+                    summary_until_id: row.get::<_, i64>(3)? as u64,
+                    window_size: row.get::<_, i64>(4)? as usize,
+                    next_id: row.get::<_, i64>(9)? as u64,
+                    last_delivered_user_id: row.get::<_, i64>(12)? as u64,
+                    active_turn_user_id: row.get::<_, i64>(13)? as u64,
                     agent_status: match row.get::<_, String>(0)?.as_str() {
                         "idle" => AgentChatStatus::Idle,
                         "thinking" => AgentChatStatus::Thinking,
                         _ => AgentChatStatus::Offline,
                     },
                     last_seen: row.get::<_, Option<String>>(1)?.map(|s| parse_dt(&s)),
-                    profile_url: row.get(6)?,
-                    auto_message: row.get(7)?,
-                    cwd: row.get(4)?,
-                    git_branch: row.get(5)?,
+                    profile_url: row.get(7)?,
+                    auto_message: row.get(8)?,
+                    cwd: row.get(5)?,
+                    git_branch: row.get(6)?,
                     manage_config,
                 })
             },
@@ -2306,10 +2317,10 @@ impl ChatStore {
             .as_ref()
             .map(|mc| serde_json::to_string(mc).unwrap_or_default());
         conn.execute(
-            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config, last_delivered_user_id, active_turn_user_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
-             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, window_size=?6, cwd=?7, git_branch=?8, profile_url=?9, auto_message=?10, next_id=?11, pinned_context=?12, manage_config=?13, last_delivered_user_id=?14, active_turn_user_id=?15",
-            params![owner, agent, status_str, last_seen_str, conv.summary, conv.window_size as i64,
+            "INSERT INTO conversations (owner, agent, agent_status, last_seen, summary, summary_until_id, window_size, cwd, git_branch, profile_url, auto_message, next_id, pinned_context, manage_config, last_delivered_user_id, active_turn_user_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+             ON CONFLICT(owner, agent) DO UPDATE SET agent_status=?3, last_seen=?4, summary=?5, summary_until_id=?6, window_size=?7, cwd=?8, git_branch=?9, profile_url=?10, auto_message=?11, next_id=?12, pinned_context=?13, manage_config=?14, last_delivered_user_id=?15, active_turn_user_id=?16",
+            params![owner, agent, status_str, last_seen_str, conv.summary, conv.summary_until_id as i64, conv.window_size as i64,
                     conv.cwd, conv.git_branch, conv.profile_url, conv.auto_message, conv.next_id as i64, conv.pinned_context, manage_json, conv.last_delivered_user_id as i64, conv.active_turn_user_id as i64],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         // Replace messages
@@ -2696,6 +2707,27 @@ impl ChatStore {
         Ok(())
     }
 
+    pub fn set_compaction_state(
+        &self,
+        owner: &str,
+        agent: &str,
+        summary: String,
+        summary_until_id: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::ensure_conversation(&conn, owner, agent)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        conn.execute(
+            "UPDATE conversations SET summary = ?1, summary_until_id = ?2 WHERE owner = ?3 AND agent = ?4",
+            params![summary, summary_until_id as i64, owner, agent],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(())
+    }
+
     pub fn update_window_size(&self, owner: &str, agent: &str, size: usize) -> Result<()> {
         let conn = self
             .conn
@@ -2724,7 +2756,7 @@ impl ChatStore {
         )
         .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
-            "UPDATE conversations SET next_id = 1, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND agent = ?2",
+            "UPDATE conversations SET next_id = 1, summary_until_id = 0, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
         )
         .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
@@ -2741,7 +2773,7 @@ impl ChatStore {
             params![owner],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
-            "UPDATE conversations SET next_id = 1, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND (agent = 'librarian' OR agent LIKE 'librarian:%')",
+            "UPDATE conversations SET next_id = 1, summary_until_id = 0, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND (agent = 'librarian' OR agent LIKE 'librarian:%')",
             params![owner],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
@@ -3157,8 +3189,8 @@ fn dir_is_empty(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentBackend, ChatStore, LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant,
-        ProjectPermission, RoleName, UserName, AUTH_SCHEMA,
+        AUTH_SCHEMA, AgentBackend, ChatStore, LocalAuthStore, NewAgentToken, NewRole, NewUser,
+        ProjectGrant, ProjectPermission, RoleName, UserName,
     };
     use crate::config::{ColorMode, UiTheme};
     use crate::model::ProjectName;

@@ -31,8 +31,8 @@ use crate::ui::{
     UiDiffLineKind, UiLibrarianAnswer, UiPendingLibrarianAction, UiProjectVersion,
     UiProjectVersionOperation, UiUserSummary, UserProjectAccess, render_admin_audit_page,
     render_admin_errors_page, render_admin_page, render_agent_guide_page, render_agents_page,
-    render_chat_main_panel, render_chat_page, render_document_page, render_login_page,
-    render_project_audit_page, render_project_history_page, render_project_page,
+    render_chat_agent_list, render_chat_main_panel, render_chat_page, render_document_page,
+    render_login_page, render_project_audit_page, render_project_history_page, render_project_page,
     render_projects_page, render_settings_page, render_setup_page,
 };
 use crate::updater::{
@@ -593,6 +593,7 @@ fn build_app_with_librarian(
         )
         .route("/v1/agents/provision", post(provision_agent_with_body))
         .route("/v1/chat/poll", get(chat_agent_poll))
+        .route("/v1/chat/stop-requested", get(chat_agent_take_stop_request))
         .route("/v1/chat/respond", post(chat_agent_respond))
         .route("/v1/chat/status", post(chat_agent_update_status))
         .route("/v1/chat/history", get(chat_agent_history))
@@ -10463,10 +10464,32 @@ fn is_pending_follow_up_user_message(conv: &ChatConversation, msg: &ChatMessage)
     matches!(msg.role, ChatRole::User) && msg.id > conv.active_turn_user_id
 }
 
+const UI_CHAT_VERBATIM_EXCHANGE_LIMIT: usize = 50;
+
+fn unsummarized_messages(conv: &ChatConversation) -> &[ChatMessage] {
+    let start = conv
+        .messages
+        .iter()
+        .position(|msg| msg.id > conv.summary_until_id)
+        .unwrap_or(conv.messages.len());
+    &conv.messages[start..]
+}
+
+fn recent_exchange_tail(messages: &[ChatMessage], exchange_limit: usize) -> &[ChatMessage] {
+    if exchange_limit == 0 || messages.is_empty() {
+        return &messages[messages.len()..];
+    }
+    let boundaries = exchange_boundaries(messages);
+    if boundaries.len() <= exchange_limit {
+        return messages;
+    }
+    &messages[boundaries[boundaries.len() - exchange_limit]..]
+}
+
 fn chat_messages_value_ordered(conv: &ChatConversation) -> (Vec<Value>, Vec<Value>) {
     let mut main = Vec::new();
     let mut pending = Vec::new();
-    for msg in &conv.messages {
+    for msg in recent_exchange_tail(&conv.messages, UI_CHAT_VERBATIM_EXCHANGE_LIMIT) {
         let value = json!({
             "id": msg.id,
             "role": match msg.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
@@ -10492,6 +10515,7 @@ fn should_append_finished_message(conv: &ChatConversation) -> bool {
         .messages
         .iter()
         .rev()
+        .take_while(|msg| msg.id > conv.summary_until_id)
         .find(|msg| !is_pending_follow_up_user_message(conv, msg))
     else {
         return false;
@@ -10689,6 +10713,7 @@ async fn chat_panel_inner(
         "ok": true,
         "selected_agent": selected,
         "is_librarian": selected == Some("librarian"),
+        "agent_list_html": render_chat_agent_list(&chat_agents, selected),
         "panel_html": panel_html,
         "messages": messages,
         "agent_status": selected_status,
@@ -11498,6 +11523,10 @@ async fn chat_agent_poll(
         Json(resp)
     };
 
+    if take_chat_agent_stop_request(&state, owner_str, &agent.name) {
+        return Ok(build_poll_response_with_stop(build_poll_response(vec![])));
+    }
+
     if !pending.is_empty() {
         let msgs: Vec<Value> = pending
             .iter()
@@ -11520,6 +11549,9 @@ async fn chat_agent_poll(
 
     // Re-check for messages after waking
     if result.is_ok() {
+        if take_chat_agent_stop_request(&state, owner_str, &agent.name) {
+            return Ok(build_poll_response_with_stop(build_poll_response(vec![])));
+        }
         let pending = state
             .chat
             .claim_pending_user_messages(owner_str, &agent.name)?;
@@ -11533,6 +11565,24 @@ async fn chat_agent_poll(
     }
 
     Ok(build_poll_response(vec![]))
+}
+
+fn build_poll_response_with_stop(mut response: Json<Value>) -> Json<Value> {
+    if let Some(obj) = response.0.as_object_mut() {
+        obj.insert("stop_requested".to_string(), json!(true));
+    }
+    response
+}
+
+async fn chat_agent_take_stop_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    Ok(Json(json!({
+        "stop_requested": take_chat_agent_stop_request(&state, owner.as_str(), &agent.name)
+    })))
 }
 
 async fn chat_agent_respond(
@@ -12374,8 +12424,7 @@ async fn chat_agent_history(
     let owner_str = owner.as_str();
 
     let conv = state.chat.load_conversation(owner_str, &agent.name)?;
-    let msgs: Vec<Value> = conv
-        .messages
+    let msgs: Vec<Value> = unsummarized_messages(&conv)
         .iter()
         .map(|m| {
             json!({
@@ -12462,15 +12511,31 @@ async fn chat_agent_compact(
     let owner_str = owner.as_str();
 
     let conv = state.chat.load_conversation(owner_str, &agent.name)?;
-    let kept_messages: Vec<ChatMessage> = conv
-        .messages
-        .into_iter()
-        .filter(|m| body.keep_message_ids.contains(&m.id))
-        .collect();
+    let unsummarized = unsummarized_messages(&conv);
+    let summary_until_id = if body.keep_message_ids.is_empty() {
+        unsummarized
+            .last()
+            .map(|m| m.id)
+            .unwrap_or(conv.summary_until_id)
+    } else {
+        unsummarized
+            .iter()
+            .find(|m| body.keep_message_ids.contains(&m.id))
+            .map(|m| m.id.saturating_sub(1))
+            .unwrap_or_else(|| {
+                unsummarized
+                    .last()
+                    .map(|m| m.id)
+                    .unwrap_or(conv.summary_until_id)
+            })
+    };
 
-    state
-        .chat
-        .set_messages(owner_str, &agent.name, kept_messages, body.summary)?;
+    state.chat.set_compaction_state(
+        owner_str,
+        &agent.name,
+        body.summary,
+        summary_until_id.max(conv.summary_until_id),
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -12554,13 +12619,14 @@ async fn chat_agent_get_manage(
     let system_prompt = build_manager_prompt(&mc, turn_in_cycle);
 
     let conv = state.chat.load_conversation(owner_str, &agent.name)?;
-    let boundaries = exchange_boundaries(&conv.messages);
+    let window_messages = unsummarized_messages(&conv);
+    let boundaries = exchange_boundaries(window_messages);
     let last_10_start = if boundaries.len() > 10 {
         boundaries[boundaries.len() - 10]
     } else {
         0
     };
-    let recent_msgs: Vec<Value> = conv.messages[last_10_start..].iter().map(|m| {
+    let recent_msgs: Vec<Value> = window_messages[last_10_start..].iter().map(|m| {
         json!({
             "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
             "content": m.content,
@@ -12718,6 +12784,10 @@ fn count_exchanges(messages: &[ChatMessage]) -> usize {
     messages.iter().filter(|m| m.role == ChatRole::User).count()
 }
 
+fn agent_window_exchange_count(conv: &ChatConversation) -> usize {
+    count_exchanges(unsummarized_messages(conv))
+}
+
 /// Returns the message index where each exchange starts (i.e. each User message index).
 fn exchange_boundaries(messages: &[ChatMessage]) -> Vec<usize> {
     messages
@@ -12768,7 +12838,8 @@ async fn do_exchange_compact(
         .load_conversation(owner, agent_name)
         .map_err(|e| format!("Compact failed: {e}"))?;
 
-    let exchanges = count_exchanges(&conv.messages);
+    let unsummarized = unsummarized_messages(&conv);
+    let exchanges = count_exchanges(unsummarized);
     if exchanges <= 2 {
         return Err("Nothing to compact (2 or fewer exchanges).".to_string());
     }
@@ -12776,19 +12847,19 @@ async fn do_exchange_compact(
     let target = if aggressive {
         conv.window_size / 2
     } else {
-        conv.window_size.saturating_sub(7).max(1)
+        conv.window_size / 2
     };
 
-    let boundaries = exchange_boundaries(&conv.messages);
+    let boundaries = exchange_boundaries(unsummarized);
     let keep_count = target.min(exchanges - 1);
     let keep_from_exchange = boundaries.len().saturating_sub(keep_count);
     let split_idx = boundaries[keep_from_exchange];
 
-    let to_summarize = &conv.messages[..split_idx];
+    let to_summarize = &unsummarized[..split_idx];
     if to_summarize.is_empty() {
         return Err("Nothing to compact.".to_string());
     }
-    let kept: Vec<ChatMessage> = conv.messages[split_idx..].to_vec();
+    let kept = &unsummarized[split_idx..];
 
     let mut conversation_text = String::new();
     if !conv.summary.is_empty() {
@@ -12873,11 +12944,15 @@ async fn do_exchange_compact(
     };
 
     let summarized_exchanges = keep_from_exchange;
-    let kept_exchanges = count_exchanges(&kept);
+    let kept_exchanges = count_exchanges(kept);
+    let summary_until_id = to_summarize
+        .last()
+        .map(|msg| msg.id)
+        .unwrap_or(conv.summary_until_id);
 
     state
         .chat
-        .set_messages(owner, agent_name, kept, summary)
+        .set_compaction_state(owner, agent_name, summary, summary_until_id)
         .map_err(|e| format!("Compact save failed: {e}"))?;
 
     Ok(format!(
@@ -13057,6 +13132,7 @@ fn finish_api_agent(state: &AppState, owner: &str, agent_name: &str, content: &s
 }
 
 fn finalize_agent_turn(state: &AppState, owner: &str, agent_name: &str) {
+    clear_chat_agent_stop_request(state, owner, agent_name);
     let _ = state.chat.complete_active_turn(owner, agent_name);
     let _ = state
         .chat
@@ -13079,6 +13155,34 @@ fn finalize_agent_turn(state: &AppState, owner: &str, agent_name: &str) {
             }),
         },
     );
+}
+
+fn chat_agent_stop_key(owner: &str, agent_name: &str) -> String {
+    format!("{owner}_{agent_name}")
+}
+
+fn request_chat_agent_stop(state: &AppState, owner: &str, agent_name: &str) {
+    state
+        .chat_agent_stops
+        .lock()
+        .unwrap()
+        .insert(chat_agent_stop_key(owner, agent_name));
+}
+
+fn take_chat_agent_stop_request(state: &AppState, owner: &str, agent_name: &str) -> bool {
+    state
+        .chat_agent_stops
+        .lock()
+        .unwrap()
+        .remove(&chat_agent_stop_key(owner, agent_name))
+}
+
+fn clear_chat_agent_stop_request(state: &AppState, owner: &str, agent_name: &str) {
+    state
+        .chat_agent_stops
+        .lock()
+        .unwrap()
+        .remove(&chat_agent_stop_key(owner, agent_name));
 }
 
 fn collect_git_context(cwd: Option<&str>) -> String {
@@ -14031,7 +14135,7 @@ async fn chat_slash_command(
                 format!(
                     "Agent: {}\nStatus: {}\nMode: API\nEndpoint: {}\nProvider: {}\nModel: {}{}{}\nExchanges: {}\nPins: {}\nWindow: {} exchanges",
                     agent_name, status_str, ep_name, ep_kind, ep_model, effort_line, manage_line,
-                    count_exchanges(&conv.messages), conv.pins.len(), conv.window_size
+                    agent_window_exchange_count(&conv), conv.pins.len(), conv.window_size
                 )
             } else {
                 let backend = agent_token.map(|a| a.backend.clone()).unwrap_or_default();
@@ -14047,14 +14151,18 @@ async fn chat_slash_command(
                     model.as_deref().unwrap_or("default"),
                     effort.as_deref().unwrap_or("default"),
                     manage_line,
-                    count_exchanges(&conv.messages), conv.pins.len(), conv.window_size
+                    agent_window_exchange_count(&conv), conv.pins.len(), conv.window_size
                 )
             }
         }
         "/context" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
             let mut parts = Vec::new();
-            parts.push(format!("{} exchanges in window (max {}).", count_exchanges(&conv.messages), conv.window_size));
+            parts.push(format!(
+                "{} exchanges in window (max {}).",
+                agent_window_exchange_count(&conv),
+                conv.window_size
+            ));
             let git_ctx = collect_git_context(conv.cwd.as_deref());
             if !git_ctx.is_empty() {
                 parts.push(format!("\nGit:\n{git_ctx}"));
@@ -14119,7 +14227,11 @@ async fn chat_slash_command(
                 parts.push(format!("\n== Recent Activity ==\n{activity}"));
             }
 
-            parts.push(format!("\n== Conversation ==\n{} exchanges in window (max {}).", count_exchanges(&conv.messages), conv.window_size));
+            parts.push(format!(
+                "\n== Conversation ==\n{} exchanges in window (max {}).",
+                agent_window_exchange_count(&conv),
+                conv.window_size
+            ));
             if !conv.summary.is_empty() {
                 parts.push(format!("\n-- Tail Summary --\n{}", conv.summary));
             }
@@ -14206,8 +14318,8 @@ async fn chat_slash_command(
                     "Window: {} exchanges\nAuto-compact at: {} exchanges (down to {})\nCurrent: {} exchanges in window\n\nUsage: /window <n> (e.g. /window 22)",
                     conv.window_size,
                     conv.window_size,
-                    conv.window_size.saturating_sub(7).max(1),
-                    count_exchanges(&conv.messages)
+                    conv.window_size / 2,
+                    agent_window_exchange_count(&conv)
                 )
             } else {
                 match args.parse::<usize>() {
@@ -14337,22 +14449,13 @@ async fn chat_slash_command(
             }
         }
         "/stop" => {
-            let is_api = agents.iter().find(|a| a.name == agent_name)
-                .map(|a| a.endpoint_id.is_some()).unwrap_or(false);
-            if is_api {
-                state.chat_agent_stops.lock().unwrap().insert(format!("{owner}_{agent_name}"));
-                let _ = state.chat.update_auto_message(owner, &agent_name, None);
-                "Stop requested. Auto-repeat cleared.".to_string()
-            } else {
-                let _ = state.chat.append_message(
-                    owner, &agent_name, ChatRole::User, "/stop".to_string(),
-                )?;
-                let notifier_key = format!("{owner}_{agent_name}");
-                if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
-                    notify.notify_one();
-                }
-                "Stop requested.".to_string()
+            request_chat_agent_stop(&state, owner, &agent_name);
+            let _ = state.chat.update_auto_message(owner, &agent_name, None);
+            let notifier_key = format!("{owner}_{agent_name}");
+            if let Some(notify) = state.chat_agent_notifiers.lock().unwrap().get(&notifier_key) {
+                notify.notify_one();
             }
+            "Stop requested. Auto-repeat cleared.".to_string()
         }
         "/restart" => {
             let _ = state.chat.append_message(
@@ -14471,7 +14574,7 @@ async fn chat_slash_command(
                     AgentChatStatus::Offline => "offline",
                 };
                 let display = a.display_name.as_deref().unwrap_or(&a.name);
-                let exchange_count = count_exchanges(&conv.messages);
+                let exchange_count = agent_window_exchange_count(&conv);
                 let auto_str = match &conv.auto_message {
                     Some(m) => format!(" auto=\"{}\"", m.chars().take(30).collect::<String>()),
                     None => String::new(),
@@ -15375,6 +15478,10 @@ mod tests {
         assert_eq!(json["selected_agent"], "agent-main");
         assert_eq!(json["agent_status"], "idle");
         assert_eq!(json["messages"][0]["content"], "hello from agent");
+        let agent_list_html = json["agent_list_html"].as_str().unwrap();
+        assert!(agent_list_html.contains("agent-main"));
+        assert!(agent_list_html.contains("hello from agent"));
+        assert!(agent_list_html.contains("chat-status-running"));
     }
 
     #[tokio::test]
@@ -18853,6 +18960,70 @@ mod tests {
     }
 
     #[test]
+    fn chat_panel_keeps_last_fifty_exchanges_verbatim() {
+        let mut conv = ChatConversation {
+            active_turn_user_id: 119,
+            last_delivered_user_id: 119,
+            ..Default::default()
+        };
+        for i in 1..=60u64 {
+            conv.messages.push(ChatMessage {
+                id: (i * 2) - 1,
+                role: ChatRole::User,
+                content: format!("user-{i}"),
+                timestamp: OffsetDateTime::UNIX_EPOCH,
+                client_message_id: None,
+            });
+            conv.messages.push(ChatMessage {
+                id: i * 2,
+                role: ChatRole::Assistant,
+                content: format!("assistant-{i}"),
+                timestamp: OffsetDateTime::UNIX_EPOCH,
+                client_message_id: None,
+            });
+        }
+        conv.summary_until_id = 100;
+
+        let messages = super::chat_messages_value_for_panel(&conv);
+        assert_eq!(messages.len(), 100);
+        assert_eq!(
+            messages.first().unwrap()["content"].as_str(),
+            Some("user-11")
+        );
+        assert_eq!(
+            messages.last().unwrap()["content"].as_str(),
+            Some("assistant-60")
+        );
+    }
+
+    #[test]
+    fn unsummarized_messages_hide_compacted_prefix_from_agent_window() {
+        let mut conv = ChatConversation::default();
+        for i in 1..=6u64 {
+            conv.messages.push(ChatMessage {
+                id: (i * 2) - 1,
+                role: ChatRole::User,
+                content: format!("user-{i}"),
+                timestamp: OffsetDateTime::UNIX_EPOCH,
+                client_message_id: None,
+            });
+            conv.messages.push(ChatMessage {
+                id: i * 2,
+                role: ChatRole::Assistant,
+                content: format!("assistant-{i}"),
+                timestamp: OffsetDateTime::UNIX_EPOCH,
+                client_message_id: None,
+            });
+        }
+        conv.summary_until_id = 6;
+
+        let remaining = super::unsummarized_messages(&conv);
+        assert_eq!(super::count_exchanges(remaining), 3);
+        assert_eq!(remaining.first().unwrap().content, "user-4");
+        assert_eq!(remaining.last().unwrap().content, "assistant-6");
+    }
+
+    #[test]
     fn finish_api_agent_preserves_only_follow_up_message_as_pending() {
         let dir = tempdir().unwrap();
         let state = super::AppState::new(FileBlockStore::new(dir.path()));
@@ -18882,6 +19053,48 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, second.id);
         assert_eq!(pending[0].content, "second");
+    }
+
+    #[test]
+    fn chat_agent_stop_request_is_one_shot() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+
+        super::request_chat_agent_stop(&state, "admin", "agent-main");
+
+        assert!(super::take_chat_agent_stop_request(
+            &state,
+            "admin",
+            "agent-main"
+        ));
+        assert!(!super::take_chat_agent_stop_request(
+            &state,
+            "admin",
+            "agent-main"
+        ));
+    }
+
+    #[test]
+    fn finalize_agent_turn_clears_pending_stop_request() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let _ = state
+            .chat
+            .append_message("admin", "agent-main", ChatRole::User, "first".into())
+            .unwrap();
+        let _ = state
+            .chat
+            .claim_pending_user_messages("admin", "agent-main")
+            .unwrap();
+
+        super::request_chat_agent_stop(&state, "admin", "agent-main");
+        super::finalize_agent_turn(&state, "admin", "agent-main");
+
+        assert!(!super::take_chat_agent_stop_request(
+            &state,
+            "admin",
+            "agent-main"
+        ));
     }
 
     #[test]

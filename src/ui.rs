@@ -65,11 +65,7 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
   var mode = '{mode}';
   var resyncTimers = [];
   function setResolvedMode(resolved) {{
-    if (mode === 'system') {{
-      root.removeAttribute('data-resolved-color-mode');
-    }} else {{
-      root.setAttribute('data-resolved-color-mode', resolved);
-    }}
+    root.setAttribute('data-resolved-color-mode', resolved);
     root.style.colorScheme = resolved;
   }}
   function clearResyncTimers() {{
@@ -3497,12 +3493,40 @@ pub fn render_chat_page(
     flash: Option<&str>,
     projects: &[(String, String)],
 ) -> String {
-    let is_librarian = selected_agent == Some("librarian");
+    let agent_list_html = render_chat_agent_list(agents, selected_agent);
     let selected_agent_status_js = selected_agent
         .and_then(|name| agents.iter().find(|agent| agent.name == name))
         .map(|agent| format!("'{}'", escape_attribute(&agent.status)))
         .unwrap_or_else(|| "''".to_string());
+    let chat_area_html = render_chat_main_panel(agents, selected_agent, csrf_token, projects);
+    let selected_agent_js = selected_agent
+        .map(|a| format!("'{}'", escape_attribute(a)))
+        .unwrap_or_else(|| "null".to_string());
+    let profile_url_js = selected_agent
+        .and_then(|name| agents.iter().find(|a| a.name == name))
+        .and_then(|a| a.profile_url.as_ref())
+        .map(|url| format!("'{}'", escape_attribute(url)))
+        .unwrap_or_else(|| "null".to_string());
+    render_chat_page_with_agent_list_html(
+        theme,
+        color_mode,
+        username,
+        csrf_token,
+        is_admin,
+        &agent_list_html,
+        selected_agent.is_some(),
+        selected_agent_js,
+        selected_agent_status_js,
+        messages_json,
+        profile_url_js,
+        active_turn_user_id,
+        flash,
+        chat_area_html,
+    )
+}
 
+pub fn render_chat_agent_list(agents: &[ChatAgentSummary], selected_agent: Option<&str>) -> String {
+    let is_librarian = selected_agent == Some("librarian");
     let librarian_active_class = if is_librarian {
         " chat-agent-active"
     } else {
@@ -3580,22 +3604,28 @@ pub fn render_chat_page(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let agent_list_html = format!("{}\n{}", librarian_entry, agent_list_html);
+    format!("{}\n{}", librarian_entry, agent_list_html)
+}
 
-    let chat_area_html = render_chat_main_panel(agents, selected_agent, csrf_token, projects);
-
-    let selected_agent_js = selected_agent
-        .map(|a| format!("'{}'", escape_attribute(a)))
-        .unwrap_or_else(|| "null".to_string());
-
-    let profile_url_js = selected_agent
-        .and_then(|name| agents.iter().find(|a| a.name == name))
-        .and_then(|a| a.profile_url.as_ref())
-        .map(|url| format!("'{}'", escape_attribute(url)))
-        .unwrap_or_else(|| "null".to_string());
+fn render_chat_page_with_agent_list_html(
+    theme: UiTheme,
+    color_mode: ColorMode,
+    username: &str,
+    csrf_token: &str,
+    is_admin: bool,
+    agent_list_html: &str,
+    has_selected_agent: bool,
+    selected_agent_js: String,
+    selected_agent_status_js: String,
+    messages_json: &str,
+    profile_url_js: String,
+    active_turn_user_id: u64,
+    flash: Option<&str>,
+    chat_area_html: String,
+) -> String {
     let username_js = escape_attribute(username);
 
-    let layout_class = if selected_agent.is_some() {
+    let layout_class = if has_selected_agent {
         "chat-layout chat-has-agent"
     } else {
         "chat-layout"
@@ -3607,7 +3637,7 @@ pub fn render_chat_page(
     <div class="chat-sidebar-header">
       <span class="chat-header-name">Agents</span>
     </div>
-    <div class="chat-agent-list">
+    <div class="chat-agent-list" id="chat-agent-list">
       {agent_list_html}
     </div>
   </div>
@@ -3874,33 +3904,39 @@ function initializeChatPanel() {{
     }});
 }}
 
+function applyChatPanelResponse(data, pushHistory) {{
+  if (!data || !data.ok) return;
+  var main = document.getElementById('chat-main');
+  if (!main) return;
+  var list = document.getElementById('chat-agent-list');
+  if (list && typeof data.agent_list_html === 'string') {{
+    list.innerHTML = data.agent_list_html;
+  }}
+  main.innerHTML = data.panel_html || '';
+  currentAgent = data.selected_agent || null;
+  chatMessages = data.messages || [];
+  agentStatus = data.agent_status || '';
+  activeTurnUserId = data.active_turn_user_id || 0;
+  agentProfileUrl = data.profile_url || null;
+  if (currentAgent) {{
+    localStorage.setItem('lastChatAgent', currentAgent);
+  }} else {{
+    localStorage.removeItem('lastChatAgent');
+  }}
+  if (pushHistory) {{
+    history.pushState({{ agent: currentAgent }}, '', currentChatUrl(currentAgent));
+  }}
+  initializeChatPanel();
+  applyChatViewportFix();
+}}
+
 function loadDesktopChatPanel(agent, pushHistory) {{
   persistCurrentChatDraft();
   var url = '/ui/chat/panel';
   if (agent) url += '?agent=' + encodeURIComponent(agent);
   fetch(url, {{ cache: 'no-store' }})
     .then(function(r) {{ return r.json(); }})
-    .then(function(data) {{
-      if (!data || !data.ok) return;
-      var main = document.getElementById('chat-main');
-      if (!main) return;
-      main.innerHTML = data.panel_html || '';
-      currentAgent = data.selected_agent || null;
-      chatMessages = data.messages || [];
-      agentStatus = data.agent_status || '';
-      activeTurnUserId = data.active_turn_user_id || 0;
-      agentProfileUrl = data.profile_url || null;
-      if (currentAgent) {{
-        localStorage.setItem('lastChatAgent', currentAgent);
-      }} else {{
-        localStorage.removeItem('lastChatAgent');
-      }}
-      if (pushHistory) {{
-        history.pushState({{ agent: currentAgent }}, '', currentChatUrl(currentAgent));
-      }}
-      initializeChatPanel();
-      applyChatViewportFix();
-    }});
+    .then(function(data) {{ applyChatPanelResponse(data, pushHistory); }});
 }}
 
 function markChatStreamAlive() {{
@@ -3927,24 +3963,7 @@ function refreshChatOnResume(force) {{
   if (currentAgent) url += '?agent=' + encodeURIComponent(currentAgent);
   fetch(url, {{ cache: 'no-store' }})
     .then(function(r) {{ return r.json(); }})
-    .then(function(data) {{
-      if (!data || !data.ok) return;
-      var main = document.getElementById('chat-main');
-      if (!main) return;
-      main.innerHTML = data.panel_html || '';
-      currentAgent = data.selected_agent || null;
-      chatMessages = data.messages || [];
-      agentStatus = data.agent_status || '';
-      activeTurnUserId = data.active_turn_user_id || 0;
-      agentProfileUrl = data.profile_url || null;
-      if (currentAgent) {{
-        localStorage.setItem('lastChatAgent', currentAgent);
-      }} else {{
-        localStorage.removeItem('lastChatAgent');
-      }}
-      initializeChatPanel();
-      applyChatViewportFix();
-    }})
+    .then(function(data) {{ applyChatPanelResponse(data, false); }})
     .catch(function() {{}})
     .finally(function() {{
       chatResumeRefreshInFlight = false;
@@ -4681,7 +4700,18 @@ function updateHeaderStatus() {{
   if (agentConfig.model) parts.push(agentConfig.model);
   if (agentConfig.effort && backendEfforts[agentConfig.backend] && backendEfforts[agentConfig.backend].length > 0) parts.push(agentConfig.effort);
   if (agentStatus) parts.push(agentStatus);
-  el.textContent = parts.join(' \u00b7 ');
+  var statusClass = chatStatusClass(agentStatus);
+  var statusTitle = agentStatus === 'idle' ? 'Finished' : agentStatus === 'thinking' ? 'Working' : agentStatus === 'restarting' ? 'Restarting' : 'Stopped';
+  var glyphHtml = agentStatus === 'idle'
+    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>'
+    : agentStatus === 'thinking'
+    ? "<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><defs><linearGradient id=\"status-working-gradient\" x1=\"2\" y1=\"12\" x2=\"22\" y2=\"12\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color='#38bdf8'/><stop offset=\"0.35\" stop-color=\"var(--accent)\"/><stop offset=\"0.65\" stop-color='#dbeafe'/><stop offset=\"1\" stop-color='#38bdf8'/><animateTransform attributeName=\"gradientTransform\" type=\"translate\" from=\"-18 0\" to=\"18 0\" dur=\"1.35s\" repeatCount=\"indefinite\"/></linearGradient></defs><path stroke='url(#status-working-gradient)' d=\"M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z\"/></svg>"
+    : agentStatus === 'restarting'
+    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>'
+    : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6"/><path d="M15 9l-6 6"/></svg>';
+  el.innerHTML = '<span class="chat-status-glyph ' + statusClass + '" title="' + statusTitle + '">' + glyphHtml + '</span><span class="chat-header-status-text"></span>';
+  var textEl = el.querySelector('.chat-header-status-text');
+  if (textEl) textEl.textContent = parts.join(' \u00b7 ');
 }}
 
 function chatStatusClass(status) {{
@@ -8348,8 +8378,8 @@ fn theme_palette(theme: UiTheme, dark: bool) -> ThemePalette {
             flash_text: "#234c31",
             flash_border: "rgba(62, 140, 93, 0.2)",
             callout_background: "rgba(181, 82, 51, 0.08)",
-            code_background: "#201814",
-            code_text: "#f9f3ec",
+            code_background: "#f6eee6",
+            code_text: "#4d3325",
             media_background: "#fff",
             media_image_background: "linear-gradient(180deg, #fffdf9, #f5eee3)",
             empty_background: "rgba(255,255,255,0.62)",
@@ -8459,8 +8489,8 @@ fn theme_palette(theme: UiTheme, dark: bool) -> ThemePalette {
             flash_text: "#065f46",
             flash_border: "rgba(16, 185, 129, 0.2)",
             callout_background: "rgba(59, 130, 246, 0.08)",
-            code_background: "#1a2233",
-            code_text: "#dce5f0",
+            code_background: "#e8eff8",
+            code_text: "#223248",
             media_background: "#ffffff",
             media_image_background: "linear-gradient(180deg, #fafbfe, #edf1f7)",
             empty_background: "rgba(255,255,255,0.66)",
@@ -8496,8 +8526,8 @@ fn theme_palette(theme: UiTheme, dark: bool) -> ThemePalette {
             flash_text: "#14532d",
             flash_border: "rgba(22, 163, 74, 0.22)",
             callout_background: "rgba(15, 143, 111, 0.08)",
-            code_background: "#10221e",
-            code_text: "#dcfff8",
+            code_background: "#e7f4ef",
+            code_text: "#18483d",
             media_background: "#ffffff",
             media_image_background: "linear-gradient(180deg, #fbfffe, #edf7f4)",
             empty_background: "rgba(255,255,255,0.66)",
@@ -8742,7 +8772,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
             let light = theme_palette(theme, false);
             let dark = theme_palette(theme, true);
             format!(
-                "    :root {{\n      {light_vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root {{\n        {dark_vars}\n      }}\n    }}",
+                "    :root {{\n      {light_vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    :root[data-resolved-color-mode=\"light\"] {{\n      {light_vars}\n    }}\n    :root[data-resolved-color-mode=\"dark\"] {{\n      {dark_vars}\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root {{\n        {dark_vars}\n      }}\n    }}",
                 light_vars = palette_css_vars(&light),
                 dark_vars = palette_css_vars(&dark)
             )
@@ -9254,8 +9284,17 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-header-status {
       font-size: 0.82rem;
       color: var(--fg-muted);
-      display: block;
+      display: inline-flex;
+      align-items: center;
+      gap: var(--s-2);
       line-height: 1.3;
+      min-width: 0;
+    }
+    .chat-header-status-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .chat-header-cwd {
       margin-left: auto;
@@ -11139,7 +11178,13 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-header .chat-avatar-sm-wrap { margin-right: 0; margin-left: 0; }
       .chat-header .chat-avatar-header { margin: 0; }
       .chat-header-cwd { display: none; }
-      .chat-header-status { display: none; }
+      .chat-header-status {
+        display: inline-flex;
+        margin-left: auto;
+        gap: 0;
+      }
+      .chat-header-status-text { display: none; }
+      #chat-manage-btn { margin-left: 0 !important; }
       .chat-messages {
         overflow-y: scroll;
         overflow-x: hidden;
@@ -11281,6 +11326,48 @@ mod tests {
     }
 
     #[test]
+    fn mobile_chat_header_keeps_status_glyph_before_manage_button() {
+        let html = render_shell(
+            PageShell {
+                title: "Lore",
+                username: None,
+                is_admin: false,
+                theme: UiTheme::Parchment,
+                color_mode: ColorMode::Light,
+                csrf_token: None,
+                flash: None,
+            },
+            String::new(),
+        );
+        assert!(html.contains(
+            ".chat-header-status {\n        display: inline-flex;\n        margin-left: auto;"
+        ));
+        assert!(html.contains(".chat-header-status-text { display: none; }"));
+        assert!(html.contains("#chat-manage-btn { margin-left: 0 !important; }"));
+
+        let panel = render_chat_main_panel(
+            &[ChatAgentSummary {
+                name: "worker".into(),
+                display_name: "Worker".into(),
+                owner: "admin".into(),
+                status: "thinking".into(),
+                last_message: None,
+                last_message_time: None,
+                profile_url: None,
+                cwd: None,
+                git_branch: None,
+            }],
+            Some("worker"),
+            "csrf",
+            &[],
+        );
+        assert!(
+            panel.contains(r#"<span class="chat-header-status" id="chat-agent-status"></span>"#)
+        );
+        assert!(panel.contains(r#"id="chat-manage-btn""#));
+    }
+
+    #[test]
     fn shell_bootstraps_system_color_mode_for_mobile_clients() {
         let html = render_shell(
             PageShell {
@@ -11308,8 +11395,20 @@ mod tests {
             html.contains(r#"window.addEventListener('pageshow', scheduleResolvedModeResync);"#)
         );
         assert!(html.contains(r#"document.addEventListener('visibilitychange', function() {"#));
-        assert!(html.contains(r#"if (mode === 'system') {"#));
-        assert!(html.contains(r#"root.removeAttribute('data-resolved-color-mode');"#));
+        assert!(html.contains(r#"root.setAttribute('data-resolved-color-mode', resolved);"#));
+        assert!(html.contains(r#":root[data-resolved-color-mode="light"] {"#));
+        assert!(html.contains(r#":root[data-resolved-color-mode="dark"] {"#));
         assert!(html.contains(r#"@media (prefers-color-scheme: dark) {"#));
+    }
+
+    #[test]
+    fn code_blocks_follow_selected_theme_mode_palette() {
+        let light = shared_styles(UiTheme::Parchment, ColorMode::Light);
+        assert!(light.contains("--code-bg: #f6eee6;"));
+        assert!(light.contains("--code-ink: #4d3325;"));
+
+        let dark = shared_styles(UiTheme::Parchment, ColorMode::Dark);
+        assert!(dark.contains("--code-bg: #120e0a;"));
+        assert!(dark.contains("--code-ink: #f0e6d8;"));
     }
 }
