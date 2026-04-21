@@ -179,16 +179,16 @@ export async function getManagerStatus(page: Page, agentName: string): Promise<{
 
 export async function waitForManagerMessage(page: Page, opts: { after?: number; timeout?: number } = {}): Promise<string> {
   const { after = 0, timeout = 30_000 } = opts;
-  // Manager messages are stored as ChatRole::User with content '[manager] ...'.
+  // Manager messages are stored as ChatRole::User with content prefixed by '👔 '.
   // They render as chat-msg-user bubbles.
   await page.waitForFunction((n) => {
     const all = document.querySelectorAll('#chat-messages .chat-msg-user');
     let managerCount = 0;
-    all.forEach((node) => { if (node.textContent?.startsWith('[manager]')) managerCount++; });
+    all.forEach((node) => { if (node.textContent?.startsWith('👔 ')) managerCount++; });
     return managerCount > n;
   }, after, { timeout });
   const all = await page.locator('#chat-messages .chat-msg-user').allInnerTexts();
-  const managerMsgs = all.filter((t) => t.startsWith('[manager]'));
+  const managerMsgs = all.filter((t) => t.startsWith('👔 '));
   return managerMsgs[managerMsgs.length - 1];
 }
 

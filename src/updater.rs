@@ -18,7 +18,6 @@ pub const SERVER_RELEASE_CLI_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
 ];
-pub const LEGACY_MACHINE_BINARY_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -418,7 +417,6 @@ pub async fn sync_release_binaries_to_directory(
     let target_version = normalize_version_tag(target_version);
     fs::create_dir_all(output_dir)?;
     if release_binaries_are_current(binary_name, output_dir, &target_version) {
-        ensure_legacy_machine_binary_link(output_dir, binary_name)?;
         return Ok(SERVER_RELEASE_CLI_TARGETS
             .iter()
             .map(|target| (*target).to_string())
@@ -468,7 +466,6 @@ pub async fn sync_release_binaries_to_directory(
         output_dir.join(format!("{binary_name}-release-version.txt")),
         target_version.as_bytes(),
     )?;
-    ensure_legacy_machine_binary_link(output_dir, binary_name)?;
     Ok(SERVER_RELEASE_CLI_TARGETS
         .iter()
         .map(|target| (*target).to_string())
@@ -840,28 +837,6 @@ fn release_binaries_are_current(
     })
 }
 
-fn ensure_legacy_machine_binary_link(output_dir: &Path, binary_name: &str) -> Result<()> {
-    let legacy_path = output_dir.join(binary_name);
-    let legacy_target = release_binary_filename(binary_name, LEGACY_MACHINE_BINARY_TARGET);
-    let target_path = output_dir.join(&legacy_target);
-    if !target_path.exists() {
-        return Err(LoreError::ExternalService(format!(
-            "missing legacy machine binary target {}",
-            target_path.display()
-        )));
-    }
-    let _ = fs::remove_file(&legacy_path);
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&legacy_target, &legacy_path)?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::copy(&target_path, &legacy_path)?;
-    }
-    Ok(())
-}
-
 fn write_binary_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     fs::write(&tmp_path, bytes)?;
@@ -877,9 +852,8 @@ fn write_binary_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, LEGACY_MACHINE_BINARY_TARGET, ReleaseStream,
-        SERVER_RELEASE_CLI_TARGETS, compare_versions, ensure_legacy_machine_binary_link,
-        normalize_version_tag, release_binary_filename,
+        AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream, compare_versions,
+        normalize_version_tag,
     };
 
     #[test]
@@ -942,37 +916,5 @@ mod tests {
         assert!(compare_versions("0.1.65", "0.1.65-rc13").is_gt());
         assert!(compare_versions("0.1.65-rc13", "0.1.65").is_lt());
         assert!(compare_versions("0.1.66", "0.1.65-rc13").is_gt());
-    }
-
-    #[test]
-    fn legacy_machine_binary_link_points_at_linux_x86_64_target() {
-        let dir = tempfile::tempdir().unwrap();
-        for target in SERVER_RELEASE_CLI_TARGETS {
-            std::fs::write(
-                dir.path().join(release_binary_filename("lore", target)),
-                target.as_bytes(),
-            )
-            .unwrap();
-        }
-
-        ensure_legacy_machine_binary_link(dir.path(), "lore").unwrap();
-
-        let legacy_path = dir.path().join("lore");
-        #[cfg(unix)]
-        {
-            let target = std::fs::read_link(&legacy_path).unwrap();
-            assert_eq!(
-                target,
-                std::path::PathBuf::from(release_binary_filename(
-                    "lore",
-                    LEGACY_MACHINE_BINARY_TARGET
-                ))
-            );
-        }
-        #[cfg(not(unix))]
-        {
-            let bytes = std::fs::read(&legacy_path).unwrap();
-            assert_eq!(bytes, LEGACY_MACHINE_BINARY_TARGET.as_bytes());
-        }
     }
 }

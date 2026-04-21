@@ -247,7 +247,7 @@ if [ -z "$CLIENT_TARGET" ]; then
 fi
 ssh "$SERVER" "mkdir -p /home/lore/lore/updates"
 scp -q target/release/lore "${SERVER}:${REMOTE_CLIENT_UPLOAD}"
-ssh "$SERVER" "chmod +x '${REMOTE_CLIENT_UPLOAD}' && mv '${REMOTE_CLIENT_UPLOAD}' '/home/lore/lore/updates/lore-${CLIENT_TARGET}' && ln -sfn 'lore-${CLIENT_TARGET}' /home/lore/lore/updates/lore"
+ssh "$SERVER" "chmod +x '${REMOTE_CLIENT_UPLOAD}' && mv '${REMOTE_CLIENT_UPLOAD}' '/home/lore/lore/updates/lore-${CLIENT_TARGET}'"
 
 # --- Restart service ---
 echo "Restarting..."

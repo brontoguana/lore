@@ -1907,64 +1907,43 @@ async fn apply_cli_update_to_target(
 async fn download_binary_from_server(context: &CliContext, machine_token: &str) -> CliResult<bool> {
     eprintln!("[service] Trying direct binary download from server...");
     let target = match service_update_target() {
-        Ok(target) => Some(target),
+        Ok(target) => target,
         Err(err) => {
             eprintln!("[service] Could not determine target-specific update path: {err}");
-            None
+            return Ok(false);
         }
     };
-    let mut urls = Vec::new();
-    if let Some(ref target) = target {
-        urls.push(format!("{}/v1/machines/binary/{target}", context.url));
-    }
-    urls.push(format!("{}/v1/machines/binary", context.url));
+    let url = format!("{}/v1/machines/binary/{target}", context.url);
 
-    let mut bytes = None;
-    for (index, url) in urls.iter().enumerate() {
-        let resp = context
-            .client
-            .get(url)
-            .header("x-lore-key", machine_token)
-            .timeout(std::time::Duration::from_secs(120))
-            .send()
-            .await;
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[service] Server binary download failed: {e}");
-                if index + 1 == urls.len() {
-                    return Ok(false);
-                }
-                continue;
-            }
-        };
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            if index + 1 == urls.len() {
-                eprintln!("[service] No staged binary on server, will try GitHub");
-                return Ok(false);
-            }
-            continue;
+    let resp = match context
+        .client
+        .get(&url)
+        .header("x-lore-key", machine_token)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!("[service] Server binary download failed: {e}");
+            return Ok(false);
         }
-        if !resp.status().is_success() {
-            eprintln!(
-                "[service] Server binary download returned {}",
-                resp.status()
-            );
-            if index + 1 == urls.len() {
-                return Ok(false);
-            }
-            continue;
-        }
-        bytes = Some(
-            resp.bytes()
-                .await
-                .map_err(|e| io::Error::other(format!("failed to read binary response: {e}")))?,
-        );
-        break;
-    }
-    let Some(bytes) = bytes else {
-        return Ok(false);
     };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        eprintln!("[service] No staged binary for target {target} on server, will try GitHub");
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        eprintln!(
+            "[service] Server binary download returned {}",
+            resp.status()
+        );
+        return Ok(false);
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| io::Error::other(format!("failed to read binary response: {e}")))?;
     if bytes.len() < 1024 {
         eprintln!(
             "[service] Server binary too small ({}b), ignoring",
@@ -3413,7 +3392,7 @@ async fn run_manager_cli(
         }
     }
 
-    prompt_parts.push("\n## Instructions\n\nReview the conversation above and provide your guidance. You may READ files from the working directory if needed to verify periodic checks, but you must NEVER edit, create, delete, or execute any files or commands. Your only output should be your guidance text.".to_string());
+    prompt_parts.push("\n## Instructions\n\nReview the conversation above and respond as the manager speaking directly to the agent. Give a concrete next instruction, not advice to the user. Do not ask the user for clarification or more input unless the stopping criteria explicitly require that. You may READ files from the working directory if needed to verify periodic checks, but you must NEVER edit, create, delete, or execute any files or commands. Your only output should be the manager's instruction text for the agent.".to_string());
 
     let full_prompt = prompt_parts.join("\n\n");
 

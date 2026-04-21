@@ -147,7 +147,7 @@ test.describe('Agent flow', () => {
     }
   });
 
-  test('3. manager guidance appears as [manager] message', async ({ page, baseURL }) => {
+  test('3. manager guidance appears as manager-tagged messages', async ({ page, baseURL }) => {
     await login(page);
     mock.clear();
     // Agent, then manager, in that order per turn.
@@ -171,7 +171,13 @@ test.describe('Agent flow', () => {
       await page.reload();
       await page.waitForSelector('#chat-messages .chat-msg-user');
       const allUser = await page.locator('#chat-messages .chat-msg-user').allInnerTexts();
-      const managerBubble = allUser.find((t) => t.startsWith('[manager]'));
+      const managerAskBubble = allUser.find((t) => t.startsWith('👔 asking manager to '));
+      expect(managerAskBubble).toBeTruthy();
+      expect(managerAskBubble).toContain('review the latest output');
+
+      const managerBubble = allUser.find(
+        (t) => t.startsWith('👔 ') && !t.startsWith('👔 asking manager to ')
+      );
       expect(managerBubble).toBeTruthy();
       expect(managerBubble).toContain('keep going');
 

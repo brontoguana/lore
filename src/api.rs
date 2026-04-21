@@ -20,6 +20,9 @@ use crate::librarian::{
     ProjectLibrarianRequest, ProviderCheckResult, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECS,
     StoredLibrarianOperation, build_action_prompt, build_prompt, build_prompt_multi_project,
 };
+use crate::manager::{
+    ManagerPromptConfig, ManagerPromptConfigStore, ManagerPromptOverride, ManagerPromptStage,
+};
 use crate::model::{
     Block, BlockId, BlockType, DocumentId, ImageUpload, KeyFingerprint, NewBlock, OrderKey,
     ProjectName, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW, UpdateBlock,
@@ -143,6 +146,7 @@ pub struct AppState {
     librarian_provider_status: Arc<LibrarianProviderStatusStore>,
     auto_update_config: Arc<AutoUpdateConfigStore>,
     auto_update_status: Arc<AutoUpdateStatusStore>,
+    manager_prompt_config: Arc<ManagerPromptConfigStore>,
     update_check_cache: Arc<Mutex<Option<(Instant, AutoUpdateStatus)>>>,
     librarian_client: Arc<dyn AnswerLibrarianClient>,
     librarian_rate_limits: Arc<Mutex<HashMap<String, Vec<OffsetDateTime>>>>,
@@ -461,7 +465,7 @@ impl AppState {
             librarian_history: Arc::new(LibrarianHistoryStore::new(root.clone())),
             project_history: Arc::new(ProjectHistoryStore::new(root.clone())),
             git_export_config: Arc::new(GitExportConfigStore::new(root.clone())),
-            git_export_status: Arc::new(GitExportStatusStore::new(root)),
+            git_export_status: Arc::new(GitExportStatusStore::new(root.clone())),
             pending_librarian_actions: Arc::new(PendingLibrarianActionStore::new(
                 provider_status_root.clone(),
             )),
@@ -470,6 +474,7 @@ impl AppState {
             )),
             auto_update_config: Arc::new(AutoUpdateConfigStore::new(auto_update_root.clone())),
             auto_update_status: Arc::new(AutoUpdateStatusStore::new(auto_update_root)),
+            manager_prompt_config: Arc::new(ManagerPromptConfigStore::new(root.clone())),
             update_check_cache: Arc::new(Mutex::new(None)),
             librarian_client,
             librarian_rate_limits: Arc::new(Mutex::new(HashMap::new())),
@@ -589,7 +594,6 @@ fn build_app_with_librarian(
         .route("/v1/context", get(get_all_agent_context))
         .route("/v1/machines/register", post(register_machine))
         .route("/v1/machines/poll", post(machine_service_poll))
-        .route("/v1/machines/binary", get(machine_binary_download))
         .route(
             "/v1/machines/binary/{target}",
             get(machine_binary_download_for_target),
@@ -800,6 +804,10 @@ fn build_app_with_librarian(
         )
         .route("/ui/admin/oidc", post(update_oidc_from_ui))
         .route("/ui/admin/auto-update", post(update_auto_update_from_ui))
+        .route(
+            "/ui/admin/manager-prompts",
+            post(update_manager_prompts_from_ui),
+        )
         .route(
             "/ui/admin/auto-update/toggle-json",
             post(toggle_auto_update_json),
@@ -1603,6 +1611,17 @@ struct UpdateAutoUpdateUiForm {
     release_stream: Option<ReleaseStream>,
     auto_update_machines: Option<String>,
     confirm_password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateManagerPromptsUiForm {
+    csrf_token: String,
+    review_latest_output_enabled: Option<String>,
+    review_latest_output_text: Option<String>,
+    run_periodic_checks_enabled: Option<String>,
+    run_periodic_checks_text: Option<String>,
+    validate_periodic_checks_enabled: Option<String>,
+    validate_periodic_checks_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4020,6 +4039,7 @@ async fn admin_page(
     let external_auth_config = state.external_auth.load()?;
     let oidc_config = state.oidc.load()?;
     let auto_update_config = state.auto_update_config.load()?;
+    let manager_prompt_config = state.manager_prompt_config.load()?;
     let librarian_config = state.librarian_config.load()?;
     let endpoints = state.endpoint_store.list()?;
     let git_export_config = state.git_export_config.load()?;
@@ -4075,6 +4095,7 @@ async fn admin_page(
         &external_auth_config,
         &oidc_config,
         &auto_update_config,
+        &manager_prompt_config,
         &librarian_config,
         &endpoints,
         &git_export_config,
@@ -4111,22 +4132,17 @@ async fn agents_page(
 
     // Enrich agents with process status from machine service reports
     {
-        let statuses = state.machine_agent_statuses.lock().unwrap();
         for agent in &mut agents {
-            if let Some(ref mname) = agent.machine_name {
-                let machine_key = format!("{}_{}", session.user.username, mname);
-                if let Some(agent_list) = statuses.get(&machine_key) {
-                    for a in agent_list {
-                        if a["name"].as_str() == Some(&agent.name) {
-                            agent.process_status = a["status"].as_str().map(|s| s.to_string());
-                            if agent.process_status.as_deref() == Some("restarting") {
-                                agent.status = "restarting".to_string();
-                            } else if agent.process_status.as_deref() == Some("stopped") {
-                                agent.status = "offline".to_string();
-                            }
-                        }
-                    }
-                }
+            agent.process_status = machine_agent_process_status(
+                &state,
+                session.user.username.as_str(),
+                &agent.name,
+                agent.machine_name.as_deref(),
+            );
+            if agent.process_status.as_deref() == Some("restarting") {
+                agent.status = "restarting".to_string();
+            } else if agent.process_status.as_deref() == Some("stopped") {
+                agent.status = "offline".to_string();
             }
         }
     }
@@ -5458,6 +5474,56 @@ async fn update_auto_update_from_ui(
         )),
     )?;
     Ok(Redirect::to("/ui/admin?flash=Auto%20update%20saved"))
+}
+
+fn manager_prompt_override_from_form(enabled: bool, text: Option<String>) -> ManagerPromptOverride {
+    ManagerPromptOverride {
+        enabled,
+        text: text.unwrap_or_default(),
+    }
+}
+
+async fn update_manager_prompts_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UpdateManagerPromptsUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+
+    let config = ManagerPromptConfig::new(
+        manager_prompt_override_from_form(
+            form.review_latest_output_enabled.as_deref() == Some("true"),
+            form.review_latest_output_text,
+        ),
+        manager_prompt_override_from_form(
+            form.run_periodic_checks_enabled.as_deref() == Some("true"),
+            form.run_periodic_checks_text,
+        ),
+        manager_prompt_override_from_form(
+            form.validate_periodic_checks_enabled.as_deref() == Some("true"),
+            form.validate_periodic_checks_text,
+        ),
+    );
+    state.manager_prompt_config.save(&config)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "update manager prompts",
+        None,
+        Some(format!(
+            "review_latest_output={} run_periodic_checks={} validate_periodic_checks={}",
+            config.review_latest_output.enabled,
+            config.run_periodic_checks.enabled,
+            config.validate_periodic_checks.enabled,
+        )),
+    )?;
+    Ok(Redirect::to(
+        "/ui/admin?section=manager&flash=Manager%20prompts%20saved",
+    ))
 }
 
 async fn check_auto_update_from_ui(
@@ -6828,6 +6894,23 @@ fn agent_token_summary(state: &AppState, token: StoredAgentToken) -> AgentTokenS
         status,
         created_at: token.created_at,
     }
+}
+
+fn machine_agent_process_status(
+    state: &AppState,
+    owner: &str,
+    agent_name: &str,
+    machine_name: Option<&str>,
+) -> Option<String> {
+    let machine_name = machine_name?;
+    let machine_key = format!("{owner}_{machine_name}");
+    let statuses = state.machine_agent_statuses.lock().unwrap();
+    let agent_list = statuses.get(&machine_key)?;
+    agent_list
+        .iter()
+        .find(|entry| entry["name"].as_str() == Some(agent_name))
+        .and_then(|entry| entry["status"].as_str())
+        .map(str::to_string)
 }
 
 fn server_config_summary(config: &ServerConfig) -> ServerConfigSummary {
@@ -12677,7 +12760,8 @@ async fn chat_agent_get_manage(
     }
 
     let turn_in_cycle = mc.turn_counter % 5;
-    let system_prompt = build_manager_prompt(&mc, turn_in_cycle);
+    let manager_prompt_config = state.manager_prompt_config.load()?;
+    let system_prompt = build_manager_prompt(&mc, &manager_prompt_config, turn_in_cycle);
 
     let conv = state.chat.load_conversation(owner_str, &agent.name)?;
     let window_messages = unsummarized_messages(&conv);
@@ -12732,7 +12816,37 @@ async fn chat_agent_manager_report(
         .chat_audit
         .log(&agent.name, owner_str, "manager", &body.content);
 
-    let display = format!("[manager] {}", body.content);
+    if let Ok(Some(mut mc)) = state.chat.get_manage_config(owner_str, &agent.name) {
+        let asking_display = manager_chat_message_prefix(&format!(
+            "asking manager to {}",
+            manager_request_summary(mc.turn_counter % 5)
+        ));
+        if let Ok(msg) = state.chat.append_message(
+            owner_str,
+            &agent.name,
+            ChatRole::User,
+            asking_display.clone(),
+        ) {
+            push_chat_event(
+                &state,
+                owner_str,
+                ChatEvent {
+                    event_type: "message".into(),
+                    agent: agent.name.clone(),
+                    owner: owner_str.to_string(),
+                    data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
+                },
+            );
+        }
+
+        mc.turn_counter += 1;
+        if body.stopped {
+            mc.enabled = false;
+        }
+        let _ = state.chat.save_manage_config(owner_str, &agent.name, &mc);
+    }
+
+    let display = manager_chat_message_prefix(&body.content);
     if let Ok(msg) =
         state
             .chat
@@ -12748,14 +12862,6 @@ async fn chat_agent_manager_report(
                 data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
             },
         );
-    }
-
-    if let Ok(Some(mut mc)) = state.chat.get_manage_config(owner_str, &agent.name) {
-        mc.turn_counter += 1;
-        if body.stopped {
-            mc.enabled = false;
-        }
-        let _ = state.chat.save_manage_config(owner_str, &agent.name, &mc);
     }
 
     if !body.stopped {
@@ -13023,10 +13129,14 @@ async fn do_exchange_compact(
 
 // --- Manager prompt ---
 
-fn build_manager_prompt(mc: &ManageConfig, turn_in_cycle: u32) -> String {
+fn build_manager_prompt(
+    mc: &ManageConfig,
+    prompt_config: &ManagerPromptConfig,
+    turn_in_cycle: u32,
+) -> String {
     let base = format!(
         "You are a manager overseeing an AI agent working on a task. \
-         Your role is to provide guidance, catch problems early, and know when to stop.\n\n\
+         Your role is to direct the agent's next action, catch problems early, and know when to stop.\n\n\
          GOALS:\n{}\n\nSTOPPING POINT:\n{}\n\nRED FLAGS:\n{}",
         mc.goals, mc.stopping_point, mc.red_flags
     );
@@ -13044,30 +13154,54 @@ fn build_manager_prompt(mc: &ManageConfig, turn_in_cycle: u32) -> String {
                      - In any other context whatsoever\n\n\
                      Write STOPPING_POINT ONLY when the stopping point criteria above are actually met right now and the agent should halt.\n\
                      Write RED_FLAG_POINT ONLY when a red flag above has actually triggered right now and the agent should halt.\n\
-                     When referring to these concepts in guidance, use plain English (\"the stopping criteria\", \"a red flag\") \u{2014} never the literal token.";
+                     When referring to these concepts in guidance, use plain English (\"the stopping criteria\", \"a red flag\") \u{2014} never the literal token.\n\n\
+                     RESPONSE RULES:\n\
+                     - Write to the agent, not to the user\n\
+                     - Give a concrete next instruction or decision\n\
+                     - Do not ask the user for clarification, approval, or more input\n\
+                     - Do not wait for the user unless the stated goals or stopping criteria require it\n\
+                     - If the agent is on track, say so briefly and tell it what to do next\n\
+                     - Keep the response short and operational";
 
-    match turn_in_cycle {
-        0 | 1 | 2 => format!(
-            "{base}{sentinel}\n\n\
-             Review the agent's latest output. Provide brief guidance on next steps. \
-             If the agent is on track, a short confirmation is enough."
+    let (stage, context) = match turn_in_cycle {
+        0 | 1 | 2 => (ManagerPromptStage::ReviewLatestOutput, String::new()),
+        3 => (
+            ManagerPromptStage::RunPeriodicChecks,
+            format!("PERIODIC CHECKS:\n{}\n\n", mc.periodic_checks),
         ),
-        3 => format!(
-            "{base}{sentinel}\n\n\
-             PERIODIC CHECKS:\n{}\n\n\
-             It's time for periodic checks. Ask the agent to verify the items listed above. \
-             Frame your message as direct instructions to the agent.",
-            mc.periodic_checks
-        ),
-        4 => format!(
-            "{base}{sentinel}\n\n\
-             PERIODIC CHECKS:\n{}\n\n\
-             The agent just ran periodic checks. Validate the results. \
-             If anything looks wrong, flag it. Then provide guidance on next steps.",
-            mc.periodic_checks
+        4 => (
+            ManagerPromptStage::ValidatePeriodicChecks,
+            format!("PERIODIC CHECKS:\n{}\n\n", mc.periodic_checks),
         ),
         _ => unreachable!(),
+    };
+    let stage_prompt = prompt_config.prompt_for_stage(stage);
+    format!("{base}{sentinel}\n\n{context}{stage_prompt}")
+}
+
+fn manager_request_summary(turn_in_cycle: u32) -> &'static str {
+    match turn_in_cycle {
+        0 | 1 | 2 => "review the latest output",
+        3 => "run periodic checks",
+        4 => "validate the periodic check results",
+        _ => unreachable!(),
     }
+}
+
+fn manager_chat_message_prefix(content: &str) -> String {
+    format!("👔 {content}")
+}
+
+fn manager_resume_message() -> &'static str {
+    "Manager mode enabled. Continue working toward the current goals until you reach a stopping point."
+}
+
+fn should_queue_resume_on_manage_enable(status: AgentChatStatus) -> bool {
+    status != AgentChatStatus::Thinking
+}
+
+fn should_restart_agent_on_manage_enable(process_status: Option<&str>) -> bool {
+    process_status == Some("stopped")
 }
 
 // --- API agent helpers (used by btw) ---
@@ -14099,7 +14233,7 @@ async fn chat_save_manage(
     let agents = state
         .auth
         .list_agent_tokens_for_user(&session.user.username)?;
-    let _agent = agents
+    let agent = agents
         .iter()
         .find(|a| a.name == agent_name)
         .ok_or(LoreError::PermissionDenied)?;
@@ -14108,6 +14242,7 @@ async fn chat_save_manage(
         .chat
         .get_manage_config(owner, &agent_name)?
         .unwrap_or_default();
+    let was_enabled = mc.enabled;
 
     if let Some(b) = &form.backend {
         mc.backend = b.clone();
@@ -14135,6 +14270,73 @@ async fn chat_save_manage(
     }
 
     state.chat.save_manage_config(owner, &agent_name, &mc)?;
+    if mc.enabled && !was_enabled {
+        let should_queue_resume = state
+            .chat
+            .load_conversation(owner, &agent_name)
+            .map(|conv| should_queue_resume_on_manage_enable(conv.agent_status))
+            .unwrap_or(false);
+        if should_queue_resume {
+            let state_clone = state.clone();
+            let owner_clone = owner.to_string();
+            let agent_name_clone = agent_name.clone();
+            let machine_name = agent.machine_name.clone();
+            let process_status = machine_agent_process_status(
+                &state,
+                owner,
+                &agent_name,
+                agent.machine_name.as_deref(),
+            );
+            tokio::spawn(async move {
+                if let Ok(msg) = state_clone.chat.append_message(
+                    &owner_clone,
+                    &agent_name_clone,
+                    ChatRole::User,
+                    manager_resume_message().to_string(),
+                ) {
+                    state_clone.chat_audit.log(
+                        &agent_name_clone,
+                        &owner_clone,
+                        "user",
+                        &msg.content,
+                    );
+                    push_chat_event(
+                        &state_clone,
+                        &owner_clone,
+                        ChatEvent {
+                            event_type: "message".into(),
+                            agent: agent_name_clone.clone(),
+                            owner: owner_clone.clone(),
+                            data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
+                        },
+                    );
+                }
+
+                let notifier_key = format!("{}_{}", owner_clone, agent_name_clone);
+                if let Some(notify) = state_clone
+                    .chat_agent_notifiers
+                    .lock()
+                    .unwrap()
+                    .get(&notifier_key)
+                {
+                    notify.notify_one();
+                }
+
+                if should_restart_agent_on_manage_enable(process_status.as_deref()) {
+                    if let Some(machine_name) = machine_name {
+                        let machine_key = format!("{}_{}", owner_clone, machine_name);
+                        let _ = queue_machine_command_and_wait(
+                            &state_clone,
+                            &machine_key,
+                            "restart_agent",
+                            json!({ "agent_name": agent_name_clone }),
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+    }
     Ok(Json(json!({"ok": true, "enabled": mc.enabled})))
 }
 
@@ -15154,15 +15356,6 @@ fn notify_all_machine_polls(state: &AppState) {
     }
 }
 
-/// Serve the staged `lore` binary for direct machine self-update.
-/// Quick-deploy uploads this file so machines can update without a GitHub release.
-async fn machine_binary_download(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    machine_binary_download_inner(&state, &headers, None).await
-}
-
 async fn machine_binary_download_for_target(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15202,11 +15395,10 @@ async fn machine_binary_download_inner(
 fn machine_binary_path(state: &AppState, target: Option<&str>) -> Option<std::path::PathBuf> {
     let updates_dir = state.store.root().join("updates");
     match target {
-        None => Some(updates_dir.join("lore")),
         Some(target) if SERVER_RELEASE_CLI_TARGETS.contains(&target) => {
             Some(updates_dir.join(format!("lore-{target}")))
         }
-        Some(_) => None,
+        _ => None,
     }
 }
 
@@ -15374,12 +15566,13 @@ mod tests {
     use tower::util::ServiceExt;
 
     use super::{finalize_pending_stream_tool_call, merge_pending_stream_tool_call};
-    use crate::auth::{AgentChatStatus, ChatConversation, ChatMessage, ChatRole};
+    use crate::auth::{AgentChatStatus, ChatConversation, ChatMessage, ChatRole, ManageConfig};
     use crate::librarian::{
         AnswerLibrarianClient, Endpoint, LibrarianAnswer, LibrarianConfig, LibrarianRequest,
         ProjectLibrarianOperation, ProjectLibrarianPlan, ProjectLibrarianRequest,
         ProviderCheckResult, RATE_LIMIT_REQUESTS,
     };
+    use crate::manager::{ManagerPromptConfig, ManagerPromptOverride};
     use crate::store::FileBlockStore;
     use crate::updater::{AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream};
     use crate::{
@@ -17059,38 +17252,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"mac-arm64");
-    }
-
-    #[tokio::test]
-    async fn machine_binary_legacy_endpoint_uses_compat_link() {
-        let dir = tempdir().unwrap();
-        let app = build_app(FileBlockStore::new(dir.path()));
-        let machine_token = register_machine_token(&app, dir.path()).await;
-        let updates_dir = dir.path().join("updates");
-        fs::create_dir_all(&updates_dir).unwrap();
-        fs::write(
-            updates_dir.join("lore-x86_64-unknown-linux-gnu"),
-            b"linux-amd64",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("lore-x86_64-unknown-linux-gnu", updates_dir.join("lore"))
-            .unwrap();
-        #[cfg(not(unix))]
-        fs::write(updates_dir.join("lore"), b"linux-amd64").unwrap();
-
-        let request = Request::builder()
-            .method("GET")
-            .uri("/v1/machines/binary")
-            .header("x-lore-key", machine_token)
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&body[..], b"linux-amd64");
     }
 
     #[tokio::test]
@@ -19442,6 +19603,109 @@ mod tests {
 
         assert_eq!(body.text.as_deref(), Some("fallback"));
         assert_eq!(body.complete, Some(true));
+    }
+
+    #[test]
+    fn manager_request_summary_matches_turn_cycle() {
+        assert_eq!(
+            super::manager_request_summary(0),
+            "review the latest output"
+        );
+        assert_eq!(
+            super::manager_request_summary(1),
+            "review the latest output"
+        );
+        assert_eq!(
+            super::manager_request_summary(2),
+            "review the latest output"
+        );
+        assert_eq!(super::manager_request_summary(3), "run periodic checks");
+        assert_eq!(
+            super::manager_request_summary(4),
+            "validate the periodic check results"
+        );
+    }
+
+    #[test]
+    fn manager_chat_messages_use_emoji_prefix() {
+        assert_eq!(
+            super::manager_chat_message_prefix("asking manager to review the latest output"),
+            "👔 asking manager to review the latest output"
+        );
+        assert_eq!(
+            super::manager_chat_message_prefix("keep going"),
+            "👔 keep going"
+        );
+    }
+
+    #[test]
+    fn manager_prompts_direct_the_agent_without_waiting_for_user_input() {
+        let mc = ManageConfig {
+            goals: "Ship the fix".into(),
+            stopping_point: "The bug is fixed".into(),
+            periodic_checks: "Run the smoke test".into(),
+            red_flags: "Data loss".into(),
+            ..Default::default()
+        };
+        let prompt_config = ManagerPromptConfig::default();
+
+        let review = super::build_manager_prompt(&mc, &prompt_config, 0);
+        assert!(review.contains("direct instructions to the agent"));
+        assert!(review.contains("Do not ask the user for input"));
+
+        let periodic = super::build_manager_prompt(&mc, &prompt_config, 3);
+        assert!(periodic.contains("direct instructions to the agent"));
+        assert!(periodic.contains("Do not ask the user for input"));
+
+        let validate = super::build_manager_prompt(&mc, &prompt_config, 4);
+        assert!(validate.contains("tell the agent exactly what to do next"));
+        assert!(validate.contains("Do not ask the user for input"));
+    }
+
+    #[test]
+    fn manager_prompt_builder_uses_admin_stage_override_when_enabled() {
+        let mc = ManageConfig {
+            goals: "Ship the fix".into(),
+            stopping_point: "The bug is fixed".into(),
+            periodic_checks: "Run the smoke test".into(),
+            red_flags: "Data loss".into(),
+            ..Default::default()
+        };
+        let prompt_config = ManagerPromptConfig::new(
+            ManagerPromptOverride {
+                enabled: true,
+                text: "Tell the agent to inspect the latest diff and then continue.".into(),
+            },
+            ManagerPromptOverride::default(),
+            ManagerPromptOverride::default(),
+        );
+
+        let review = super::build_manager_prompt(&mc, &prompt_config, 1);
+        assert!(review.contains("Tell the agent to inspect the latest diff and then continue."));
+        assert!(!review.contains(
+            "Review the agent's latest output and decide the next thing the agent should do."
+        ));
+    }
+
+    #[test]
+    fn manage_enable_resume_policy_matches_agent_state() {
+        assert!(super::should_queue_resume_on_manage_enable(
+            AgentChatStatus::Idle
+        ));
+        assert!(super::should_queue_resume_on_manage_enable(
+            AgentChatStatus::Offline
+        ));
+        assert!(!super::should_queue_resume_on_manage_enable(
+            AgentChatStatus::Thinking
+        ));
+
+        assert!(super::should_restart_agent_on_manage_enable(Some(
+            "stopped"
+        )));
+        assert!(!super::should_restart_agent_on_manage_enable(Some(
+            "running"
+        )));
+        assert!(!super::should_restart_agent_on_manage_enable(None));
     }
 
     #[tokio::test]

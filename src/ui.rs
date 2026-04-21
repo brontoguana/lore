@@ -8,6 +8,7 @@ use crate::librarian::{
     LibrarianRunStatus, ProjectLibrarianOperationType, ProviderCheckResult,
     StoredLibrarianOperation,
 };
+use crate::manager::{ManagerPromptConfig, ManagerPromptStage};
 use crate::model::{
     Block, BlockId, BlockType, ProjectName, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW,
 };
@@ -1051,6 +1052,7 @@ pub fn render_admin_page(
     external_auth_config: &ExternalAuthConfig,
     oidc_config: &OidcConfig,
     auto_update_config: &AutoUpdateConfig,
+    manager_prompt_config: &ManagerPromptConfig,
     librarian_config: &LibrarianConfig,
     endpoints: &[crate::librarian::Endpoint],
     git_export_config: &GitExportConfig,
@@ -1294,6 +1296,37 @@ pub fn render_admin_page(
     } else {
         ""
     };
+    let manager_review_enabled_checked = if manager_prompt_config.review_latest_output.enabled {
+        " checked"
+    } else {
+        ""
+    };
+    let manager_periodic_enabled_checked = if manager_prompt_config.run_periodic_checks.enabled {
+        " checked"
+    } else {
+        ""
+    };
+    let manager_validate_enabled_checked = if manager_prompt_config.validate_periodic_checks.enabled
+    {
+        " checked"
+    } else {
+        ""
+    };
+    let manager_review_text = if manager_prompt_config.review_latest_output.enabled {
+        manager_prompt_config.review_latest_output.text.as_str()
+    } else {
+        ManagerPromptStage::ReviewLatestOutput.default_text()
+    };
+    let manager_periodic_text = if manager_prompt_config.run_periodic_checks.enabled {
+        manager_prompt_config.run_periodic_checks.text.as_str()
+    } else {
+        ManagerPromptStage::RunPeriodicChecks.default_text()
+    };
+    let manager_validate_text = if manager_prompt_config.validate_periodic_checks.enabled {
+        manager_prompt_config.validate_periodic_checks.text.as_str()
+    } else {
+        ManagerPromptStage::ValidatePeriodicChecks.default_text()
+    };
     let _ = auto_update_status; // no longer rendered
 
     let sections = [
@@ -1306,6 +1339,7 @@ pub fn render_admin_page(
         "oidc",
         "external-auth",
         "updates",
+        "manager",
         "audit",
     ];
     let section_labels = [
@@ -1318,6 +1352,7 @@ pub fn render_admin_page(
         "OIDC",
         "External auth",
         "Updates",
+        "Manager",
         "Audit",
     ];
     let active = if sections.contains(&active_section) {
@@ -1649,6 +1684,89 @@ pub fn render_admin_page(
         </div>
       </section>
 
+      <section class="panel" data-panel="manager"{manager_display}>
+        <div class="panel-header">
+          <h2>Manager</h2>
+          <p>Review the stage-specific prompts sent to the manager. Goals, stopping rules, red flags, and safety instructions are still added automatically.</p>
+        </div>
+        <form method="post" action="/ui/admin/manager-prompts">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+
+          <div class="panel-header" style="margin-top:0">
+            <h2>Review Latest Output</h2>
+            <p>Used on the normal manager turns between periodic checks.</p>
+          </div>
+          <label class="toggle" style="padding:0 var(--s-5) var(--s-3);">
+            <input
+              type="checkbox"
+              name="review_latest_output_enabled"
+              value="true"
+              data-manager-prompt-toggle
+              data-manager-target="manager-review-prompt"
+              {manager_review_enabled_checked}>
+            <span>Edit this prompt</span>
+          </label>
+          <div style="padding:0 var(--s-5) var(--s-5);">
+            <textarea
+              id="manager-review-prompt"
+              name="review_latest_output_text"
+              class="chat-config-textarea"
+              data-manager-default="{manager_review_default}"
+              style="min-height: 10rem;"{manager_review_disabled}>{manager_review_text}</textarea>
+          </div>
+
+          <div class="panel-header">
+            <h2>Run Periodic Checks</h2>
+            <p>Used when the manager should tell the agent to run its periodic verification checklist.</p>
+          </div>
+          <label class="toggle" style="padding:0 var(--s-5) var(--s-3);">
+            <input
+              type="checkbox"
+              name="run_periodic_checks_enabled"
+              value="true"
+              data-manager-prompt-toggle
+              data-manager-target="manager-periodic-prompt"
+              {manager_periodic_enabled_checked}>
+            <span>Edit this prompt</span>
+          </label>
+          <div style="padding:0 var(--s-5) var(--s-5);">
+            <textarea
+              id="manager-periodic-prompt"
+              name="run_periodic_checks_text"
+              class="chat-config-textarea"
+              data-manager-default="{manager_periodic_default}"
+              style="min-height: 9rem;"{manager_periodic_disabled}>{manager_periodic_text}</textarea>
+          </div>
+
+          <div class="panel-header">
+            <h2>Validate Periodic Check Results</h2>
+            <p>Used after the agent reports back from a periodic-check turn.</p>
+          </div>
+          <label class="toggle" style="padding:0 var(--s-5) var(--s-3);">
+            <input
+              type="checkbox"
+              name="validate_periodic_checks_enabled"
+              value="true"
+              data-manager-prompt-toggle
+              data-manager-target="manager-validate-prompt"
+              {manager_validate_enabled_checked}>
+            <span>Edit this prompt</span>
+          </label>
+          <div style="padding:0 var(--s-5) var(--s-5);">
+            <textarea
+              id="manager-validate-prompt"
+              name="validate_periodic_checks_text"
+              class="chat-config-textarea"
+              data-manager-default="{manager_validate_default}"
+              style="min-height: 9rem;"{manager_validate_disabled}>{manager_validate_text}</textarea>
+          </div>
+
+          <div style="padding:0 var(--s-5) var(--s-5);">
+            <button type="submit" class="btn-lg">Save manager prompts</button>
+          </div>
+        </form>
+      </section>
+
       <section class="panel" data-panel="audit"{audit_display}>
         <div class="panel-header">
           <h2>Audit</h2>
@@ -1907,6 +2025,25 @@ pub fn render_admin_page(
         }});
       }}
 
+      function syncManagerPromptEditor(toggle) {{
+        var targetId = toggle.getAttribute('data-manager-target');
+        if (!targetId) return;
+        var textarea = document.getElementById(targetId);
+        if (!textarea) return;
+        if (toggle.checked) {{
+          textarea.disabled = false;
+        }} else {{
+          textarea.value = textarea.getAttribute('data-manager-default') || '';
+          textarea.disabled = true;
+        }}
+      }}
+      document.querySelectorAll('[data-manager-prompt-toggle]').forEach(function(toggle) {{
+        syncManagerPromptEditor(toggle);
+        toggle.addEventListener('change', function() {{
+          syncManagerPromptEditor(toggle);
+        }});
+      }});
+
       function initSelList(scope) {{
         var items = scope.querySelectorAll('.sel-list .sel-item');
         var details = scope.querySelectorAll('.sel-detail');
@@ -2102,7 +2239,32 @@ pub fn render_admin_page(
         oidc_display = hidden("oidc"),
         external_auth_display = hidden("external-auth"),
         updates_display = hidden("updates"),
+        manager_display = hidden("manager"),
         audit_display = hidden("audit"),
+        manager_review_default =
+            escape_attribute(ManagerPromptStage::ReviewLatestOutput.default_text()),
+        manager_periodic_default =
+            escape_attribute(ManagerPromptStage::RunPeriodicChecks.default_text()),
+        manager_validate_default =
+            escape_attribute(ManagerPromptStage::ValidatePeriodicChecks.default_text()),
+        manager_review_disabled = if manager_prompt_config.review_latest_output.enabled {
+            ""
+        } else {
+            " disabled"
+        },
+        manager_periodic_disabled = if manager_prompt_config.run_periodic_checks.enabled {
+            ""
+        } else {
+            " disabled"
+        },
+        manager_validate_disabled = if manager_prompt_config.validate_periodic_checks.enabled {
+            ""
+        } else {
+            " disabled"
+        },
+        manager_review_text = escape_text(manager_review_text),
+        manager_periodic_text = escape_text(manager_periodic_text),
+        manager_validate_text = escape_text(manager_validate_text),
     );
 
     render_shell(
@@ -4218,7 +4380,7 @@ function renderMessages() {{
     var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : msg.role === 'config' ? 'chat-msg-config' : msg.role === 'tool' ? 'chat-msg-tool' : msg.role === 'error' ? 'chat-msg-error' : 'chat-msg-assistant';
     if (msg._thinking) cls += ' chat-msg-thinking';
     html += '<div class="chat-msg ' + cls + '" data-chat-idx="' + i + '">';
-    if (msg.role === 'assistant') {{
+    if (msg.role === 'assistant' || msg.role === 'user') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
     }} else if (msg.role === 'error') {{
       html += '<div class="chat-msg-content chat-msg-error-content"><svg class="chat-msg-error-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><span>' + escapeHtml(msg.content) + '</span></div>';
@@ -9732,7 +9894,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       overflow: auto;
       font-size: 0.78rem;
     }
-    .chat-msg-user .chat-msg-content,
     .chat-msg-system .chat-msg-content { white-space: pre-wrap; }
     .chat-msg-content {
       min-width: 0;
@@ -9740,47 +9901,73 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       max-width: 100%;
       box-sizing: border-box;
     }
-    .chat-msg-assistant .chat-msg-content {
+    .chat-msg-assistant .chat-msg-content,
+    .chat-msg-user .chat-msg-content {
       min-width: 0;
       max-width: 100%;
       overflow-wrap: anywhere;
       word-break: break-word;
     }
-    .chat-msg-assistant .chat-msg-content > * {
+    .chat-msg-assistant .chat-msg-content > *,
+    .chat-msg-user .chat-msg-content > * {
       max-width: 100%;
     }
-    .chat-msg-assistant .chat-msg-content p { margin: 0.3em 0; }
-    .chat-msg-assistant .chat-msg-content p:first-child { margin-top: 0; }
-    .chat-msg-assistant .chat-msg-content p:last-child { margin-bottom: 0; }
+    .chat-msg-assistant .chat-msg-content p,
+    .chat-msg-user .chat-msg-content p { margin: 0.3em 0; }
+    .chat-msg-assistant .chat-msg-content p:first-child,
+    .chat-msg-user .chat-msg-content p:first-child { margin-top: 0; }
+    .chat-msg-assistant .chat-msg-content p:last-child,
+    .chat-msg-user .chat-msg-content p:last-child { margin-bottom: 0; }
     .chat-msg-assistant .chat-msg-content h1,
     .chat-msg-assistant .chat-msg-content h2,
     .chat-msg-assistant .chat-msg-content h3,
-    .chat-msg-assistant .chat-msg-content h4 {
+    .chat-msg-assistant .chat-msg-content h4,
+    .chat-msg-user .chat-msg-content h1,
+    .chat-msg-user .chat-msg-content h2,
+    .chat-msg-user .chat-msg-content h3,
+    .chat-msg-user .chat-msg-content h4 {
       margin: 0.6em 0 0.3em;
       line-height: 1.3;
     }
-    .chat-msg-assistant .chat-msg-content h1 { font-size: 1.15em; }
-    .chat-msg-assistant .chat-msg-content h2 { font-size: 1.05em; }
-    .chat-msg-assistant .chat-msg-content h3 { font-size: 1em; font-weight: 600; }
-    .chat-msg-assistant .chat-msg-content h4 { font-size: 0.95em; font-weight: 600; }
+    .chat-msg-assistant .chat-msg-content h1,
+    .chat-msg-user .chat-msg-content h1 { font-size: 1.15em; }
+    .chat-msg-assistant .chat-msg-content h2,
+    .chat-msg-user .chat-msg-content h2 { font-size: 1.05em; }
+    .chat-msg-assistant .chat-msg-content h3,
+    .chat-msg-user .chat-msg-content h3 { font-size: 1em; font-weight: 600; }
+    .chat-msg-assistant .chat-msg-content h4,
+    .chat-msg-user .chat-msg-content h4 { font-size: 0.95em; font-weight: 600; }
     .chat-msg-assistant .chat-msg-content ul,
-    .chat-msg-assistant .chat-msg-content ol {
+    .chat-msg-assistant .chat-msg-content ol,
+    .chat-msg-user .chat-msg-content ul,
+    .chat-msg-user .chat-msg-content ol {
       margin: 0.3em 0;
       padding-left: 1.4em;
     }
-    .chat-msg-assistant .chat-msg-content li { margin: 0.15em 0; }
-    .chat-msg-assistant .chat-msg-content blockquote {
+    .chat-msg-assistant .chat-msg-content li,
+    .chat-msg-user .chat-msg-content li { margin: 0.15em 0; }
+    .chat-msg-assistant .chat-msg-content blockquote,
+    .chat-msg-user .chat-msg-content blockquote {
       border-left: 3px solid var(--accent);
       margin: 0.3em 0;
       padding: 0.15em 0.7em;
       color: var(--muted);
     }
-    .chat-msg-assistant .chat-msg-content hr {
+    .chat-msg-user .chat-msg-content blockquote {
+      border-left-color: color-mix(in srgb, var(--accent-fg) 70%, transparent);
+      color: color-mix(in srgb, var(--accent-fg) 88%, transparent);
+    }
+    .chat-msg-assistant .chat-msg-content hr,
+    .chat-msg-user .chat-msg-content hr {
       border: none;
       border-top: 1px solid var(--line);
       margin: 0.5em 0;
     }
-    .chat-msg-assistant .chat-msg-content pre {
+    .chat-msg-user .chat-msg-content hr {
+      border-top-color: color-mix(in srgb, var(--accent-fg) 28%, transparent);
+    }
+    .chat-msg-assistant .chat-msg-content pre,
+    .chat-msg-user .chat-msg-content pre {
       background: var(--code-bg);
       color: var(--code-ink);
       border: 1px solid var(--line);
@@ -9794,11 +9981,18 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       margin: 0.4em 0;
       white-space: pre;
     }
-    .chat-msg-assistant .chat-msg-content code {
+    .chat-msg-user .chat-msg-content pre {
+      background: color-mix(in srgb, var(--accent-fg) 12%, var(--accent));
+      color: var(--accent-fg);
+      border-color: color-mix(in srgb, var(--accent-fg) 20%, transparent);
+    }
+    .chat-msg-assistant .chat-msg-content code,
+    .chat-msg-user .chat-msg-content code {
       font-family: var(--font-mono);
       font-size: 0.88em;
     }
-    .chat-msg-assistant .chat-msg-content :not(pre) > code {
+    .chat-msg-assistant .chat-msg-content :not(pre) > code,
+    .chat-msg-user .chat-msg-content :not(pre) > code {
       background: var(--code-bg);
       color: var(--code-ink);
       border-radius: 3px;
@@ -9807,9 +10001,17 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       overflow-wrap: anywhere;
       word-break: break-word;
     }
-    .chat-msg-assistant .chat-msg-content a {
+    .chat-msg-user .chat-msg-content :not(pre) > code {
+      background: color-mix(in srgb, var(--accent-fg) 14%, var(--accent));
+      color: var(--accent-fg);
+    }
+    .chat-msg-assistant .chat-msg-content a,
+    .chat-msg-user .chat-msg-content a {
       color: var(--accent);
       text-decoration: underline;
+    }
+    .chat-msg-user .chat-msg-content a {
+      color: var(--accent-fg);
     }
     .chat-table-wrap {
       overflow-x: auto;
@@ -10761,6 +10963,54 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .block-body {
       font-size: 1.05rem;
       line-height: 1.7;
+      min-width: 0;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+
+    .block-body > * {
+      max-width: 100%;
+      box-sizing: border-box;
+    }
+
+    .block-body img,
+    .block-body svg {
+      display: block;
+      max-width: 100%;
+      height: auto;
+    }
+
+    .block-body table {
+      display: block;
+      width: max-content;
+      max-width: 100%;
+      overflow-x: auto;
+      border-collapse: collapse;
+      margin: var(--s-4) 0;
+      font-size: 0.95rem;
+    }
+
+    .block-body th,
+    .block-body td {
+      border: 1px solid var(--line);
+      padding: 0.4em 0.65em;
+      text-align: left;
+    }
+
+    .block-body th {
+      background: var(--surface);
+      font-weight: 600;
+    }
+
+    .block-body :not(pre) > code {
+      background: var(--code-bg);
+      color: var(--code-ink);
+      border-radius: 3px;
+      padding: 0.1em 0.3em;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
 
     .block-body pre {
@@ -10770,6 +11020,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: var(--code-bg);
       color: var(--code-ink);
       overflow-x: auto;
+      max-width: 100%;
+      box-sizing: border-box;
       font-size: 0.9rem;
     }
 

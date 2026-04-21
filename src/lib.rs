@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod librarian;
+pub mod manager;
 pub mod model;
 pub mod order;
 pub mod store;
