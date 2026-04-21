@@ -3649,6 +3649,7 @@ fn render_chat_page_with_agent_list_html(
     chat_area_html: String,
 ) -> String {
     let username_js = escape_attribute(username);
+    let messages_json = escape_json_for_inline_script(messages_json);
 
     let layout_class = if has_selected_agent {
         "chat-layout chat-has-agent"
@@ -8340,6 +8341,15 @@ fn escape_attribute(value: &str) -> String {
     escape_text(value)
 }
 
+fn escape_json_for_inline_script(value: &str) -> String {
+    value
+        .replace('<', "\\u003C")
+        .replace('>', "\\u003E")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 struct ThemePalette {
     color_scheme: &'static str,
     bg: &'static str,
@@ -11413,6 +11423,40 @@ mod tests {
             panel.contains(r#"<span class="chat-header-status" id="chat-agent-status"></span>"#)
         );
         assert!(panel.contains(r#"id="chat-manage-btn""#));
+    }
+
+    #[test]
+    fn chat_page_escapes_inline_message_json_for_script_tags() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[ChatAgentSummary {
+                name: "lore".into(),
+                display_name: "Lore".into(),
+                owner: "admin".into(),
+                status: "idle".into(),
+                last_message: Some("</script> boom".into()),
+                last_message_time: None,
+                profile_url: None,
+                cwd: None,
+                git_branch: None,
+            }],
+            Some("lore"),
+            r#"[{"role":"assistant","content":"</script> boom"}]"#,
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains(
+            r#"var chatMessages = [{"role":"assistant","content":"\u003C/script\u003E boom"}];"#
+        ));
+        assert!(!html.contains(
+            r#"var chatMessages = [{"role":"assistant","content":"</script> boom"}];"#
+        ));
     }
 
     #[test]
