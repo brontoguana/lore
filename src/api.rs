@@ -113,6 +113,7 @@ fn librarian_history_messages_from_runs(
         messages.push(json!({
             "role": "assistant",
             "content": content,
+            "timestamp": run.created_at.unix_timestamp(),
             "status": status,
             "run_id": run.id,
             "context_block_count": run.source_block_ids.len(),
@@ -17659,6 +17660,7 @@ mod tests {
                 .unwrap_or("")
                 .contains("Persisted librarian answer")
         }));
+        assert!(messages.iter().all(|m| m.get("timestamp").is_some()));
     }
 
     #[tokio::test]

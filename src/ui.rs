@@ -4377,9 +4377,15 @@ function renderMessages() {{
   var html = '';
   for (var i = 0; i < chatMessages.length; i++) {{
     var msg = chatMessages[i];
-    var cls = msg.role === 'user' ? 'chat-msg-user' : msg.role === 'system' ? 'chat-msg-system' : msg.role === 'config' ? 'chat-msg-config' : msg.role === 'tool' ? 'chat-msg-tool' : msg.role === 'error' ? 'chat-msg-error' : 'chat-msg-assistant';
+    var kind = msg.role === 'user' ? 'user' : msg.role === 'system' ? 'system' : msg.role === 'config' ? 'config' : msg.role === 'tool' ? 'tool' : msg.role === 'error' ? 'error' : 'assistant';
+    var cls = kind === 'user' ? 'chat-msg-user' : kind === 'system' ? 'chat-msg-system' : kind === 'config' ? 'chat-msg-config' : kind === 'tool' ? 'chat-msg-tool' : kind === 'error' ? 'chat-msg-error' : 'chat-msg-assistant';
     if (msg._thinking) cls += ' chat-msg-thinking';
-    html += '<div class="chat-msg ' + cls + '" data-chat-idx="' + i + '">';
+    html += '<div class="chat-msg-row chat-msg-row-' + kind + '" data-chat-idx="' + i + '">';
+    var timestamp = formatChatTimestamp(msg.timestamp);
+    if (timestamp) {{
+      html += '<div class="chat-msg-timestamp">' + escapeHtmlRaw(timestamp) + '</div>';
+    }}
+    html += '<div class="chat-msg ' + cls + '">';
     if (msg.role === 'assistant' || msg.role === 'user') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
     }} else if (msg.role === 'error') {{
@@ -4389,7 +4395,7 @@ function renderMessages() {{
     }} else {{
       html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
     }}
-    html += '</div>';
+    html += '</div></div>';
   }}
   container.innerHTML = html;
   if (shouldFollow) {{
@@ -4537,6 +4543,34 @@ function escapeHtmlRaw(text) {{
   var d = document.createElement('div');
   d.textContent = text;
   return d.innerHTML;
+}}
+
+function parseChatTimestamp(value) {{
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') {{
+    return new Date(value * 1000);
+  }}
+  if (typeof value === 'string' && /^\d+$/.test(value)) {{
+    return new Date(parseInt(value, 10) * 1000);
+  }}
+  var parsed = new Date(value);
+  return isNaN(parsed.getTime()) ? null : parsed;
+}}
+
+function formatChatTimestamp(value) {{
+  var parsed = parseChatTimestamp(value);
+  if (!parsed) return '';
+  var now = new Date();
+  var sameDay = parsed.getFullYear() === now.getFullYear()
+    && parsed.getMonth() === now.getMonth()
+    && parsed.getDate() === now.getDate();
+  if (sameDay) {{
+    return parsed.toLocaleTimeString([], {{ hour: 'numeric', minute: '2-digit' }});
+  }}
+  var sameYear = parsed.getFullYear() === now.getFullYear();
+  return parsed.toLocaleString([], sameYear
+    ? {{ month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }}
+    : {{ year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }});
 }}
 
 function renderMarkdown(text) {{
@@ -9644,6 +9678,33 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       flex-direction: column;
       gap: var(--s-3);
     }
+    .chat-msg-row {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      max-width: 100%;
+    }
+    .chat-msg-row-user {
+      align-items: flex-end;
+    }
+    .chat-msg-row-assistant,
+    .chat-msg-row-tool,
+    .chat-msg-row-error {
+      align-items: flex-start;
+    }
+    .chat-msg-row-system,
+    .chat-msg-row-config {
+      align-items: center;
+    }
+    .chat-msg-timestamp {
+      font-size: 0.74rem;
+      line-height: 1.25;
+      font-style: italic;
+      color: var(--fg-muted);
+      opacity: 0.85;
+      padding: 0 var(--s-1);
+      max-width: 90%;
+    }
     .chat-jump-btn {
       position: absolute;
       right: var(--s-4);
@@ -9751,7 +9812,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       word-break: break-word;
       border: 1px solid var(--line);
       border-radius: var(--radius-sm);
-      background: var(--bg-subtle, #f5f5f5);
+      background: var(--details-bg);
     }
     .chat-msg-error {
       align-self: stretch;
@@ -11688,6 +11749,27 @@ mod tests {
                 r#"var chatMessages = [{"role":"assistant","content":"</script> boom"}];"#
             )
         );
+    }
+
+    #[test]
+    fn chat_page_includes_message_timestamp_renderer_and_styles() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("lore"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("function formatChatTimestamp(value) {"));
+        assert!(html.contains(".chat-msg-timestamp {"));
+        assert!(html.contains("chat-msg-row-"));
     }
 
     #[test]
