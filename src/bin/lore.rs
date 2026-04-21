@@ -1,7 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use lore_core::{
     AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, ReleaseStream,
-    SelfUpdateOutcome, apply_update_to_version, check_for_update, maybe_apply_self_update, slugify,
+    SelfUpdateOutcome, apply_update_to_version, check_for_update,
+    manager::extract_manager_delay_prefix, maybe_apply_self_update, slugify,
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -3330,6 +3331,7 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         return Ok(());
     }
 
+    let (delay_seconds, manager_response) = extract_manager_delay_prefix(&manager_response);
     let has_stop = manager_response.contains("STOPPING_POINT");
     let has_red = manager_response.contains("RED_FLAG_POINT");
     let stopped = has_stop || has_red;
@@ -3351,6 +3353,7 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         .json(&serde_json::json!({
             "content": display,
             "stopped": stopped,
+            "delay_seconds": if stopped { None } else { delay_seconds },
         }))
         .send()
         .await;
@@ -3403,7 +3406,7 @@ async fn run_manager_cli(
         }
     }
 
-    prompt_parts.push("\n## Instructions\n\nReview the conversation above and respond as the manager speaking directly to the agent. Give a concrete next instruction, not advice to the user. Do not ask the user for clarification or more input unless the stopping criteria explicitly require that. You may READ files from the working directory if needed to verify periodic checks, but you must NEVER edit, create, delete, or execute any files or commands. Your only output should be the manager's instruction text for the agent.".to_string());
+    prompt_parts.push("\n## Instructions\n\nReview the conversation above and respond as the manager speaking directly to the agent. Give a concrete next instruction, not advice to the user. Do not ask the user for clarification or more input unless the stopping criteria explicitly require that. If the agent needs to wait on a known long-running task, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line and put the delayed instruction below it. You may READ files from the working directory if needed to verify periodic checks, but you must NEVER edit, create, delete, or execute any files or commands. Your only output should be the manager's instruction text for the agent.".to_string());
 
     let full_prompt = prompt_parts.join("\n\n");
 

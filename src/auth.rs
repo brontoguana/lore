@@ -2010,6 +2010,10 @@ pub struct ManageConfig {
     pub run_requested: bool,
     #[serde(default)]
     pub request_announced: bool,
+    #[serde(default)]
+    pub delayed_message: String,
+    #[serde(default)]
+    pub delayed_until_unix: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

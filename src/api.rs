@@ -22,6 +22,7 @@ use crate::librarian::{
 };
 use crate::manager::{
     ManagerPromptConfig, ManagerPromptConfigStore, ManagerPromptOverride, ManagerPromptStage,
+    describe_manager_delay, extract_manager_delay_prefix,
 };
 use crate::model::{
     Block, BlockId, BlockType, DocumentId, ImageUpload, KeyFingerprint, NewBlock, OrderKey,
@@ -11628,13 +11629,6 @@ async fn chat_agent_poll(
         },
     );
 
-    // Claim unprocessed user messages. This uses a delivery cursor instead of
-    // inferring pending state from the last assistant message, which breaks if
-    // the user sends follow-up input while the agent is still thinking.
-    let pending = state
-        .chat
-        .claim_pending_user_messages(owner_str, &agent.name)?;
-
     // Check if machine has a pending update (transient, auto-expires after 3 min)
     let server_version = env!("CARGO_PKG_VERSION");
     let update_to = if let Some(mname) = machine_name.as_ref() {
@@ -11689,6 +11683,15 @@ async fn chat_agent_poll(
         )));
     }
 
+    let _ = release_due_delayed_manager_message(&state, owner_str, &agent.name)?;
+
+    // Claim unprocessed user messages. This uses a delivery cursor instead of
+    // inferring pending state from the last assistant message, which breaks if
+    // the user sends follow-up input while the agent is still thinking.
+    let pending = state
+        .chat
+        .claim_pending_user_messages(owner_str, &agent.name)?;
+
     if !pending.is_empty() {
         let msgs: Vec<Value> = pending
             .iter()
@@ -11717,6 +11720,7 @@ async fn chat_agent_poll(
                 current_manage_requested()?,
             )));
         }
+        let _ = release_due_delayed_manager_message(&state, owner_str, &agent.name)?;
         let pending = state
             .chat
             .claim_pending_user_messages(owner_str, &agent.name)?;
@@ -12822,6 +12826,8 @@ struct ManagerReportBody {
     content: String,
     #[serde(default)]
     stopped: bool,
+    #[serde(default)]
+    delay_seconds: Option<u64>,
 }
 
 async fn chat_agent_manager_report(
@@ -12837,20 +12843,54 @@ async fn chat_agent_manager_report(
         .chat_audit
         .log(&agent.name, owner_str, "manager", &body.content);
 
+    let mut delayed_content = body.content.trim().to_string();
+    let mut delayed_until_unix = None;
+    if !body.stopped {
+        if let Some(delay_seconds) = body.delay_seconds.filter(|secs| *secs > 0) {
+            delayed_until_unix =
+                Some(OffsetDateTime::now_utc().unix_timestamp() + delay_seconds as i64);
+        } else {
+            let (parsed_delay, stripped_content) = extract_manager_delay_prefix(&body.content);
+            if let Some(delay_seconds) = parsed_delay {
+                delayed_until_unix =
+                    Some(OffsetDateTime::now_utc().unix_timestamp() + delay_seconds as i64);
+                delayed_content = stripped_content;
+            }
+        }
+    }
+
     let mut auto_disabled = false;
+    let mut delayed_status = None;
     if let Ok(Some(mut mc)) = state.chat.get_manage_config(owner_str, &agent.name) {
         mc.turn_counter += 1;
         mc.run_requested = false;
         mc.request_announced = false;
+        mc.delayed_message.clear();
+        mc.delayed_until_unix = 0;
         if body.stopped {
             auto_disabled = mc.enabled;
             mc.enabled = false;
+        } else if let Some(until) = delayed_until_unix {
+            mc.delayed_message = delayed_content.clone();
+            mc.delayed_until_unix = until;
+            let delay_seconds = (until - OffsetDateTime::now_utc().unix_timestamp()).max(1) as u64;
+            delayed_status = Some(describe_manager_delay(delay_seconds));
         }
         let _ = state.chat.save_manage_config(owner_str, &agent.name, &mc);
     }
 
-    let display = manager_chat_message_prefix(&body.content);
-    append_manager_chat_message(&state, owner_str, &agent.name, ChatRole::User, &display);
+    if let Some(status) = delayed_status {
+        append_manager_chat_message(
+            &state,
+            owner_str,
+            &agent.name,
+            ChatRole::Assistant,
+            &manager_chat_message_prefix(&status),
+        );
+    } else {
+        let display = manager_chat_message_prefix(&delayed_content);
+        append_manager_chat_message(&state, owner_str, &agent.name, ChatRole::User, &display);
+    }
     if auto_disabled {
         append_manager_chat_message(
             &state,
@@ -12861,7 +12901,7 @@ async fn chat_agent_manager_report(
         );
     }
 
-    if !body.stopped {
+    if !body.stopped && delayed_until_unix.is_none() {
         let notifier_key = format!("{}_{}", owner_str, agent.name);
         if let Some(notify) = state
             .chat_agent_notifiers
@@ -13188,6 +13228,7 @@ fn build_manager_prompt(
                      - Do not ask the user for clarification, approval, or more input\n\
                      - Do not wait for the user unless the stated goals or stopping criteria require it\n\
                      - If the agent is on track, say so briefly and tell it what to do next\n\
+                     - If the agent is waiting on a known long-running task, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line, then put the delayed instruction below it\n\
                      - Keep the response short and operational";
 
     let (stage, context) = match turn_in_cycle {
@@ -13221,6 +13262,34 @@ fn manager_chat_message_prefix(content: &str) -> String {
 
 fn should_restart_agent_on_manage_enable(process_status: Option<&str>) -> bool {
     process_status == Some("stopped")
+}
+
+fn release_due_delayed_manager_message(
+    state: &AppState,
+    owner: &str,
+    agent_name: &str,
+) -> Result<bool, ApiError> {
+    let Ok(Some(mut mc)) = state.chat.get_manage_config(owner, agent_name) else {
+        return Ok(false);
+    };
+    if mc.delayed_message.trim().is_empty() || mc.delayed_until_unix <= 0 {
+        return Ok(false);
+    }
+    if OffsetDateTime::now_utc().unix_timestamp() < mc.delayed_until_unix {
+        return Ok(false);
+    }
+
+    let content = std::mem::take(&mut mc.delayed_message);
+    mc.delayed_until_unix = 0;
+    state.chat.save_manage_config(owner, agent_name, &mc)?;
+    append_manager_chat_message(
+        state,
+        owner,
+        agent_name,
+        ChatRole::User,
+        &manager_chat_message_prefix(content.trim()),
+    );
+    Ok(true)
 }
 
 fn append_manager_chat_message(
@@ -14325,9 +14394,13 @@ async fn chat_save_manage(
             mc.turn_counter = 0;
             mc.run_requested = true;
             mc.request_announced = false;
+            mc.delayed_message.clear();
+            mc.delayed_until_unix = 0;
         } else if !en {
             mc.run_requested = false;
             mc.request_announced = false;
+            mc.delayed_message.clear();
+            mc.delayed_until_unix = 0;
         }
         mc.enabled = en;
     }
@@ -19695,14 +19768,17 @@ mod tests {
         let review = super::build_manager_prompt(&mc, &prompt_config, 0);
         assert!(review.contains("direct instructions to the agent"));
         assert!(review.contains("Do not ask the user for input"));
+        assert!(review.contains("WAIT_FOR_SECONDS: <1-600>"));
 
         let periodic = super::build_manager_prompt(&mc, &prompt_config, 3);
         assert!(periodic.contains("direct instructions to the agent"));
         assert!(periodic.contains("Do not ask the user for input"));
+        assert!(periodic.contains("WAIT_FOR_SECONDS: <1-600>"));
 
         let validate = super::build_manager_prompt(&mc, &prompt_config, 4);
         assert!(validate.contains("tell the agent exactly what to do next"));
         assert!(validate.contains("Do not ask the user for input"));
+        assert!(validate.contains("WAIT_FOR_SECONDS: <1-600>"));
     }
 
     #[test]
@@ -19739,6 +19815,44 @@ mod tests {
             "running"
         )));
         assert!(!super::should_restart_agent_on_manage_enable(None));
+    }
+
+    #[test]
+    fn due_delayed_manager_message_is_released_to_pending_user_queue() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let owner = "alice";
+        let agent = "agent-main";
+        state
+            .chat
+            .save_manage_config(
+                owner,
+                agent,
+                &ManageConfig {
+                    enabled: true,
+                    delayed_message: "Check whether the build finished, then continue.".into(),
+                    delayed_until_unix: OffsetDateTime::now_utc().unix_timestamp() - 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let released = super::release_due_delayed_manager_message(&state, owner, agent);
+        assert!(matches!(released, Ok(true)));
+
+        let pending = state
+            .chat
+            .claim_pending_user_messages(owner, agent)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].content,
+            "👔 Check whether the build finished, then continue."
+        );
+
+        let saved = state.chat.get_manage_config(owner, agent).unwrap().unwrap();
+        assert!(saved.delayed_message.is_empty());
+        assert_eq!(saved.delayed_until_unix, 0);
     }
 
     #[tokio::test]

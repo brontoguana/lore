@@ -4,6 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 use time::OffsetDateTime;
 
+pub const MANAGER_DELAY_PREFIX: &str = "WAIT_FOR_SECONDS:";
+pub const MAX_MANAGER_DELAY_SECONDS: u64 = 10 * 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagerPromptStage {
     ReviewLatestOutput,
@@ -18,19 +21,70 @@ impl ManagerPromptStage {
                 "Review the agent's latest output and decide the next thing the agent should do. \
 Respond as direct instructions to the agent. \
 Do not ask the user for input. \
+If the agent is waiting on a known long-running task, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line, then put the delayed instruction below it. \
 If the agent is on track, briefly confirm that and tell it the next concrete step."
             }
             Self::RunPeriodicChecks => {
                 "It's time for periodic checks. Ask the agent to verify the items listed above. \
 Frame your message as direct instructions to the agent. \
+If the checks are known to take a while, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line, then put the delayed instruction below it. \
 Do not ask the user for input."
             }
             Self::ValidatePeriodicChecks => {
                 "The agent just ran periodic checks. Validate the results. \
 If anything looks wrong, flag it. Then tell the agent exactly what to do next. \
+If the agent now needs to wait on a known long-running task, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line, then put the delayed instruction below it. \
 Do not ask the user for input."
             }
         }
+    }
+}
+
+pub fn extract_manager_delay_prefix(content: &str) -> (Option<u64>, String) {
+    let trimmed = content.trim_start();
+    let Some(first_line_end) = trimmed.find('\n') else {
+        return parse_delay_line(trimmed, "");
+    };
+    let (first_line, rest) = trimmed.split_at(first_line_end);
+    parse_delay_line(first_line, rest.trim_start_matches('\n'))
+}
+
+fn parse_delay_line(first_line: &str, rest: &str) -> (Option<u64>, String) {
+    let Some(raw_delay) = first_line.strip_prefix(MANAGER_DELAY_PREFIX) else {
+        return (
+            None,
+            first_line.to_string() + if rest.is_empty() { "" } else { "\n" } + rest,
+        );
+    };
+    let Ok(delay_seconds) = raw_delay.trim().parse::<u64>() else {
+        return (
+            None,
+            first_line.to_string() + if rest.is_empty() { "" } else { "\n" } + rest,
+        );
+    };
+    if delay_seconds == 0 || delay_seconds > MAX_MANAGER_DELAY_SECONDS {
+        return (
+            None,
+            first_line.to_string() + if rest.is_empty() { "" } else { "\n" } + rest,
+        );
+    }
+    let delayed_message = rest.trim().to_string();
+    if delayed_message.is_empty() {
+        return (
+            None,
+            first_line.to_string() + if rest.is_empty() { "" } else { "\n" } + rest,
+        );
+    }
+    (Some(delay_seconds), delayed_message)
+}
+
+pub fn describe_manager_delay(delay_seconds: u64) -> String {
+    let minutes = delay_seconds / 60;
+    let seconds = delay_seconds % 60;
+    match (minutes, seconds) {
+        (0, s) => format!("Pausing for {s}s before the next manager instruction"),
+        (m, 0) => format!("Pausing for {m}m before the next manager instruction"),
+        (m, s) => format!("Pausing for {m}m {s}s before the next manager instruction"),
     }
 }
 
@@ -165,6 +219,7 @@ fn write_json_atomic(path: PathBuf, value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::{
         ManagerPromptConfig, ManagerPromptConfigStore, ManagerPromptOverride, ManagerPromptStage,
+        describe_manager_delay, extract_manager_delay_prefix,
     };
     use tempfile::tempdir;
 
@@ -240,6 +295,37 @@ mod tests {
         assert_eq!(
             loaded.prompt_for_stage(ManagerPromptStage::ValidatePeriodicChecks),
             "Custom validate"
+        );
+    }
+
+    #[test]
+    fn manager_delay_prefix_extracts_delay_and_message() {
+        let (delay, message) = extract_manager_delay_prefix(
+            "WAIT_FOR_SECONDS: 180\nWait for the build to finish, then check the logs.",
+        );
+        assert_eq!(delay, Some(180));
+        assert_eq!(
+            message,
+            "Wait for the build to finish, then check the logs."
+        );
+    }
+
+    #[test]
+    fn manager_delay_prefix_ignores_invalid_delay() {
+        let (delay, message) = extract_manager_delay_prefix("WAIT_FOR_SECONDS: 999\nToo long");
+        assert_eq!(delay, None);
+        assert_eq!(message, "WAIT_FOR_SECONDS: 999\nToo long");
+    }
+
+    #[test]
+    fn manager_delay_status_is_human_readable() {
+        assert_eq!(
+            describe_manager_delay(45),
+            "Pausing for 45s before the next manager instruction"
+        );
+        assert_eq!(
+            describe_manager_delay(120),
+            "Pausing for 2m before the next manager instruction"
         );
     }
 }
