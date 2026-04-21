@@ -28,7 +28,7 @@ const ICON_STOP: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill=
 const ICON_RESTART: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 const ICON_STATUS_DONE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>"#;
-const ICON_STATUS_WORKING: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><defs><linearGradient id="status-working-gradient" x1="2" y1="12" x2="22" y2="12" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color='#38bdf8'/><stop offset="0.35" stop-color="var(--accent)"/><stop offset="0.65" stop-color='#dbeafe'/><stop offset="1" stop-color='#38bdf8'/><animateTransform attributeName="gradientTransform" type="translate" from="-18 0" to="18 0" dur="1.35s" repeatCount="indefinite"/></linearGradient></defs><path stroke='url(#status-working-gradient)' d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>"#;
+const ICON_STATUS_WORKING: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>"#;
 const ICON_STATUS_STOPPED: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6"/><path d="M15 9l-6 6"/></svg>"#;
 
 fn chat_status_indicator(status: &str) -> (&'static str, &'static str, &'static str) {
@@ -64,6 +64,13 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
   var root = document.documentElement;
   var mode = '{mode}';
   var resyncTimers = [];
+  function readCssResolvedMode() {{
+    if (!window.getComputedStyle) return null;
+    var probe = window.getComputedStyle(root).getPropertyValue('--system-color-mode');
+    if (!probe) return null;
+    probe = probe.trim().replace(/^['"]|['"]$/g, '');
+    return probe === 'dark' ? 'dark' : probe === 'light' ? 'light' : null;
+  }}
   function setResolvedMode(resolved) {{
     root.setAttribute('data-resolved-color-mode', resolved);
     root.style.colorScheme = resolved;
@@ -79,12 +86,12 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
     return;
   }}
   if (!window.matchMedia) {{
-    setResolvedMode('light');
+    setResolvedMode(readCssResolvedMode() || 'light');
     return;
   }}
   var query = window.matchMedia('(prefers-color-scheme: dark)');
   function detectResolvedMode() {{
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    return readCssResolvedMode() || (query.matches ? 'dark' : 'light');
   }}
   function applyResolvedMode() {{
     setResolvedMode(detectResolvedMode());
@@ -103,10 +110,16 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
     query.addListener(scheduleResolvedModeResync);
   }}
   window.addEventListener('pageshow', scheduleResolvedModeResync);
+  window.addEventListener('load', scheduleResolvedModeResync);
   window.addEventListener('focus', scheduleResolvedModeResync);
   document.addEventListener('visibilitychange', function() {{
     if (!document.hidden) scheduleResolvedModeResync();
   }});
+  if (window.requestAnimationFrame) {{
+    window.requestAnimationFrame(function() {{
+      window.requestAnimationFrame(applyResolvedMode);
+    }});
+  }}
 }})();"#,
         mode = mode.as_str()
     )
@@ -3284,10 +3297,12 @@ pub fn render_chat_main_panel(
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
   </button>
   {header_avatar}<span class="chat-header-name">{display_name}</span>
-  <span class="chat-header-status" id="chat-agent-status"></span>
   {cwd_html}
-  <button type="button" class="btn-sm button-link" id="chat-manage-btn" style="margin-left:auto;" onclick="toggleManagePanel()" title="Manage"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>
-  <button type="button" class="btn-sm button-link" id="chat-config-btn" style="margin-left:var(--s-2);" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
+  <div class="chat-header-actions">
+    <span class="chat-header-status" id="chat-agent-status"></span>
+    <button type="button" class="btn-sm button-link" id="chat-manage-btn" onclick="toggleManagePanel()" title="Manage"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>
+    <button type="button" class="btn-sm button-link" id="chat-config-btn" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
+  </div>
 </div>
 <div class="chat-messages-wrap" id="chat-messages-wrap">
   <div class="chat-messages" id="chat-messages"></div>
@@ -4703,12 +4718,12 @@ function updateHeaderStatus() {{
   var statusClass = chatStatusClass(agentStatus);
   var statusTitle = agentStatus === 'idle' ? 'Finished' : agentStatus === 'thinking' ? 'Working' : agentStatus === 'restarting' ? 'Restarting' : 'Stopped';
   var glyphHtml = agentStatus === 'idle'
-    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>'
+    ? '{ICON_STATUS_DONE}'
     : agentStatus === 'thinking'
-    ? "<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><defs><linearGradient id=\"status-working-gradient\" x1=\"2\" y1=\"12\" x2=\"22\" y2=\"12\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color='#38bdf8'/><stop offset=\"0.35\" stop-color=\"var(--accent)\"/><stop offset=\"0.65\" stop-color='#dbeafe'/><stop offset=\"1\" stop-color='#38bdf8'/><animateTransform attributeName=\"gradientTransform\" type=\"translate\" from=\"-18 0\" to=\"18 0\" dur=\"1.35s\" repeatCount=\"indefinite\"/></linearGradient></defs><path stroke='url(#status-working-gradient)' d=\"M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z\"/></svg>"
+    ? '{ICON_STATUS_WORKING}'
     : agentStatus === 'restarting'
-    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>'
-    : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6"/><path d="M15 9l-6 6"/></svg>';
+    ? '{ICON_RESTART}'
+    : '{ICON_STATUS_STOPPED}';
   el.innerHTML = '<span class="chat-status-glyph ' + statusClass + '" title="' + statusTitle + '">' + glyphHtml + '</span><span class="chat-header-status-text"></span>';
   var textEl = el.querySelector('.chat-header-status-text');
   if (textEl) textEl.textContent = parts.join(' \u00b7 ');
@@ -4732,16 +4747,16 @@ function updateAgentListStatus(agent, status) {{
   glyph.classList.add(statusClass);
   if (status === 'idle') {{
     glyph.title = 'Finished';
-    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>';
+    glyph.innerHTML = '{ICON_STATUS_DONE}';
   }} else if (status === 'thinking') {{
     glyph.title = 'Working';
-    glyph.innerHTML = "<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><defs><linearGradient id=\"status-working-gradient\" x1=\"2\" y1=\"12\" x2=\"22\" y2=\"12\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color='#38bdf8'/><stop offset=\"0.35\" stop-color=\"var(--accent)\"/><stop offset=\"0.65\" stop-color='#dbeafe'/><stop offset=\"1\" stop-color='#38bdf8'/><animateTransform attributeName=\"gradientTransform\" type=\"translate\" from=\"-18 0\" to=\"18 0\" dur=\"1.35s\" repeatCount=\"indefinite\"/></linearGradient></defs><path stroke='url(#status-working-gradient)' d=\"M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z\"/></svg>";
+    glyph.innerHTML = '{ICON_STATUS_WORKING}';
   }} else if (status === 'restarting') {{
     glyph.title = 'Restarting';
-    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>';
+    glyph.innerHTML = '{ICON_RESTART}';
   }} else {{
     glyph.title = 'Stopped';
-    glyph.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6"/><path d="M15 9l-6 6"/></svg>';
+    glyph.innerHTML = '{ICON_STATUS_STOPPED}';
   }}
 }}
 
@@ -8772,7 +8787,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
             let light = theme_palette(theme, false);
             let dark = theme_palette(theme, true);
             format!(
-                "    :root {{\n      {light_vars}\n\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    :root[data-resolved-color-mode=\"light\"] {{\n      {light_vars}\n    }}\n    :root[data-resolved-color-mode=\"dark\"] {{\n      {dark_vars}\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root {{\n        {dark_vars}\n      }}\n    }}",
+                "    :root {{\n      {light_vars}\n\n      --system-color-mode: light;\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    :root[data-resolved-color-mode=\"light\"] {{\n      {light_vars}\n    }}\n    :root[data-resolved-color-mode=\"dark\"] {{\n      {dark_vars}\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root {{\n        --system-color-mode: dark;\n        {dark_vars}\n      }}\n    }}",
                 light_vars = palette_css_vars(&light),
                 dark_vars = palette_css_vars(&dark)
             )
@@ -9237,9 +9252,24 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: block;
     }
     .chat-status-running { color: #22c55e; }
-    .chat-status-working { color: var(--accent); }
+    .chat-status-working {
+      color: var(--accent);
+      animation: chat-status-working-color-shift 1.1s ease-in-out infinite;
+    }
     .chat-status-restarting { color: #f59e0b; }
     .chat-status-stopped { color: var(--fg-muted); }
+    @keyframes chat-status-working-color-shift {
+      0%, 100% {
+        color: var(--accent);
+        opacity: 1;
+        filter: drop-shadow(0 0 0 rgba(56, 189, 248, 0));
+      }
+      50% {
+        color: #38bdf8;
+        opacity: 0.72;
+        filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.35));
+      }
+    }
     .chat-agent-snippet {
       font-size: 0.82rem;
       color: var(--fg-muted);
@@ -9280,6 +9310,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+    .chat-header-actions {
+      margin-left: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: var(--s-2);
+      min-width: 0;
+      flex-shrink: 0;
     }
     .chat-header-status {
       font-size: 0.82rem;
@@ -11178,13 +11216,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-header .chat-avatar-sm-wrap { margin-right: 0; margin-left: 0; }
       .chat-header .chat-avatar-header { margin: 0; }
       .chat-header-cwd { display: none; }
-      .chat-header-status {
-        display: inline-flex;
-        margin-left: auto;
-        gap: 0;
-      }
+      .chat-header-actions { gap: var(--s-2); }
+      .chat-header-status { gap: 0; }
       .chat-header-status-text { display: none; }
-      #chat-manage-btn { margin-left: 0 !important; }
       .chat-messages {
         overflow-y: scroll;
         overflow-x: hidden;
@@ -11320,6 +11354,8 @@ mod tests {
 
         assert!(html.contains(r#"title="Working""#));
         assert!(html.contains(r#"chat-status-working"#));
+        assert!(html.contains("chat-status-working-color-shift"));
+        assert!(!html.contains("status-working-gradient"));
         assert!(html.contains(r#"title="Finished""#));
         assert!(html.contains(r#"chat-status-running"#));
         assert!(!html.contains("agent-status-badge"));
@@ -11339,11 +11375,12 @@ mod tests {
             },
             String::new(),
         );
-        assert!(html.contains(
-            ".chat-header-status {\n        display: inline-flex;\n        margin-left: auto;"
-        ));
+        assert!(html.contains(".chat-header-actions {"));
+        assert!(html.contains("margin-left: auto;"));
+        assert!(html.contains("display: inline-flex;"));
+        assert!(html.contains(".chat-header-actions { gap: var(--s-2); }"));
         assert!(html.contains(".chat-header-status-text { display: none; }"));
-        assert!(html.contains("#chat-manage-btn { margin-left: 0 !important; }"));
+        assert!(html.contains(".chat-header-status { gap: 0; }"));
 
         let panel = render_chat_main_panel(
             &[ChatAgentSummary {
@@ -11361,6 +11398,7 @@ mod tests {
             "csrf",
             &[],
         );
+        assert!(panel.contains(r#"<div class="chat-header-actions">"#));
         assert!(
             panel.contains(r#"<span class="chat-header-status" id="chat-agent-status"></span>"#)
         );
@@ -11385,17 +11423,27 @@ mod tests {
         assert!(html.contains(r#"<meta name="color-scheme" content="light dark">"#));
         assert!(html.contains(r#"root.setAttribute('data-color-mode', mode);"#));
         assert!(html.contains(r#"root.style.colorScheme = resolved;"#));
-        assert!(html.contains(
-            r#"return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';"#
-        ));
+        assert!(html.contains(r#"function readCssResolvedMode() {"#));
+        assert!(
+            html.contains(
+                r#"window.getComputedStyle(root).getPropertyValue('--system-color-mode');"#
+            )
+        );
+        assert!(
+            html.contains(r#"return readCssResolvedMode() || (query.matches ? 'dark' : 'light');"#)
+        );
         assert!(html.contains(r#"var resyncTimers = [];"#));
         assert!(html.contains(r#"function scheduleResolvedModeResync() {"#));
         assert!(html.contains(r#"[80, 240, 600, 1200].forEach(function(delay) {"#));
         assert!(
             html.contains(r#"window.addEventListener('pageshow', scheduleResolvedModeResync);"#)
         );
+        assert!(html.contains(r#"window.addEventListener('load', scheduleResolvedModeResync);"#));
         assert!(html.contains(r#"document.addEventListener('visibilitychange', function() {"#));
+        assert!(html.contains(r#"window.requestAnimationFrame(function() {"#));
         assert!(html.contains(r#"root.setAttribute('data-resolved-color-mode', resolved);"#));
+        assert!(html.contains(r#"--system-color-mode: light;"#));
+        assert!(html.contains(r#"--system-color-mode: dark;"#));
         assert!(html.contains(r#":root[data-resolved-color-mode="light"] {"#));
         assert!(html.contains(r#":root[data-resolved-color-mode="dark"] {"#));
         assert!(html.contains(r#"@media (prefers-color-scheme: dark) {"#));
