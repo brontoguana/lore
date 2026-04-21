@@ -81,7 +81,7 @@ fn shell_theme_bootstrap(mode: ColorMode) -> String {
   }}
   function setResolvedMode(resolved) {{
     root.setAttribute('data-resolved-color-mode', resolved);
-    root.style.colorScheme = resolved;
+    root.style.colorScheme = mode === 'system' ? 'light dark' : resolved;
   }}
   function clearResyncTimers() {{
     while (resyncTimers.length) {{
@@ -8807,7 +8807,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
             let light = theme_palette(theme, false);
             let dark = theme_palette(theme, true);
             format!(
-                "    :root {{\n      {light_vars}\n\n      --system-color-mode: light;\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    :root[data-color-mode=\"system\"][data-resolved-color-mode=\"light\"] {{\n      {light_vars}\n    }}\n    :root[data-color-mode=\"system\"][data-resolved-color-mode=\"dark\"] {{\n      {dark_vars}\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root[data-color-mode=\"system\"] {{\n        --system-color-mode: dark;\n        {dark_vars}\n      }}\n    }}",
+                "    :root {{\n      {light_vars}\n\n      --system-color-mode: light;\n      --s-1: 4px;\n      --s-2: 8px;\n      --s-3: 12px;\n      --s-4: 16px;\n      --s-5: 24px;\n      --s-6: 32px;\n      --s-7: 48px;\n      --s-8: 64px;\n    }}\n    :root[data-color-mode=\"system\"] {{\n      color-scheme: light dark;\n      {light_vars}\n    }}\n    @media (prefers-color-scheme: dark) {{\n      :root[data-color-mode=\"system\"] {{\n        --system-color-mode: dark;\n        {dark_vars}\n      }}\n    }}",
                 light_vars = palette_css_vars(&light),
                 dark_vars = palette_css_vars(&dark)
             )
@@ -11454,9 +11454,11 @@ mod tests {
         assert!(html.contains(
             r#"var chatMessages = [{"role":"assistant","content":"\u003C/script\u003E boom"}];"#
         ));
-        assert!(!html.contains(
-            r#"var chatMessages = [{"role":"assistant","content":"</script> boom"}];"#
-        ));
+        assert!(
+            !html.contains(
+                r#"var chatMessages = [{"role":"assistant","content":"</script> boom"}];"#
+            )
+        );
     }
 
     #[test]
@@ -11477,7 +11479,11 @@ mod tests {
         assert!(html.contains(r#"<html lang="en" data-color-mode="system">"#));
         assert!(html.contains(r#"<meta name="color-scheme" content="light dark">"#));
         assert!(html.contains(r#"root.setAttribute('data-color-mode', mode);"#));
-        assert!(html.contains(r#"root.style.colorScheme = resolved;"#));
+        assert!(
+            html.contains(
+                r#"root.style.colorScheme = mode === 'system' ? 'light dark' : resolved;"#
+            )
+        );
         assert!(html.contains(r#"function readCssResolvedMode() {"#));
         assert!(
             html.contains(
@@ -11499,14 +11505,10 @@ mod tests {
         assert!(html.contains(r#"root.setAttribute('data-resolved-color-mode', resolved);"#));
         assert!(html.contains(r#"--system-color-mode: light;"#));
         assert!(html.contains(r#"--system-color-mode: dark;"#));
-        assert!(
-            html.contains(r#":root[data-color-mode="system"][data-resolved-color-mode="light"] {"#)
-        );
-        assert!(
-            html.contains(r#":root[data-color-mode="system"][data-resolved-color-mode="dark"] {"#)
-        );
         assert!(html.contains(r#":root[data-color-mode="system"] {"#));
         assert!(html.contains(r#"@media (prefers-color-scheme: dark) {"#));
+        assert!(!html.contains(r#"data-resolved-color-mode="light"] {"#));
+        assert!(!html.contains(r#"data-resolved-color-mode="dark"] {"#));
     }
 
     #[test]
