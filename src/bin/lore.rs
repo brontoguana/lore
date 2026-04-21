@@ -2796,9 +2796,14 @@ async fn agent_poll_and_process(
         return Ok(AgentPollAction::Stop);
     }
 
+    let manage_requested = body["manage_requested"].as_bool().unwrap_or(false);
+
     let messages = body["messages"].as_array();
 
     if messages.is_none() || messages.unwrap().is_empty() {
+        if manage_requested {
+            maybe_run_manager(context, agent_name).await?;
+        }
         return Ok(AgentPollAction::Continue);
     }
 
@@ -3291,6 +3296,12 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
     }
 
     eprintln!("[manager] Running manager turn");
+    let _ = context
+        .client
+        .post(format!("{}/v1/chat/manager/requested", context.url))
+        .header("x-lore-key", token)
+        .send()
+        .await;
 
     let has_endpoint = manage["has_endpoint"].as_bool().unwrap_or(false);
     let manager_response = if has_endpoint {

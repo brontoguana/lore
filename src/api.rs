@@ -612,6 +612,10 @@ fn build_app_with_librarian(
         .route("/v1/chat/compact", post(chat_agent_compact))
         .route("/v1/chat/config", get(chat_agent_config))
         .route("/v1/chat/manage", get(chat_agent_get_manage))
+        .route(
+            "/v1/chat/manager/requested",
+            post(chat_agent_manager_requested),
+        )
         .route("/v1/chat/manager", post(chat_agent_manager_report))
         .route(
             "/v1/chat/manager/completions",
@@ -11651,9 +11655,20 @@ async fn chat_agent_poll(
 
     let poll_backend = agent.backend.to_string();
     let poll_endpoint_id = agent.endpoint_id.clone();
+    let current_manage_requested = || -> Result<bool, ApiError> {
+        Ok(state
+            .chat
+            .get_manage_config(owner_str, &agent.name)?
+            .map(|mc| mc.enabled && mc.run_requested)
+            .unwrap_or(false))
+    };
 
-    let build_poll_response = |msgs: Vec<Value>| -> Json<Value> {
-        let mut resp = json!({ "messages": msgs, "backend": poll_backend });
+    let build_poll_response = |msgs: Vec<Value>, manage_requested: bool| -> Json<Value> {
+        let mut resp = json!({
+            "messages": msgs,
+            "backend": poll_backend,
+            "manage_requested": manage_requested
+        });
         if let Some(ref eid) = poll_endpoint_id {
             resp["endpoint_id"] = json!(eid);
         }
@@ -11668,7 +11683,10 @@ async fn chat_agent_poll(
     };
 
     if take_chat_agent_stop_request(&state, owner_str, &agent.name) {
-        return Ok(build_poll_response_with_stop(build_poll_response(vec![])));
+        return Ok(build_poll_response_with_stop(build_poll_response(
+            vec![],
+            current_manage_requested()?,
+        )));
     }
 
     if !pending.is_empty() {
@@ -11676,7 +11694,7 @@ async fn chat_agent_poll(
             .iter()
             .map(|m| json!({ "id": m.id, "content": m.content, "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() }))
             .collect();
-        return Ok(build_poll_response(msgs));
+        return Ok(build_poll_response(msgs, current_manage_requested()?));
     }
 
     // No messages — long-poll up to 30 seconds
@@ -11694,7 +11712,10 @@ async fn chat_agent_poll(
     // Re-check for messages after waking
     if result.is_ok() {
         if take_chat_agent_stop_request(&state, owner_str, &agent.name) {
-            return Ok(build_poll_response_with_stop(build_poll_response(vec![])));
+            return Ok(build_poll_response_with_stop(build_poll_response(
+                vec![],
+                current_manage_requested()?,
+            )));
         }
         let pending = state
             .chat
@@ -11704,11 +11725,11 @@ async fn chat_agent_poll(
                 .iter()
                 .map(|m| json!({ "id": m.id, "content": m.content, "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() }))
                 .collect();
-            return Ok(build_poll_response(msgs));
+            return Ok(build_poll_response(msgs, current_manage_requested()?));
         }
     }
 
-    Ok(build_poll_response(vec![]))
+    Ok(build_poll_response(vec![], current_manage_requested()?))
 }
 
 fn build_poll_response_with_stop(mut response: Json<Value>) -> Json<Value> {
@@ -12816,51 +12837,27 @@ async fn chat_agent_manager_report(
         .chat_audit
         .log(&agent.name, owner_str, "manager", &body.content);
 
+    let mut auto_disabled = false;
     if let Ok(Some(mut mc)) = state.chat.get_manage_config(owner_str, &agent.name) {
-        let asking_display = manager_chat_message_prefix(&format!(
-            "asking manager to {}",
-            manager_request_summary(mc.turn_counter % 5)
-        ));
-        if let Ok(msg) = state.chat.append_message(
-            owner_str,
-            &agent.name,
-            ChatRole::User,
-            asking_display.clone(),
-        ) {
-            push_chat_event(
-                &state,
-                owner_str,
-                ChatEvent {
-                    event_type: "message".into(),
-                    agent: agent.name.clone(),
-                    owner: owner_str.to_string(),
-                    data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
-                },
-            );
-        }
-
         mc.turn_counter += 1;
+        mc.run_requested = false;
+        mc.request_announced = false;
         if body.stopped {
+            auto_disabled = mc.enabled;
             mc.enabled = false;
         }
         let _ = state.chat.save_manage_config(owner_str, &agent.name, &mc);
     }
 
     let display = manager_chat_message_prefix(&body.content);
-    if let Ok(msg) =
-        state
-            .chat
-            .append_message(owner_str, &agent.name, ChatRole::User, display.clone())
-    {
-        push_chat_event(
+    append_manager_chat_message(&state, owner_str, &agent.name, ChatRole::User, &display);
+    if auto_disabled {
+        append_manager_chat_message(
             &state,
             owner_str,
-            ChatEvent {
-                event_type: "message".into(),
-                agent: agent.name.clone(),
-                owner: owner_str.to_string(),
-                data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
-            },
+            &agent.name,
+            ChatRole::Assistant,
+            &manager_chat_message_prefix("Manager Disabled"),
         );
     }
 
@@ -12874,6 +12871,36 @@ async fn chat_agent_manager_report(
         {
             notify.notify_one();
         }
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn chat_agent_manager_requested(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    if let Ok(Some(mut mc)) = state.chat.get_manage_config(owner_str, &agent.name) {
+        if !mc.enabled || mc.request_announced {
+            return Ok(StatusCode::OK);
+        }
+
+        append_manager_chat_message(
+            &state,
+            owner_str,
+            &agent.name,
+            ChatRole::Assistant,
+            &manager_chat_message_prefix(&format!(
+                "asking manager to {}",
+                manager_request_summary(mc.turn_counter % 5)
+            )),
+        );
+        mc.request_announced = true;
+        let _ = state.chat.save_manage_config(owner_str, &agent.name, &mc);
     }
 
     Ok(StatusCode::OK)
@@ -13192,16 +13219,47 @@ fn manager_chat_message_prefix(content: &str) -> String {
     format!("👔 {content}")
 }
 
-fn manager_resume_message() -> &'static str {
-    "Manager mode enabled. Continue working toward the current goals until you reach a stopping point."
-}
-
-fn should_queue_resume_on_manage_enable(status: AgentChatStatus) -> bool {
-    status != AgentChatStatus::Thinking
-}
-
 fn should_restart_agent_on_manage_enable(process_status: Option<&str>) -> bool {
     process_status == Some("stopped")
+}
+
+fn append_manager_chat_message(
+    state: &AppState,
+    owner: &str,
+    agent_name: &str,
+    role: ChatRole,
+    content: &str,
+) {
+    if let Ok(msg) = state
+        .chat
+        .append_message(owner, agent_name, role, content.to_string())
+    {
+        let audit_role = match role {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+            ChatRole::Tool => "tool",
+            ChatRole::Error => "error",
+        };
+        state
+            .chat_audit
+            .log(agent_name, owner, audit_role, &msg.content);
+        let event_role = match role {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+            ChatRole::Tool => "tool",
+            ChatRole::Error => "error",
+        };
+        push_chat_event(
+            state,
+            owner,
+            ChatEvent {
+                event_type: "message".into(),
+                agent: agent_name.to_string(),
+                owner: owner.to_string(),
+                data: json!({ "id": msg.id, "role": event_role, "content": msg.content }),
+            },
+        );
+    }
 }
 
 // --- API agent helpers (used by btw) ---
@@ -14265,77 +14323,62 @@ async fn chat_save_manage(
     if let Some(en) = form.enabled {
         if en && !mc.enabled {
             mc.turn_counter = 0;
+            mc.run_requested = true;
+            mc.request_announced = false;
+        } else if !en {
+            mc.run_requested = false;
+            mc.request_announced = false;
         }
         mc.enabled = en;
     }
 
     state.chat.save_manage_config(owner, &agent_name, &mc)?;
     if mc.enabled && !was_enabled {
-        let should_queue_resume = state
-            .chat
-            .load_conversation(owner, &agent_name)
-            .map(|conv| should_queue_resume_on_manage_enable(conv.agent_status))
-            .unwrap_or(false);
-        if should_queue_resume {
-            let state_clone = state.clone();
-            let owner_clone = owner.to_string();
-            let agent_name_clone = agent_name.clone();
-            let machine_name = agent.machine_name.clone();
-            let process_status = machine_agent_process_status(
-                &state,
-                owner,
-                &agent_name,
-                agent.machine_name.as_deref(),
-            );
-            tokio::spawn(async move {
-                if let Ok(msg) = state_clone.chat.append_message(
-                    &owner_clone,
-                    &agent_name_clone,
-                    ChatRole::User,
-                    manager_resume_message().to_string(),
-                ) {
-                    state_clone.chat_audit.log(
-                        &agent_name_clone,
-                        &owner_clone,
-                        "user",
-                        &msg.content,
-                    );
-                    push_chat_event(
+        append_manager_chat_message(
+            &state,
+            owner,
+            &agent_name,
+            ChatRole::Assistant,
+            &manager_chat_message_prefix("Manager Enabled"),
+        );
+        let state_clone = state.clone();
+        let owner_clone = owner.to_string();
+        let agent_name_clone = agent_name.clone();
+        let machine_name = agent.machine_name.clone();
+        let process_status =
+            machine_agent_process_status(&state, owner, &agent_name, agent.machine_name.as_deref());
+        tokio::spawn(async move {
+            let notifier_key = format!("{}_{}", owner_clone, agent_name_clone);
+            if let Some(notify) = state_clone
+                .chat_agent_notifiers
+                .lock()
+                .unwrap()
+                .get(&notifier_key)
+            {
+                notify.notify_one();
+            }
+
+            if should_restart_agent_on_manage_enable(process_status.as_deref()) {
+                if let Some(machine_name) = machine_name {
+                    let machine_key = format!("{}_{}", owner_clone, machine_name);
+                    let _ = queue_machine_command_and_wait(
                         &state_clone,
-                        &owner_clone,
-                        ChatEvent {
-                            event_type: "message".into(),
-                            agent: agent_name_clone.clone(),
-                            owner: owner_clone.clone(),
-                            data: json!({ "id": msg.id, "role": "user", "content": msg.content }),
-                        },
-                    );
+                        &machine_key,
+                        "restart_agent",
+                        json!({ "agent_name": agent_name_clone }),
+                    )
+                    .await;
                 }
-
-                let notifier_key = format!("{}_{}", owner_clone, agent_name_clone);
-                if let Some(notify) = state_clone
-                    .chat_agent_notifiers
-                    .lock()
-                    .unwrap()
-                    .get(&notifier_key)
-                {
-                    notify.notify_one();
-                }
-
-                if should_restart_agent_on_manage_enable(process_status.as_deref()) {
-                    if let Some(machine_name) = machine_name {
-                        let machine_key = format!("{}_{}", owner_clone, machine_name);
-                        let _ = queue_machine_command_and_wait(
-                            &state_clone,
-                            &machine_key,
-                            "restart_agent",
-                            json!({ "agent_name": agent_name_clone }),
-                        )
-                        .await;
-                    }
-                }
-            });
-        }
+            }
+        });
+    } else if !mc.enabled && was_enabled {
+        append_manager_chat_message(
+            &state,
+            owner,
+            &agent_name,
+            ChatRole::Assistant,
+            &manager_chat_message_prefix("Manager Disabled"),
+        );
     }
     Ok(Json(json!({"ok": true, "enabled": mc.enabled})))
 }
@@ -19688,17 +19731,7 @@ mod tests {
     }
 
     #[test]
-    fn manage_enable_resume_policy_matches_agent_state() {
-        assert!(super::should_queue_resume_on_manage_enable(
-            AgentChatStatus::Idle
-        ));
-        assert!(super::should_queue_resume_on_manage_enable(
-            AgentChatStatus::Offline
-        ));
-        assert!(!super::should_queue_resume_on_manage_enable(
-            AgentChatStatus::Thinking
-        ));
-
+    fn manage_enable_restart_policy_matches_agent_state() {
         assert!(super::should_restart_agent_on_manage_enable(Some(
             "stopped"
         )));

@@ -2006,6 +2006,10 @@ pub struct ManageConfig {
     pub enabled: bool,
     #[serde(default)]
     pub turn_counter: u32,
+    #[serde(default)]
+    pub run_requested: bool,
+    #[serde(default)]
+    pub request_announced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
