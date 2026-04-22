@@ -182,6 +182,11 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     var meta = document.getElementById('meta-' + blockId);
     var article = document.getElementById('block-' + blockId);
     if (!body || !edit) return;
+    var expandedSource = edit.querySelector('textarea[data-editor-save="block"]');
+    if (edit.style.display === 'none' && expandedSource && expandedSource.id) {{
+      openExpandedTextEditor(expandedSource.id);
+      return;
+    }}
     var row = article.closest('.editline-row');
     var band = row ? row.querySelector('.editline-band') : null;
     if (edit.style.display === 'none') {{
@@ -272,6 +277,11 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
   }}
   document.addEventListener('keydown', function(e) {{
     if (e.key !== 'Escape') return;
+    if (document.body.classList.contains('expanded-editor-open')) {{
+      cancelExpandedTextEditor();
+      e.preventDefault();
+      return;
+    }}
     // Check for an open edit panel
     var editPanel = document.querySelector('.block-edit-panel[style=""],.block-edit-panel:not([style*="display:none"])');
     if (editPanel && editPanel.style.display !== 'none') {{
@@ -3356,6 +3366,32 @@ fn chat_agent_status_indicator(
     }
 }
 
+fn render_expanded_text_editor_shell() -> String {
+    format!(
+        r#"<div class="expanded-editor-overlay" id="expanded-text-editor" style="display:none;">
+  <div class="expanded-editor-shell">
+    <div class="expanded-editor-header">
+      <div class="expanded-editor-kicker">Editing</div>
+      <h2 class="expanded-editor-title" id="expanded-editor-title">Edit</h2>
+    </div>
+    <textarea id="expanded-editor-input" class="expanded-editor-input" spellcheck="false"></textarea>
+    <div class="expanded-editor-footer">
+      <div class="expanded-editor-actions expanded-editor-actions-desktop">
+        <button type="button" class="btn-lg" onclick="return cancelExpandedTextEditor()">Cancel</button>
+        <button type="button" class="btn-lg button-link" onclick="return saveExpandedTextEditor()">Save</button>
+      </div>
+      <div class="expanded-editor-actions expanded-editor-actions-mobile">
+        <button type="button" class="btn-sm" onclick="return cancelExpandedTextEditor()" title="Cancel">{close_icon}</button>
+        <button type="button" class="btn-sm button-link" onclick="return saveExpandedTextEditor()" title="Save">{check_icon}</button>
+      </div>
+    </div>
+  </div>
+</div>"#,
+        close_icon = ICON_CLOSE,
+        check_icon = ICON_CHECK,
+    )
+}
+
 pub fn render_chat_main_panel(
     agents: &[ChatAgentSummary],
     selected_agent: Option<&str>,
@@ -4288,6 +4324,7 @@ function resizeChatInput() {{
   var input = document.getElementById('chat-input');
   if (!input) return false;
   var form = document.getElementById('chat-input-form');
+  var sendBtn = document.querySelector('#chat-input-form .chat-send-btn');
   var header = document.querySelector('.chat-header');
   var messages = document.getElementById('chat-messages');
   var viewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
@@ -4307,6 +4344,7 @@ function resizeChatInput() {{
   var nextOverflow = input.scrollHeight > maxHeight ? 'auto' : 'hidden';
   input.style.height = nextHeight + 'px';
   input.style.overflowY = nextOverflow;
+  if (sendBtn) sendBtn.style.height = nextHeight + 'px';
   var changed = Math.abs(nextHeight - prevHeight) > 1 || prevOverflow !== nextOverflow;
   if (changed && messages && wasFollowing) {{
     chatFollowScroll = true;
@@ -5588,6 +5626,13 @@ function saveExpandedTextEditor() {{
   }} else if (saveKind === 'manage') {{
     if (manageSaveTimer) clearTimeout(manageSaveTimer);
     saveManageConfig();
+  }} else if (saveKind === 'block') {{
+    var formId = source.getAttribute('data-editor-form') || '';
+    var form = formId ? document.getElementById(formId) : source.form;
+    if (form) {{
+      form.submit();
+      return false;
+    }}
   }} else {{
     source.dispatchEvent(new Event('input', {{ bubbles: true }}));
   }}
@@ -7082,7 +7127,8 @@ pub fn render_document_page(
     {child_doc_items}
     {add_subdoc_html}
     {read_only_notice}
-    {delete_doc_html}"#,
+    {delete_doc_html}
+    {expanded_editor_shell}"#,
         project_slug = project_slug,
         project_name = escape_text(project_display_name),
         rename_html = rename_html,
@@ -7091,6 +7137,7 @@ pub fn render_document_page(
         add_subdoc_html = add_subdoc_html,
         read_only_notice = read_only_notice,
         delete_doc_html = delete_doc_html,
+        expanded_editor_shell = render_expanded_text_editor_shell(),
     );
 
     render_shell(
@@ -7242,12 +7289,12 @@ fn render_doc_block(
         };
         format!(
             r#"<div class="block-edit-panel" id="edit-{block_id}" style="display:none;">
-  <form method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/edit" enctype="multipart/form-data">
+  <form id="block-edit-form-{block_id}" method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/edit" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <div class="block-edit-top-row">
       <select name="block_type" class="block-type-select">{block_type_options}</select>
     </div>
-    <textarea name="content" class="block-edit-textarea">{content_escaped}</textarea>
+    <textarea name="content" class="block-edit-textarea{expanded_editor_class}"{expanded_editor_attrs}>{content_escaped}</textarea>
     {media_replace}
     <div class="block-edit-actions">
       <button type="submit" class="button-link">Save</button>
@@ -7255,6 +7302,18 @@ fn render_doc_block(
     </div>
   </form>
 </div>"#,
+            expanded_editor_class = if block.block_type == crate::model::BlockType::Markdown {
+                " expanded-editor-source"
+            } else {
+                ""
+            },
+            expanded_editor_attrs = if block.block_type == crate::model::BlockType::Markdown {
+                format!(
+                    r#" id="block-edit-content-{block_id}" data-editor-label="Edit Markdown" data-editor-save="block" data-editor-form="block-edit-form-{block_id}""#
+                )
+            } else {
+                String::new()
+            },
         )
     } else {
         String::new()
@@ -8236,9 +8295,9 @@ fn render_block(
     let edit_doc_link_picker = render_doc_link_picker(project_infos);
     let edit_form = if can_write {
         format!(
-            r#"<form method="post" action="/ui/{project_slug}/blocks/{block_id}/edit" enctype="multipart/form-data">
+            r#"<form id="block-edit-form-{block_id}" method="post" action="/ui/{project_slug}/blocks/{block_id}/edit" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{csrf}">
-    <textarea name="content" class="block-edit-textarea">{content}</textarea>
+    <textarea name="content" class="block-edit-textarea{expanded_editor_class}"{expanded_editor_attrs}>{content}</textarea>
     {edit_doc_link_picker}
     {image_replace}
   </form>"#,
@@ -8246,6 +8305,18 @@ fn render_block(
             project_slug = project_slug,
             csrf = csrf,
             content = escape_text(&block.content),
+            expanded_editor_class = if block.block_type == crate::model::BlockType::Markdown {
+                " expanded-editor-source"
+            } else {
+                ""
+            },
+            expanded_editor_attrs = if block.block_type == crate::model::BlockType::Markdown {
+                format!(
+                    r#" id="block-edit-content-{block_id}" data-editor-label="Edit Markdown" data-editor-save="block" data-editor-form="block-edit-form-{block_id}""#
+                )
+            } else {
+                String::new()
+            },
             edit_doc_link_picker = edit_doc_link_picker,
             image_replace = if block.block_type == crate::model::BlockType::Image {
                 r#"<div class="block-edit-extras">
@@ -12137,6 +12208,49 @@ mod tests {
         let html = r#"<a href="lore://00000000-0000-0000-0000-000000000000">gone</a>"#;
         let resolved = resolve_lore_links_in_html(html, &store);
         assert!(resolved.contains("lore-link-broken"));
+    }
+
+    #[test]
+    fn document_page_uses_expanded_editor_for_markdown_block_edit_line() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let info = store.create_project("My Docs", None).unwrap();
+        let block = store
+            .create_block(NewBlock {
+                project: info.slug.clone(),
+                block_type: BlockType::Markdown,
+                content: "Hello world".into(),
+                author_key: "key-a".into(),
+                left: None,
+                right: None,
+                image_upload: None,
+            })
+            .unwrap();
+
+        let html = render_document_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            &info.slug,
+            "My Docs",
+            "doc-1",
+            "Doc 1",
+            &[block],
+            &[],
+            None,
+            "admin",
+            true,
+            true,
+            "csrf",
+            &store,
+        );
+
+        assert!(html.contains(r#"data-editor-save="block""#));
+        assert!(html.contains(r#"data-editor-form="block-edit-form-"#));
+        assert!(html.contains(r#"id="block-edit-content-"#));
+        assert!(html.contains(r#"id="expanded-text-editor""#));
+        assert!(html.contains(
+            "var expandedSource = edit.querySelector('textarea[data-editor-save=\"block\"]');"
+        ));
     }
 
     #[test]
