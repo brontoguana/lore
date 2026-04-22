@@ -11452,6 +11452,7 @@ struct ChatSendForm {
 struct ChatExcludeMessageForm {
     csrf_token: String,
     message_id: u64,
+    excluded: bool,
 }
 
 async fn chat_send_message(
@@ -11551,9 +11552,12 @@ async fn chat_update_message(
         return Err(LoreError::PermissionDenied.into());
     }
 
-    let updated = state
-        .chat
-        .exclude_message_from_context(owner, &agent_name, form.message_id)?;
+    let updated = state.chat.set_message_context_excluded(
+        owner,
+        &agent_name,
+        form.message_id,
+        form.excluded,
+    )?;
     let conv = state.chat.load_conversation(owner, &agent_name)?;
     let last_message = conv
         .messages
@@ -16040,7 +16044,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_update_message_marks_message_excluded_from_persisted_context() {
+    async fn chat_update_message_toggles_message_context_exclusion() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
@@ -16084,7 +16088,7 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded")
             .header("cookie", &session_cookie)
             .body(Body::from(format!(
-                "csrf_token={}&message_id={}",
+                "csrf_token={}&message_id={}&excluded=true",
                 urlencoding::encode(&csrf_token),
                 1
             )))
@@ -16107,6 +16111,31 @@ mod tests {
         assert_eq!(saved.messages.len(), 2);
         assert!(saved.messages[0].excluded_from_context);
         assert_eq!(saved.messages[1].content, "keep me");
+
+        let include_request = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/agent-main/message")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}&message_id={}&excluded=false",
+                urlencoding::encode(&csrf_token),
+                1
+            )))
+            .unwrap();
+        let include_response = app.clone().oneshot(include_request).await.unwrap();
+        assert_eq!(include_response.status(), StatusCode::OK);
+        let include_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(include_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(include_json["ok"], true);
+        assert_eq!(include_json["message"]["excluded_from_context"], false);
+
+        let saved = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert!(!saved.messages[0].excluded_from_context);
     }
 
     #[tokio::test]

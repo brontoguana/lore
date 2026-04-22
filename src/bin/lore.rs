@@ -2611,7 +2611,7 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
                     Ok(AgentPollAction::Continue) => {
                         consecutive_errors = 0;
                     }
-                    Ok(AgentPollAction::Stop | AgentPollAction::UpdateAvailable) => break,
+                    Ok(AgentPollAction::UpdateAvailable) => break,
                     Ok(AgentPollAction::Restart) => {
                         eprintln!("[agent] Restarting...");
                         break;
@@ -2635,8 +2635,6 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
 enum AgentPollAction {
     /// Keep polling for the next message.
     Continue,
-    /// Stop this agent — do not auto-restart.
-    Stop,
     /// Restart this agent (e.g. /restart chat command).
     Restart,
     /// Server says an update is available — the *service* handles the actual
@@ -2794,7 +2792,7 @@ async fn agent_poll_and_process(
     if body["stop_requested"].as_bool().unwrap_or(false) {
         eprintln!("[agent] Received /stop command");
         let _ = acknowledge_control_command("/stop").await;
-        return Ok(AgentPollAction::Stop);
+        return Ok(AgentPollAction::Continue);
     }
 
     let manage_requested = body["manage_requested"].as_bool().unwrap_or(false);
@@ -2828,7 +2826,7 @@ async fn agent_poll_and_process(
             } else if trimmed == "/stop" {
                 eprintln!("[agent] Received /stop command");
                 let _ = acknowledge_control_command("/stop").await;
-                return Ok(AgentPollAction::Stop);
+                return Ok(AgentPollAction::Continue);
             } else if trimmed == "/restart" {
                 eprintln!("[agent] Received /restart — restarting");
                 let _ = acknowledge_control_command("/restart").await;
@@ -3208,7 +3206,7 @@ async fn agent_poll_and_process(
                     eprintln!("[agent] Stop requested during backend run; terminating child tree");
                     terminate_child_process_tree(&mut child).await;
                     let _ = acknowledge_control_command("/stop").await;
-                    return Ok(AgentPollAction::Stop);
+                    return Ok(AgentPollAction::Continue);
                 }
             }
         }
@@ -5639,10 +5637,8 @@ struct ServiceState {
     state_dir: PathBuf,
     /// Runtime task handles for each agent, keyed by agent name.
     tasks: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-    /// Agents explicitly stopped (via command or /stop chat message) — skip auto-restart.
+    /// Agents explicitly stopped via service command — skip auto-restart.
     stopped: std::collections::HashSet<String>,
-    /// Shared with agent tasks: they insert their name here when they receive /stop.
-    self_stops: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ServiceState {
@@ -5661,9 +5657,6 @@ impl ServiceState {
             state_dir: state_dir.to_path_buf(),
             tasks: std::collections::HashMap::new(),
             stopped: std::collections::HashSet::new(),
-            self_stops: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashSet::new()),
-            ),
         }
     }
 
@@ -5676,14 +5669,6 @@ impl ServiceState {
     }
 
     fn check_agents(&mut self) {
-        // Drain any self-stop requests from agent tasks.
-        if let Ok(mut stops) = self.self_stops.lock() {
-            for name in stops.drain() {
-                eprintln!("[service] Agent '{}' self-stopped via chat command", name);
-                self.stopped.insert(name);
-            }
-        }
-
         let mut dead: Vec<String> = Vec::new();
         for (name, handle) in &self.tasks {
             if handle.is_finished() {
@@ -5708,7 +5693,7 @@ impl ServiceState {
             if self.stopped.contains(&agent.name) {
                 continue; // explicitly stopped — don't auto-restart
             }
-            let handle = spawn_agent_task(context, agent, self.self_stops.clone());
+            let handle = spawn_agent_task(context, agent);
             eprintln!("[service] Started agent '{}' as task", agent.name);
             self.tasks.insert(agent.name.clone(), handle);
         }
@@ -5789,7 +5774,7 @@ impl ServiceState {
                 handle.abort();
             }
             // Restart as new task
-            let handle = spawn_agent_task(context, &agent, self.self_stops.clone());
+            let handle = spawn_agent_task(context, &agent);
             eprintln!("[service] Restarted agent '{}' as task", name);
             self.tasks.insert(name.to_string(), handle);
             self.save();
@@ -5813,11 +5798,7 @@ impl ServiceState {
 }
 
 /// Spawn an agent as a tokio task within this process.
-fn spawn_agent_task(
-    context: &CliContext,
-    agent: &ManagedAgent,
-    self_stops: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_agent_task(context: &CliContext, agent: &ManagedAgent) -> tokio::task::JoinHandle<()> {
     let folder = PathBuf::from(&agent.folder);
     let name = agent.name.clone();
     let backend_override = agent.backend.as_ref().and_then(|b| b.parse().ok());
@@ -5841,16 +5822,8 @@ fn spawn_agent_task(
                 Ok(AgentPollAction::Continue) => {
                     consecutive_errors = 0;
                 }
-                Ok(AgentPollAction::Stop) => {
-                    eprintln!("[agent] Task for '{}' stopped via /stop", name);
-                    if let Ok(mut stops) = self_stops.lock() {
-                        stops.insert(name.clone());
-                    }
-                    break;
-                }
                 Ok(AgentPollAction::Restart) => {
                     eprintln!("[agent] Task for '{}' restarting", name);
-                    // Don't add to self_stops — service will auto-restart
                     break;
                 }
                 Ok(AgentPollAction::UpdateAvailable) => {
@@ -6513,7 +6486,7 @@ async fn service_handle_create_agent(
     };
 
     // Start the agent as a task within this process
-    let handle = spawn_agent_task(context, &managed, svc_state.self_stops.clone());
+    let handle = spawn_agent_task(context, &managed);
     eprintln!(
         "[service] Agent '{}' started in {} as task",
         agent_slug, managed.folder,

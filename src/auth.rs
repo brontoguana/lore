@@ -2804,11 +2804,12 @@ impl ChatStore {
         Ok(())
     }
 
-    pub fn exclude_message_from_context(
+    pub fn set_message_context_excluded(
         &self,
         owner: &str,
         agent: &str,
         message_id: u64,
+        excluded_from_context: bool,
     ) -> Result<ChatMessage> {
         let mut conv = self.load_conversation(owner, agent)?;
         let idx = conv
@@ -2816,9 +2817,14 @@ impl ChatStore {
             .iter()
             .position(|msg| msg.id == message_id)
             .ok_or_else(|| LoreError::Validation("message not found".into()))?;
-        conv.messages[idx].excluded_from_context = true;
+        if conv.messages[idx].role != ChatRole::User {
+            return Err(LoreError::Validation(
+                "only user messages can be excluded from context".into(),
+            ));
+        }
+        conv.messages[idx].excluded_from_context = excluded_from_context;
 
-        // Message edits/deletes must immediately disappear from future agent context,
+        // Context-exclusion changes must immediately affect future agent context,
         // including any compacted summary derived from earlier history.
         conv.summary.clear();
         conv.summary_until_id = 0;
@@ -3657,7 +3663,7 @@ mod tests {
         chat.save_conversation("alice", "worker", &conv).unwrap();
 
         let excluded = chat
-            .exclude_message_from_context("alice", "worker", 3)
+            .set_message_context_excluded("alice", "worker", 3, true)
             .unwrap();
         assert_eq!(excluded.id, 3);
         assert!(excluded.excluded_from_context);
@@ -3677,5 +3683,39 @@ mod tests {
                 .map(|msg| msg.excluded_from_context)
                 .unwrap_or(false)
         );
+
+        let restored = chat
+            .set_message_context_excluded("alice", "worker", 3, false)
+            .unwrap();
+        assert!(!restored.excluded_from_context);
+
+        let saved = chat.load_conversation("alice", "worker").unwrap();
+        assert!(!saved.messages[2].excluded_from_context);
+    }
+
+    #[test]
+    fn excluding_non_user_chat_message_is_rejected() {
+        let dir = tempdir().unwrap();
+        let chat = ChatStore::new(dir.path());
+        let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+
+        let conv = ChatConversation {
+            messages: vec![ChatMessage {
+                id: 1,
+                role: ChatRole::Assistant,
+                content: "assistant reply".into(),
+                timestamp: base,
+                client_message_id: None,
+                excluded_from_context: false,
+            }],
+            next_id: 2,
+            ..ChatConversation::default()
+        };
+        chat.save_conversation("alice", "worker", &conv).unwrap();
+
+        let err = chat
+            .set_message_context_excluded("alice", "worker", 1, true)
+            .unwrap_err();
+        assert!(format!("{err}").contains("only user messages"));
     }
 }

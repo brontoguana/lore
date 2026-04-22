@@ -4408,6 +4408,13 @@ function renderMessages() {{
     if (timestamp) {{
       html += '<div class="chat-msg-timestamp">' + escapeHtmlRaw(timestamp) + '</div>';
     }}
+    if (canMutate) {{
+      var toggleExcluded = msg.excluded_from_context ? 'false' : 'true';
+      var toggleTitle = msg.excluded_from_context ? 'Include in agent context' : 'Exclude from agent context';
+      var actionClass = 'btn-sm chat-msg-swipe-action' + (msg.excluded_from_context ? ' chat-msg-swipe-action-active' : '');
+      html += '<div class="chat-msg-swipe-shell">';
+      html += '<button type="button" class="' + actionClass + '" title="' + toggleTitle + '" aria-label="' + toggleTitle + '" onclick="event.stopPropagation(); return toggleChatMessageContextExclusion(' + messageId + ', ' + toggleExcluded + ');"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button>';
+    }}
     html += '<div class="chat-msg ' + cls + '">';
     if (msg.excluded_from_context) {{
       html += '<div class="chat-msg-excluded-prefix" title="Excluded from agent context">&#128465;</div>';
@@ -4421,7 +4428,11 @@ function renderMessages() {{
     }} else {{
       html += '<div class="chat-msg-content">' + escapeHtml(msg.content) + '</div>';
     }}
-    html += '</div></div>';
+    html += '</div>';
+    if (canMutate) {{
+      html += '</div>';
+    }}
+    html += '</div>';
   }}
   container.innerHTML = html;
   if (shouldFollow) {{
@@ -4775,35 +4786,61 @@ function applyExcludedChatMessage(data, messageId) {{
   updateAgentListPreview(currentAgent, data.last_message || '', data.last_message_time || '');
 }}
 
-function excludeChatMessageFromContext(messageId) {{
+function toggleChatMessageContextExclusion(messageId, excluded) {{
   if (!messageId || chatMessageEditPending || !currentAgent) return false;
   var msg = findChatMessageById(messageId);
-  if (!chatMessageCanMutate(msg) || msg.excluded_from_context) return false;
+  if (!chatMessageCanMutate(msg)) return false;
   chatMessageEditPending = true;
   fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/message', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
     body: 'csrf_token=' + encodeURIComponent(csrfToken)
       + '&message_id=' + encodeURIComponent(messageId)
+      + '&excluded=' + encodeURIComponent(excluded ? 'true' : 'false')
   }})
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
       chatMessageEditPending = false;
-      if (!data || !data.ok) throw new Error((data && data.error) || 'Failed to exclude message');
+      if (!data || !data.ok) throw new Error((data && data.error) || 'Failed to update message exclusion');
       applyExcludedChatMessage(data, messageId);
     }})
     .catch(function(err) {{
       chatMessageEditPending = false;
-      alert(err && err.message ? err.message : 'Failed to exclude message');
+      alert(err && err.message ? err.message : 'Failed to update message exclusion');
     }});
   return false;
 }}
 
-function cancelChatMessageLongPress() {{
-  if (chatMessageLongPressTimer) {{
-    clearTimeout(chatMessageLongPressTimer);
-    chatMessageLongPressTimer = null;
-  }}
+function setChatMessageSwipeOffset(row, offset) {{
+  if (!row) return;
+  var clamped = Math.max(0, Math.min(CHAT_MESSAGE_SWIPE_REVEAL, offset || 0));
+  row.style.setProperty('--chat-msg-swipe-offset', clamped + 'px');
+  row.classList.toggle('chat-msg-row-swipe-visible', clamped > 0);
+  row.classList.toggle('chat-msg-row-swipe-open', clamped >= CHAT_MESSAGE_SWIPE_REVEAL - 1);
+}}
+
+function closeChatSwipeRow(row) {{
+  setChatMessageSwipeOffset(row, 0);
+}}
+
+function closeAllChatSwipeRows(exceptRow) {{
+  var container = document.getElementById('chat-messages');
+  if (!container) return;
+  var rows = container.querySelectorAll('.chat-msg-row-swipe-visible[data-chat-msg-id]');
+  rows.forEach(function(row) {{
+    if (exceptRow && row === exceptRow) return;
+    closeChatSwipeRow(row);
+  }});
+}}
+
+function openChatSwipeRow(row) {{
+  if (!row) return;
+  closeAllChatSwipeRows(row);
+  setChatMessageSwipeOffset(row, CHAT_MESSAGE_SWIPE_REVEAL);
+}}
+
+function clearChatMessageSwipeGesture() {{
+  chatMessageSwipeGesture = null;
 }}
 
 function bindChatMessageMutationGestures() {{
@@ -4815,24 +4852,99 @@ function bindChatMessageMutationGestures() {{
     var row = e.target && e.target.closest ? e.target.closest('.chat-msg-row[data-chat-msg-id]') : null;
     if (!row) return;
     e.preventDefault();
-    excludeChatMessageFromContext(parseInt(row.getAttribute('data-chat-msg-id'), 10) || 0);
+    var messageId = parseInt(row.getAttribute('data-chat-msg-id'), 10) || 0;
+    var msg = findChatMessageById(messageId);
+    if (!chatMessageCanMutate(msg)) return;
+    toggleChatMessageContextExclusion(messageId, !msg.excluded_from_context);
+  }});
+
+  container.addEventListener('click', function(e) {{
+    if (e.target && e.target.closest && e.target.closest('.chat-msg-swipe-action')) return;
+    var row = e.target && e.target.closest ? e.target.closest('.chat-msg-row[data-chat-msg-id]') : null;
+    if (!row || !row.classList.contains('chat-msg-row-swipe-open')) {{
+      closeAllChatSwipeRows(null);
+    }}
   }});
 
   container.addEventListener('pointerdown', function(e) {{
-    if (e.pointerType !== 'touch') return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (e.target && e.target.closest && e.target.closest('.chat-msg-swipe-action')) return;
     var row = e.target && e.target.closest ? e.target.closest('.chat-msg-row[data-chat-msg-id]') : null;
     if (!row) return;
-    cancelChatMessageLongPress();
     var messageId = parseInt(row.getAttribute('data-chat-msg-id'), 10) || 0;
-    chatMessageLongPressTimer = setTimeout(function() {{
-      chatMessageLongPressTimer = null;
-      excludeChatMessageFromContext(messageId);
-    }}, 450);
+    var msg = findChatMessageById(messageId);
+    if (!chatMessageCanMutate(msg)) return;
+    closeAllChatSwipeRows(row);
+    chatMessageSwipeGesture = {{
+      pointerId: e.pointerId,
+      row: row,
+      messageId: messageId,
+      startX: e.clientX,
+      startY: e.clientY,
+      startOffset: row.classList.contains('chat-msg-row-swipe-open') ? CHAT_MESSAGE_SWIPE_REVEAL : 0,
+      horizontal: false
+    }};
+    if (row.setPointerCapture) {{
+      try {{ row.setPointerCapture(e.pointerId); }} catch (_err) {{}}
+    }}
   }});
 
-  ['pointerup', 'pointercancel', 'pointermove', 'scroll'].forEach(function(eventName) {{
-    container.addEventListener(eventName, cancelChatMessageLongPress, {{ passive: true }});
+  container.addEventListener('pointermove', function(e) {{
+    if (!chatMessageSwipeGesture || chatMessageSwipeGesture.pointerId !== e.pointerId) return;
+    var dx = e.clientX - chatMessageSwipeGesture.startX;
+    var dy = e.clientY - chatMessageSwipeGesture.startY;
+    if (!chatMessageSwipeGesture.horizontal) {{
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      if (Math.abs(dy) >= Math.abs(dx)) {{
+        closeChatSwipeRow(chatMessageSwipeGesture.row);
+        clearChatMessageSwipeGesture();
+        return;
+      }}
+      chatMessageSwipeGesture.horizontal = true;
+    }}
+    var nextOffset = chatMessageSwipeGesture.startOffset - dx;
+    setChatMessageSwipeOffset(chatMessageSwipeGesture.row, nextOffset);
+    e.preventDefault();
   }});
+
+  function finishChatMessageSwipe(e, cancelled) {{
+    if (!chatMessageSwipeGesture) return;
+    if (e && chatMessageSwipeGesture.pointerId !== e.pointerId) return;
+    var gesture = chatMessageSwipeGesture;
+    clearChatMessageSwipeGesture();
+    if (gesture.row && gesture.row.releasePointerCapture && e) {{
+      try {{ gesture.row.releasePointerCapture(e.pointerId); }} catch (_err) {{}}
+    }}
+    if (cancelled || !gesture.horizontal) {{
+      if (!gesture.row.classList.contains('chat-msg-row-swipe-open')) {{
+        closeChatSwipeRow(gesture.row);
+      }}
+      return;
+    }}
+    var msg = findChatMessageById(gesture.messageId);
+    var offsetValue = parseFloat((gesture.row.style.getPropertyValue('--chat-msg-swipe-offset') || '0').replace('px', '')) || 0;
+    if (offsetValue >= CHAT_MESSAGE_SWIPE_TOGGLE_THRESHOLD && msg) {{
+      closeChatSwipeRow(gesture.row);
+      toggleChatMessageContextExclusion(gesture.messageId, !msg.excluded_from_context);
+      return;
+    }}
+    if (offsetValue >= CHAT_MESSAGE_SWIPE_OPEN_THRESHOLD) {{
+      openChatSwipeRow(gesture.row);
+    }} else {{
+      closeChatSwipeRow(gesture.row);
+    }}
+  }}
+
+  container.addEventListener('pointerup', function(e) {{
+    finishChatMessageSwipe(e, false);
+  }});
+  container.addEventListener('pointercancel', function(e) {{
+    finishChatMessageSwipe(e, true);
+  }});
+  container.addEventListener('scroll', function() {{
+    closeAllChatSwipeRows(null);
+    clearChatMessageSwipeGesture();
+  }}, {{ passive: true }});
 }}
 
 function setChatSendPending(pending) {{
@@ -5002,8 +5114,7 @@ function updateHeaderStatus() {{
   if (agentConfig.effort && backendEfforts[agentConfig.backend] && backendEfforts[agentConfig.backend].length > 0) parts.push(agentConfig.effort);
   if (agentStatus) parts.push(agentStatus);
   var statusClass = chatStatusClass(agentStatus);
-  var managerEnabled = !!(manageConfigData && manageConfigData.enabled);
-  var useManagerGlyph = managerEnabled && statusClass === 'chat-status-working';
+  var useManagerGlyph = shouldUseManagerGlyph(currentAgent, statusClass);
   var statusTitle = agentStatus === 'idle' ? 'Finished' : agentStatus === 'thinking' ? 'Working' : agentStatus === 'restarting' ? 'Restarting' : 'Stopped';
   var glyphHtml = useManagerGlyph
     ? '{ICON_MANAGER}'
@@ -5098,8 +5209,7 @@ function chatMessageId(msg) {{
 
 function chatMessageCanMutate(msg) {{
   if (!msg || msg._thinking) return false;
-  if (msg.excluded_from_context) return false;
-  if (!(msg.role === 'user' || msg.role === 'assistant' || msg.role === 'tool' || msg.role === 'error')) return false;
+  if (msg.role !== 'user') return false;
   return chatMessageId(msg) > 0;
 }}
 
@@ -5340,7 +5450,10 @@ var manageConfigData = null;
 var configSaveTimer = null;
 var manageSaveTimer = null;
 var chatMessageEditPending = false;
-var chatMessageLongPressTimer = null;
+var chatMessageSwipeGesture = null;
+var CHAT_MESSAGE_SWIPE_REVEAL = 44;
+var CHAT_MESSAGE_SWIPE_OPEN_THRESHOLD = 14;
+var CHAT_MESSAGE_SWIPE_TOGGLE_THRESHOLD = 30;
 
 var backendModels = {{
   claude: ['default', 'opus', 'sonnet', 'haiku'],
@@ -9829,9 +9942,56 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       flex-direction: column;
       gap: 2px;
       max-width: 100%;
+      --chat-msg-swipe-offset: 0px;
+    }
+    .chat-msg-row-mutable {
+      touch-action: pan-y;
+    }
+    .chat-msg-swipe-shell {
+      width: 100%;
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      position: relative;
     }
     .chat-msg-row-mutable .chat-msg {
-      cursor: pointer;
+      cursor: grab;
+      position: relative;
+      z-index: 1;
+      transform: translateX(calc(-1 * var(--chat-msg-swipe-offset)));
+      transition: transform 140ms ease;
+      will-change: transform;
+    }
+    .chat-msg-row-mutable.chat-msg-row-swipe-visible .chat-msg {
+      transition-duration: 120ms;
+    }
+    .chat-msg-swipe-action {
+      position: absolute;
+      right: 0;
+      top: 50%;
+      transform: translateY(-50%) scale(0.92);
+      opacity: 0;
+      pointer-events: none;
+      color: var(--danger);
+      background: color-mix(in srgb, var(--danger) 16%, transparent);
+      border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+      transition: opacity 140ms ease, transform 140ms ease, background 140ms ease;
+    }
+    .chat-msg-row-mutable.chat-msg-row-swipe-visible .chat-msg-swipe-action {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(-50%) scale(1);
+    }
+    .chat-msg-swipe-action:hover {
+      background: color-mix(in srgb, var(--danger) 24%, transparent);
+    }
+    .chat-msg-swipe-action-active {
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 16%, transparent);
+      border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    }
+    .chat-msg-swipe-action-active:hover {
+      background: color-mix(in srgb, var(--accent) 24%, transparent);
     }
     .chat-msg-row-excluded .chat-msg-timestamp {
       color: var(--fg-dim);
@@ -11908,11 +12068,10 @@ mod tests {
             &[],
         );
         assert!(
-            html.contains("var managerEnabled = !!(manageConfigData && manageConfigData.enabled);")
+            html.contains(
+                "var useManagerGlyph = shouldUseManagerGlyph(currentAgent, statusClass);"
+            )
         );
-        assert!(html.contains(
-            "var useManagerGlyph = managerEnabled && statusClass === 'chat-status-working';"
-        ));
         assert!(html.contains(format!("? '{}'", ICON_MANAGER).as_str()));
         assert!(html.contains("function shouldUseManagerGlyph(agent, statusClass) {"));
         assert!(html.contains("item.dataset.manageEnabled === 'true'"));
@@ -11982,7 +12141,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_page_includes_message_exclusion_long_press_hooks() {
+    fn chat_page_includes_message_exclusion_swipe_hooks() {
         let html = render_chat_page(
             UiTheme::Parchment,
             ColorMode::Light,
@@ -11998,7 +12157,9 @@ mod tests {
         );
 
         assert!(html.contains("function bindChatMessageMutationGestures() {"));
-        assert!(html.contains("function excludeChatMessageFromContext(messageId) {"));
+        assert!(html.contains("function toggleChatMessageContextExclusion(messageId, excluded) {"));
+        assert!(html.contains("CHAT_MESSAGE_SWIPE_TOGGLE_THRESHOLD = 30;"));
+        assert!(html.contains(".chat-msg-swipe-action {"));
         assert!(html.contains(".chat-msg-excluded {"));
         assert!(html.contains("data-chat-msg-id="));
     }
