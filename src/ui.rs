@@ -3333,11 +3333,24 @@ pub struct ChatAgentSummary {
     pub display_name: String,
     pub owner: String,
     pub status: String,
+    pub manage_enabled: bool,
     pub last_message: Option<String>,
     pub last_message_time: Option<String>,
     pub profile_url: Option<String>,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
+}
+
+fn chat_agent_status_indicator(
+    status: &str,
+    manage_enabled: bool,
+) -> (&'static str, &'static str, &'static str) {
+    let (status_class, status_title, status_icon) = chat_status_indicator(status);
+    if manage_enabled && status == "thinking" {
+        (status_class, status_title, ICON_MANAGER)
+    } else {
+        (status_class, status_title, status_icon)
+    }
 }
 
 pub fn render_chat_main_panel(
@@ -3695,7 +3708,7 @@ pub fn render_chat_agent_list(agents: &[ChatAgentSummary], selected_agent: Optio
         ""
     };
     let (librarian_status_class, librarian_status_title, librarian_status_icon) =
-        chat_status_indicator("idle");
+        chat_agent_status_indicator("idle", false);
     let librarian_entry = format!(
         r#"<div class="chat-agent-item{active_class}" data-agent="librarian" onclick="selectAgent('librarian')">
   <div class="chat-agent-header">
@@ -3720,7 +3733,8 @@ pub fn render_chat_agent_list(agents: &[ChatAgentSummary], selected_agent: Optio
             } else {
                 ""
             };
-            let (status_class, status_title, status_icon) = chat_status_indicator(&agent.status);
+            let (status_class, status_title, status_icon) =
+                chat_agent_status_indicator(&agent.status, agent.manage_enabled);
             let snippet = agent
                 .last_message
                 .as_deref()
@@ -3745,7 +3759,7 @@ pub fn render_chat_agent_list(agents: &[ChatAgentSummary], selected_agent: Optio
                 )
             };
             format!(
-                r#"<div class="chat-agent-item{active_class}" data-agent="{name}" onclick="selectAgent('{name}')">
+                r#"<div class="chat-agent-item{active_class}" data-agent="{name}" data-manage-enabled="{manage_enabled}" onclick="selectAgent('{name}')">
   <div class="chat-agent-header">
     {avatar_html}<span class="chat-agent-name">{display_name}</span>
     <span class="chat-status-glyph {status_class}" title="{status_title}">{status_icon}</span>
@@ -3755,6 +3769,7 @@ pub fn render_chat_agent_list(agents: &[ChatAgentSummary], selected_agent: Optio
 </div>"#,
                 active_class = active_class,
                 name = escape_attribute(&agent.name),
+                manage_enabled = if agent.manage_enabled { "true" } else { "false" },
                 avatar_html = avatar_html,
                 display_name = escape_text(&agent.display_name),
                 status_class = status_class,
@@ -5004,6 +5019,17 @@ function updateHeaderStatus() {{
   if (textEl) textEl.textContent = parts.join(' \u00b7 ');
 }}
 
+function shouldUseManagerGlyph(agent, statusClass) {{
+  if (statusClass !== 'chat-status-working' || !agent) return false;
+  var item = document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(agent) + '"]');
+  if (item && item.dataset && item.dataset.manageEnabled === 'true') return true;
+  return !!(
+    agent === currentAgent &&
+    manageConfigData &&
+    manageConfigData.enabled
+  );
+}}
+
 function chatStatusClass(status) {{
   if (status === 'idle') return 'chat-status-running';
   if (status === 'thinking') return 'chat-status-working';
@@ -5020,12 +5046,13 @@ function updateAgentListStatus(agent, status) {{
   glyph.classList.remove('chat-status-running', 'chat-status-working', 'chat-status-restarting', 'chat-status-stopped');
   var statusClass = chatStatusClass(status);
   glyph.classList.add(statusClass);
+  var useManagerGlyph = shouldUseManagerGlyph(agent, statusClass);
   if (status === 'idle') {{
     glyph.title = 'Finished';
     glyph.innerHTML = '{ICON_STATUS_DONE}';
   }} else if (status === 'thinking') {{
     glyph.title = 'Working';
-    glyph.innerHTML = '{ICON_STATUS_WORKING}';
+    glyph.innerHTML = useManagerGlyph ? '{ICON_MANAGER}' : '{ICON_STATUS_WORKING}';
   }} else if (status === 'restarting') {{
     glyph.title = 'Restarting';
     glyph.innerHTML = '{ICON_RESTART}';
@@ -5523,6 +5550,9 @@ function loadManageConfig() {{
 function updateManageToggle(enabled) {{
   var btn = document.getElementById('mgr-toggle');
   var headerBtn = document.getElementById('chat-manage-btn');
+  var currentItem = currentAgent
+    ? document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(currentAgent) + '"]')
+    : null;
   if (btn) {{
     btn.textContent = enabled ? 'Disable' : 'Enable';
     btn.className = enabled ? 'btn-lg button-danger' : 'btn-lg';
@@ -5530,7 +5560,11 @@ function updateManageToggle(enabled) {{
   if (headerBtn) {{
     headerBtn.style.color = enabled ? 'var(--accent)' : '';
   }}
+  if (currentItem && currentItem.dataset) {{
+    currentItem.dataset.manageEnabled = enabled ? 'true' : 'false';
+  }}
   updateHeaderStatus();
+  if (currentAgent) updateAgentListStatus(currentAgent, agentStatus);
 }}
 
 function onManageChange() {{
@@ -11829,6 +11863,7 @@ mod tests {
                 display_name: "Worker".into(),
                 owner: "admin".into(),
                 status: "thinking".into(),
+                manage_enabled: false,
                 last_message: None,
                 last_message_time: None,
                 profile_url: None,
@@ -11859,6 +11894,7 @@ mod tests {
                 display_name: "Worker".into(),
                 owner: "admin".into(),
                 status: "thinking".into(),
+                manage_enabled: true,
                 last_message: None,
                 last_message_time: None,
                 profile_url: None,
@@ -11878,6 +11914,13 @@ mod tests {
             "var useManagerGlyph = managerEnabled && statusClass === 'chat-status-working';"
         ));
         assert!(html.contains(format!("? '{}'", ICON_MANAGER).as_str()));
+        assert!(html.contains("function shouldUseManagerGlyph(agent, statusClass) {"));
+        assert!(html.contains("item.dataset.manageEnabled === 'true'"));
+        assert!(html.contains(r#"data-manage-enabled="true""#));
+        assert!(html.contains("glyph.innerHTML = useManagerGlyph ? '"));
+        assert!(
+            html.contains("if (currentAgent) updateAgentListStatus(currentAgent, agentStatus);")
+        );
     }
 
     #[test]
@@ -11893,6 +11936,7 @@ mod tests {
                 display_name: "Lore".into(),
                 owner: "admin".into(),
                 status: "idle".into(),
+                manage_enabled: false,
                 last_message: Some("</script> boom".into()),
                 last_message_time: None,
                 profile_url: None,

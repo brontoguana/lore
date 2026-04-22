@@ -10753,6 +10753,11 @@ fn build_chat_agents(
                     AgentChatStatus::Thinking => "thinking".to_string(),
                     AgentChatStatus::Offline => "offline".to_string(),
                 },
+                manage_enabled: conv
+                    .manage_config
+                    .as_ref()
+                    .map(|mc| mc.enabled)
+                    .unwrap_or(false),
                 last_message: snippet,
                 last_message_time: time_str,
                 profile_url: conv.profile_url.clone(),
