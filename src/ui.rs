@@ -4024,7 +4024,7 @@ function initializeChatPanel() {{
   agentConfig = {{ backend: '', model: '', effort: '' }};
   if (isLibrarian || !currentAgent) agentStatus = '';
   chatFollowScroll = true;
-  cancelChatMessageLongPress();
+  clearChatMessageSwipeGesture();
   chatMessageEditPending = false;
   closeAllPanels();
   setActiveAgentInList(currentAgent);
@@ -12162,6 +12162,26 @@ mod tests {
         assert!(html.contains(".chat-msg-swipe-action {"));
         assert!(html.contains(".chat-msg-excluded {"));
         assert!(html.contains("data-chat-msg-id="));
+    }
+
+    #[test]
+    fn chat_page_initializer_does_not_reference_removed_long_press_handler() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf123",
+            true,
+            &[],
+            Some("agent-main"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("clearChatMessageSwipeGesture();"));
+        assert!(!html.contains("cancelChatMessageLongPress();"));
     }
 
     #[test]
