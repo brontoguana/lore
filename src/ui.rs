@@ -155,6 +155,85 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
 <body>
   {nav_html}
   {csrf_hidden}
+  <script>
+  var expandedTextEditorState = null;
+  function setExpandedTextEditorOpen(open) {{
+    var overlay = document.getElementById('expanded-text-editor');
+    if (overlay) overlay.style.display = open ? 'flex' : 'none';
+    document.body.classList.toggle('expanded-editor-open', !!open);
+  }}
+  function openExpandedTextEditor(sourceId) {{
+    var source = document.getElementById(sourceId);
+    var overlay = document.getElementById('expanded-text-editor');
+    var input = document.getElementById('expanded-editor-input');
+    var title = document.getElementById('expanded-editor-title');
+    if (!source || !overlay || !input || !title || source.disabled) return false;
+    expandedTextEditorState = {{
+      sourceId: sourceId,
+      saveKind: source.getAttribute('data-editor-save') || ''
+    }};
+    title.textContent = source.getAttribute('data-editor-label') || 'Edit';
+    input.value = source.value || '';
+    input.placeholder = source.getAttribute('placeholder') || '';
+    setExpandedTextEditorOpen(true);
+    window.setTimeout(function() {{
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }}, 0);
+    return false;
+  }}
+  function cancelExpandedTextEditor() {{
+    expandedTextEditorState = null;
+    setExpandedTextEditorOpen(false);
+    return false;
+  }}
+  function saveExpandedTextEditor() {{
+    if (!expandedTextEditorState) return false;
+    var source = document.getElementById(expandedTextEditorState.sourceId);
+    var input = document.getElementById('expanded-editor-input');
+    if (!source || !input) {{
+      cancelExpandedTextEditor();
+      return false;
+    }}
+    source.value = input.value;
+    var saveKind = expandedTextEditorState.saveKind;
+    cancelExpandedTextEditor();
+    if (saveKind === 'pinned') {{
+      if (typeof pinnedSaveTimer !== 'undefined' && pinnedSaveTimer) clearTimeout(pinnedSaveTimer);
+      if (typeof savePinnedContext === 'function') savePinnedContext();
+    }} else if (saveKind === 'manage') {{
+      if (typeof manageSaveTimer !== 'undefined' && manageSaveTimer) clearTimeout(manageSaveTimer);
+      if (typeof saveManageConfig === 'function') saveManageConfig();
+    }} else if (saveKind === 'block') {{
+      var action = source.getAttribute('data-editor-action') || '';
+      var blockType = source.getAttribute('data-editor-block-type') || 'markdown';
+      var csrf = document.querySelector('input[name="csrf_token"]');
+      if (!action || !csrf) return false;
+      var formData = new FormData();
+      formData.append('csrf_token', csrf.value);
+      formData.append('block_type', blockType);
+      formData.append('content', input.value);
+      fetch(action, {{
+        method: 'POST',
+        body: formData,
+        credentials: 'same-origin'
+      }}).then(function(response) {{
+        if (!response.ok) throw new Error('Block save failed');
+        if (response.redirected && response.url) {{
+          window.location.assign(response.url);
+        }} else {{
+          window.location.reload();
+        }}
+      }}).catch(function(err) {{
+        alert(err && err.message ? err.message : 'Failed to save block');
+      }});
+      return false;
+    }} else {{
+      source.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    }}
+    return false;
+  }}
+  </script>
   <main class="shell">
     {flash_html}
     {content}
@@ -179,8 +258,13 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
   function toggleBlockEdit(blockId) {{
     var body = document.getElementById('body-' + blockId);
     var edit = document.getElementById('edit-' + blockId);
+    var directSource = document.getElementById('block-edit-content-' + blockId);
     var meta = document.getElementById('meta-' + blockId);
     var article = document.getElementById('block-' + blockId);
+    if (directSource && directSource.getAttribute('data-editor-save') === 'block') {{
+      openExpandedTextEditor(directSource.id);
+      return;
+    }}
     if (!body || !edit) return;
     var expandedSource = edit.querySelector('textarea[data-editor-save="block"]');
     if (edit.style.display === 'none' && expandedSource && expandedSource.id) {{
@@ -4344,7 +4428,12 @@ function resizeChatInput() {{
   var nextOverflow = input.scrollHeight > maxHeight ? 'auto' : 'hidden';
   input.style.height = nextHeight + 'px';
   input.style.overflowY = nextOverflow;
-  if (sendBtn) sendBtn.style.height = nextHeight + 'px';
+  if (sendBtn) {{
+    // Match the textarea's real rendered box, not just the requested height,
+    // so the button stays flush when browser text metrics round differently.
+    var renderedHeight = Math.max(minHeight, input.offsetHeight || nextHeight);
+    sendBtn.style.height = renderedHeight + 'px';
+  }}
   var changed = Math.abs(nextHeight - prevHeight) > 1 || prevOverflow !== nextOverflow;
   if (changed && messages && wasFollowing) {{
     chatFollowScroll = true;
@@ -5473,6 +5562,12 @@ function connectSSE() {{
         if (lastMsg && lastMsg.streaming) {{
           lastMsg.streaming = false;
           lastMsg.content = evt.data.content || lastMsg.content;
+        }} else if (evt.data && evt.data.content) {{
+          insertChatMessage({{
+            role: 'assistant',
+            content: evt.data.content,
+            _id: evt.data.id
+          }});
         }}
         streamingContent = '';
         renderMessages();
@@ -5538,7 +5633,6 @@ var configSaveTimer = null;
 var manageSaveTimer = null;
 var chatMessageEditPending = false;
 var chatMessageSwipeGesture = null;
-var expandedTextEditorState = null;
 var CHAT_MESSAGE_SWIPE_REVEAL = 44;
 var CHAT_MESSAGE_SWIPE_OPEN_THRESHOLD = 14;
 var CHAT_MESSAGE_SWIPE_TOGGLE_THRESHOLD = 30;
@@ -5574,69 +5668,6 @@ function closeAllPanels() {{
   chatConfigOpen = false;
   chatManageOpen = false;
   updateChatJumpButton();
-}}
-
-function setExpandedTextEditorOpen(open) {{
-  var overlay = document.getElementById('expanded-text-editor');
-  if (overlay) overlay.style.display = open ? 'flex' : 'none';
-  document.body.classList.toggle('expanded-editor-open', !!open);
-}}
-
-function openExpandedTextEditor(sourceId) {{
-  var source = document.getElementById(sourceId);
-  var overlay = document.getElementById('expanded-text-editor');
-  var input = document.getElementById('expanded-editor-input');
-  var title = document.getElementById('expanded-editor-title');
-  if (!source || !overlay || !input || !title || source.disabled) return false;
-  expandedTextEditorState = {{
-    sourceId: sourceId,
-    saveKind: source.getAttribute('data-editor-save') || ''
-  }};
-  title.textContent = source.getAttribute('data-editor-label') || 'Edit';
-  input.value = source.value || '';
-  input.placeholder = source.getAttribute('placeholder') || '';
-  setExpandedTextEditorOpen(true);
-  window.setTimeout(function() {{
-    input.focus();
-    input.setSelectionRange(input.value.length, input.value.length);
-  }}, 0);
-  return false;
-}}
-
-function cancelExpandedTextEditor() {{
-  expandedTextEditorState = null;
-  setExpandedTextEditorOpen(false);
-  return false;
-}}
-
-function saveExpandedTextEditor() {{
-  if (!expandedTextEditorState) return false;
-  var source = document.getElementById(expandedTextEditorState.sourceId);
-  var input = document.getElementById('expanded-editor-input');
-  if (!source || !input) {{
-    cancelExpandedTextEditor();
-    return false;
-  }}
-  source.value = input.value;
-  var saveKind = expandedTextEditorState.saveKind;
-  cancelExpandedTextEditor();
-  if (saveKind === 'pinned') {{
-    if (pinnedSaveTimer) clearTimeout(pinnedSaveTimer);
-    savePinnedContext();
-  }} else if (saveKind === 'manage') {{
-    if (manageSaveTimer) clearTimeout(manageSaveTimer);
-    saveManageConfig();
-  }} else if (saveKind === 'block') {{
-    var formId = source.getAttribute('data-editor-form') || '';
-    var form = formId ? document.getElementById(formId) : source.form;
-    if (form) {{
-      form.submit();
-      return false;
-    }}
-  }} else {{
-    source.dispatchEvent(new Event('input', {{ bubbles: true }}));
-  }}
-  return false;
 }}
 
 function toggleChatConfig() {{
@@ -7278,7 +7309,12 @@ fn render_doc_block(
 
     let block_type_label = format!("{:?}", block.block_type).to_lowercase();
     let body_html = render_block_body_with_doc(block, Some(doc_id));
-    let edit_panel = if can_write {
+    let edit_panel = if can_write && block.block_type == crate::model::BlockType::Markdown {
+        format!(
+            r#"<textarea name="content" id="block-edit-content-{block_id}" class="expanded-editor-source" data-editor-label="Edit Markdown" data-editor-save="block" data-editor-action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/edit" data-editor-block-type="markdown" style="display:none;">{content}</textarea>"#,
+            content = escape_text(&block.content),
+        )
+    } else if can_write {
         let block_type_options = render_block_type_options(block.block_type);
         let content_escaped = escape_text(&block.content);
         let media_replace = match block.block_type {
@@ -7302,18 +7338,8 @@ fn render_doc_block(
     </div>
   </form>
 </div>"#,
-            expanded_editor_class = if block.block_type == crate::model::BlockType::Markdown {
-                " expanded-editor-source"
-            } else {
-                ""
-            },
-            expanded_editor_attrs = if block.block_type == crate::model::BlockType::Markdown {
-                format!(
-                    r#" id="block-edit-content-{block_id}" data-editor-label="Edit Markdown" data-editor-save="block" data-editor-form="block-edit-form-{block_id}""#
-                )
-            } else {
-                String::new()
-            },
+            expanded_editor_class = "",
+            expanded_editor_attrs = String::new(),
         )
     } else {
         String::new()
@@ -8293,7 +8319,14 @@ fn render_block(
     };
 
     let edit_doc_link_picker = render_doc_link_picker(project_infos);
-    let edit_form = if can_write {
+    let edit_form = if can_write && block.block_type == crate::model::BlockType::Markdown {
+        format!(
+            r#"<textarea name="content" id="block-edit-content-{block_id}" class="expanded-editor-source" data-editor-label="Edit Markdown" data-editor-save="block" data-editor-action="/ui/{project_slug}/blocks/{block_id}/edit" data-editor-block-type="markdown" style="display:none;">{content}</textarea>"#,
+            block_id = block_id,
+            project_slug = project_slug,
+            content = escape_text(&block.content),
+        )
+    } else if can_write {
         format!(
             r#"<form id="block-edit-form-{block_id}" method="post" action="/ui/{project_slug}/blocks/{block_id}/edit" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{csrf}">
@@ -8305,18 +8338,8 @@ fn render_block(
             project_slug = project_slug,
             csrf = csrf,
             content = escape_text(&block.content),
-            expanded_editor_class = if block.block_type == crate::model::BlockType::Markdown {
-                " expanded-editor-source"
-            } else {
-                ""
-            },
-            expanded_editor_attrs = if block.block_type == crate::model::BlockType::Markdown {
-                format!(
-                    r#" id="block-edit-content-{block_id}" data-editor-label="Edit Markdown" data-editor-save="block" data-editor-form="block-edit-form-{block_id}""#
-                )
-            } else {
-                String::new()
-            },
+            expanded_editor_class = "",
+            expanded_editor_attrs = String::new(),
             edit_doc_link_picker = edit_doc_link_picker,
             image_replace = if block.block_type == crate::model::BlockType::Image {
                 r#"<div class="block-edit-extras">
@@ -12245,11 +12268,13 @@ mod tests {
         );
 
         assert!(html.contains(r#"data-editor-save="block""#));
-        assert!(html.contains(r#"data-editor-form="block-edit-form-"#));
+        assert!(html.contains(r#"data-editor-action="/ui/"#));
+        assert!(html.contains(r#"data-editor-block-type="markdown""#));
         assert!(html.contains(r#"id="block-edit-content-"#));
         assert!(html.contains(r#"id="expanded-text-editor""#));
+        assert!(html.contains("function openExpandedTextEditor(sourceId) {"));
         assert!(html.contains(
-            "var expandedSource = edit.querySelector('textarea[data-editor-save=\"block\"]');"
+            "var directSource = document.getElementById('block-edit-content-' + blockId);"
         ));
     }
 
