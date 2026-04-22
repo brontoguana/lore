@@ -406,6 +406,77 @@ pub async fn apply_update_to_version(
     }))
 }
 
+pub async fn download_update_to_path(
+    client: &reqwest::Client,
+    binary_name: &str,
+    current_version: &str,
+    target_version: &str,
+    github_repo: &str,
+    destination_path: &Path,
+) -> Result<SelfUpdateOutcome> {
+    validate_github_repo(github_repo)?;
+    let target = detect_target()?;
+    let current_version = normalize_version_tag(current_version);
+    let target_version = normalize_version_tag(target_version);
+    if current_version == target_version && destination_path.exists() {
+        eprintln!("updater: already at target version {current_version}");
+        return Ok(SelfUpdateOutcome::UpToDate(AutoUpdateStatus {
+            checked_at: OffsetDateTime::now_utc(),
+            current_version,
+            latest_version: Some(target_version),
+            detail: "already at target version".to_string(),
+            applied: false,
+            ok: true,
+        }));
+    }
+    let tag = format!("v{target_version}");
+    eprintln!("updater: fetching exact release {tag} from {github_repo}");
+    let release = fetch_release_by_tag(client, github_repo, &tag).await?;
+    let archive_name = format!("{binary_name}-{target}.tar.gz");
+    let checksum_name = format!("{archive_name}.sha256");
+    let archive_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == archive_name)
+        .map(|asset| asset.browser_download_url.clone())
+        .ok_or_else(|| {
+            LoreError::ExternalService(format!("release {tag} missing asset: {archive_name}"))
+        })?;
+    let checksum_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == checksum_name)
+        .map(|asset| asset.browser_download_url.clone())
+        .ok_or_else(|| {
+            LoreError::ExternalService(format!("release {tag} missing asset: {checksum_name}"))
+        })?;
+    eprintln!("updater: downloading {current_version} -> {target_version}");
+    let archive = fetch_bytes(client, &archive_url).await?;
+    eprintln!(
+        "updater: downloaded {} bytes, verifying checksum",
+        archive.len()
+    );
+    let checksum = fetch_text(client, &checksum_url).await?;
+    verify_checksum(&archive, &checksum)?;
+    let extracted = extract_binary(binary_name, &archive)?;
+    eprintln!(
+        "updater: checksum verified, staging binary at {}",
+        destination_path.display()
+    );
+    if let Some(parent) = destination_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_binary_atomic(destination_path, &extracted)?;
+    Ok(SelfUpdateOutcome::Updated(AutoUpdateStatus {
+        checked_at: OffsetDateTime::now_utc(),
+        current_version: current_version.clone(),
+        latest_version: Some(target_version.clone()),
+        detail: format!("downloaded {binary_name} from {current_version} to {target_version}"),
+        applied: true,
+        ok: true,
+    }))
+}
+
 pub async fn sync_release_binaries_to_directory(
     client: &reqwest::Client,
     binary_name: &str,
@@ -676,7 +747,7 @@ fn verify_checksum(archive: &[u8], checksum_text: &str) -> Result<()> {
     Ok(())
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub fn hex_sha256(bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
     hash.update(bytes);
     let digest = hash.finalize();

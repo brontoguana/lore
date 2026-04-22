@@ -41,8 +41,8 @@ use crate::ui::{
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
-    ReleaseStream, SERVER_RELEASE_CLI_TARGETS, check_for_update, maybe_apply_self_update,
-    sync_release_binaries_to_directory,
+    ReleaseStream, SERVER_RELEASE_CLI_TARGETS, check_for_update, hex_sha256,
+    maybe_apply_self_update, sync_release_binaries_to_directory,
 };
 use crate::versioning::{
     GitExportConfig, GitExportConfigStore, GitExportStatus, GitExportStatusStore,
@@ -170,6 +170,7 @@ pub struct AppState {
     librarian_client_http: reqwest::Client,
     agent_recent_activity: Arc<Mutex<HashMap<String, AgentRecentActivity>>>,
     machine_update_timestamps: Arc<Mutex<HashMap<String, Instant>>>,
+    machine_update_signal_state: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -501,6 +502,7 @@ impl AppState {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             agent_recent_activity: Arc::new(Mutex::new(HashMap::new())),
             machine_update_timestamps: Arc::new(Mutex::new(HashMap::new())),
+            machine_update_signal_state: Arc::new(Mutex::new(HashMap::new())),
         };
         let _ = maybe_mark_machine_auto_update_rollout(&state);
         state
@@ -596,6 +598,7 @@ fn build_app_with_librarian(
         .route("/v1/context", get(get_all_agent_context))
         .route("/v1/machines/register", post(register_machine))
         .route("/v1/machines/poll", post(machine_service_poll))
+        .route("/v1/machines/ready", post(machine_service_ready))
         .route(
             "/v1/machines/binary/{target}",
             get(machine_binary_download_for_target),
@@ -11714,7 +11717,12 @@ async fn chat_agent_poll(
     let server_version = env!("CARGO_PKG_VERSION");
     let update_to = if let Some(mname) = machine_name.as_ref() {
         let machine_key = format!("{}_{}", owner, mname);
-        if machine_update_requested(&state, &machine_key, cli_version.as_deref())? {
+        let poll_key = format!("chat:{machine_key}:{}", agent.name);
+        if should_emit_machine_update_signal(
+            &state,
+            &poll_key,
+            machine_update_requested(&state, &machine_key, cli_version.as_deref())?,
+        ) {
             Some(server_version.to_string())
         } else {
             None
@@ -15316,7 +15324,12 @@ async fn machine_service_poll(
     // Check if machine should self-update (transient, auto-expires after 3 min)
     let server_version = env!("CARGO_PKG_VERSION");
     let reported_version = headers.get("x-lore-version").and_then(|v| v.to_str().ok());
-    let update_to = if machine_update_requested(&state, &machine_key, reported_version)? {
+    let poll_key = format!("machine:{machine_key}");
+    let update_to = if should_emit_machine_update_signal(
+        &state,
+        &poll_key,
+        machine_update_requested(&state, &machine_key, reported_version)?,
+    ) {
         Some(server_version.to_string())
     } else {
         None
@@ -15373,6 +15386,34 @@ async fn machine_service_poll(
     }
 
     Ok(build_response(vec![]))
+}
+
+async fn machine_service_ready(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let machine_token = headers
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let machine = state.auth.authenticate_machine_token(machine_token)?;
+    let machine_key = format!("{}_{}", machine.user.username, machine.machine_name);
+    let reported_version = headers.get("x-lore-version").and_then(|v| v.to_str().ok());
+
+    if let Some(version) = reported_version {
+        let _ = state.auth.update_machine_version(
+            &machine.machine_name,
+            &machine.user.username,
+            version,
+        );
+    }
+
+    let update_requested = machine_update_requested(&state, &machine_key, reported_version)?;
+    Ok(Json(json!({
+        "ok": true,
+        "server_version": env!("CARGO_PKG_VERSION"),
+        "update_requested": update_requested,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -15494,6 +15535,21 @@ fn machine_update_requested(
     machine_auto_update_rollout_active_for_current_version(state)
 }
 
+fn should_emit_machine_update_signal(
+    state: &AppState,
+    poll_key: &str,
+    update_requested: bool,
+) -> bool {
+    let mut map = state.machine_update_signal_state.lock().unwrap();
+    if !update_requested {
+        map.remove(poll_key);
+        return false;
+    }
+    let emit = map.get(poll_key).copied().unwrap_or(true);
+    map.insert(poll_key.to_string(), !emit);
+    emit
+}
+
 fn maybe_mark_machine_auto_update_rollout(state: &AppState) -> Result<(), LoreError> {
     let config = state.auto_update_config.load()?;
     if !config.auto_update_machines {
@@ -15579,11 +15635,22 @@ async fn machine_binary_download_inner(
     let bytes = tokio::fs::read(&binary_path)
         .await
         .map_err(|e| ApiError(LoreError::Io(e)))?;
-    Ok((
-        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        bytes,
-    )
-        .into_response())
+    let sha256 = hex_sha256(&bytes);
+    let mut response = Response::new(Body::from(bytes));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-lore-binary-sha256"),
+        HeaderValue::from_str(&sha256)
+            .map_err(|e| ApiError(LoreError::Validation(e.to_string())))?,
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-lore-binary-version"),
+        HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    Ok(response)
 }
 
 fn machine_binary_path(state: &AppState, target: Option<&str>) -> Option<std::path::PathBuf> {
@@ -15768,7 +15835,7 @@ mod tests {
     };
     use crate::manager::{ManagerPromptConfig, ManagerPromptOverride};
     use crate::store::FileBlockStore;
-    use crate::updater::{AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream};
+    use crate::updater::{AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream, hex_sha256};
     use crate::{
         AgentBackend, BlockType, LocalAuthStore, NewAgentToken, ProjectGrant, ProjectName,
         ProjectPermission, UserName,
@@ -17543,10 +17610,56 @@ mod tests {
             .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-lore-binary-version")
+                .and_then(|value| value.to_str().ok()),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-lore-binary-sha256")
+                .and_then(|value| value.to_str().ok()),
+            Some(hex_sha256(b"mac-arm64").as_str())
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         assert_eq!(&body[..], b"mac-arm64");
+    }
+
+    #[tokio::test]
+    async fn machine_ready_reports_update_state_without_consuming_commands() {
+        let dir = tempdir().unwrap();
+        ensure_test_admin(dir.path());
+        AutoUpdateConfigStore::new(dir.path())
+            .update(
+                false,
+                DEFAULT_UPDATE_REPO.to_string(),
+                ReleaseStream::Stable,
+                true,
+            )
+            .unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let machine_token = register_machine_token(&app, dir.path()).await;
+
+        let ready = Request::builder()
+            .method("POST")
+            .uri("/v1/machines/ready")
+            .header(API_KEY_HEADER, &machine_token)
+            .header("x-lore-version", "0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(ready).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], json!(true));
+        assert_eq!(json["update_requested"], json!(true));
     }
 
     #[tokio::test]
@@ -19321,6 +19434,91 @@ mod tests {
             config.last_machine_rollout_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[tokio::test]
+    async fn machine_poll_only_includes_update_every_other_poll() {
+        let dir = tempdir().unwrap();
+        ensure_test_admin(dir.path());
+        AutoUpdateConfigStore::new(dir.path())
+            .update(
+                false,
+                DEFAULT_UPDATE_REPO.to_string(),
+                ReleaseStream::Stable,
+                true,
+            )
+            .unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let machine_token = register_machine_token(&app, dir.path()).await;
+
+        for expected_update in [true, false, true, false] {
+            let poll = Request::builder()
+                .method("POST")
+                .uri("/v1/machines/poll")
+                .header("content-type", "application/json")
+                .header(API_KEY_HEADER, &machine_token)
+                .header("x-lore-version", "0.0.1")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = app.clone().oneshot(poll).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json.get("update_to").is_some(), expected_update);
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_poll_only_includes_update_every_other_poll() {
+        let dir = tempdir().unwrap();
+        ensure_test_admin(dir.path());
+        AutoUpdateConfigStore::new(dir.path())
+            .update(
+                false,
+                DEFAULT_UPDATE_REPO.to_string(),
+                ReleaseStream::Stable,
+                true,
+            )
+            .unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let _machine_token = register_machine_token(&app, dir.path()).await;
+        let agent_token =
+            issue_agent_token(&app, dir.path(), "agent-upd", ProjectPermission::ReadWrite).await;
+
+        for (idx, expected_update) in [true, false, true, false].into_iter().enumerate() {
+            let send = Request::builder()
+                .method("POST")
+                .uri("/ui/chat/agent-upd/send")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", &session_cookie)
+                .body(Body::from(format!(
+                    "csrf_token={}&message={}",
+                    urlencoding::encode(&csrf_token),
+                    urlencoding::encode(&format!("poll message {idx}"))
+                )))
+                .unwrap();
+            let response = app.clone().oneshot(send).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let poll = Request::builder()
+                .method("GET")
+                .uri("/v1/chat/poll")
+                .header(API_KEY_HEADER, &agent_token)
+                .header("x-lore-machine", "desk")
+                .header("x-lore-version", "0.0.1")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(poll).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json.get("update_to").is_some(), expected_update);
+        }
     }
 
     #[test]

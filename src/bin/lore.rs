@@ -1,8 +1,9 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use lore_core::updater::{download_update_to_path, hex_sha256};
 use lore_core::{
     AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, ReleaseStream,
-    SelfUpdateOutcome, apply_update_to_version, check_for_update,
-    manager::extract_manager_delay_prefix, maybe_apply_self_update, slugify,
+    SelfUpdateOutcome, check_for_update, manager::extract_manager_delay_prefix,
+    maybe_apply_self_update, slugify,
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -15,13 +16,17 @@ use std::io;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::io::AsyncBufReadExt;
 
 type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const CLI_SELF_UPDATE_SKIP_ENV: &str = "LORE_SKIP_CLI_SELF_UPDATE";
 const CLI_AUTO_UPDATE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 const STOP_POLL_INTERVAL_MS: u64 = 200;
+const LORE_SERVICE_HANDOFF_READY_ENV: &str = "LORE_SERVICE_HANDOFF_READY";
+const LORE_SERVICE_HANDOFF_PARENT_PID_ENV: &str = "LORE_SERVICE_HANDOFF_PARENT_PID";
+const LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV: &str = "LORE_SERVICE_HANDOFF_CANONICAL_EXE";
+const LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV: &str = "LORE_SERVICE_HANDOFF_TARGET_VERSION";
 
 fn resolve_executable_path(executable: &str, fallback_relative_paths: &[&str]) -> PathBuf {
     if executable.contains(std::path::MAIN_SEPARATOR) {
@@ -847,7 +852,7 @@ async fn run() -> CliResult<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
 
-            let child = spawn_service_daemon(&exe, &url, &token, &log_path)?;
+            let child = spawn_service_daemon(&exe, &url, &token, &log_path, &[])?;
             let pid = child.id();
             fs::write(&pid_path, pid.to_string())?;
             println!("Service started (pid {})", pid);
@@ -1871,41 +1876,311 @@ fn resolved_current_exe() -> io::Result<PathBuf> {
     }
 }
 
-async fn apply_cli_update_to_target(
-    config: &mut CliConfig,
-    target_version: &str,
-    repo: &str,
-) -> CliResult<()> {
-    let client = reqwest::Client::new();
-    let executable_path = resolved_current_exe()?;
-    match apply_update_to_version(
-        &client,
-        "lore",
-        env!("CARGO_PKG_VERSION"),
-        target_version,
-        repo,
-        &executable_path,
-    )
-    .await
-    .map_err(|err| io::Error::other(err.to_string()))?
-    {
-        SelfUpdateOutcome::UpToDate(status) => {
-            eprintln!("[update] {}", status.detail);
-            config.last_update_check = Some(status.checked_at);
-            save_cli_config(config)?;
-        }
-        SelfUpdateOutcome::Updated(status) => {
-            eprintln!("[update] {}", status.detail);
-            config.last_update_check = Some(status.checked_at);
-            save_cli_config(config)?;
-        }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ServiceUpdateFailureState {
+    target_version: String,
+    failures: u32,
+    next_retry_at: OffsetDateTime,
+    last_error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ServiceHandoffReadyMarker {
+    pid: u32,
+    version: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedServiceUpdate {
+    staged_executable: PathBuf,
+    canonical_executable: PathBuf,
+    target_version: String,
+    source: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ServiceHandoff {
+    ready_path: PathBuf,
+    parent_pid: u32,
+    canonical_executable: PathBuf,
+    target_version: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MachineServiceReadyStatus {
+    update_requested: bool,
+}
+
+fn normalize_version_tag(value: &str) -> String {
+    value.trim().trim_start_matches('v').to_string()
+}
+
+fn parse_cli_version_output(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| line.split_whitespace().last())
+        .map(normalize_version_tag)
+}
+
+fn read_binary_version(path: &Path) -> CliResult<String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "version check failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+        .into());
+    }
+    parse_cli_version_output(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        io::Error::other(format!("could not parse version from {}", path.display())).into()
+    })
+}
+
+fn verify_binary_matches_target(path: &Path, target_version: &str) -> CliResult<()> {
+    let actual = read_binary_version(path)?;
+    let expected = normalize_version_tag(target_version);
+    if actual != expected {
+        return Err(io::Error::other(format!(
+            "staged binary version mismatch: expected {expected}, got {actual}"
+        ))
+        .into());
     }
     Ok(())
 }
 
-/// Download the lore binary directly from the server's staged binary endpoint.
-/// Returns Ok(true) if updated, Ok(false) if not available, Err on failure.
-async fn download_binary_from_server(context: &CliContext, machine_token: &str) -> CliResult<bool> {
+fn write_executable_atomically(path: &Path, bytes: &[u8]) -> CliResult<()> {
+    let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    fs::write(&tmp_path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
+    }
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+fn service_versions_dir(lore_dir: &Path) -> PathBuf {
+    lore_dir.join("versions")
+}
+
+fn service_staged_binary_path(lore_dir: &Path, target_version: &str) -> CliResult<PathBuf> {
+    let target = service_update_target()?;
+    Ok(service_versions_dir(lore_dir)
+        .join(normalize_version_tag(target_version))
+        .join(format!("lore-{target}")))
+}
+
+fn service_update_failure_path(lore_dir: &Path) -> PathBuf {
+    lore_dir.join("update-failure.json")
+}
+
+fn load_service_update_failure(lore_dir: &Path) -> Option<ServiceUpdateFailureState> {
+    let path = service_update_failure_path(lore_dir);
+    let data = fs::read(path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+fn next_service_update_retry_delay_secs(failures: u32) -> i64 {
+    std::cmp::min(5 * (1i64 << failures.saturating_sub(1)), 300)
+}
+
+fn current_service_update_backoff(
+    lore_dir: &Path,
+    target_version: &str,
+) -> Option<std::time::Duration> {
+    let state = load_service_update_failure(lore_dir)?;
+    if state.target_version != normalize_version_tag(target_version) {
+        return None;
+    }
+    let remaining = (state.next_retry_at - OffsetDateTime::now_utc()).whole_seconds();
+    if remaining <= 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(remaining as u64))
+}
+
+fn record_service_update_failure(lore_dir: &Path, target_version: &str, error: &str) {
+    let path = service_update_failure_path(lore_dir);
+    let normalized_target = normalize_version_tag(target_version);
+    let failures = load_service_update_failure(lore_dir)
+        .filter(|state| state.target_version == normalized_target)
+        .map(|state| state.failures.saturating_add(1))
+        .unwrap_or(1);
+    let next_retry_at = OffsetDateTime::now_utc()
+        + TimeDuration::seconds(next_service_update_retry_delay_secs(failures));
+    let state = ServiceUpdateFailureState {
+        target_version: normalized_target,
+        failures,
+        next_retry_at,
+        last_error: error.to_string(),
+    };
+    if let Ok(bytes) = serde_json::to_vec_pretty(&state) {
+        let _ = fs::write(path, bytes);
+    }
+}
+
+fn clear_service_update_failure(lore_dir: &Path) {
+    let _ = fs::remove_file(service_update_failure_path(lore_dir));
+}
+
+async fn service_ready_check(
+    context: &CliContext,
+    machine_token: &str,
+) -> CliResult<MachineServiceReadyStatus> {
+    let body: serde_json::Value = context
+        .client
+        .post(format!("{}/v1/machines/ready", context.url))
+        .header("x-lore-key", machine_token)
+        .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(MachineServiceReadyStatus {
+        update_requested: body["update_requested"].as_bool().unwrap_or(false),
+    })
+}
+
+fn wait_for_handoff_ready_marker(
+    ready_path: &Path,
+    timeout: std::time::Duration,
+) -> CliResult<ServiceHandoffReadyMarker> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if let Ok(bytes) = fs::read(ready_path) {
+            let marker: ServiceHandoffReadyMarker = serde_json::from_slice(&bytes)?;
+            return Ok(marker);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Err(io::Error::other(format!(
+        "timed out waiting for new service readiness marker at {}",
+        ready_path.display()
+    ))
+    .into())
+}
+
+fn promote_staged_binary_to_canonical(
+    staged_executable: &Path,
+    canonical_executable: &Path,
+) -> CliResult<()> {
+    if staged_executable == canonical_executable {
+        return Ok(());
+    }
+    let bytes = fs::read(staged_executable)?;
+    if let Some(parent) = canonical_executable.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_executable_atomically(canonical_executable, &bytes)
+}
+
+fn service_handoff_from_env() -> CliResult<Option<ServiceHandoff>> {
+    let Some(ready_path) = env::var_os(LORE_SERVICE_HANDOFF_READY_ENV) else {
+        return Ok(None);
+    };
+    let parent_pid = env::var(LORE_SERVICE_HANDOFF_PARENT_PID_ENV)?
+        .parse::<u32>()
+        .map_err(|e| io::Error::other(format!("invalid handoff parent pid: {e}")))?;
+    let canonical_executable = PathBuf::from(
+        env::var(LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV)
+            .map_err(|e| io::Error::other(format!("missing canonical exe for handoff: {e}")))?,
+    );
+    let target_version = env::var(LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV)
+        .map_err(|e| io::Error::other(format!("missing target version for handoff: {e}")))?;
+    Ok(Some(ServiceHandoff {
+        ready_path: PathBuf::from(ready_path),
+        parent_pid,
+        canonical_executable,
+        target_version,
+    }))
+}
+
+async fn complete_service_handoff(
+    context: &CliContext,
+    machine_token: &str,
+    handoff: &ServiceHandoff,
+) -> CliResult<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let status = service_ready_check(context, machine_token).await?;
+        if !status.update_requested {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "new service still seen as outdated after waiting for v{}",
+                handoff.target_version
+            ))
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    let marker = ServiceHandoffReadyMarker {
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    fs::write(&handoff.ready_path, serde_json::to_vec(&marker)?)?;
+    eprintln!(
+        "[service] Standby update service is ready on v{}, waiting for old pid {} to exit",
+        marker.version, handoff.parent_pid
+    );
+
+    let parent_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while is_process_running(handoff.parent_pid) {
+        if std::time::Instant::now() >= parent_deadline {
+            return Err(io::Error::other(format!(
+                "old service pid {} did not exit after handoff",
+                handoff.parent_pid
+            ))
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let staged_executable = resolved_current_exe()?;
+    promote_staged_binary_to_canonical(&staged_executable, &handoff.canonical_executable)?;
+    let _ = fs::remove_file(&handoff.ready_path);
+    Ok(())
+}
+
+fn reuse_or_clear_staged_binary(staged_path: &Path, target_version: &str) -> CliResult<bool> {
+    if !staged_path.exists() {
+        return Ok(false);
+    }
+
+    match verify_binary_matches_target(staged_path, target_version) {
+        Ok(()) => Ok(true),
+        Err(err) => {
+            eprintln!(
+                "[service] Discarding invalid staged binary at {}: {err}",
+                staged_path.display()
+            );
+            let _ = fs::remove_file(staged_path);
+            Ok(false)
+        }
+    }
+}
+
+async fn stage_binary_from_server(
+    context: &CliContext,
+    machine_token: &str,
+    target_version: &str,
+    staged_path: &Path,
+) -> CliResult<bool> {
+    if reuse_or_clear_staged_binary(staged_path, target_version)? {
+        return Ok(true);
+    }
+
     eprintln!("[service] Trying direct binary download from server...");
     let target = match service_update_target() {
         Ok(target) => target,
@@ -1941,35 +2216,95 @@ async fn download_binary_from_server(context: &CliContext, machine_token: &str) 
         );
         return Ok(false);
     }
+
+    let expected_sha = resp
+        .headers()
+        .get("x-lore-binary-sha256")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let served_version = resp
+        .headers()
+        .get("x-lore-binary-version")
+        .and_then(|value| value.to_str().ok())
+        .map(normalize_version_tag);
+    let normalized_target = normalize_version_tag(target_version);
+    if let Some(ref served_version) = served_version {
+        if served_version != &normalized_target {
+            return Err(io::Error::other(format!(
+                "server served wrong version header for update: expected {normalized_target}, got {served_version}"
+            ))
+            .into());
+        }
+    }
+
     let bytes = resp
         .bytes()
         .await
         .map_err(|e| io::Error::other(format!("failed to read binary response: {e}")))?;
     if bytes.len() < 1024 {
-        eprintln!(
-            "[service] Server binary too small ({}b), ignoring",
-            bytes.len()
-        );
-        return Ok(false);
+        return Err(io::Error::other(format!("server binary too small ({}b)", bytes.len())).into());
     }
+    if let Some(expected_sha) = expected_sha {
+        let actual_sha = hex_sha256(&bytes);
+        if actual_sha != expected_sha {
+            return Err(io::Error::other(format!(
+                "server binary checksum mismatch: expected {expected_sha}, got {actual_sha}"
+            ))
+            .into());
+        }
+    }
+
+    if let Some(parent) = staged_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_executable_atomically(staged_path, &bytes)?;
+    verify_binary_matches_target(staged_path, target_version)?;
     eprintln!(
-        "[service] Downloaded {}b binary from server, replacing executable...",
-        bytes.len()
+        "[service] Downloaded and verified staged server binary at {}",
+        staged_path.display()
     );
-    let executable_path = resolved_current_exe()?;
-    let parent = executable_path
-        .parent()
-        .ok_or_else(|| io::Error::other("current executable has no parent directory"))?;
-    let temp_path = parent.join(format!(".lore.update-{}", uuid::Uuid::new_v4()));
-    fs::write(&temp_path, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o755))?;
-    }
-    fs::rename(&temp_path, &executable_path)?;
-    eprintln!("[service] Binary replaced successfully");
     Ok(true)
+}
+
+async fn prepare_service_update(
+    context: &CliContext,
+    machine_token: &str,
+    target_version: &str,
+    repo: &str,
+    lore_dir: &Path,
+) -> CliResult<PreparedServiceUpdate> {
+    let canonical_executable = resolved_current_exe()?;
+    let staged_executable = service_staged_binary_path(lore_dir, target_version)?;
+    let normalized_target = normalize_version_tag(target_version);
+
+    let source =
+        if stage_binary_from_server(context, machine_token, target_version, &staged_executable)
+            .await?
+        {
+            "server"
+        } else {
+            let _ = reuse_or_clear_staged_binary(&staged_executable, target_version)?;
+            let client = reqwest::Client::new();
+            download_update_to_path(
+                &client,
+                "lore",
+                env!("CARGO_PKG_VERSION"),
+                target_version,
+                repo,
+                &staged_executable,
+            )
+            .await
+            .map_err(|err| io::Error::other(err.to_string()))?;
+            verify_binary_matches_target(&staged_executable, target_version)?;
+            "github"
+        };
+
+    Ok(PreparedServiceUpdate {
+        staged_executable,
+        canonical_executable,
+        target_version: normalized_target,
+        source,
+    })
 }
 
 fn service_update_target() -> io::Result<String> {
@@ -2060,6 +2395,7 @@ fn spawn_service_daemon(
     url: &str,
     token: &str,
     log_path: &Path,
+    extra_env: &[(&str, String)],
 ) -> CliResult<std::process::Child> {
     let log_file = fs::OpenOptions::new()
         .create(true)
@@ -2072,6 +2408,9 @@ fn spawn_service_daemon(
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
         .stdin(std::process::Stdio::null());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -2606,7 +2945,13 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
         .scope(folder, async move {
             let mut consecutive_errors: u32 = 0;
             loop {
-                match agent_poll_and_process(&agent_context, &args.name, cli_backend_override).await
+                match agent_poll_and_process(
+                    &agent_context,
+                    &args.name,
+                    cli_backend_override,
+                    false,
+                )
+                .await
                 {
                     Ok(AgentPollAction::Continue) => {
                         consecutive_errors = 0;
@@ -2702,6 +3047,7 @@ async fn agent_poll_and_process(
     context: &CliContext,
     agent_name: &str,
     cli_backend_override: Option<AgentBackend>,
+    service_managed: bool,
 ) -> CliResult<AgentPollAction> {
     let token = context.token.as_deref().ok_or("no token configured")?;
 
@@ -2760,7 +3106,7 @@ async fn agent_poll_and_process(
 
     // Server says a CLI update is available.  The *service* handles the actual
     // binary swap; standalone agents just exit so the user can restart manually.
-    if body["update_to"].as_str().is_some() {
+    if body["update_to"].as_str().is_some() && !service_managed {
         eprintln!("[agent] Server signalled update available");
         return Ok(AgentPollAction::UpdateAvailable);
     }
@@ -5770,8 +6116,6 @@ impl ServiceState {
             handle.abort();
         }
     }
-
-    fn restart_all_agents(&mut self) {}
 }
 
 /// Spawn an agent as a tokio task within this process.
@@ -5794,7 +6138,7 @@ fn spawn_agent_task(context: &CliContext, agent: &ManagedAgent) -> tokio::task::
         eprintln!("[agent] Task started for '{}'", name);
         let mut consecutive_errors: u32 = 0;
         loop {
-            let outcome = agent_poll_and_process(&ctx, &name, backend_override).await;
+            let outcome = agent_poll_and_process(&ctx, &name, backend_override, true).await;
             match outcome {
                 Ok(AgentPollAction::Continue) => {
                     consecutive_errors = 0;
@@ -6014,7 +6358,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         }
 
         let exe = resolved_current_exe()?;
-        let child = spawn_service_daemon(&exe, &context.url, machine_token, &log_path)?;
+        let child = spawn_service_daemon(&exe, &context.url, machine_token, &log_path, &[])?;
         let pid = child.id();
         fs::write(&pid_path, pid.to_string())?;
         println!("Lore service started (pid {})", pid);
@@ -6037,6 +6381,8 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         env!("CARGO_PKG_VERSION")
     );
 
+    let handoff = service_handoff_from_env()?;
+
     // Load managed agents state
     let mut svc_state = ServiceState::load(&lore_dir);
 
@@ -6053,6 +6399,10 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
     // Start all agents as tasks within this process
     svc_state.check_agents();
     svc_state.start_agent_tasks(context);
+
+    if let Some(handoff) = handoff.as_ref() {
+        complete_service_handoff(context, machine_token, handoff).await?;
+    }
 
     // Rotate service log if it's grown large (>2MB)
     let service_log_path = lore_dir.join("service.log");
@@ -6104,67 +6454,107 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             Ok(update_info) => {
                 consecutive_service_errors = 0;
                 if let Some((target_version, repo)) = update_info {
-                    let cfg = load_cli_config()?;
-                    if !cfg.auto_update_enabled {
+                    if let Some(delay) = current_service_update_backoff(&lore_dir, &target_version)
+                    {
                         eprintln!(
-                            "[service] Ignoring self-update to v{target_version} because auto-update is disabled."
+                            "[service] Delaying retry of v{} for {}s after previous failed update",
+                            normalize_version_tag(&target_version),
+                            delay.as_secs()
                         );
                         continue;
                     }
+
                     eprintln!(
-                        "[service] Self-update to v{target_version} requested, stopping all agents..."
+                        "[service] Server-directed self-update to v{target_version} requested; staging replacement while current service stays live"
                     );
-                    svc_state.stop_all_agents();
-                    // Resolve exe path BEFORE update — after update /proc/self/exe
-                    // points to the deleted old binary which can cause exec issues.
-                    let exe = resolved_current_exe()?;
-                    let mut cfg = cfg;
-                    // Try direct download from server first (works after quick-deploy),
-                    // fall back to GitHub release if not available
-                    let update_result =
-                        match download_binary_from_server(context, machine_token).await {
-                            Ok(true) => Ok(()),
-                            _ => {
-                                eprintln!("[service] Falling back to GitHub release download...");
-                                apply_cli_update_to_target(&mut cfg, &target_version, &repo).await
-                            }
-                        };
-                    match update_result {
-                        Ok(()) => {
-                            eprintln!(
-                                "[service] Updated CLI binary, re-launching as {}",
-                                exe.display()
-                            );
-                            let lore_dir = env::var("HOME")
-                                .map(PathBuf::from)
-                                .unwrap_or_else(|_| PathBuf::from("."))
-                                .join("lore-service");
-                            let log_path = lore_dir.join("service.log");
-                            let pid_path = lore_dir.join("service.pid");
-                            match spawn_service_daemon(&exe, &context.url, machine_token, &log_path)
-                            {
+
+                    match prepare_service_update(
+                        context,
+                        machine_token,
+                        &target_version,
+                        &repo,
+                        &lore_dir,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => {
+                            let ready_path =
+                                lore_dir.join(format!("handoff-{}.json", uuid::Uuid::new_v4()));
+                            let handoff_env = [
+                                (
+                                    LORE_SERVICE_HANDOFF_READY_ENV,
+                                    ready_path.display().to_string(),
+                                ),
+                                (
+                                    LORE_SERVICE_HANDOFF_PARENT_PID_ENV,
+                                    std::process::id().to_string(),
+                                ),
+                                (
+                                    LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV,
+                                    prepared.canonical_executable.display().to_string(),
+                                ),
+                                (
+                                    LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV,
+                                    prepared.target_version.clone(),
+                                ),
+                            ];
+                            match spawn_service_daemon(
+                                &prepared.staged_executable,
+                                &context.url,
+                                machine_token,
+                                &service_log_path,
+                                &handoff_env,
+                            ) {
                                 Ok(child) => {
-                                    let _ = fs::write(&pid_path, child.id().to_string());
-                                    eprintln!(
-                                        "[service] New service started (pid {}), exiting old.",
-                                        child.id()
-                                    );
-                                    std::process::exit(0);
+                                    match wait_for_handoff_ready_marker(
+                                        &ready_path,
+                                        std::time::Duration::from_secs(60),
+                                    ) {
+                                        Ok(marker) => {
+                                            clear_service_update_failure(&lore_dir);
+                                            eprintln!(
+                                                "[service] New v{} service ready from {}, stopping agents and handing off to pid {}",
+                                                marker.version,
+                                                prepared.source,
+                                                child.id()
+                                            );
+                                            svc_state.stop_all_agents();
+                                            svc_state.save();
+                                            std::process::exit(0);
+                                        }
+                                        Err(e) => {
+                                            let _ = fs::remove_file(&ready_path);
+                                            kill_process(child.id());
+                                            let _ = fs::write(
+                                                lore_dir.join("service.pid"),
+                                                std::process::id().to_string(),
+                                            );
+                                            record_service_update_failure(
+                                                &lore_dir,
+                                                &target_version,
+                                                &e.to_string(),
+                                            );
+                                            eprintln!("[service] Update handoff failed: {e}");
+                                        }
+                                    }
                                 }
                                 Err(e) => {
-                                    eprintln!("[service] Failed to spawn new service: {e}");
-                                    // Fall through to restart agents on old binary
+                                    record_service_update_failure(
+                                        &lore_dir,
+                                        &target_version,
+                                        &e.to_string(),
+                                    );
+                                    eprintln!("[service] Failed to spawn staged service: {e}");
                                 }
                             }
-                            // If spawn failed, restart agents on old binary and keep running
-                            svc_state.restart_all_agents();
-                            svc_state.start_agent_tasks(context);
                         }
                         Err(e) => {
-                            eprintln!("[service] Update failed: {e}");
-                            // Restart agent tasks after the failed update attempt
-                            svc_state.restart_all_agents();
-                            svc_state.start_agent_tasks(context);
+                            record_service_update_failure(
+                                &lore_dir,
+                                &target_version,
+                                &e.to_string(),
+                            );
+                            eprintln!("[service] Update staging failed: {e}");
                         }
                     }
                 }
@@ -6491,11 +6881,13 @@ mod tests {
     use super::{
         DocWriteArgs, append_assistant_segment, append_new_stream_text, count_history_exchanges,
         history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
-        load_doc_write_content, parse_codex_line, recent_history_exchange_tail,
+        load_doc_write_content, next_service_update_retry_delay_secs, parse_cli_version_output,
+        parse_codex_line, recent_history_exchange_tail, reuse_or_clear_staged_binary,
         service_update_target,
     };
     use serde_json::json;
     use std::collections::HashSet;
+    use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -6578,6 +6970,33 @@ mod tests {
                 | "x86_64-apple-darwin"
                 | "aarch64-apple-darwin"
         ));
+    }
+
+    #[test]
+    fn parse_cli_version_output_extracts_version() {
+        assert_eq!(
+            parse_cli_version_output("lore 0.1.65-rc110\n"),
+            Some("0.1.65-rc110".to_string())
+        );
+    }
+
+    #[test]
+    fn service_update_retry_backoff_is_exponential_and_capped() {
+        assert_eq!(next_service_update_retry_delay_secs(1), 5);
+        assert_eq!(next_service_update_retry_delay_secs(2), 10);
+        assert_eq!(next_service_update_retry_delay_secs(3), 20);
+        assert_eq!(next_service_update_retry_delay_secs(10), 300);
+    }
+
+    #[test]
+    fn reuse_or_clear_staged_binary_removes_invalid_cached_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("lore");
+        fs::write(&staged, b"not a real executable").unwrap();
+
+        let reused = reuse_or_clear_staged_binary(&staged, "0.1.65-rc110").unwrap();
+        assert!(!reused);
+        assert!(!staged.exists());
     }
 
     #[test]
