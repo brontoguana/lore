@@ -5,8 +5,10 @@ $Repo = if ($env:LORE_GITHUB_REPO) { $env:LORE_GITHUB_REPO } else { "brontoguana
 $Version = if ($env:LORE_VERSION) { $env:LORE_VERSION } else { "latest" }
 $InstallDir = if ($env:LORE_INSTALL_DIR) { $env:LORE_INSTALL_DIR } else { "$env:LOCALAPPDATA\lore\bin" }
 $BinaryName = "lore"
-$LoreServiceDir = if ($env:LORE_SERVICE_DIR) { $env:LORE_SERVICE_DIR } else { "$HOME\lore-service" }
+$LoreServiceDir = if ($env:LORE_SERVICE_DIR) { $env:LORE_SERVICE_DIR } else { "$HOME\.lore-service" }
+$LegacyLoreServiceDir = if ($env:LEGACY_LORE_SERVICE_DIR) { $env:LEGACY_LORE_SERVICE_DIR } else { "$HOME\lore-service" }
 $ServicePidFile = Join-Path $LoreServiceDir "service.pid"
+$LegacyServicePidFile = Join-Path $LegacyLoreServiceDir "service.pid"
 
 function Resolve-LatestVersion {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ "User-Agent" = "lore-installer" }
@@ -27,18 +29,27 @@ function Get-CurrentVersion {
 }
 
 function Test-ServiceRunning {
-    if (-not (Test-Path $ServicePidFile)) {
-        return $false
-    }
-    try {
-        $pid = (Get-Content $ServicePidFile -ErrorAction Stop | Select-Object -First 1).Trim()
-        if (-not $pid) {
-            return $false
+    foreach ($pidFile in @($ServicePidFile, $LegacyServicePidFile)) {
+        if (-not (Test-Path $pidFile)) {
+            continue
         }
-        Get-Process -Id ([int]$pid) -ErrorAction Stop | Out-Null
-        return $true
-    } catch {
-        return $false
+        try {
+            $pid = (Get-Content $pidFile -ErrorAction Stop | Select-Object -First 1).Trim()
+            if (-not $pid) {
+                continue
+            }
+            Get-Process -Id ([int]$pid) -ErrorAction Stop | Out-Null
+            return $true
+        } catch {
+            continue
+        }
+    }
+    return $false
+}
+
+function Move-LegacyServiceDirIfPresent {
+    if ((Test-Path $LegacyLoreServiceDir) -and -not (Test-Path $LoreServiceDir)) {
+        Move-Item -Path $LegacyLoreServiceDir -Destination $LoreServiceDir
     }
 }
 
@@ -109,6 +120,7 @@ try {
     $src = Join-Path $TmpDir "$BinaryName.exe"
     $dst = Join-Path $InstallDir "$BinaryName.exe"
     Copy-Item -Path $src -Destination $dst -Force
+    Move-LegacyServiceDirIfPresent
     Restart-ServiceIfRunning
 
     if ($CurrentVersion -ne "not installed") {

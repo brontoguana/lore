@@ -825,11 +825,7 @@ async fn run() -> CliResult<()> {
             // Auto-start the machine service daemon
             println!("Starting machine service...");
             let exe = resolved_current_exe()?;
-            let lore_dir = env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("lore-service");
-            fs::create_dir_all(&lore_dir)?;
+            let lore_dir = service_root_dir()?;
             let log_path = lore_dir.join("service.log");
             let pid_path = lore_dir.join("service.pid");
 
@@ -854,7 +850,7 @@ async fn run() -> CliResult<()> {
 
             let child = spawn_service_daemon(&exe, &url, &token, &log_path, &[])?;
             let pid = child.id();
-            fs::write(&pid_path, pid.to_string())?;
+            write_service_pid_file(&lore_dir, pid)?;
             println!("Service started (pid {})", pid);
             println!("  Log: {}", log_path.display());
 
@@ -2081,6 +2077,52 @@ fn promote_staged_binary_to_canonical(
         fs::create_dir_all(parent)?;
     }
     write_executable_atomically(canonical_executable, &bytes)
+}
+
+fn legacy_service_root_dir() -> PathBuf {
+    env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("lore-service")
+}
+
+fn service_root_dir() -> CliResult<PathBuf> {
+    let home = env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let hidden_dir = home.join(".lore-service");
+    let legacy_dir = legacy_service_root_dir();
+
+    if !hidden_dir.exists() && legacy_dir.exists() {
+        fs::rename(&legacy_dir, &hidden_dir).map_err(|e| {
+            io::Error::other(format!(
+                "failed to migrate service directory from {} to {}: {e}",
+                legacy_dir.display(),
+                hidden_dir.display()
+            ))
+        })?;
+    }
+
+    fs::create_dir_all(&hidden_dir)?;
+    Ok(hidden_dir)
+}
+
+fn write_service_pid_file(lore_dir: &Path, pid: u32) -> CliResult<()> {
+    fs::write(lore_dir.join("service.pid"), pid.to_string())?;
+    Ok(())
+}
+
+fn remove_owned_service_pid_file(lore_dir: &Path, pid: u32) {
+    let pid_path = lore_dir.join("service.pid");
+    let Ok(contents) = fs::read_to_string(&pid_path) else {
+        return;
+    };
+    let Ok(recorded_pid) = contents.trim().parse::<u32>() else {
+        return;
+    };
+    if recorded_pid == pid {
+        let _ = fs::remove_file(pid_path);
+    }
 }
 
 fn service_handoff_from_env() -> CliResult<Option<ServiceHandoff>> {
@@ -6327,11 +6369,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
 
     if !args.fg && !is_daemon {
         // Daemonize
-        let lore_dir = env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("lore-service");
-        fs::create_dir_all(&lore_dir)?;
+        let lore_dir = service_root_dir()?;
         let log_path = lore_dir.join("service.log");
         let pid_path = lore_dir.join("service.pid");
 
@@ -6360,20 +6398,16 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         let exe = resolved_current_exe()?;
         let child = spawn_service_daemon(&exe, &context.url, machine_token, &log_path, &[])?;
         let pid = child.id();
-        fs::write(&pid_path, pid.to_string())?;
+        write_service_pid_file(&lore_dir, pid)?;
         println!("Lore service started (pid {})", pid);
         println!("  Log: {}", log_path.display());
         return Ok(());
     }
 
     // Write PID file for daemon mode
-    let lore_dir = env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("lore-service");
-    fs::create_dir_all(&lore_dir)?;
+    let lore_dir = service_root_dir()?;
     if is_daemon {
-        fs::write(lore_dir.join("service.pid"), std::process::id().to_string())?;
+        write_service_pid_file(&lore_dir, std::process::id())?;
     }
 
     eprintln!(
@@ -6437,8 +6471,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             eprintln!("[service] Shutting down gracefully...");
             svc_state.stop_all_agents();
             svc_state.save();
-            let pid_path = lore_dir.join("service.pid");
-            let _ = fs::remove_file(&pid_path);
+            remove_owned_service_pid_file(&lore_dir, std::process::id());
             eprintln!("[service] Shutdown complete");
             return Ok(());
         }
@@ -6525,9 +6558,9 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                                         Err(e) => {
                                             let _ = fs::remove_file(&ready_path);
                                             kill_process(child.id());
-                                            let _ = fs::write(
-                                                lore_dir.join("service.pid"),
-                                                std::process::id().to_string(),
+                                            let _ = write_service_pid_file(
+                                                &lore_dir,
+                                                std::process::id(),
                                             );
                                             record_service_update_failure(
                                                 &lore_dir,
@@ -6882,8 +6915,8 @@ mod tests {
         DocWriteArgs, append_assistant_segment, append_new_stream_text, count_history_exchanges,
         history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
         load_doc_write_content, next_service_update_retry_delay_secs, parse_cli_version_output,
-        parse_codex_line, recent_history_exchange_tail, reuse_or_clear_staged_binary,
-        service_update_target,
+        parse_codex_line, recent_history_exchange_tail, remove_owned_service_pid_file,
+        reuse_or_clear_staged_binary, service_update_target,
     };
     use serde_json::json;
     use std::collections::HashSet;
@@ -6997,6 +7030,19 @@ mod tests {
         let reused = reuse_or_clear_staged_binary(&staged, "0.1.65-rc110").unwrap();
         assert!(!reused);
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn remove_owned_service_pid_file_only_removes_matching_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("service.pid");
+        fs::write(&pid_path, "12345").unwrap();
+
+        remove_owned_service_pid_file(dir.path(), 67890);
+        assert_eq!(fs::read_to_string(&pid_path).unwrap(), "12345");
+
+        remove_owned_service_pid_file(dir.path(), 12345);
+        assert!(!pid_path.exists());
     }
 
     #[test]

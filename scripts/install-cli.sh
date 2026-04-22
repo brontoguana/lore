@@ -8,8 +8,10 @@ REPO="${LORE_GITHUB_REPO:-brontoguana/lore}"
 VERSION="${1:-${LORE_VERSION:-latest}}"
 INSTALL_DIR="${LORE_INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="lore"
-LORE_SERVICE_DIR="${LORE_SERVICE_DIR:-$HOME/lore-service}"
+LORE_SERVICE_DIR="${LORE_SERVICE_DIR:-$HOME/.lore-service}"
+LEGACY_LORE_SERVICE_DIR="${LEGACY_LORE_SERVICE_DIR:-$HOME/lore-service}"
 SERVICE_PID_FILE="$LORE_SERVICE_DIR/service.pid"
+LEGACY_SERVICE_PID_FILE="$LEGACY_LORE_SERVICE_DIR/service.pid"
 
 detect_target() {
   os="$(uname -s)"
@@ -84,16 +86,28 @@ get_current_version() {
 }
 
 is_service_running() {
-  if [ ! -f "$SERVICE_PID_FILE" ]; then
-    return 1
-  fi
+  for pid_file in "$SERVICE_PID_FILE" "$LEGACY_SERVICE_PID_FILE"; do
+    if [ ! -f "$pid_file" ]; then
+      continue
+    fi
 
-  pid="$(cat "$SERVICE_PID_FILE" 2>/dev/null || true)"
-  if [ -z "$pid" ]; then
-    return 1
-  fi
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -z "$pid" ]; then
+      continue
+    fi
 
-  kill -0 "$pid" 2>/dev/null
+    if kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+migrate_legacy_service_dir_if_present() {
+  if [ -d "$LEGACY_LORE_SERVICE_DIR" ] && [ ! -e "$LORE_SERVICE_DIR" ]; then
+    mv "$LEGACY_LORE_SERVICE_DIR" "$LORE_SERVICE_DIR"
+  fi
 }
 
 restart_service_if_running() {
@@ -152,6 +166,7 @@ verify_checksum "$ARCHIVE" "$CHECKSUM"
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
 install "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+migrate_legacy_service_dir_if_present
 
 INSTALLED_VERSION="$(get_current_version)"
 expected_cmp="$(echo "$REMOTE_VERSION" | sed 's/^v//')"
