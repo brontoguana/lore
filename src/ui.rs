@@ -3515,7 +3515,8 @@ pub fn render_chat_main_panel(
   <button type="submit" class="chat-send-btn">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
   </button>
-</form>"#,
+</form>
+"#,
             header_avatar = header_avatar,
             display_name = escape_text(display),
             cwd_html = cwd_html,
@@ -4007,6 +4008,8 @@ function initializeChatPanel() {{
   agentConfig = {{ backend: '', model: '', effort: '' }};
   if (isLibrarian || !currentAgent) agentStatus = '';
   chatFollowScroll = true;
+  cancelChatMessageLongPress();
+  chatMessageEditPending = false;
   closeAllPanels();
   setActiveAgentInList(currentAgent);
   if (eventSource) {{
@@ -4016,6 +4019,7 @@ function initializeChatPanel() {{
   connectSSE();
   initChatComposer();
   bindChatScrollState();
+  bindChatMessageMutationGestures();
 
   if (isLibrarian) {{
     var params = new URLSearchParams(window.location.search);
@@ -4380,12 +4384,18 @@ function renderMessages() {{
     var kind = msg.role === 'user' ? 'user' : msg.role === 'system' ? 'system' : msg.role === 'config' ? 'config' : msg.role === 'tool' ? 'tool' : msg.role === 'error' ? 'error' : 'assistant';
     var cls = kind === 'user' ? 'chat-msg-user' : kind === 'system' ? 'chat-msg-system' : kind === 'config' ? 'chat-msg-config' : kind === 'tool' ? 'chat-msg-tool' : kind === 'error' ? 'chat-msg-error' : 'chat-msg-assistant';
     if (msg._thinking) cls += ' chat-msg-thinking';
-    html += '<div class="chat-msg-row chat-msg-row-' + kind + '" data-chat-idx="' + i + '">';
+    if (msg.excluded_from_context) cls += ' chat-msg-excluded';
+    var messageId = chatMessageId(msg);
+    var canMutate = chatMessageCanMutate(msg);
+    html += '<div class="chat-msg-row chat-msg-row-' + kind + (canMutate ? ' chat-msg-row-mutable' : '') + (msg.excluded_from_context ? ' chat-msg-row-excluded' : '') + '" data-chat-idx="' + i + '"' + (canMutate ? ' data-chat-msg-id="' + messageId + '"' : '') + '>';
     var timestamp = formatChatTimestamp(msg.timestamp);
     if (timestamp) {{
       html += '<div class="chat-msg-timestamp">' + escapeHtmlRaw(timestamp) + '</div>';
     }}
     html += '<div class="chat-msg ' + cls + '">';
+    if (msg.excluded_from_context) {{
+      html += '<div class="chat-msg-excluded-prefix" title="Excluded from agent context">&#128465;</div>';
+    }}
     if (msg.role === 'assistant' || msg.role === 'user') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
     }} else if (msg.role === 'error') {{
@@ -4733,6 +4743,82 @@ function handleChatKey(e) {{
   return true;
 }}
 
+function applyExcludedChatMessage(data, messageId) {{
+  if (!data) return;
+  if (data.message) {{
+    for (var i = 0; i < chatMessages.length; i++) {{
+      if (chatMessageId(chatMessages[i]) === data.message.id) {{
+        chatMessages[i].excluded_from_context = !!data.message.excluded_from_context;
+        break;
+      }}
+    }}
+  }}
+  activeTurnUserId = data.active_turn_user_id || 0;
+  syncQueuedFollowUpFlags(false);
+  renderMessages();
+  updateAgentListPreview(currentAgent, data.last_message || '', data.last_message_time || '');
+}}
+
+function excludeChatMessageFromContext(messageId) {{
+  if (!messageId || chatMessageEditPending || !currentAgent) return false;
+  var msg = findChatMessageById(messageId);
+  if (!chatMessageCanMutate(msg) || msg.excluded_from_context) return false;
+  chatMessageEditPending = true;
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/message', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: 'csrf_token=' + encodeURIComponent(csrfToken)
+      + '&message_id=' + encodeURIComponent(messageId)
+  }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      chatMessageEditPending = false;
+      if (!data || !data.ok) throw new Error((data && data.error) || 'Failed to exclude message');
+      applyExcludedChatMessage(data, messageId);
+    }})
+    .catch(function(err) {{
+      chatMessageEditPending = false;
+      alert(err && err.message ? err.message : 'Failed to exclude message');
+    }});
+  return false;
+}}
+
+function cancelChatMessageLongPress() {{
+  if (chatMessageLongPressTimer) {{
+    clearTimeout(chatMessageLongPressTimer);
+    chatMessageLongPressTimer = null;
+  }}
+}}
+
+function bindChatMessageMutationGestures() {{
+  var container = document.getElementById('chat-messages');
+  if (!container || container.dataset.messageMutationBound === '1') return;
+  container.dataset.messageMutationBound = '1';
+
+  container.addEventListener('contextmenu', function(e) {{
+    var row = e.target && e.target.closest ? e.target.closest('.chat-msg-row[data-chat-msg-id]') : null;
+    if (!row) return;
+    e.preventDefault();
+    excludeChatMessageFromContext(parseInt(row.getAttribute('data-chat-msg-id'), 10) || 0);
+  }});
+
+  container.addEventListener('pointerdown', function(e) {{
+    if (e.pointerType !== 'touch') return;
+    var row = e.target && e.target.closest ? e.target.closest('.chat-msg-row[data-chat-msg-id]') : null;
+    if (!row) return;
+    cancelChatMessageLongPress();
+    var messageId = parseInt(row.getAttribute('data-chat-msg-id'), 10) || 0;
+    chatMessageLongPressTimer = setTimeout(function() {{
+      chatMessageLongPressTimer = null;
+      excludeChatMessageFromContext(messageId);
+    }}, 450);
+  }});
+
+  ['pointerup', 'pointercancel', 'pointermove', 'scroll'].forEach(function(eventName) {{
+    container.addEventListener(eventName, cancelChatMessageLongPress, {{ passive: true }});
+  }});
+}}
+
 function setChatSendPending(pending) {{
   chatSendInFlight = !!pending;
   var input = document.getElementById('chat-input');
@@ -4978,6 +5064,20 @@ function chatMessageId(msg) {{
   return Number.isFinite(id) ? id : 0;
 }}
 
+function chatMessageCanMutate(msg) {{
+  if (!msg || msg._thinking) return false;
+  if (msg.excluded_from_context) return false;
+  if (!(msg.role === 'user' || msg.role === 'assistant' || msg.role === 'tool' || msg.role === 'error')) return false;
+  return chatMessageId(msg) > 0;
+}}
+
+function findChatMessageById(messageId) {{
+  for (var i = 0; i < chatMessages.length; i++) {{
+    if (chatMessageId(chatMessages[i]) === messageId) return chatMessages[i];
+  }}
+  return null;
+}}
+
 function isQueuedFollowUpUserMessage(msg) {{
   if (!msg || msg.role !== 'user') return false;
   var id = chatMessageId(msg);
@@ -5207,6 +5307,8 @@ var chatConfigData = null;
 var manageConfigData = null;
 var configSaveTimer = null;
 var manageSaveTimer = null;
+var chatMessageEditPending = false;
+var chatMessageLongPressTimer = null;
 
 var backendModels = {{
   claude: ['default', 'opus', 'sonnet', 'haiku'],
@@ -9684,6 +9786,12 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       gap: 2px;
       max-width: 100%;
     }
+    .chat-msg-row-mutable .chat-msg {
+      cursor: pointer;
+    }
+    .chat-msg-row-excluded .chat-msg-timestamp {
+      color: var(--fg-dim);
+    }
     .chat-msg-row-user {
       align-items: flex-end;
     }
@@ -9725,6 +9833,19 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       word-wrap: break-word;
       min-width: 0;
       box-sizing: border-box;
+    }
+    .chat-msg-excluded {
+      opacity: 0.78;
+      filter: saturate(0.55);
+    }
+    .chat-msg-excluded-prefix {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: var(--s-1);
+      font-size: 0.9rem;
+      line-height: 1;
+      opacity: 0.9;
     }
     .chat-msg-user {
       align-self: flex-end;
@@ -11770,6 +11891,28 @@ mod tests {
         assert!(html.contains("function formatChatTimestamp(value) {"));
         assert!(html.contains(".chat-msg-timestamp {"));
         assert!(html.contains("chat-msg-row-"));
+    }
+
+    #[test]
+    fn chat_page_includes_message_exclusion_long_press_hooks() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("worker"),
+            r#"[{"id":1,"role":"user","content":"hello"}]"#,
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("function bindChatMessageMutationGestures() {"));
+        assert!(html.contains("function excludeChatMessageFromContext(messageId) {"));
+        assert!(html.contains(".chat-msg-excluded {"));
+        assert!(html.contains("data-chat-msg-id="));
     }
 
     #[test]

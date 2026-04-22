@@ -752,6 +752,7 @@ fn build_app_with_librarian(
         )
         .route("/ui/chat/librarian/clear", post(librarian_chat_clear))
         .route("/ui/chat/{agent}/send", post(chat_send_message))
+        .route("/ui/chat/{agent}/message", post(chat_update_message))
         .route("/ui/chat/{agent}/command", post(chat_slash_command))
         .route(
             "/ui/chat/{agent}/config",
@@ -10615,7 +10616,9 @@ struct ChatPageQuery {
 }
 
 fn is_pending_follow_up_user_message(conv: &ChatConversation, msg: &ChatMessage) -> bool {
-    matches!(msg.role, ChatRole::User) && msg.id > conv.active_turn_user_id
+    matches!(msg.role, ChatRole::User)
+        && !msg.excluded_from_context
+        && msg.id > conv.active_turn_user_id
 }
 
 const UI_CHAT_VERBATIM_EXCHANGE_LIMIT: usize = 50;
@@ -10629,11 +10632,29 @@ fn unsummarized_messages(conv: &ChatConversation) -> &[ChatMessage] {
     &conv.messages[start..]
 }
 
+fn chat_message_json(msg: &ChatMessage) -> Value {
+    json!({
+        "id": msg.id,
+        "role": match msg.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
+        "content": msg.content,
+        "timestamp": msg.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+        "excluded_from_context": msg.excluded_from_context,
+    })
+}
+
+fn agent_context_messages(messages: &[ChatMessage]) -> Vec<&ChatMessage> {
+    messages
+        .iter()
+        .filter(|msg| !msg.excluded_from_context)
+        .collect()
+}
+
 fn recent_exchange_tail(messages: &[ChatMessage], exchange_limit: usize) -> &[ChatMessage] {
     if exchange_limit == 0 || messages.is_empty() {
         return &messages[messages.len()..];
     }
-    let boundaries = exchange_boundaries(messages);
+    let visible: Vec<&ChatMessage> = messages.iter().collect();
+    let boundaries = exchange_boundaries(&visible);
     if boundaries.len() <= exchange_limit {
         return messages;
     }
@@ -10644,11 +10665,7 @@ fn chat_messages_value_ordered(conv: &ChatConversation) -> (Vec<Value>, Vec<Valu
     let mut main = Vec::new();
     let mut pending = Vec::new();
     for msg in recent_exchange_tail(&conv.messages, UI_CHAT_VERBATIM_EXCHANGE_LIMIT) {
-        let value = json!({
-            "id": msg.id,
-            "role": match msg.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
-            "content": msg.content,
-        });
+        let value = chat_message_json(msg);
         if is_pending_follow_up_user_message(conv, msg) {
             pending.push(value);
         } else {
@@ -10709,12 +10726,16 @@ fn build_chat_agents(
     for agent in &agents {
         let owner = agent.owner.as_ref().map(|o| o.as_str()).unwrap_or("");
         let conv = state.chat.load_conversation(owner, &agent.name)?;
-        let last_msg = conv.messages.last();
+        let last_msg = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| !m.excluded_from_context);
         let last_user = conv
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == ChatRole::User);
+            .find(|m| m.role == ChatRole::User && !m.excluded_from_context);
         let last_user_at = last_user.map(|m| m.timestamp);
         let snippet = last_msg.map(|m| m.content.chars().take(60).collect::<String>());
         let time_str = last_user_at.map(format_chat_time);
@@ -11422,6 +11443,12 @@ struct ChatSendForm {
     client_message_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatExcludeMessageForm {
+    csrf_token: String,
+    message_id: u64,
+}
+
 async fn chat_send_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -11498,6 +11525,52 @@ async fn chat_send_message(
             "role": "user",
             "content": msg.content,
         }
+    }))
+    .into_response())
+}
+
+async fn chat_update_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent_name): Path<String>,
+    Form(form): Form<ChatExcludeMessageForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let owner = session.user.username.as_str();
+
+    let agents = state
+        .auth
+        .list_agent_tokens_for_user(&session.user.username)?;
+    if !agents.iter().any(|a| a.name == agent_name) {
+        return Err(LoreError::PermissionDenied.into());
+    }
+
+    let updated = state
+        .chat
+        .exclude_message_from_context(owner, &agent_name, form.message_id)?;
+    let conv = state.chat.load_conversation(owner, &agent_name)?;
+    let last_message = conv
+        .messages
+        .iter()
+        .rev()
+        .find(|msg| !msg.excluded_from_context)
+        .map(|msg| msg.content.chars().take(60).collect::<String>())
+        .unwrap_or_default();
+    let last_message_time = conv
+        .messages
+        .iter()
+        .rev()
+        .find(|msg| msg.role == ChatRole::User && !msg.excluded_from_context)
+        .map(|msg| format_chat_time(msg.timestamp))
+        .unwrap_or_default();
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": chat_message_json(&updated),
+        "active_turn_user_id": conv.active_turn_user_id,
+        "last_message": last_message,
+        "last_message_time": last_message_time,
     }))
     .into_response())
 }
@@ -12594,16 +12667,9 @@ async fn chat_agent_history(
     let owner_str = owner.as_str();
 
     let conv = state.chat.load_conversation(owner_str, &agent.name)?;
-    let msgs: Vec<Value> = unsummarized_messages(&conv)
+    let msgs: Vec<Value> = agent_context_messages(unsummarized_messages(&conv))
         .iter()
-        .map(|m| {
-            json!({
-                "id": m.id,
-                "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
-                "content": m.content,
-                "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
-            })
-        })
+        .map(|m| chat_message_json(m))
         .collect();
 
     let backend_str = agent.backend.to_string();
@@ -12790,19 +12856,22 @@ async fn chat_agent_get_manage(
     let system_prompt = build_manager_prompt(&mc, &manager_prompt_config, turn_in_cycle);
 
     let conv = state.chat.load_conversation(owner_str, &agent.name)?;
-    let window_messages = unsummarized_messages(&conv);
-    let boundaries = exchange_boundaries(window_messages);
+    let window_messages = agent_context_messages(unsummarized_messages(&conv));
+    let boundaries = exchange_boundaries(&window_messages);
     let last_10_start = if boundaries.len() > 10 {
         boundaries[boundaries.len() - 10]
     } else {
         0
     };
-    let recent_msgs: Vec<Value> = window_messages[last_10_start..].iter().map(|m| {
-        json!({
-            "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
-            "content": m.content,
+    let recent_msgs: Vec<Value> = window_messages[last_10_start..]
+        .iter()
+        .map(|m| {
+            json!({
+                "role": match m.role { ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool", ChatRole::Error => "error" },
+                "content": m.content,
+            })
         })
-    }).collect();
+        .collect();
 
     let has_endpoint = !mc.endpoint_id.is_empty()
         && state
@@ -13015,16 +13084,17 @@ async fn chat_manager_proxy_completions(
 // This matches Snoot's MessagePair concept. Window size, compaction, and context
 // management all count exchanges, not individual messages.
 
-fn count_exchanges(messages: &[ChatMessage]) -> usize {
+fn count_exchanges(messages: &[&ChatMessage]) -> usize {
     messages.iter().filter(|m| m.role == ChatRole::User).count()
 }
 
 fn agent_window_exchange_count(conv: &ChatConversation) -> usize {
-    count_exchanges(unsummarized_messages(conv))
+    let messages = agent_context_messages(unsummarized_messages(conv));
+    count_exchanges(&messages)
 }
 
 /// Returns the message index where each exchange starts (i.e. each User message index).
-fn exchange_boundaries(messages: &[ChatMessage]) -> Vec<usize> {
+fn exchange_boundaries(messages: &[&ChatMessage]) -> Vec<usize> {
     messages
         .iter()
         .enumerate()
@@ -13073,8 +13143,8 @@ async fn do_exchange_compact(
         .load_conversation(owner, agent_name)
         .map_err(|e| format!("Compact failed: {e}"))?;
 
-    let unsummarized = unsummarized_messages(&conv);
-    let exchanges = count_exchanges(unsummarized);
+    let unsummarized = agent_context_messages(unsummarized_messages(&conv));
+    let exchanges = count_exchanges(&unsummarized);
     if exchanges <= 2 {
         return Err("Nothing to compact (2 or fewer exchanges).".to_string());
     }
@@ -13085,7 +13155,7 @@ async fn do_exchange_compact(
         conv.window_size / 2
     };
 
-    let boundaries = exchange_boundaries(unsummarized);
+    let boundaries = exchange_boundaries(&unsummarized);
     let keep_count = target.min(exchanges - 1);
     let keep_from_exchange = boundaries.len().saturating_sub(keep_count);
     let split_idx = boundaries[keep_from_exchange];
@@ -15763,6 +15833,7 @@ mod tests {
             content: "first".into(),
             timestamp: base + Duration::milliseconds(100),
             client_message_id: None,
+            excluded_from_context: false,
         });
         alpha_conv.next_id = 2;
         state
@@ -15777,6 +15848,7 @@ mod tests {
             content: "second".into(),
             timestamp: base + Duration::milliseconds(900),
             client_message_id: None,
+            excluded_from_context: false,
         });
         bravo_conv.next_id = 2;
         state
@@ -15826,6 +15898,7 @@ mod tests {
             content: "alpha user".into(),
             timestamp: alpha_user_at,
             client_message_id: None,
+            excluded_from_context: false,
         });
         alpha_conv.messages.push(ChatMessage {
             id: 2,
@@ -15833,6 +15906,7 @@ mod tests {
             content: "alpha assistant".into(),
             timestamp: base + Duration::minutes(10),
             client_message_id: None,
+            excluded_from_context: false,
         });
         alpha_conv.next_id = 3;
         state
@@ -15847,6 +15921,7 @@ mod tests {
             content: "bravo user".into(),
             timestamp: bravo_user_at,
             client_message_id: None,
+            excluded_from_context: false,
         });
         bravo_conv.messages.push(ChatMessage {
             id: 2,
@@ -15854,6 +15929,7 @@ mod tests {
             content: "bravo assistant".into(),
             timestamp: base + Duration::minutes(4),
             client_message_id: None,
+            excluded_from_context: false,
         });
         bravo_conv.next_id = 3;
         state
@@ -15956,6 +16032,76 @@ mod tests {
         assert_eq!(conv.messages.len(), 1);
         assert_eq!(conv.messages[0].role, ChatRole::User);
         assert_eq!(conv.messages[0].content, "hello from user");
+    }
+
+    #[tokio::test]
+    async fn chat_update_message_marks_message_excluded_from_persisted_context() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let _agent_token =
+            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let conv = ChatConversation {
+            messages: vec![
+                ChatMessage {
+                    id: 1,
+                    role: ChatRole::User,
+                    content: "remove me".into(),
+                    timestamp: base,
+                    client_message_id: None,
+                    excluded_from_context: false,
+                },
+                ChatMessage {
+                    id: 2,
+                    role: ChatRole::Assistant,
+                    content: "keep me".into(),
+                    timestamp: base + Duration::seconds(1),
+                    client_message_id: None,
+                    excluded_from_context: false,
+                },
+            ],
+            summary: "old summary".into(),
+            summary_until_id: 2,
+            next_id: 3,
+            ..ChatConversation::default()
+        };
+        state
+            .chat
+            .save_conversation("admin", "agent-main", &conv)
+            .unwrap();
+
+        let exclude_request = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/agent-main/message")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}&message_id={}",
+                urlencoding::encode(&csrf_token),
+                1
+            )))
+            .unwrap();
+        let exclude_response = app.clone().oneshot(exclude_request).await.unwrap();
+        assert_eq!(exclude_response.status(), StatusCode::OK);
+        let exclude_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(exclude_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exclude_json["ok"], true);
+        assert_eq!(exclude_json["message"]["id"], 1);
+        assert_eq!(exclude_json["message"]["excluded_from_context"], true);
+
+        let saved = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert_eq!(saved.summary, "");
+        assert_eq!(saved.summary_until_id, 0);
+        assert_eq!(saved.messages.len(), 2);
+        assert!(saved.messages[0].excluded_from_context);
+        assert_eq!(saved.messages[1].content, "keep me");
     }
 
     #[tokio::test]
@@ -19415,6 +19561,7 @@ mod tests {
             content: "hello".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
         conv.messages.push(ChatMessage {
             id: 2,
@@ -19422,6 +19569,7 @@ mod tests {
             content: "done".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);
@@ -19442,6 +19590,7 @@ mod tests {
             content: "hello".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
         conv.messages.push(ChatMessage {
             id: 2,
@@ -19449,6 +19598,7 @@ mod tests {
             content: "done".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);
@@ -19473,6 +19623,7 @@ mod tests {
             content: "hello".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
         conv.messages.push(ChatMessage {
             id: 2,
@@ -19480,6 +19631,7 @@ mod tests {
             content: "partial".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);
@@ -19504,6 +19656,7 @@ mod tests {
             content: "first".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
         conv.messages.push(ChatMessage {
             id: 2,
@@ -19511,6 +19664,7 @@ mod tests {
             content: "working".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
         conv.messages.push(ChatMessage {
             id: 3,
@@ -19518,6 +19672,7 @@ mod tests {
             content: "follow-up".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
         conv.messages.push(ChatMessage {
             id: 4,
@@ -19525,6 +19680,7 @@ mod tests {
             content: "tool step".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);
@@ -19549,6 +19705,7 @@ mod tests {
             content: "first".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
         conv.messages.push(ChatMessage {
             id: 2,
@@ -19556,6 +19713,7 @@ mod tests {
             content: "done".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
         conv.messages.push(ChatMessage {
             id: 3,
@@ -19563,6 +19721,7 @@ mod tests {
             content: "follow-up".to_string(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             client_message_id: None,
+            excluded_from_context: false,
         });
 
         let messages = super::chat_messages_value_for_panel(&conv);
@@ -19587,6 +19746,7 @@ mod tests {
                 content: format!("user-{i}"),
                 timestamp: OffsetDateTime::UNIX_EPOCH,
                 client_message_id: None,
+                excluded_from_context: false,
             });
             conv.messages.push(ChatMessage {
                 id: i * 2,
@@ -19594,6 +19754,7 @@ mod tests {
                 content: format!("assistant-{i}"),
                 timestamp: OffsetDateTime::UNIX_EPOCH,
                 client_message_id: None,
+                excluded_from_context: false,
             });
         }
         conv.summary_until_id = 100;
@@ -19620,6 +19781,7 @@ mod tests {
                 content: format!("user-{i}"),
                 timestamp: OffsetDateTime::UNIX_EPOCH,
                 client_message_id: None,
+                excluded_from_context: false,
             });
             conv.messages.push(ChatMessage {
                 id: i * 2,
@@ -19627,12 +19789,14 @@ mod tests {
                 content: format!("assistant-{i}"),
                 timestamp: OffsetDateTime::UNIX_EPOCH,
                 client_message_id: None,
+                excluded_from_context: false,
             });
         }
         conv.summary_until_id = 6;
 
         let remaining = super::unsummarized_messages(&conv);
-        assert_eq!(super::count_exchanges(remaining), 3);
+        let context_remaining = super::agent_context_messages(remaining);
+        assert_eq!(super::count_exchanges(&context_remaining), 3);
         assert_eq!(remaining.first().unwrap().content, "user-4");
         assert_eq!(remaining.last().unwrap().content, "assistant-6");
     }

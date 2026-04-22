@@ -532,6 +532,12 @@ fn run_migrations(conn: &Connection) {
             table: "conversations",
             column: "summary_until_id",
         },
+        Migration {
+            version: 8,
+            sql: "ALTER TABLE messages ADD COLUMN excluded_from_context INTEGER NOT NULL DEFAULT 0",
+            table: "messages",
+            column: "excluded_from_context",
+        },
     ];
 
     for m in migrations {
@@ -1971,6 +1977,8 @@ pub struct ChatMessage {
     pub timestamp: OffsetDateTime,
     #[serde(default)]
     pub client_message_id: Option<String>,
+    #[serde(default)]
+    pub excluded_from_context: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2107,6 +2115,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     client_message_id TEXT,
     timestamp TEXT NOT NULL,
+    excluded_from_context INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (owner, agent, id)
 );
 CREATE TABLE IF NOT EXISTS pins (
@@ -2255,7 +2264,7 @@ impl ChatStore {
         };
         // Load messages
         let mut stmt = conn.prepare(
-            "SELECT id, role, content, timestamp, client_message_id FROM messages WHERE owner = ?1 AND agent = ?2 ORDER BY id"
+            "SELECT id, role, content, timestamp, client_message_id, excluded_from_context FROM messages WHERE owner = ?1 AND agent = ?2 ORDER BY id"
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conv.messages = stmt
             .query_map(params![owner, agent], |row| {
@@ -2271,6 +2280,7 @@ impl ChatStore {
                     content: row.get(2)?,
                     timestamp: parse_dt(&row.get::<_, String>(3)?),
                     client_message_id: row.get(4)?,
+                    excluded_from_context: row.get::<_, i64>(5)? != 0,
                 })
             })
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?
@@ -2345,8 +2355,8 @@ impl ChatStore {
                 ChatRole::Error => "error",
             };
             conn.execute(
-                "INSERT INTO messages (owner, agent, id, role, content, client_message_id, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![owner, agent, msg.id as i64, role_str, msg.content, msg.client_message_id, fmt_dt(&msg.timestamp)],
+                "INSERT INTO messages (owner, agent, id, role, content, client_message_id, timestamp, excluded_from_context) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![owner, agent, msg.id as i64, role_str, msg.content, msg.client_message_id, fmt_dt(&msg.timestamp), if msg.excluded_from_context { 1 } else { 0 }],
             ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         }
         // Replace pins
@@ -2399,7 +2409,7 @@ impl ChatStore {
             ChatRole::Error => "error",
         };
         conn.execute(
-            "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages (owner, agent, id, role, content, timestamp, excluded_from_context) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
             params![owner, agent, next_id, role_str, content, fmt_dt(&now)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
@@ -2413,6 +2423,7 @@ impl ChatStore {
             content,
             timestamp: now,
             client_message_id: None,
+            excluded_from_context: false,
         })
     }
 
@@ -2423,7 +2434,7 @@ impl ChatStore {
         client_message_id: &str,
     ) -> Result<Option<ChatMessage>> {
         conn.query_row(
-            "SELECT id, role, content, timestamp, client_message_id FROM messages WHERE owner = ?1 AND agent = ?2 AND client_message_id = ?3 LIMIT 1",
+            "SELECT id, role, content, timestamp, client_message_id, excluded_from_context FROM messages WHERE owner = ?1 AND agent = ?2 AND client_message_id = ?3 LIMIT 1",
             params![owner, agent, client_message_id],
             |row| {
                 Ok(ChatMessage {
@@ -2437,6 +2448,7 @@ impl ChatStore {
                     content: row.get(2)?,
                     timestamp: parse_dt(&row.get::<_, String>(3)?),
                     client_message_id: row.get(4)?,
+                    excluded_from_context: row.get::<_, i64>(5)? != 0,
                 })
             },
         )
@@ -2485,7 +2497,7 @@ impl ChatStore {
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let now = OffsetDateTime::now_utc();
         conn.execute(
-            "INSERT INTO messages (owner, agent, id, role, content, client_message_id, timestamp) VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6)",
+            "INSERT INTO messages (owner, agent, id, role, content, client_message_id, timestamp, excluded_from_context) VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6, 0)",
             params![owner, agent, next_id, content, normalized_client_message_id, fmt_dt(&now)],
         )
         .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
@@ -2501,6 +2513,7 @@ impl ChatStore {
                 content,
                 timestamp: now,
                 client_message_id: normalized_client_message_id,
+                excluded_from_context: false,
             },
             true,
         ))
@@ -2555,6 +2568,7 @@ impl ChatStore {
                     content: new_content,
                     timestamp: parse_dt(&last_ts),
                     client_message_id: None,
+                    excluded_from_context: false,
                 });
             }
         }
@@ -2568,7 +2582,7 @@ impl ChatStore {
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let now = OffsetDateTime::now_utc();
         conn.execute(
-            "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, 'tool', ?4, ?5)",
+            "INSERT INTO messages (owner, agent, id, role, content, timestamp, excluded_from_context) VALUES (?1, ?2, ?3, 'tool', ?4, ?5, 0)",
             params![owner, agent, next_id, detail, fmt_dt(&now)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
@@ -2582,6 +2596,7 @@ impl ChatStore {
             content: detail.to_string(),
             timestamp: now,
             client_message_id: None,
+            excluded_from_context: false,
         })
     }
 
@@ -2623,6 +2638,7 @@ impl ChatStore {
                         content: new_content,
                         timestamp: parse_dt(&last_ts),
                         client_message_id: None,
+                        excluded_from_context: false,
                     });
                 }
             }
@@ -2637,7 +2653,7 @@ impl ChatStore {
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let now = OffsetDateTime::now_utc();
         conn.execute(
-            "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, 'error', ?4, ?5)",
+            "INSERT INTO messages (owner, agent, id, role, content, timestamp, excluded_from_context) VALUES (?1, ?2, ?3, 'error', ?4, ?5, 0)",
             params![owner, agent, next_id, detail, fmt_dt(&now)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
@@ -2651,6 +2667,7 @@ impl ChatStore {
             content: detail.to_string(),
             timestamp: now,
             client_message_id: None,
+            excluded_from_context: false,
         })
     }
 
@@ -2787,6 +2804,37 @@ impl ChatStore {
         Ok(())
     }
 
+    pub fn exclude_message_from_context(
+        &self,
+        owner: &str,
+        agent: &str,
+        message_id: u64,
+    ) -> Result<ChatMessage> {
+        let mut conv = self.load_conversation(owner, agent)?;
+        let idx = conv
+            .messages
+            .iter()
+            .position(|msg| msg.id == message_id)
+            .ok_or_else(|| LoreError::Validation("message not found".into()))?;
+        conv.messages[idx].excluded_from_context = true;
+
+        // Message edits/deletes must immediately disappear from future agent context,
+        // including any compacted summary derived from earlier history.
+        conv.summary.clear();
+        conv.summary_until_id = 0;
+
+        let old_last_delivered = conv.last_delivered_user_id;
+        let old_active_turn = conv.active_turn_user_id;
+        conv.last_delivered_user_id =
+            previous_existing_user_message_id(&conv.messages, old_last_delivered);
+        conv.active_turn_user_id =
+            previous_existing_user_message_id(&conv.messages, old_active_turn)
+                .max(conv.last_delivered_user_id);
+
+        self.save_conversation(owner, agent, &conv)?;
+        Ok(conv.messages[idx].clone())
+    }
+
     pub fn claim_pending_user_messages(
         &self,
         owner: &str,
@@ -2821,7 +2869,7 @@ impl ChatStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, content, timestamp FROM messages \
-                 WHERE owner = ?1 AND agent = ?2 AND role = 'user' AND id > ?3 ORDER BY id",
+                 WHERE owner = ?1 AND agent = ?2 AND role = 'user' AND excluded_from_context = 0 AND id > ?3 ORDER BY id",
             )
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let pending: Vec<ChatMessage> = stmt
@@ -2832,6 +2880,7 @@ impl ChatStore {
                     content: row.get(1)?,
                     timestamp: parse_dt(&row.get::<_, String>(2)?),
                     client_message_id: None,
+                    excluded_from_context: false,
                 })
             })
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?
@@ -2899,8 +2948,8 @@ impl ChatStore {
                 ChatRole::Error => "error",
             };
             conn.execute(
-                "INSERT INTO messages (owner, agent, id, role, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![owner, agent, msg.id as i64, role_str, msg.content, fmt_dt(&msg.timestamp)],
+                "INSERT INTO messages (owner, agent, id, role, content, timestamp, excluded_from_context) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![owner, agent, msg.id as i64, role_str, msg.content, fmt_dt(&msg.timestamp), if msg.excluded_from_context { 1 } else { 0 }],
             ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         }
         conn.execute(
@@ -3072,6 +3121,15 @@ impl ChatStore {
     }
 }
 
+fn previous_existing_user_message_id(messages: &[ChatMessage], cursor: u64) -> u64 {
+    messages
+        .iter()
+        .filter(|msg| msg.role == ChatRole::User && !msg.excluded_from_context && msg.id <= cursor)
+        .map(|msg| msg.id)
+        .max()
+        .unwrap_or(0)
+}
+
 pub struct ChatAuditLog {
     root: PathBuf,
 }
@@ -3197,13 +3255,15 @@ fn dir_is_empty(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_SCHEMA, AgentBackend, ChatStore, LocalAuthStore, NewAgentToken, NewRole, NewUser,
-        ProjectGrant, ProjectPermission, RoleName, UserName,
+        AUTH_SCHEMA, AgentBackend, ChatConversation, ChatMessage, ChatRole, ChatStore,
+        LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant, ProjectPermission, RoleName,
+        UserName,
     };
     use crate::config::{ColorMode, UiTheme};
     use crate::model::ProjectName;
     use rusqlite::Connection;
     use tempfile::tempdir;
+    use time::{Duration, OffsetDateTime};
 
     #[test]
     fn hashes_passwords_and_authenticates_users() {
@@ -3552,5 +3612,70 @@ mod tests {
         let conv = chat.load_conversation("alice", "krasis").unwrap();
         assert_eq!(conv.messages.len(), 1);
         assert_eq!(conv.messages[0].content, third.content);
+    }
+
+    #[test]
+    fn excluding_chat_message_clears_summary_and_removes_it_from_future_context() {
+        let dir = tempdir().unwrap();
+        let chat = ChatStore::new(dir.path());
+        let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+
+        let conv = ChatConversation {
+            messages: vec![
+                ChatMessage {
+                    id: 1,
+                    role: ChatRole::User,
+                    content: "first request".into(),
+                    timestamp: base,
+                    client_message_id: None,
+                    excluded_from_context: false,
+                },
+                ChatMessage {
+                    id: 2,
+                    role: ChatRole::Assistant,
+                    content: "first answer".into(),
+                    timestamp: base + Duration::seconds(1),
+                    client_message_id: None,
+                    excluded_from_context: false,
+                },
+                ChatMessage {
+                    id: 3,
+                    role: ChatRole::User,
+                    content: "second request".into(),
+                    timestamp: base + Duration::seconds(2),
+                    client_message_id: None,
+                    excluded_from_context: false,
+                },
+            ],
+            summary: "summary still mentions first request".into(),
+            summary_until_id: 2,
+            next_id: 4,
+            last_delivered_user_id: 3,
+            active_turn_user_id: 3,
+            ..ChatConversation::default()
+        };
+        chat.save_conversation("alice", "worker", &conv).unwrap();
+
+        let excluded = chat
+            .exclude_message_from_context("alice", "worker", 3)
+            .unwrap();
+        assert_eq!(excluded.id, 3);
+        assert!(excluded.excluded_from_context);
+
+        let saved = chat.load_conversation("alice", "worker").unwrap();
+        assert_eq!(saved.summary, "");
+        assert_eq!(saved.summary_until_id, 0);
+        assert_eq!(saved.last_delivered_user_id, 1);
+        assert_eq!(saved.active_turn_user_id, 1);
+        assert_eq!(saved.messages.len(), 3);
+        assert_eq!(saved.messages[0].content, "first request");
+        assert!(
+            saved
+                .messages
+                .iter()
+                .find(|msg| msg.id == 3)
+                .map(|msg| msg.excluded_from_context)
+                .unwrap_or(false)
+        );
     }
 }
