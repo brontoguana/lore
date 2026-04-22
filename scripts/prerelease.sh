@@ -46,6 +46,8 @@ echo "Building..."
 cargo build --release 2>&1 | tail -1
 echo "Testing..."
 cargo test 2>&1 | tail -3
+echo "UI smoke..."
+./tests/run-smoke.sh
 echo ""
 
 # Commit, tag, push

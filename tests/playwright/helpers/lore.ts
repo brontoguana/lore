@@ -1,4 +1,4 @@
-import { Page, APIRequestContext, request as pwRequest } from '@playwright/test';
+import { Page, APIRequestContext, request as pwRequest, ConsoleMessage, Request } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -14,6 +14,40 @@ export async function login(page: Page): Promise<void> {
   await page.fill('input[name="password"]', ADMIN_PASS);
   await page.click('button[type="submit"]');
   await page.waitForURL(/\/ui/);
+}
+
+export interface PageHealthMonitor {
+  errors(): string[];
+}
+
+export function attachPageHealthChecks(page: Page): PageHealthMonitor {
+  const issues: string[] = [];
+
+  page.on('pageerror', (error) => {
+    issues.push(`pageerror: ${error.message}`);
+  });
+
+  page.on('console', (msg: ConsoleMessage) => {
+    if (msg.type() === 'error') {
+      issues.push(`console.error: ${msg.text()}`);
+    }
+  });
+
+  page.on('requestfailed', (request: Request) => {
+    const url = request.url();
+    const sameOrigin = url.startsWith('http://127.0.0.1:') || url.startsWith('http://localhost:');
+    const kind = request.resourceType();
+    const isAbortedEventStream = kind === 'eventsource' && (request.failure()?.errorText ?? '').includes('ERR_ABORTED');
+    if (!isAbortedEventStream && (sameOrigin || ['document', 'script', 'stylesheet', 'fetch', 'xhr'].includes(kind))) {
+      issues.push(`requestfailed: ${kind} ${request.method()} ${url} ${request.failure()?.errorText ?? ''}`.trim());
+    }
+  });
+
+  return {
+    errors() {
+      return [...issues];
+    },
+  };
 }
 
 export interface AdminClient {

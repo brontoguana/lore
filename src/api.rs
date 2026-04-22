@@ -4148,8 +4148,6 @@ async fn agents_page(
             );
             if agent.process_status.as_deref() == Some("restarting") {
                 agent.status = "restarting".to_string();
-            } else if agent.process_status.as_deref() == Some("stopped") {
-                agent.status = "offline".to_string();
             }
         }
     }
@@ -13341,7 +13339,7 @@ fn manager_chat_message_prefix(content: &str) -> String {
 }
 
 fn should_restart_agent_on_manage_enable(process_status: Option<&str>) -> bool {
-    process_status == Some("stopped")
+    matches!(process_status, Some("restarting") | Some("offline"))
 }
 
 fn release_due_delayed_manager_message(
@@ -20009,7 +20007,10 @@ mod tests {
     #[test]
     fn manage_enable_restart_policy_matches_agent_state() {
         assert!(super::should_restart_agent_on_manage_enable(Some(
-            "stopped"
+            "restarting"
+        )));
+        assert!(super::should_restart_agent_on_manage_enable(Some(
+            "offline"
         )));
         assert!(!super::should_restart_agent_on_manage_enable(Some(
             "running"

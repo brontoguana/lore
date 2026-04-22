@@ -254,6 +254,51 @@ The title area inside a panel. `display: grid`, `gap: var(--s-2)`, no padding (p
 
 ---
 
+## Expanded Text Editor
+
+A standard full-screen editing pattern for any multiline field that is expected to hold real content rather than a short note. This is the default pattern for long prompt/config/note editing surfaces across phone, tablet, and desktop.
+
+### When to use it
+
+Use the expanded text editor for:
+- Prompt-like config such as `Pinned Context`, `Goals`, `Stopping Point`, `Periodic Checks`, and `Red Flags`
+- Any textarea that is not effectively single-line
+- Any multiline field where focused editing matters more than seeing surrounding controls
+
+Do not keep these fields as the primary inline editing surface inside dense panels. The inline field should act as the visible summary/preview surface; the actual edit interaction should open the expanded editor.
+
+### Interaction Model
+
+- The editor is always full-screen and shown as an overlay without navigating away from the current page
+- Opening the editor should feel like temporarily switching into an editing mode, not like expanding the current card a bit
+- `Cancel` discards the overlay edits and returns to the previous page state
+- `Save` commits the new value back to the source field and runs that field's normal save/update flow
+- The source field remains in place underneath as the summary/preview surface
+
+### Layout
+
+- Full-screen overlay, edge to edge
+- Field label/title at the top
+- One large mono textarea filling most of the height
+- Fixed bottom action row
+- Respect safe-area insets on mobile
+
+### Buttons
+
+- Desktop and iPad: use `btn-lg` text buttons for `Save` and `Cancel`
+- iPhone: use `btn-sm` icon buttons for `Save` and `Cancel` to save space
+- On iPhone, `btn-sm` actions must use glyphs, not text
+- Optional field-specific extra actions may appear in the same footer row, but the standard save/cancel actions remain the anchor
+
+### Consistency Rules
+
+- Reuse one shared expanded-editor shell instead of inventing field-specific fullscreen editors
+- Keep typography and textarea styling consistent with the underlying field
+- Prefer opening the expanded editor from tapping/clicking the multiline field itself, optionally with a small edit glyph for clarity
+- Treat this as the default target for multiline editing; inline typing inside cramped config panels should be the exception, not the rule
+
+---
+
 ## Layout Components
 
 ### `.block-meta`

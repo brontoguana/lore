@@ -214,6 +214,7 @@ sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
 VERSION_BUMPED=1
 run_step "Building" cargo build --release
 run_step "Testing" cargo test
+run_step "UI smoke" ./tests/run-smoke.sh
 echo ""
 
 # --- Commit and tag (local only) ---

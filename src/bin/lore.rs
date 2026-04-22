@@ -5637,8 +5637,6 @@ struct ServiceState {
     state_dir: PathBuf,
     /// Runtime task handles for each agent, keyed by agent name.
     tasks: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-    /// Agents explicitly stopped via service command — skip auto-restart.
-    stopped: std::collections::HashSet<String>,
 }
 
 impl ServiceState {
@@ -5656,7 +5654,6 @@ impl ServiceState {
             agents,
             state_dir: state_dir.to_path_buf(),
             tasks: std::collections::HashMap::new(),
-            stopped: std::collections::HashSet::new(),
         }
     }
 
@@ -5672,11 +5669,7 @@ impl ServiceState {
         let mut dead: Vec<String> = Vec::new();
         for (name, handle) in &self.tasks {
             if handle.is_finished() {
-                if self.stopped.contains(name) {
-                    eprintln!("[service] Agent '{}' task finished (stopped)", name);
-                } else {
-                    eprintln!("[service] Agent '{}' task finished, will restart", name);
-                }
+                eprintln!("[service] Agent '{}' task finished, will restart", name);
                 dead.push(name.clone());
             }
         }
@@ -5689,9 +5682,6 @@ impl ServiceState {
         for agent in &self.agents {
             if self.tasks.contains_key(&agent.name) {
                 continue; // already running
-            }
-            if self.stopped.contains(&agent.name) {
-                continue; // explicitly stopped — don't auto-restart
             }
             let handle = spawn_agent_task(context, agent);
             eprintln!("[service] Started agent '{}' as task", agent.name);
@@ -5708,13 +5698,7 @@ impl ServiceState {
                     .get(&a.name)
                     .map(|h| !h.is_finished())
                     .unwrap_or(false);
-                let status = if running {
-                    "running"
-                } else if self.stopped.contains(&a.name) {
-                    "stopped"
-                } else {
-                    "restarting"
-                };
+                let status = if running { "running" } else { "restarting" };
                 serde_json::json!({
                     "name": a.name,
                     "pid": std::process::id(),
@@ -5727,9 +5711,8 @@ impl ServiceState {
 
     fn stop_agent(&mut self, name: &str) -> serde_json::Value {
         if self.agents.iter().any(|a| a.name == name) {
-            self.stopped.insert(name.to_string());
             if let Some(handle) = self.tasks.remove(name) {
-                eprintln!("[service] Stopping agent '{}'", name);
+                eprintln!("[service] Cancelling current task for agent '{}'", name);
                 handle.abort();
                 serde_json::json!({ "ok": true, "agent_name": name })
             } else {
@@ -5749,7 +5732,6 @@ impl ServiceState {
             } else {
                 eprintln!("[service] Removing agent '{}'", name);
             }
-            self.stopped.remove(name);
 
             self.agents.remove(index);
             self.save();
@@ -5767,8 +5749,6 @@ impl ServiceState {
 
     fn restart_agent(&mut self, context: &CliContext, name: &str) -> serde_json::Value {
         if let Some(agent) = self.agents.iter().find(|a| a.name == name).cloned() {
-            // Clear stopped flag so it can run
-            self.stopped.remove(name);
             // Stop if running
             if let Some(handle) = self.tasks.remove(name) {
                 handle.abort();
@@ -5787,14 +5767,11 @@ impl ServiceState {
     fn stop_all_agents(&mut self) {
         for (name, handle) in self.tasks.drain() {
             eprintln!("[service] Stopping agent '{}'", name);
-            self.stopped.insert(name);
             handle.abort();
         }
     }
 
-    fn restart_all_agents(&mut self) {
-        self.stopped.clear();
-    }
+    fn restart_all_agents(&mut self) {}
 }
 
 /// Spawn an agent as a tokio task within this process.
@@ -6127,6 +6104,13 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             Ok(update_info) => {
                 consecutive_service_errors = 0;
                 if let Some((target_version, repo)) = update_info {
+                    let cfg = load_cli_config()?;
+                    if !cfg.auto_update_enabled {
+                        eprintln!(
+                            "[service] Ignoring self-update to v{target_version} because auto-update is disabled."
+                        );
+                        continue;
+                    }
                     eprintln!(
                         "[service] Self-update to v{target_version} requested, stopping all agents..."
                     );
@@ -6134,7 +6118,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                     // Resolve exe path BEFORE update — after update /proc/self/exe
                     // points to the deleted old binary which can cause exec issues.
                     let exe = resolved_current_exe()?;
-                    let mut cfg = load_cli_config()?;
+                    let mut cfg = cfg;
                     // Try direct download from server first (works after quick-deploy),
                     // fall back to GitHub release if not available
                     let update_result =
@@ -6178,7 +6162,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                         }
                         Err(e) => {
                             eprintln!("[service] Update failed: {e}");
-                            // Restart agents that were stopped for the update
+                            // Restart agent tasks after the failed update attempt
                             svc_state.restart_all_agents();
                             svc_state.start_agent_tasks(context);
                         }

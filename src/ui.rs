@@ -27,6 +27,9 @@ use time::format_description::well_known::Rfc3339;
 // Lucide-style SVG icons for agent controls (14x14)
 const ICON_STOP: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>"#;
 const ICON_RESTART: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>"#;
+const ICON_CHECK: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>"#;
+const ICON_CLOSE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"#;
+const ICON_EDIT: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4Z"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 const ICON_MANAGER: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
 const ICON_STATUS_DONE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>"#;
@@ -3482,8 +3485,11 @@ pub fn render_chat_main_panel(
       <select id="cfg-effort" class="chat-config-select" onchange="onConfigChange()"></select>
     </div>
     <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Pinned Context</label>
-      <textarea id="cfg-pinned-context" class="chat-config-textarea" placeholder="Context sent with every message to this agent..." oninput="onPinnedContextChange()"></textarea>
+      <div class="chat-config-label-row">
+        <label class="chat-config-label" for="cfg-pinned-context">Pinned Context</label>
+        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('cfg-pinned-context')" title="Edit Pinned Context">{edit_icon}</button>
+      </div>
+      <textarea id="cfg-pinned-context" class="chat-config-textarea expanded-editor-source" data-editor-label="Pinned Context" data-editor-save="pinned" placeholder="Context sent with every message to this agent..." readonly onclick="return openExpandedTextEditor('cfg-pinned-context')"></textarea>
     </div>
     <div class="chat-config-field" id="cfg-project-context-field" style="flex:1;display:flex;flex-direction:column;display:none;">
       <label class="chat-config-label">Project Context</label>
@@ -3502,20 +3508,32 @@ pub fn render_chat_main_panel(
       <select id="mgr-backend" class="chat-config-select" onchange="onManageChange()"></select>
     </div>
     <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Goals</label>
-      <textarea id="mgr-goals" class="chat-config-textarea" placeholder="What should the agent accomplish?" oninput="onManageFieldChange()"></textarea>
+      <div class="chat-config-label-row">
+        <label class="chat-config-label" for="mgr-goals">Goals</label>
+        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('mgr-goals')" title="Edit Goals">{edit_icon}</button>
+      </div>
+      <textarea id="mgr-goals" class="chat-config-textarea expanded-editor-source" data-editor-label="Goals" data-editor-save="manage" placeholder="What should the agent accomplish?" readonly onclick="return openExpandedTextEditor('mgr-goals')"></textarea>
     </div>
     <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Stopping Point</label>
-      <textarea id="mgr-stopping" class="chat-config-textarea" placeholder="When should the manager stop the agent?" oninput="onManageFieldChange()"></textarea>
+      <div class="chat-config-label-row">
+        <label class="chat-config-label" for="mgr-stopping">Stopping Point</label>
+        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('mgr-stopping')" title="Edit Stopping Point">{edit_icon}</button>
+      </div>
+      <textarea id="mgr-stopping" class="chat-config-textarea expanded-editor-source" data-editor-label="Stopping Point" data-editor-save="manage" placeholder="When should the manager stop the agent?" readonly onclick="return openExpandedTextEditor('mgr-stopping')"></textarea>
     </div>
     <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Periodic Checks</label>
-      <textarea id="mgr-checks" class="chat-config-textarea" placeholder="What should the agent verify every few turns?" oninput="onManageFieldChange()"></textarea>
+      <div class="chat-config-label-row">
+        <label class="chat-config-label" for="mgr-checks">Periodic Checks</label>
+        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('mgr-checks')" title="Edit Periodic Checks">{edit_icon}</button>
+      </div>
+      <textarea id="mgr-checks" class="chat-config-textarea expanded-editor-source" data-editor-label="Periodic Checks" data-editor-save="manage" placeholder="What should the agent verify every few turns?" readonly onclick="return openExpandedTextEditor('mgr-checks')"></textarea>
     </div>
     <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <label class="chat-config-label">Red Flags</label>
-      <textarea id="mgr-redflags" class="chat-config-textarea" placeholder="What should cause the manager to halt the agent?" oninput="onManageFieldChange()"></textarea>
+      <div class="chat-config-label-row">
+        <label class="chat-config-label" for="mgr-redflags">Red Flags</label>
+        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('mgr-redflags')" title="Edit Red Flags">{edit_icon}</button>
+      </div>
+      <textarea id="mgr-redflags" class="chat-config-textarea expanded-editor-source" data-editor-label="Red Flags" data-editor-save="manage" placeholder="What should cause the manager to halt the agent?" readonly onclick="return openExpandedTextEditor('mgr-redflags')"></textarea>
     </div>
     <div class="chat-config-field">
       <button type="button" class="btn-lg" id="mgr-toggle" onclick="toggleManageMode()">Enable</button>
@@ -3530,11 +3548,33 @@ pub fn render_chat_main_panel(
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
   </button>
 </form>
+<div class="expanded-editor-overlay" id="expanded-text-editor" style="display:none;">
+  <div class="expanded-editor-shell">
+    <div class="expanded-editor-header">
+      <div class="expanded-editor-kicker">Editing</div>
+      <h2 class="expanded-editor-title" id="expanded-editor-title">Edit</h2>
+    </div>
+    <textarea id="expanded-editor-input" class="expanded-editor-input" spellcheck="false"></textarea>
+    <div class="expanded-editor-footer">
+      <div class="expanded-editor-actions expanded-editor-actions-desktop">
+        <button type="button" class="btn-lg" onclick="return cancelExpandedTextEditor()">Cancel</button>
+        <button type="button" class="btn-lg button-link" onclick="return saveExpandedTextEditor()">Save</button>
+      </div>
+      <div class="expanded-editor-actions expanded-editor-actions-mobile">
+        <button type="button" class="btn-sm" onclick="return cancelExpandedTextEditor()" title="Cancel">{close_icon}</button>
+        <button type="button" class="btn-sm button-link" onclick="return saveExpandedTextEditor()" title="Save">{check_icon}</button>
+      </div>
+    </div>
+  </div>
+</div>
 "#,
             header_avatar = header_avatar,
             display_name = escape_text(display),
             cwd_html = cwd_html,
             settings_icon = ICON_SETTINGS,
+            edit_icon = ICON_EDIT,
+            close_icon = ICON_CLOSE,
+            check_icon = ICON_CHECK,
             csrf_token = escape_attribute(csrf_token),
         );
     }
@@ -4026,6 +4066,8 @@ function initializeChatPanel() {{
   chatFollowScroll = true;
   clearChatMessageSwipeGesture();
   chatMessageEditPending = false;
+  expandedTextEditorState = null;
+  setExpandedTextEditorOpen(false);
   closeAllPanels();
   setActiveAgentInList(currentAgent);
   if (eventSource) {{
@@ -4761,6 +4803,10 @@ function expandSvg(container) {{
 
 document.addEventListener('keydown', function(e) {{
   if (e.key === 'Escape') {{
+    if (expandedTextEditorState) {{
+      cancelExpandedTextEditor();
+      return;
+    }}
     var ov = document.querySelector('.svg-overlay');
     if (ov) ov.remove();
   }}
@@ -5317,6 +5363,9 @@ function connectSSE() {{
           insertOrReconcileConfirmedUserMessage(evt.data);
           renderMessages();
         }}
+      }} else if (evt.event_type === 'message' && evt.data) {{
+        moveAgentItemToTop(evt.agent);
+        updateAgentListPreview(evt.agent, evt.data.content || '');
       }} else if (evt.event_type === 'response_complete') {{
         updateAgentListPreview(evt.agent, evt.data && evt.data.content ? evt.data.content : '');
       }} else if (evt.event_type === 'status') {{
@@ -5451,6 +5500,7 @@ var configSaveTimer = null;
 var manageSaveTimer = null;
 var chatMessageEditPending = false;
 var chatMessageSwipeGesture = null;
+var expandedTextEditorState = null;
 var CHAT_MESSAGE_SWIPE_REVEAL = 44;
 var CHAT_MESSAGE_SWIPE_OPEN_THRESHOLD = 14;
 var CHAT_MESSAGE_SWIPE_TOGGLE_THRESHOLD = 30;
@@ -5470,6 +5520,7 @@ var backendEfforts = {{
 }};
 
 function closeAllPanels() {{
+  cancelExpandedTextEditor();
   var msgsWrap = document.getElementById('chat-messages-wrap');
   var form = document.getElementById('chat-input-form');
   var cfg = document.getElementById('chat-config-panel');
@@ -5485,6 +5536,62 @@ function closeAllPanels() {{
   chatConfigOpen = false;
   chatManageOpen = false;
   updateChatJumpButton();
+}}
+
+function setExpandedTextEditorOpen(open) {{
+  var overlay = document.getElementById('expanded-text-editor');
+  if (overlay) overlay.style.display = open ? 'flex' : 'none';
+  document.body.classList.toggle('expanded-editor-open', !!open);
+}}
+
+function openExpandedTextEditor(sourceId) {{
+  var source = document.getElementById(sourceId);
+  var overlay = document.getElementById('expanded-text-editor');
+  var input = document.getElementById('expanded-editor-input');
+  var title = document.getElementById('expanded-editor-title');
+  if (!source || !overlay || !input || !title || source.disabled) return false;
+  expandedTextEditorState = {{
+    sourceId: sourceId,
+    saveKind: source.getAttribute('data-editor-save') || ''
+  }};
+  title.textContent = source.getAttribute('data-editor-label') || 'Edit';
+  input.value = source.value || '';
+  input.placeholder = source.getAttribute('placeholder') || '';
+  setExpandedTextEditorOpen(true);
+  window.setTimeout(function() {{
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }}, 0);
+  return false;
+}}
+
+function cancelExpandedTextEditor() {{
+  expandedTextEditorState = null;
+  setExpandedTextEditorOpen(false);
+  return false;
+}}
+
+function saveExpandedTextEditor() {{
+  if (!expandedTextEditorState) return false;
+  var source = document.getElementById(expandedTextEditorState.sourceId);
+  var input = document.getElementById('expanded-editor-input');
+  if (!source || !input) {{
+    cancelExpandedTextEditor();
+    return false;
+  }}
+  source.value = input.value;
+  var saveKind = expandedTextEditorState.saveKind;
+  cancelExpandedTextEditor();
+  if (saveKind === 'pinned') {{
+    if (pinnedSaveTimer) clearTimeout(pinnedSaveTimer);
+    savePinnedContext();
+  }} else if (saveKind === 'manage') {{
+    if (manageSaveTimer) clearTimeout(manageSaveTimer);
+    saveManageConfig();
+  }} else {{
+    source.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  }}
+  return false;
 }}
 
 function toggleChatConfig() {{
@@ -9886,6 +9993,12 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       flex-direction: column;
       gap: var(--s-1);
     }
+    .chat-config-label-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--s-2);
+    }
     .chat-config-label {
       font-size: 0.85rem;
       font-weight: 600;
@@ -9917,6 +10030,80 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: var(--bg-secondary, var(--bg));
       opacity: 0.75;
       cursor: default;
+    }
+    .expanded-editor-source {
+      resize: none;
+      cursor: pointer;
+    }
+    .expanded-editor-source:hover {
+      border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+    }
+    body.expanded-editor-open {
+      overflow: hidden;
+    }
+    .expanded-editor-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      background: color-mix(in srgb, var(--bg) 78%, black 22%);
+      display: none;
+    }
+    .expanded-editor-shell {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-4);
+      padding: max(var(--s-5), env(safe-area-inset-top)) var(--s-5) max(var(--s-5), env(safe-area-inset-bottom));
+      background: var(--bg);
+    }
+    .expanded-editor-header {
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-1);
+    }
+    .expanded-editor-kicker {
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--fg-muted);
+    }
+    .expanded-editor-title {
+      margin: 0;
+      font-size: 1.15rem;
+      line-height: 1.2;
+    }
+    .expanded-editor-input {
+      flex: 1;
+      min-height: 0;
+      width: 100%;
+      padding: var(--s-4);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--input-bg);
+      color: var(--ink);
+      font: inherit;
+      font-family: var(--font-mono);
+      font-size: 0.95rem;
+      line-height: 1.55;
+      resize: none;
+    }
+    .expanded-editor-footer {
+      position: sticky;
+      bottom: 0;
+      padding-top: var(--s-2);
+      background: linear-gradient(to top, var(--bg) 72%, transparent);
+    }
+    .expanded-editor-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: var(--s-2);
+    }
+    .expanded-editor-actions-mobile {
+      display: none;
     }
     .chat-messages-wrap {
       position: relative;
@@ -10505,6 +10692,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border: none;
       border-radius: 6px;
       width: 38px;
+      height: 38px;
       min-width: 38px;
       padding: 0;
       cursor: pointer;
@@ -10512,7 +10700,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       align-items: center;
       justify-content: center;
       flex-shrink: 0;
-      align-self: stretch;
+      align-self: flex-end;
     }
     .chat-send-btn:hover { opacity: 0.85; }
     .chat-empty {
@@ -11890,6 +12078,20 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       }
 
     }
+
+    @media (max-width: 640px) {
+      .expanded-editor-shell {
+        padding: max(var(--s-4), env(safe-area-inset-top)) var(--s-3) max(var(--s-4), env(safe-area-inset-bottom));
+      }
+
+      .expanded-editor-actions-desktop {
+        display: none;
+      }
+
+      .expanded-editor-actions-mobile {
+        display: flex;
+      }
+    }
     "#;
     format!("{root}{base}{rest}")
 }
@@ -12138,6 +12340,52 @@ mod tests {
         assert!(html.contains("function formatChatTimestamp(value) {"));
         assert!(html.contains(".chat-msg-timestamp {"));
         assert!(html.contains("chat-msg-row-"));
+    }
+
+    #[test]
+    fn chat_page_updates_agent_list_preview_for_assistant_message_events() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("worker"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("updateAgentListPreview(evt.agent, evt.data.content || '');"));
+        assert!(html.contains("moveAgentItemToTop(evt.agent);"));
+    }
+
+    #[test]
+    fn chat_page_includes_expanded_text_editor_shell_for_large_config_fields() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("worker"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains(r#"id="expanded-text-editor""#));
+        assert!(html.contains("function openExpandedTextEditor(sourceId) {"));
+        assert!(html.contains("function saveExpandedTextEditor() {"));
+        assert!(html.contains(r#"data-editor-save="pinned""#));
+        assert!(html.contains(r#"data-editor-save="manage""#));
+        assert!(html.contains(".expanded-editor-actions-desktop {"));
+        assert!(html.contains(".expanded-editor-actions-mobile {"));
+        assert!(html.contains("@media (max-width: 640px) {"));
     }
 
     #[test]
