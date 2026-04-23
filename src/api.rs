@@ -595,6 +595,11 @@ fn build_app_with_librarian(
         .route("/v1/admin/auto-update/apply", post(apply_auto_update))
         .route("/v1/admin/librarian-runs", get(list_admin_librarian_runs))
         .route("/v1/projects", get(list_projects))
+        .route(
+            "/v1/documents/{doc_id}/project",
+            get(resolve_document_project),
+        )
+        .route("/v1/blocks/{block_id}/project", get(resolve_block_project))
         .route("/v1/context", get(get_all_agent_context))
         .route("/v1/machines/register", post(register_machine))
         .route("/v1/machines/poll", post(machine_service_poll))
@@ -1098,7 +1103,7 @@ struct CreateBlockForm {
 #[derive(Debug, Deserialize)]
 struct UpdateBlockRequest {
     project: String,
-    block_type: BlockType,
+    block_type: Option<BlockType>,
     content: String,
     left: Option<String>,
     right: Option<String>,
@@ -1126,7 +1131,7 @@ struct ProjectBlockRequest {
 
 #[derive(Debug, Deserialize)]
 struct ProjectBlockUpdateRequest {
-    block_type: BlockType,
+    block_type: Option<BlockType>,
     content: String,
     after_block_id: Option<String>,
 }
@@ -1157,9 +1162,16 @@ struct DocBlockCreateRequest {
 
 #[derive(Debug, Deserialize)]
 struct DocBlockUpdateRequest {
-    block_type: BlockType,
+    block_type: Option<BlockType>,
     content: String,
     after_block_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectResolutionBody {
+    project: String,
+    document_id: Option<String>,
+    block_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2226,6 +2238,44 @@ async fn list_projects(
     Ok(Json(projects))
 }
 
+async fn resolve_document_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(doc_id): Path<String>,
+) -> ApiResult<Json<ProjectResolutionBody>> {
+    let actor = require_authenticated_actor(&state, &headers)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let project = state.store.find_document_project(&doc_id)?;
+    let visible = filter_projects_for_actor(&actor, std::slice::from_ref(&project));
+    if visible.is_empty() {
+        return Err(LoreError::Validation(format!("document '{}' not found", doc_id)).into());
+    }
+    Ok(Json(ProjectResolutionBody {
+        project: project.as_str().to_string(),
+        document_id: Some(doc_id.as_str().to_string()),
+        block_id: None,
+    }))
+}
+
+async fn resolve_block_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(block_id): Path<String>,
+) -> ApiResult<Json<ProjectResolutionBody>> {
+    let actor = require_authenticated_actor(&state, &headers)?;
+    let block_id = BlockId::from_string(block_id)?;
+    let (project, doc_id) = state.store.find_block_project_and_document(&block_id)?;
+    let visible = filter_projects_for_actor(&actor, std::slice::from_ref(&project));
+    if visible.is_empty() {
+        return Err(LoreError::BlockNotFound(block_id.as_str().to_string()).into());
+    }
+    Ok(Json(ProjectResolutionBody {
+        project: project.as_str().to_string(),
+        document_id: Some(doc_id.as_str().to_string()),
+        block_id: Some(block_id.as_str().to_string()),
+    }))
+}
+
 async fn get_all_agent_context(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2535,10 +2585,11 @@ async fn api_update_doc_block(
     let before = state
         .store
         .snapshot_doc_block(&project, &doc_id, &block_id)?;
+    let existing = state.store.get_doc_block(&project, &doc_id, &block_id)?;
     let update = UpdateBlock {
         project: project.clone(),
         block_id,
-        block_type: body.block_type,
+        block_type: body.block_type.unwrap_or(existing.block_type),
         content: body.content,
         author_key: actor_author_value(&actor),
         left,
@@ -3874,10 +3925,12 @@ async fn update_block(
 ) -> ApiResult<Json<Block>> {
     let project = ProjectName::new(payload.project)?;
     let actor = authorize_project_write(&state, &headers, &project)?;
+    let block_id = BlockId::from_string(id)?;
+    let existing = state.store.get_block(&project, &block_id)?;
     let update = UpdateBlock {
         project: project.clone(),
-        block_id: BlockId::from_string(id)?,
-        block_type: payload.block_type,
+        block_id: block_id.clone(),
+        block_type: payload.block_type.unwrap_or(existing.block_type),
         content: payload.content,
         author_key: actor_author_value(&actor),
         left: payload.left.map(OrderKey::new).transpose()?,
@@ -3917,6 +3970,7 @@ async fn update_project_block(
     let project = ProjectName::new(project)?;
     let block_id = BlockId::from_string(id)?;
     let actor = authorize_project_write(&state, &headers, &project)?;
+    let existing = state.store.get_block(&project, &block_id)?;
     let after_block_id = payload
         .after_block_id
         .map(BlockId::from_string)
@@ -3928,7 +3982,7 @@ async fn update_project_block(
     let update = UpdateBlock {
         project: project.clone(),
         block_id,
-        block_type: payload.block_type,
+        block_type: payload.block_type.unwrap_or(existing.block_type),
         content: payload.content,
         author_key: actor_author_value(&actor),
         left,
@@ -20430,5 +20484,121 @@ mod tests {
             text.contains("does not belong to project"),
             "error should mention project scope: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_project_endpoints_return_accessible_document_and_block_project() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Resolve Target", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Scratch")
+            .unwrap();
+        let block = store
+            .create_doc_block(
+                &doc.id,
+                crate::NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Markdown,
+                    content: "hello".into(),
+                    author_key: "seed-key".into(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let token = issue_agent_token_multi_project(
+            &app,
+            dir.path(),
+            "agent-resolve-project",
+            &[(project.slug.as_str(), ProjectPermission::ReadWrite)],
+        )
+        .await;
+
+        let doc_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/documents/{}/project", doc.id))
+            .header(API_KEY_HEADER, &token)
+            .body(Body::empty())
+            .unwrap();
+        let doc_response = app.clone().oneshot(doc_request).await.unwrap();
+        assert_eq!(doc_response.status(), StatusCode::OK);
+        let doc_body = axum::body::to_bytes(doc_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc_json: Value = serde_json::from_slice(&doc_body).unwrap();
+        assert_eq!(doc_json["project"], json!(project.slug.as_str()));
+        assert_eq!(doc_json["document_id"], json!(doc.id.as_str()));
+
+        let block_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/blocks/{}/project", block.id))
+            .header(API_KEY_HEADER, &token)
+            .body(Body::empty())
+            .unwrap();
+        let block_response = app.clone().oneshot(block_request).await.unwrap();
+        assert_eq!(block_response.status(), StatusCode::OK);
+        let block_body = axum::body::to_bytes(block_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let block_json: Value = serde_json::from_slice(&block_body).unwrap();
+        assert_eq!(block_json["project"], json!(project.slug.as_str()));
+        assert_eq!(block_json["document_id"], json!(doc.id.as_str()));
+        assert_eq!(block_json["block_id"], json!(block.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn update_doc_block_accepts_missing_block_type_and_keeps_existing_type() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Update Target", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Scratch")
+            .unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let token = issue_agent_token_multi_project(
+            &app,
+            dir.path(),
+            "agent-update-doc-block",
+            &[(project.slug.as_str(), ProjectPermission::ReadWrite)],
+        )
+        .await;
+        let block = store
+            .create_doc_block(
+                &doc.id,
+                crate::NewBlock {
+                    project: project.slug.clone(),
+                    block_type: BlockType::Markdown,
+                    content: "before".into(),
+                    author_key: token.clone(),
+                    left: None,
+                    right: None,
+                    image_upload: None,
+                },
+            )
+            .unwrap();
+
+        let request = Request::builder()
+            .method("PATCH")
+            .uri(format!(
+                "/v1/projects/{}/documents/{}/blocks/{}",
+                project.slug.as_str(),
+                doc.id.as_str(),
+                block.id.as_str()
+            ))
+            .header("content-type", "application/json")
+            .header(API_KEY_HEADER, &token)
+            .body(Body::from(r#"{"content":"after"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["content"], json!("after"));
+        assert_eq!(json["block_type"], json!("markdown"));
     }
 }

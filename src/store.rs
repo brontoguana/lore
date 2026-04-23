@@ -1785,6 +1785,30 @@ impl FileBlockStore {
             .ok_or_else(|| LoreError::BlockNotFound(block_id.as_str().to_string()))
     }
 
+    pub fn find_document_project(&self, doc_id: &DocumentId) -> Result<ProjectName> {
+        for project in self.list_projects()? {
+            if self.find_doc_dir(&project, doc_id).is_ok() {
+                return Ok(project);
+            }
+        }
+        Err(LoreError::Validation(format!(
+            "document '{}' not found",
+            doc_id
+        )))
+    }
+
+    pub fn find_block_project_and_document(
+        &self,
+        block_id: &BlockId,
+    ) -> Result<(ProjectName, DocumentId)> {
+        for project in self.list_projects()? {
+            if let Ok(doc_id) = self.find_block_document(&project, block_id) {
+                return Ok((project, doc_id));
+            }
+        }
+        Err(LoreError::BlockNotFound(block_id.as_str().to_string()))
+    }
+
     pub fn read_doc_blocks_around(
         &self,
         project: &ProjectName,

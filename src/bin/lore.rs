@@ -95,6 +95,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Manage the repo-local Lore project marker
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
     /// List all projects
     Projects,
     /// Read the project overview
@@ -149,6 +154,22 @@ enum ConfigCommand {
     Set(ConfigSetArgs),
     /// Clear configuration values
     Clear(ConfigClearArgs),
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// Show the resolved repo-local project marker for the current directory
+    Show,
+    /// Write or update the nearest repo-local .lore/project file
+    SetLocal(ProjectSetLocalArgs),
+    /// Remove the nearest repo-local .lore/project file
+    ClearLocal,
+}
+
+#[derive(Args)]
+struct ProjectSetLocalArgs {
+    /// Project slug or display name
+    project: String,
 }
 
 #[derive(Args)]
@@ -620,6 +641,24 @@ struct CliConfig {
     last_update_check: Option<OffsetDateTime>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProjectResolutionResponse {
+    project: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedProject {
+    value: String,
+    source: ProjectSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProjectSource {
+    Flag,
+    Env,
+    LocalFile(PathBuf),
+}
+
 #[derive(Debug)]
 struct CliContext {
     client: reqwest::Client,
@@ -735,6 +774,14 @@ struct ErrorBody {
     error: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DocBlockChunkResponse {
+    content: String,
+    total_lines: usize,
+    offset: usize,
+    limit: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct AskLibrarianRequest {
     question: String,
@@ -769,6 +816,7 @@ async fn run() -> CliResult<()> {
 
     match cli.command {
         Command::Config { command } => return run_config(command, &mut config),
+        Command::Project { command } => return run_project_command(command),
         Command::SelfUpdate { command } => return run_update(command, &mut config).await,
         Command::Setup(args) => {
             let url = normalize_url(&args.url);
@@ -874,7 +922,10 @@ async fn run() -> CliResult<()> {
         Command::History { command } => history_command(&context, command).await?,
         Command::Agent(args) => agent_command(&context, args).await?,
         Command::Service(args) => service_command(&context, args).await?,
-        Command::Config { .. } | Command::SelfUpdate { .. } | Command::Setup(_) => {}
+        Command::Config { .. }
+        | Command::Project { .. }
+        | Command::SelfUpdate { .. }
+        | Command::Setup(_) => {}
     }
     Ok(())
 }
@@ -889,7 +940,7 @@ fn run_config(command: ConfigCommand, config: &mut CliConfig) -> CliResult<()> {
                 config.token.as_ref().map(|_| "(set)").unwrap_or("(unset)")
             );
             println!(
-                "project: {}",
+                "project (legacy global fallback, not used by default): {}",
                 config.project.as_deref().unwrap_or("(unset)")
             );
             println!(
@@ -904,6 +955,7 @@ fn run_config(command: ConfigCommand, config: &mut CliConfig) -> CliResult<()> {
             println!("update stream: {}", config.update_stream.as_str());
         }
         ConfigCommand::Set(args) => {
+            let set_project = args.project.is_some();
             if let Some(url) = args.url {
                 config.url = Some(normalize_url(&url));
             }
@@ -916,6 +968,11 @@ fn run_config(command: ConfigCommand, config: &mut CliConfig) -> CliResult<()> {
             }
             save_cli_config(config)?;
             println!("saved {}", cli_config_path()?.display());
+            if set_project {
+                println!(
+                    "note: config --project is legacy; prefer a repo-local .lore/project file or --project"
+                );
+            }
         }
         ConfigCommand::Clear(args) => {
             if !(args.url || args.token || args.project) {
@@ -935,6 +992,55 @@ fn run_config(command: ConfigCommand, config: &mut CliConfig) -> CliResult<()> {
             }
             save_cli_config(config)?;
             println!("saved {}", cli_config_path()?.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_project_command(command: ProjectCommand) -> CliResult<()> {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match command {
+        ProjectCommand::Show => {
+            if let Some(path) = find_cwd_project_file(&cwd) {
+                let value = fs::read_to_string(&path)?;
+                let project = value.trim();
+                println!("project file: {}", path.display());
+                if project.is_empty() {
+                    println!("project: (empty)");
+                } else {
+                    println!("project: {project}");
+                }
+            } else {
+                println!("No repo-local .lore/project found from {}.", cwd.display());
+            }
+        }
+        ProjectCommand::SetLocal(args) => {
+            let project = canonicalize_project_value(&args.project)?.to_string();
+            let path = local_project_file_target(&cwd);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, format!("{project}\n"))?;
+            let applies_to = path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(cwd.as_path());
+            println!(
+                "Set local project '{}' for {}.",
+                project,
+                applies_to.display()
+            );
+            println!("project file: {}", path.display());
+        }
+        ProjectCommand::ClearLocal => {
+            let Some(path) = find_cwd_project_file(&cwd) else {
+                return Err(io::Error::other(
+                    "no repo-local .lore/project found from current directory",
+                )
+                .into());
+            };
+            fs::remove_file(&path)?;
+            println!("removed {}", path.display());
         }
     }
     Ok(())
@@ -1066,9 +1172,9 @@ async fn run_update(command: UpdateCommand, config: &mut CliConfig) -> CliResult
 }
 
 async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<()> {
-    let project = context.require_project(None)?;
     match command {
         DocsCommand::List => {
+            let project = context.require_project(None)?;
             let path = format!("/v1/projects/{}/documents", project.as_str());
             let resp: serde_json::Value = context.get_json(&path).await?;
             let docs = resp["documents"].as_array();
@@ -1080,6 +1186,7 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
             }
         }
         DocsCommand::Read(args) => {
+            let project = context.resolve_project_for_document(&args.doc_id).await?;
             let mut path = format!(
                 "/v1/projects/{}/documents/{}/text",
                 project.as_str(),
@@ -1098,6 +1205,7 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
             println!("{}", text);
         }
         DocsCommand::Write(args) => {
+            let project = context.resolve_project_for_document(&args.doc_id).await?;
             let content = load_doc_write_content(&args)?;
             let path = format!(
                 "/v1/projects/{}/documents/{}/text",
@@ -1120,6 +1228,11 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
             );
         }
         DocsCommand::Create(args) => {
+            let project = match (&context.project, &args.parent) {
+                (Some(_), _) => context.require_project(None)?,
+                (None, Some(parent)) => context.resolve_project_for_document(parent).await?,
+                (None, None) => context.require_project(None)?,
+            };
             let path = format!("/v1/projects/{}/documents", project.as_str());
             let resp: serde_json::Value = context
                 .send_json(
@@ -1136,6 +1249,7 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
             println!("Created document \"{}\" ({}).", name, id);
         }
         DocsCommand::Rename(args) => {
+            let project = context.resolve_project_for_document(&args.doc_id).await?;
             let path = format!(
                 "/v1/projects/{}/documents/{}",
                 project.as_str(),
@@ -1151,6 +1265,7 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
             println!("Renamed document {} to \"{}\".", args.doc_id, args.name);
         }
         DocsCommand::Delete(args) => {
+            let project = context.resolve_project_for_document(&args.doc_id).await?;
             if !args.yes {
                 return Err(io::Error::other("delete requires --yes").into());
             }
@@ -1179,9 +1294,9 @@ fn print_doc_tree(docs: &[serde_json::Value], depth: usize) {
 }
 
 async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResult<()> {
-    let project = context.require_project(None)?;
     match command {
         BlocksCommand::List(args) => {
+            let project = context.resolve_project_for_document(&args.doc).await?;
             let path = format!(
                 "/v1/projects/{}/documents/{}/blocks",
                 project.as_str(),
@@ -1203,38 +1318,20 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             }
         }
         BlocksCommand::Read(args) => {
-            let path = format!(
-                "/v1/projects/{}/documents/{}/blocks/{}",
-                project.as_str(),
-                args.doc,
-                args.id
-            );
-            let block: Block = context.get_json(&path).await?;
-            let content = match (args.offset, args.limit) {
-                (Some(off), Some(lim)) => block
-                    .content
-                    .lines()
-                    .skip(off)
-                    .take(lim)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                (Some(off), None) => block
-                    .content
-                    .lines()
-                    .skip(off)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                (None, Some(lim)) => block
-                    .content
-                    .lines()
-                    .take(lim)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                (None, None) => block.content.clone(),
-            };
+            let project = context.resolve_project_for_document(&args.doc).await?;
+            let content = read_block_content(
+                context,
+                &project,
+                &args.doc,
+                &args.id,
+                args.offset,
+                args.limit,
+            )
+            .await?;
             println!("{}", content);
         }
         BlocksCommand::Around(args) => {
+            let project = context.resolve_project_for_block(&args.id).await?;
             let path = format!(
                 "/v1/projects/{}/blocks/{}/around?before={}&after={}",
                 project.as_str(),
@@ -1259,6 +1356,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             }
         }
         BlocksCommand::Create(args) => {
+            let project = context.resolve_project_for_document(&args.doc).await?;
             let content = load_cli_text_input(
                 args.content.as_ref(),
                 args.file.as_ref(),
@@ -1285,6 +1383,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             println!("Created block {}.", block.id);
         }
         BlocksCommand::Update(args) => {
+            let project = context.resolve_project_for_document(&args.doc).await?;
             let content = load_cli_text_input(
                 args.content.as_ref(),
                 args.file.as_ref(),
@@ -1305,6 +1404,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             println!("Updated block {}.", block.id);
         }
         BlocksCommand::Edit(args) => {
+            let project = context.resolve_project_for_document(&args.doc).await?;
             let path = format!(
                 "/v1/projects/{}/documents/{}/blocks/{}/edit",
                 project.as_str(),
@@ -1324,6 +1424,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             println!("Edited block {}.", block.id);
         }
         BlocksCommand::Move(args) => {
+            let project = context.resolve_project_for_document(&args.doc).await?;
             let path = format!(
                 "/v1/projects/{}/documents/{}/blocks/{}/move",
                 project.as_str(),
@@ -1340,6 +1441,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             println!("Moved block {} to order {}.", block.id, block.order);
         }
         BlocksCommand::Delete(args) => {
+            let project = context.resolve_project_for_document(&args.doc).await?;
             if !args.yes {
                 return Err(io::Error::other("delete requires --yes").into());
             }
@@ -1353,6 +1455,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             println!("Deleted block {}.", args.id);
         }
         BlocksCommand::Split(args) => {
+            let project = context.resolve_project_for_document(&args.doc).await?;
             let path = format!(
                 "/v1/projects/{}/documents/{}/blocks/{}/split",
                 project.as_str(),
@@ -1371,6 +1474,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
             println!("Split block {} -> {} + {}.", args.id, original, new_block);
         }
         BlocksCommand::Combine(args) => {
+            let project = context.resolve_project_for_document(&args.doc).await?;
             if args.ids.len() < 2 {
                 return Err(io::Error::other("combine requires at least 2 block IDs").into());
             }
@@ -1715,24 +1819,32 @@ fn build_context(cli: &Cli, config: &CliConfig) -> CliResult<CliContext> {
         .or_else(|| env::var("LORE_AGENT_TOKEN").ok())
         .or_else(|| env::var("LORE_TOKEN").ok())
         .or_else(|| config.token.clone());
-    let project = cli
-        .project
-        .clone()
-        .or_else(|| env::var("LORE_PROJECT").ok())
-        .or_else(|| config.project.clone());
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project = resolve_context_project(cli, &cwd);
+    if let Some(resolved) = &project {
+        if let ProjectSource::LocalFile(path) = &resolved.source {
+            eprintln!(
+                "loaded project '{}' from {}",
+                resolved.value,
+                path.display()
+            );
+        }
+    }
     Ok(CliContext {
         client: reqwest::Client::builder().build()?,
         url: normalize_url(&url),
         token,
-        project,
+        project: project.map(|resolved| resolved.value),
     })
 }
 
 impl CliContext {
     fn require_project(&self, project: Option<String>) -> CliResult<ProjectName> {
-        let value = project
-            .or_else(|| self.project.clone())
-            .ok_or_else(|| io::Error::other("set --project, LORE_PROJECT, or config project"))?;
+        let value = project.or_else(|| self.project.clone()).ok_or_else(|| {
+            io::Error::other(
+                "set --project, set LORE_PROJECT, or create .lore/project in this repo",
+            )
+        })?;
         // Try as slug first; if that fails, slugify the display name
         match ProjectName::new(&value) {
             Ok(name) => Ok(name),
@@ -1751,6 +1863,26 @@ impl CliContext {
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> CliResult<T> {
         self.send(Method::GET, path, None::<&()>).await
+    }
+
+    async fn resolve_project_for_document(&self, doc_id: &str) -> CliResult<ProjectName> {
+        if let Some(project) = &self.project {
+            return self.require_project(Some(project.clone()));
+        }
+        let response: ProjectResolutionResponse = self
+            .get_json(&format!("/v1/documents/{}/project", doc_id))
+            .await?;
+        self.require_project(Some(response.project))
+    }
+
+    async fn resolve_project_for_block(&self, block_id: &str) -> CliResult<ProjectName> {
+        if let Some(project) = &self.project {
+            return self.require_project(Some(project.clone()));
+        }
+        let response: ProjectResolutionResponse = self
+            .get_json(&format!("/v1/blocks/{}/project", block_id))
+            .await?;
+        self.require_project(Some(response.project))
     }
 
     async fn get_text(&self, path: &str) -> CliResult<String> {
@@ -2211,6 +2343,161 @@ fn reuse_or_clear_staged_binary(staged_path: &Path, target_version: &str) -> Cli
             Ok(false)
         }
     }
+}
+
+fn resolve_context_project(cli: &Cli, cwd: &Path) -> Option<ResolvedProject> {
+    cli.project
+        .clone()
+        .map(|value| ResolvedProject {
+            value,
+            source: ProjectSource::Flag,
+        })
+        .or_else(|| {
+            env::var("LORE_PROJECT").ok().map(|value| ResolvedProject {
+                value,
+                source: ProjectSource::Env,
+            })
+        })
+        .or_else(|| resolve_cwd_project(cwd))
+}
+
+fn canonicalize_project_value(value: &str) -> CliResult<ProjectName> {
+    match ProjectName::new(value) {
+        Ok(name) => Ok(name),
+        Err(_) => Ok(ProjectName::new(slugify(value))?),
+    }
+}
+
+fn resolve_cwd_project(cwd: &Path) -> Option<ResolvedProject> {
+    let path = find_cwd_project_file(cwd)?;
+    let value = fs::read_to_string(&path).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(ResolvedProject {
+        value: trimmed.to_string(),
+        source: ProjectSource::LocalFile(path),
+    })
+}
+
+fn find_cwd_project_file(cwd: &Path) -> Option<PathBuf> {
+    for dir in cwd.ancestors() {
+        let candidate = dir.join(".lore").join("project");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn local_project_file_target(cwd: &Path) -> PathBuf {
+    find_cwd_project_file(cwd).unwrap_or_else(|| cwd.join(".lore").join("project"))
+}
+
+async fn read_block_content(
+    context: &CliContext,
+    project: &ProjectName,
+    doc_id: &str,
+    block_id: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> CliResult<String> {
+    match (offset, limit) {
+        (Some(offset), limit) => {
+            read_single_block_chunk(context, project, doc_id, block_id, offset, limit).await
+        }
+        (None, Some(limit)) => {
+            read_single_block_chunk(context, project, doc_id, block_id, 0, Some(limit)).await
+        }
+        (None, None) => read_full_block_content(context, project, doc_id, block_id).await,
+    }
+}
+
+async fn read_full_block_content(
+    context: &CliContext,
+    project: &ProjectName,
+    doc_id: &str,
+    block_id: &str,
+) -> CliResult<String> {
+    const CHUNK_LINES: usize = 256;
+
+    let first_chunk =
+        read_doc_block_chunk(context, project, doc_id, block_id, 0, Some(CHUNK_LINES)).await?;
+    if first_chunk.total_lines <= first_chunk.limit {
+        return decode_numbered_block_chunk(&first_chunk.content);
+    }
+
+    let mut parts = Vec::new();
+    parts.push(decode_numbered_block_chunk(&first_chunk.content)?);
+    let mut next_offset = first_chunk.offset + first_chunk.limit;
+    while next_offset < first_chunk.total_lines {
+        let chunk = read_doc_block_chunk(
+            context,
+            project,
+            doc_id,
+            block_id,
+            next_offset,
+            Some(CHUNK_LINES),
+        )
+        .await?;
+        parts.push(decode_numbered_block_chunk(&chunk.content)?);
+        if chunk.limit == 0 {
+            break;
+        }
+        next_offset = chunk.offset + chunk.limit;
+    }
+    Ok(parts.join("\n"))
+}
+
+async fn read_single_block_chunk(
+    context: &CliContext,
+    project: &ProjectName,
+    doc_id: &str,
+    block_id: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> CliResult<String> {
+    let chunk = read_doc_block_chunk(context, project, doc_id, block_id, offset, limit).await?;
+    decode_numbered_block_chunk(&chunk.content)
+}
+
+async fn read_doc_block_chunk(
+    context: &CliContext,
+    project: &ProjectName,
+    doc_id: &str,
+    block_id: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> CliResult<DocBlockChunkResponse> {
+    let mut path = format!(
+        "/v1/projects/{}/documents/{}/blocks/{}?offset={}",
+        project.as_str(),
+        doc_id,
+        block_id,
+        offset
+    );
+    if let Some(limit) = limit {
+        path.push_str("&limit=");
+        path.push_str(&limit.to_string());
+    }
+    context.get_json(&path).await
+}
+
+fn decode_numbered_block_chunk(content: &str) -> CliResult<String> {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let (prefix, body) = line
+            .split_once('\t')
+            .ok_or_else(|| io::Error::other("invalid block chunk response: missing line number"))?;
+        if prefix.parse::<usize>().is_err() {
+            return Err(
+                io::Error::other("invalid block chunk response: malformed line number").into(),
+            );
+        }
+        lines.push(body);
+    }
+    Ok(lines.join("\n"))
 }
 
 async fn stage_binary_from_server(
@@ -6912,11 +7199,12 @@ async fn service_handle_create_agent(
 #[cfg(test)]
 mod tests {
     use super::{
-        DocWriteArgs, append_assistant_segment, append_new_stream_text, count_history_exchanges,
+        Cli, Command, DocWriteArgs, ProjectSource, ResolvedProject, append_assistant_segment,
+        append_new_stream_text, count_history_exchanges, find_cwd_project_file,
         history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
         load_doc_write_content, next_service_update_retry_delay_secs, parse_cli_version_output,
         parse_codex_line, recent_history_exchange_tail, remove_owned_service_pid_file,
-        reuse_or_clear_staged_binary, service_update_target,
+        resolve_context_project, reuse_or_clear_staged_binary, service_update_target,
     };
     use serde_json::json;
     use std::collections::HashSet;
@@ -7260,5 +7548,90 @@ mod tests {
         };
         let err = load_doc_write_content(&args).unwrap_err();
         assert!(err.to_string().contains("only one input source"));
+    }
+
+    #[test]
+    fn resolve_context_project_prefers_explicit_project_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".lore")).unwrap();
+        fs::write(dir.path().join(".lore").join("project"), "cwd-project\n").unwrap();
+
+        let cli = Cli {
+            url: None,
+            token: None,
+            project: Some("flag-project".into()),
+            command: Command::Projects,
+        };
+
+        assert_eq!(
+            resolve_context_project(&cli, dir.path()),
+            Some(ResolvedProject {
+                value: "flag-project".into(),
+                source: ProjectSource::Flag,
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_context_project_falls_back_to_cwd_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b");
+        fs::create_dir_all(nested.join(".unused")).unwrap();
+        fs::create_dir_all(dir.path().join(".lore")).unwrap();
+        fs::write(dir.path().join(".lore").join("project"), "lore\n").unwrap();
+
+        let cli = Cli {
+            url: None,
+            token: None,
+            project: None,
+            command: Command::Projects,
+        };
+
+        assert_eq!(
+            resolve_context_project(&cli, &nested),
+            Some(ResolvedProject {
+                value: "lore".into(),
+                source: ProjectSource::LocalFile(dir.path().join(".lore").join("project")),
+            })
+        );
+        assert_eq!(
+            find_cwd_project_file(&nested),
+            Some(dir.path().join(".lore").join("project"))
+        );
+    }
+
+    #[test]
+    fn resolve_context_project_ignores_legacy_config_and_empty_cwd_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".lore")).unwrap();
+        fs::write(dir.path().join(".lore").join("project"), "\n").unwrap();
+
+        let cli = Cli {
+            url: None,
+            token: None,
+            project: None,
+            command: Command::Projects,
+        };
+
+        assert_eq!(resolve_context_project(&cli, dir.path()), None);
+    }
+
+    #[test]
+    fn local_project_file_target_prefers_nearest_existing_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("repo").join("src");
+        fs::create_dir_all(nested.clone()).unwrap();
+        fs::create_dir_all(dir.path().join("repo").join(".lore")).unwrap();
+        let existing = dir.path().join("repo").join(".lore").join("project");
+        fs::write(&existing, "lore\n").unwrap();
+
+        assert_eq!(super::local_project_file_target(&nested), existing);
+    }
+
+    #[test]
+    fn decode_numbered_block_chunk_preserves_content_lines() {
+        let content =
+            super::decode_numbered_block_chunk("1\tfirst line\n2\t\n3\tthird\twith tab").unwrap();
+        assert_eq!(content, "first line\n\nthird\twith tab");
     }
 }

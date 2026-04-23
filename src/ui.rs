@@ -4297,17 +4297,28 @@ function shouldRefreshChatOnResume(force) {{
   return (now - chatLastStreamEventAt) > 10000;
 }}
 
+function reconnectChatStreamForResume() {{
+  if (eventSource) {{
+    eventSource.close();
+    eventSource = null;
+  }}
+  connectSSE();
+}}
+
 function refreshChatOnResume(force) {{
   if (!shouldRefreshChatOnResume(force)) return;
   chatWasBackgrounded = false;
   chatResumeRefreshInFlight = true;
   chatLastResumeRefreshAt = Date.now();
+  reconnectChatStreamForResume();
   var url = '/ui/chat/panel';
   if (currentAgent) url += '?agent=' + encodeURIComponent(currentAgent);
   fetch(url, {{ cache: 'no-store' }})
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{ applyChatPanelResponse(data, false); }})
-    .catch(function() {{}})
+    .catch(function() {{
+      reconnectChatStreamForResume();
+    }})
     .finally(function() {{
       chatResumeRefreshInFlight = false;
     }});
@@ -11154,6 +11165,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border: none;
       border-radius: 0;
       background: transparent;
+      min-width: 0;
+      max-width: 100%;
       transition: background 0.15s;
     }
 
@@ -11682,6 +11695,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
 
     .block-body pre {
+      display: block;
+      width: 100%;
+      min-width: 0;
       margin: var(--s-4) 0;
       padding: var(--s-4);
       border-radius: var(--s-3);
@@ -11690,7 +11706,13 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       overflow-x: auto;
       max-width: 100%;
       box-sizing: border-box;
+      -webkit-overflow-scrolling: touch;
       font-size: 0.9rem;
+    }
+
+    .block-body pre code {
+      display: block;
+      min-width: max-content;
     }
 
     .media-frame {
@@ -12499,6 +12521,32 @@ mod tests {
 
         assert!(html.contains("updateAgentListPreview(evt.agent, evt.data.content || '');"));
         assert!(html.contains("moveAgentItemToTop(evt.agent);"));
+    }
+
+    #[test]
+    fn chat_page_reconnects_stream_and_refreshes_on_resume() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("worker"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("function reconnectChatStreamForResume() {"));
+        assert!(html.contains("eventSource.close();"));
+        assert!(html.contains("connectSSE();"));
+        assert!(html.contains("reconnectChatStreamForResume();\n  var url = '/ui/chat/panel';"));
+        assert!(html.contains(".catch(function() {\n      reconnectChatStreamForResume();"));
+        assert!(html.contains(
+            "if (document.visibilityState === 'visible') {\n    refreshChatOnResume(false);"
+        ));
     }
 
     #[test]
