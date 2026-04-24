@@ -269,6 +269,28 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
         alert(err && err.message ? err.message : 'Failed to save block');
       }});
       return false;
+    }} else if (saveKind === 'reserved') {{
+      var action = source.getAttribute('data-editor-action') || '';
+      var csrf = document.querySelector('input[name="csrf_token"]');
+      if (!action || !csrf) return false;
+      var formData = new FormData();
+      formData.append('csrf_token', csrf.value);
+      formData.append('content', input.value);
+      fetch(action, {{
+        method: 'POST',
+        body: formData,
+        credentials: 'same-origin'
+      }}).then(function(response) {{
+        if (!response.ok) throw new Error('Section save failed');
+        if (response.redirected && response.url) {{
+          window.location.assign(response.url);
+        }} else {{
+          window.location.reload();
+        }}
+      }}).catch(function(err) {{
+        alert(err && err.message ? err.message : 'Failed to save section');
+      }});
+      return false;
     }} else {{
       source.dispatchEvent(new Event('input', {{ bubbles: true }}));
     }}
@@ -389,23 +411,9 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     }}
   }}
   function toggleReservedEdit(safeId) {{
-    var body = document.getElementById('reserved-' + safeId + '-body');
-    var editPanel = document.getElementById('reserved-' + safeId + '-edit');
-    var band = document.querySelector('.reserved-band-' + safeId);
-    var block = document.querySelector('.reserved-block-' + safeId);
-    if (!editPanel) return;
-    if (editPanel.style.display === 'none') {{
-      if (body) body.style.display = 'none';
-      editPanel.style.display = '';
-      if (band) band.classList.add('editline-band-active');
-      if (block) block.classList.add('editing');
-      var ta = editPanel.querySelector('textarea');
-      if (ta) {{ ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }}
-    }} else {{
-      if (body) body.style.display = '';
-      editPanel.style.display = 'none';
-      if (band) band.classList.remove('editline-band-active');
-      if (block) block.classList.remove('editing');
+    var source = document.getElementById('reserved-' + safeId + '-content');
+    if (source) {{
+      openExpandedTextEditor(source.id);
     }}
   }}
   function toggleEditlineInserter(btn) {{
@@ -6950,13 +6958,15 @@ pub fn render_project_page(
     <div style="margin-top:var(--s-4);">{reserved_html}</div>
     {doc_list_html}
     {read_only_notice}
-    {delete_project_html}"#,
+    {delete_project_html}
+    {expanded_editor_shell}"#,
         rename_html = rename_html,
         project_slug = project_slug,
         reserved_html = reserved_html,
         doc_list_html = doc_list_html,
         read_only_notice = read_only_notice,
         delete_project_html = delete_project_html,
+        expanded_editor_shell = render_expanded_text_editor_shell(),
     );
 
     render_shell(
@@ -6994,13 +7004,12 @@ fn render_reserved_block_panel(
     project: &ProjectName,
     block: &Block,
     can_write: bool,
-    csrf_token: &str,
+    _csrf_token: &str,
 ) -> String {
     let block_id_str = block.id.as_str();
     let label = reserved_block_label(block_id_str);
     let safe_id = block_id_str.replace('-', "_");
     let project_slug = escape_attribute(project.as_str());
-    let csrf = escape_attribute(csrf_token);
     let content = &block.content;
 
     let limit_warning = if let Some((soft, hard)) = reserved_block_limit(block_id_str) {
@@ -7028,20 +7037,20 @@ fn render_reserved_block_panel(
         "panel"
     };
 
-    let edit_form = if can_write {
+    let expanded_editor_source = if can_write {
         format!(
-            r#"<form id="reserved-{safe_id}-form" method="post" action="/ui/{project_slug}/reserved/{block_id}">
-    <textarea name="content" class="block-edit-textarea reserved-textarea">{escaped}</textarea>
-    <input type="hidden" name="csrf_token" value="{csrf}">
-    <div style="display:flex; gap:var(--s-3);">
-      <button type="submit" class="button-link">Save</button>
-      <button type="button" class="button-link" onclick="toggleReservedEdit('{safe_id}')">Cancel</button>
-    </div>
-  </form>"#,
+            r#"<textarea
+        name="content"
+        id="reserved-{safe_id}-content"
+        class="expanded-editor-source"
+        data-editor-label="{label}"
+        data-editor-save="reserved"
+        data-editor-action="/ui/{project_slug}/reserved/{block_id}"
+        style="display:none;">{escaped}</textarea>"#,
             safe_id = safe_id,
+            label = escape_attribute(label),
             project_slug = project_slug,
             block_id = escape_attribute(block_id_str),
-            csrf = csrf,
             escaped = escape_text(content),
         )
     } else {
@@ -7072,7 +7081,7 @@ fn render_reserved_block_panel(
   <div class="editline-row">
     <article class="block reserved-block reserved-block-{safe_id}">
       <div class="block-body" id="reserved-{safe_id}-body">{rendered_body}</div>
-      <div class="block-edit-panel" id="reserved-{safe_id}-edit" style="display:none;">{edit_form}</div>
+      {expanded_editor_source}
     </article>{band_html}
   </div>
 </section>"#,
@@ -10985,6 +10994,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .timeline {
       display: grid;
       gap: 6px;
+      min-width: 0;
+      max-width: 100%;
+      overflow-x: hidden;
     }
 
     .project-tree-panel {
@@ -11229,6 +11241,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .editline-row {
       display: flex;
       align-items: stretch;
+      min-width: 0;
+      max-width: 100%;
     }
 
     .editline-row > .block {
@@ -11804,11 +11818,13 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       line-height: 1.7;
       min-width: 0;
       max-width: 100%;
+      overflow-x: hidden;
       overflow-wrap: anywhere;
       word-break: break-word;
     }
 
     .block-body > * {
+      min-width: 0;
       max-width: 100%;
       box-sizing: border-box;
     }
@@ -12476,6 +12492,94 @@ mod tests {
                 .as_str()
             )
         );
+    }
+
+    #[test]
+    fn project_page_reserved_sections_use_expanded_editor() {
+        let project = ProjectName::new("my-docs").unwrap();
+        let reserved = Block {
+            id: BlockId::reserved(RESERVED_OVERVIEW),
+            project: project.clone(),
+            block_type: BlockType::Markdown,
+            order: crate::model::OrderKey::new("00000001".into()).unwrap(),
+            author: crate::model::KeyFingerprint::from_user_name("admin").unwrap(),
+            content: "Overview body".into(),
+            media_type: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            pinned: false,
+        };
+
+        let html = render_project_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            &project,
+            "My Docs",
+            "project-uuid",
+            &[reserved],
+            &[],
+            None,
+            "admin",
+            true,
+            true,
+            "csrf",
+        );
+
+        assert!(html.contains(r#"id="expanded-text-editor""#));
+        assert!(html.contains(r#"id="reserved-_overview-content""#));
+        assert!(html.contains(r#"data-editor-save="reserved""#));
+        assert!(html.contains(r#"data-editor-action="/ui/my-docs/reserved/_overview""#));
+        assert!(html.contains(r#"onclick="toggleReservedEdit('_overview')""#));
+        assert!(
+            html.contains(
+                "var source = document.getElementById('reserved-' + safeId + '-content');"
+            )
+        );
+        assert!(!html.contains(r#"id="reserved-_overview-edit""#));
+        assert!(!html.contains(r#"id="reserved-_overview-form""#));
+        assert!(!html.contains("class=\"block-edit-textarea reserved-textarea\""));
+    }
+
+    #[test]
+    fn document_page_bounds_code_blocks_to_document_width() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let info = store.create_project("My Docs", None).unwrap();
+        let block = store
+            .create_block(NewBlock {
+                project: info.slug.clone(),
+                block_type: BlockType::Markdown,
+                content: "```rust\nlet really_long_name = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\";\n```".into(),
+                author_key: "key-a".into(),
+                left: None,
+                right: None,
+                image_upload: None,
+            })
+            .unwrap();
+
+        let html = render_document_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            &info.slug,
+            "My Docs",
+            "doc-1",
+            "Doc 1",
+            &[block],
+            &[],
+            None,
+            "admin",
+            true,
+            true,
+            "csrf",
+            &store,
+        );
+
+        assert!(html.contains(".timeline {\n      display: grid;\n      gap: 6px;\n      min-width: 0;\n      max-width: 100%;\n      overflow-x: hidden;"));
+        assert!(html.contains(".editline-row {\n      display: flex;\n      align-items: stretch;\n      min-width: 0;\n      max-width: 100%;"));
+        assert!(html.contains(".block-body {\n      font-size: 1.05rem;\n      line-height: 1.7;\n      min-width: 0;\n      max-width: 100%;\n      overflow-x: hidden;"));
+        assert!(html.contains(".block-body > * {\n      min-width: 0;\n      max-width: 100%;"));
+        assert!(html.contains(".block-body pre {"));
+        assert!(html.contains("overflow-x: auto;"));
+        assert!(html.contains("-webkit-overflow-scrolling: touch;"));
     }
 
     #[test]
