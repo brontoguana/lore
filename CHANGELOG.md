@@ -12,3 +12,7 @@
 - Locked the fullscreen expanded editor to the visible viewport and editor scroll area so document content cannot scroll underneath it and the editor cannot drift horizontally.
 - Kept the fullscreen expanded editor backdrop fixed edge-to-edge while only the editor shell tracks the visual viewport, preventing document content from showing at the top or bottom edges.
 - Added Codex model selection to agent configuration, using Codex's local model cache when available and a current documented Codex model fallback otherwise.
+- Fixed admin manager prompt edit controls so the glyph edit button is right-aligned and ticking "Edit this prompt" reliably enables the shared expanded editor from either the button or preview.
+- Hardened admin manager prompt editing so the glyph action has a dedicated right-aligned style slot and checked prompts explicitly remove the disabled source-field attribute before opening the expanded editor.
+- Locked chat text-size adjustment on mobile so rotating the phone cannot leave agent chat messages or the composer stuck at an inflated Safari font size.
+- Fixed project reserved-section expanded-editor saves so Agent Context, Overview, and File Map submit URL-encoded form bodies matching the UI endpoint instead of multipart `FormData`.

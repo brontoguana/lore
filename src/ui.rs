@@ -315,11 +315,12 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
       var action = source.getAttribute('data-editor-action') || '';
       var csrf = document.querySelector('input[name="csrf_token"]');
       if (!action || !csrf) return false;
-      var formData = new FormData();
-      formData.append('csrf_token', csrf.value);
-      formData.append('content', input.value);
+      var formData = new URLSearchParams();
+      formData.set('csrf_token', csrf.value);
+      formData.set('content', input.value);
       fetch(action, {{
         method: 'POST',
+        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
         body: formData,
         credentials: 'same-origin'
       }}).then(function(response) {{
@@ -1922,17 +1923,20 @@ pub fn render_admin_page(
           <div style="padding:0 var(--s-5) var(--s-5);">
             <div class="chat-config-field-header">
               <label class="chat-config-label" for="manager-review-prompt">Prompt</label>
-              <button
-                type="button"
-                class="btn-sm"
-                data-manager-edit-button="manager-review-prompt"
-                onclick="return openExpandedTextEditor('manager-review-prompt')"
-                title="Edit Review Latest Output Prompt"{manager_review_disabled}>{edit_icon}</button>
+              <span class="chat-config-field-actions">
+                <button
+                  type="button"
+                  class="btn-sm manager-prompt-edit-button"
+                  data-manager-edit-button="manager-review-prompt"
+                  onclick="return openManagerPromptEditor('manager-review-prompt')"
+                  title="Edit Review Latest Output Prompt"
+                  aria-disabled="{manager_review_aria_disabled}">{edit_icon}</button>
+              </span>
             </div>
             <div
               class="chat-config-textarea expanded-editor-preview"
               data-expanded-editor-preview-for="manager-review-prompt"
-              onclick="return openExpandedTextEditor('manager-review-prompt')"></div>
+              onclick="return openManagerPromptEditor('manager-review-prompt')"></div>
             <textarea
               id="manager-review-prompt"
               name="review_latest_output_text"
@@ -1962,17 +1966,20 @@ pub fn render_admin_page(
           <div style="padding:0 var(--s-5) var(--s-5);">
             <div class="chat-config-field-header">
               <label class="chat-config-label" for="manager-periodic-prompt">Prompt</label>
-              <button
-                type="button"
-                class="btn-sm"
-                data-manager-edit-button="manager-periodic-prompt"
-                onclick="return openExpandedTextEditor('manager-periodic-prompt')"
-                title="Edit Run Periodic Checks Prompt"{manager_periodic_disabled}>{edit_icon}</button>
+              <span class="chat-config-field-actions">
+                <button
+                  type="button"
+                  class="btn-sm manager-prompt-edit-button"
+                  data-manager-edit-button="manager-periodic-prompt"
+                  onclick="return openManagerPromptEditor('manager-periodic-prompt')"
+                  title="Edit Run Periodic Checks Prompt"
+                  aria-disabled="{manager_periodic_aria_disabled}">{edit_icon}</button>
+              </span>
             </div>
             <div
               class="chat-config-textarea expanded-editor-preview"
               data-expanded-editor-preview-for="manager-periodic-prompt"
-              onclick="return openExpandedTextEditor('manager-periodic-prompt')"></div>
+              onclick="return openManagerPromptEditor('manager-periodic-prompt')"></div>
             <textarea
               id="manager-periodic-prompt"
               name="run_periodic_checks_text"
@@ -2002,17 +2009,20 @@ pub fn render_admin_page(
           <div style="padding:0 var(--s-5) var(--s-5);">
             <div class="chat-config-field-header">
               <label class="chat-config-label" for="manager-validate-prompt">Prompt</label>
-              <button
-                type="button"
-                class="btn-sm"
-                data-manager-edit-button="manager-validate-prompt"
-                onclick="return openExpandedTextEditor('manager-validate-prompt')"
-                title="Edit Validate Periodic Check Results Prompt"{manager_validate_disabled}>{edit_icon}</button>
+              <span class="chat-config-field-actions">
+                <button
+                  type="button"
+                  class="btn-sm manager-prompt-edit-button"
+                  data-manager-edit-button="manager-validate-prompt"
+                  onclick="return openManagerPromptEditor('manager-validate-prompt')"
+                  title="Edit Validate Periodic Check Results Prompt"
+                  aria-disabled="{manager_validate_aria_disabled}">{edit_icon}</button>
+              </span>
             </div>
             <div
               class="chat-config-textarea expanded-editor-preview"
               data-expanded-editor-preview-for="manager-validate-prompt"
-              onclick="return openExpandedTextEditor('manager-validate-prompt')"></div>
+              onclick="return openManagerPromptEditor('manager-validate-prompt')"></div>
             <textarea
               id="manager-validate-prompt"
               name="validate_periodic_checks_text"
@@ -2298,16 +2308,29 @@ pub fn render_admin_page(
         if (!textarea) return;
         if (toggle.checked) {{
           textarea.disabled = false;
-          if (editButton) editButton.disabled = false;
+          textarea.removeAttribute('disabled');
+          if (editButton) editButton.setAttribute('aria-disabled', 'false');
           if (preview) preview.classList.remove('is-disabled');
         }} else {{
           textarea.value = textarea.getAttribute('data-manager-default') || '';
           textarea.disabled = true;
-          if (editButton) editButton.disabled = true;
+          textarea.setAttribute('disabled', 'disabled');
+          if (editButton) editButton.setAttribute('aria-disabled', 'true');
           if (preview) preview.classList.add('is-disabled');
         }}
         syncExpandedEditorPreview(targetId);
       }}
+      window.openManagerPromptEditor = function(targetId) {{
+        var toggle = document.querySelector('[data-manager-prompt-toggle][data-manager-target="' + targetId + '"]');
+        if (!toggle || !toggle.checked) return false;
+        syncManagerPromptEditor(toggle);
+        var textarea = document.getElementById(targetId);
+        if (textarea) {{
+          textarea.disabled = false;
+          textarea.removeAttribute('disabled');
+        }}
+        return openExpandedTextEditor(targetId);
+      }};
       document.querySelectorAll('[data-manager-prompt-toggle]').forEach(function(toggle) {{
         syncManagerPromptEditor(toggle);
         toggle.addEventListener('change', function() {{
@@ -2532,6 +2555,21 @@ pub fn render_admin_page(
             ""
         } else {
             " disabled"
+        },
+        manager_review_aria_disabled = if manager_prompt_config.review_latest_output.enabled {
+            "false"
+        } else {
+            "true"
+        },
+        manager_periodic_aria_disabled = if manager_prompt_config.run_periodic_checks.enabled {
+            "false"
+        } else {
+            "true"
+        },
+        manager_validate_aria_disabled = if manager_prompt_config.validate_periodic_checks.enabled {
+            "false"
+        } else {
+            "true"
         },
         edit_icon = ICON_EDIT,
         manager_review_text = escape_text(manager_review_text),
@@ -9672,7 +9710,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 
     * { box-sizing: border-box; }
 
-    html { scrollbar-gutter: stable; }
+    html {
+      scrollbar-gutter: stable;
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+    }
 
     body {
       margin: 0;
@@ -9682,6 +9724,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       min-height: 100vh;
       line-height: 1.5;
       touch-action: manipulation;
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
     }
 "#;
     let rest = r#"
@@ -10319,6 +10363,24 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       justify-content: space-between;
       gap: var(--s-2);
     }
+    .chat-config-field-header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: var(--s-2);
+      width: 100%;
+    }
+    .chat-config-field-header .chat-config-label {
+      min-width: 0;
+    }
+    .chat-config-field-actions {
+      justify-self: end;
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: var(--s-1);
+      min-width: 28px;
+    }
     .chat-config-label {
       font-size: 0.85rem;
       font-weight: 600;
@@ -10367,6 +10429,14 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     .expanded-editor-preview:hover {
       border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+    }
+    .expanded-editor-preview.is-disabled,
+    .manager-prompt-edit-button[aria-disabled="true"] {
+      opacity: 0.45;
+      cursor: default;
+    }
+    .expanded-editor-preview.is-disabled:hover {
+      border-color: var(--line);
     }
     .expanded-editor-preview.is-placeholder {
       color: var(--fg-muted);
@@ -10475,6 +10545,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       flex-direction: column;
       gap: var(--s-3);
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
     }
     .chat-msg-row {
       display: flex;
@@ -10576,6 +10648,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       word-wrap: break-word;
       min-width: 0;
       box-sizing: border-box;
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
     }
     .chat-msg-excluded {
       opacity: 0.78;
@@ -11037,6 +11111,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       min-height: 38px;
       max-height: 50vh;
       overflow-y: hidden;
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
     }
     .chat-send-btn {
       background: var(--accent);
@@ -12609,6 +12685,8 @@ mod tests {
         assert!(html.contains(r#"data-editor-save="reserved""#));
         assert!(html.contains(r#"data-editor-action="/ui/my-docs/reserved/_overview""#));
         assert!(html.contains(r#"onclick="toggleReservedEdit('_overview')""#));
+        assert!(html.contains("var formData = new URLSearchParams();"));
+        assert!(html.contains("headers: {'Content-Type': 'application/x-www-form-urlencoded'},"));
         assert!(
             html.contains(
                 "var source = document.getElementById('reserved-' + safeId + '-content');"
@@ -13012,12 +13090,23 @@ mod tests {
         assert!(html.contains(r#"data-editor-label="Run Periodic Checks Prompt""#));
         assert!(html.contains(r#"data-editor-label="Validate Periodic Check Results Prompt""#));
         assert!(
-            html.contains(r#"onclick="return openExpandedTextEditor('manager-review-prompt')""#)
+            html.contains(r#"onclick="return openManagerPromptEditor('manager-review-prompt')""#)
         );
+        assert!(html.contains(r#"aria-disabled="true""#));
+        assert!(html.contains("window.openManagerPromptEditor = function(targetId) {"));
+        assert!(html.contains("syncManagerPromptEditor(toggle);"));
+        assert!(html.contains("return openExpandedTextEditor(targetId);"));
+        assert!(html.contains(".chat-config-field-header {"));
+        assert!(html.contains("grid-template-columns: minmax(0, 1fr) auto;"));
+        assert!(html.contains(".chat-config-field-actions {"));
+        assert!(html.contains("justify-self: end;"));
+        assert!(html.contains(".manager-prompt-edit-button[aria-disabled=\"true\"]"));
         assert!(html.contains("function syncExpandedEditorPreview(sourceId) {"));
         assert!(html.contains(
-            r#"var editButton = document.querySelector('[data-manager-edit-button="' + targetId + '"]');"#
-        ));
+	            r#"var editButton = document.querySelector('[data-manager-edit-button="' + targetId + '"]');"#
+	        ));
+        assert!(html.contains("textarea.removeAttribute('disabled');"));
+        assert!(html.contains("textarea.setAttribute('disabled', 'disabled');"));
     }
 
     #[test]
@@ -13042,6 +13131,29 @@ mod tests {
         assert!(html.contains(".chat-msg-swipe-action {"));
         assert!(html.contains(".chat-msg-excluded {"));
         assert!(html.contains("data-chat-msg-id="));
+    }
+
+    #[test]
+    fn chat_page_locks_mobile_text_size_adjustment() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf123",
+            true,
+            &[],
+            Some("agent-main"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("-webkit-text-size-adjust: 100%;"));
+        assert!(html.contains("text-size-adjust: 100%;"));
+        assert!(html.contains(".chat-messages {\n      height: 100%;"));
+        assert!(html.contains(".chat-msg {\n      max-width: 80%;"));
+        assert!(html.contains(".chat-input {\n      flex: 1;"));
     }
 
     #[test]
