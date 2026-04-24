@@ -67,6 +67,8 @@ use openidconnect::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -84,6 +86,15 @@ const AGENT_AUTH_RATE_LIMIT_WINDOW_SECS: i64 = 60;
 const GLOBAL_LIBRARIAN_RATE_LIMIT: usize = 30;
 const GLOBAL_LIBRARIAN_RATE_LIMIT_WINDOW_SECS: i64 = 60;
 const MACHINE_COMMAND_TIMEOUT_SECS: u64 = 15;
+const FALLBACK_CODEX_MODEL_OPTIONS: &[&str] = &[
+    "default",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2",
+];
 
 fn librarian_chat_agent_name(project: Option<&ProjectName>) -> String {
     match project {
@@ -14322,6 +14333,82 @@ struct ChatSaveConfigForm {
 const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "max"];
 const CODEX_EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 
+fn codex_home_dir() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+}
+
+fn codex_model_options() -> Vec<String> {
+    let fallback = || {
+        FALLBACK_CODEX_MODEL_OPTIONS
+            .iter()
+            .map(|model| model.to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let Some(cache_path) = codex_home_dir().map(|dir| dir.join("models_cache.json")) else {
+        return fallback();
+    };
+    let Ok(bytes) = fs::read(cache_path) else {
+        return fallback();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return fallback();
+    };
+    codex_model_options_from_cache_value(&value).unwrap_or_else(fallback)
+}
+
+fn codex_model_options_from_cache_value(value: &Value) -> Option<Vec<String>> {
+    let models = value.get("models").and_then(|models| models.as_array())?;
+    let mut options = vec!["default".to_string()];
+    let mut seen = HashSet::from(["default".to_string()]);
+    for model in models {
+        let visibility = model
+            .get("visibility")
+            .and_then(|visibility| visibility.as_str())
+            .unwrap_or("list");
+        if visibility != "list" {
+            continue;
+        }
+        let Some(slug) = model.get("slug").and_then(|slug| slug.as_str()) else {
+            continue;
+        };
+        if slug.is_empty() || !seen.insert(slug.to_string()) {
+            continue;
+        }
+        options.push(slug.to_string());
+    }
+
+    if options.len() > 1 {
+        Some(options)
+    } else {
+        None
+    }
+}
+
+fn chat_backend_model_options() -> Value {
+    json!({
+        "claude": ["default", "opus", "sonnet", "haiku"],
+        "gemini": ["default", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-pro-preview"],
+        "codex": codex_model_options(),
+        "openai": ["default"],
+    })
+}
+
+fn model_options_text(current: &str, models: &[String]) -> String {
+    let options = models
+        .iter()
+        .filter(|model| model.as_str() != "default")
+        .map(|model| format!("  /model {model}"))
+        .chain(std::iter::once(
+            "  /model default -- reset to default".to_string(),
+        ))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Current model: {current}\n\nOptions:\n{options}")
+}
+
 fn effort_options_text(current: &str, levels: &[&str]) -> String {
     let options = levels
         .iter()
@@ -14380,6 +14467,7 @@ async fn chat_get_config(
         "project_context": project_context,
         "endpoint_id": agent.endpoint_id,
         "endpoints": endpoints,
+        "model_options": chat_backend_model_options(),
     })))
 }
 
@@ -14885,6 +14973,7 @@ async fn chat_slash_command(
                         "claude" => format!(
                             "Current model: {current}\n\nOptions:\n  /model opus (claude-opus-4-6)\n  /model sonnet (claude-sonnet-4-6)\n  /model haiku (claude-haiku-4-5)\n  /model <full-model-id>\n  /model default"
                         ),
+                        "codex" => model_options_text(current, &codex_model_options()),
                         _ => format!(
                             "Current model: {current}\n\nUsage: /model <model-name>\n  /model default"
                         ),
@@ -15921,6 +16010,28 @@ mod tests {
         AgentBackend, BlockType, LocalAuthStore, NewAgentToken, ProjectGrant, ProjectName,
         ProjectPermission, UserName,
     };
+
+    #[test]
+    fn codex_model_options_from_cache_value_uses_visible_slugs() {
+        let options = super::codex_model_options_from_cache_value(&json!({
+            "models": [
+                {"slug": "gpt-5.5", "visibility": "list"},
+                {"slug": "codex-auto-review", "visibility": "hide"},
+                {"slug": "gpt-5.4", "visibility": "list"},
+                {"slug": "gpt-5.5", "visibility": "list"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            options,
+            vec![
+                "default".to_string(),
+                "gpt-5.5".to_string(),
+                "gpt-5.4".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn parse_role_grants_skips_no_access_rows() {

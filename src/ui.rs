@@ -5825,7 +5825,7 @@ var CHAT_MESSAGE_SWIPE_TOGGLE_THRESHOLD = 30;
 var backendModels = {{
   claude: ['default', 'opus', 'sonnet', 'haiku'],
   gemini: ['default', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-3-pro-preview'],
-  codex: ['default'],
+  codex: ['default', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2'],
   openai: ['default']
 }};
 
@@ -5894,6 +5894,7 @@ function loadChatConfig() {{
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
       chatConfigData = data;
+      applyBackendModelOptions(data.model_options);
       populateConfigDropdowns(data.backend, data.prefs);
       var ta = document.getElementById('cfg-pinned-context');
       if (ta) ta.value = data.pinned_context || '';
@@ -5911,6 +5912,29 @@ function loadChatConfig() {{
       }}
     }});
   refreshErrorsPanel();
+}}
+
+function normalizeModelOptions(models) {{
+  var seen = {{}};
+  var normalized = [];
+  function add(model) {{
+    if (!model || typeof model !== 'string') return;
+    if (seen[model]) return;
+    seen[model] = true;
+    normalized.push(model);
+  }}
+  add('default');
+  if (Array.isArray(models)) {{
+    for (var i = 0; i < models.length; i++) add(models[i]);
+  }}
+  return normalized;
+}}
+
+function applyBackendModelOptions(options) {{
+  if (!options || typeof options !== 'object') return;
+  Object.keys(options).forEach(function(backend) {{
+    backendModels[backend] = normalizeModelOptions(options[backend]);
+  }});
 }}
 
 function refreshErrorsPanel() {{
@@ -12908,6 +12932,11 @@ mod tests {
         assert!(html.contains("function saveExpandedTextEditor() {"));
         assert!(html.contains(r#"data-editor-save="pinned""#));
         assert!(html.contains(r#"data-editor-save="manage""#));
+        assert!(html.contains(
+            "codex: ['default', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2']"
+        ));
+        assert!(html.contains("function applyBackendModelOptions(options) {"));
+        assert!(html.contains("applyBackendModelOptions(data.model_options);"));
         assert!(html.contains("codex: ['default', 'minimal', 'low', 'medium', 'high', 'xhigh']"));
         assert!(html.contains("function syncExpandedTextEditorViewport() {"));
         assert!(html.contains("scheduleExpandedTextEditorViewportSync();"));

@@ -11,3 +11,4 @@
 - Added Codex reasoning-effort selection to agent configuration and wired Codex process launches to pass the selected effort through to the Codex CLI.
 - Locked the fullscreen expanded editor to the visible viewport and editor scroll area so document content cannot scroll underneath it and the editor cannot drift horizontally.
 - Kept the fullscreen expanded editor backdrop fixed edge-to-edge while only the editor shell tracks the visual viewport, preventing document content from showing at the top or bottom edges.
+- Added Codex model selection to agent configuration, using Codex's local model cache when available and a current documented Codex model fallback otherwise.
