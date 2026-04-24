@@ -157,10 +157,35 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
   {csrf_hidden}
   <script>
   var expandedTextEditorState = null;
+  function syncExpandedTextEditorViewport() {{
+    var overlay = document.getElementById('expanded-text-editor');
+    if (!overlay) return;
+    if (!document.body.classList.contains('expanded-editor-open')) {{
+      overlay.style.top = '';
+      overlay.style.height = '';
+      return;
+    }}
+    if (window.visualViewport) {{
+      overlay.style.top = Math.max(0, Math.round(window.visualViewport.offsetTop)) + 'px';
+      overlay.style.height = Math.max(0, Math.round(window.visualViewport.height)) + 'px';
+    }} else {{
+      overlay.style.top = '';
+      overlay.style.height = '';
+    }}
+  }}
+  function scheduleExpandedTextEditorViewportSync() {{
+    syncExpandedTextEditorViewport();
+    requestAnimationFrame(function() {{
+      syncExpandedTextEditorViewport();
+      setTimeout(syncExpandedTextEditorViewport, 60);
+      setTimeout(syncExpandedTextEditorViewport, 180);
+    }});
+  }}
   function setExpandedTextEditorOpen(open) {{
     var overlay = document.getElementById('expanded-text-editor');
     if (overlay) overlay.style.display = open ? 'flex' : 'none';
     document.body.classList.toggle('expanded-editor-open', !!open);
+    syncExpandedTextEditorViewport();
   }}
   function openExpandedTextEditor(sourceId) {{
     var source = document.getElementById(sourceId);
@@ -177,10 +202,25 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     input.placeholder = source.getAttribute('placeholder') || '';
     setExpandedTextEditorOpen(true);
     window.setTimeout(function() {{
+      scheduleExpandedTextEditorViewportSync();
       input.focus();
       input.setSelectionRange(input.value.length, input.value.length);
     }}, 0);
     return false;
+  }}
+  function syncExpandedEditorPreview(sourceId) {{
+    var source = document.getElementById(sourceId);
+    var preview = document.querySelector('[data-expanded-editor-preview-for="' + sourceId + '"]');
+    if (!source || !preview) return;
+    var value = source.value || '';
+    var placeholder = source.getAttribute('placeholder') || '';
+    if (value.trim()) {{
+      preview.textContent = value;
+      preview.classList.remove('is-placeholder');
+    }} else {{
+      preview.textContent = placeholder;
+      preview.classList.add('is-placeholder');
+    }}
   }}
   function cancelExpandedTextEditor() {{
     expandedTextEditorState = null;
@@ -196,6 +236,7 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
       return false;
     }}
     source.value = input.value;
+    syncExpandedEditorPreview(source.id);
     var saveKind = expandedTextEditorState.saveKind;
     cancelExpandedTextEditor();
     if (saveKind === 'pinned') {{
@@ -233,6 +274,30 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
     }}
     return false;
   }}
+  if (window.visualViewport) {{
+    window.visualViewport.addEventListener('resize', function() {{
+      syncExpandedTextEditorViewport();
+    }});
+    window.visualViewport.addEventListener('scroll', function() {{
+      syncExpandedTextEditorViewport();
+    }});
+  }}
+  document.addEventListener('focusin', function(e) {{
+    if (e.target && e.target.id === 'expanded-editor-input') {{
+      scheduleExpandedTextEditorViewportSync();
+    }}
+  }});
+  document.addEventListener('focusout', function(e) {{
+    if (e.target && e.target.id === 'expanded-editor-input') {{
+      setTimeout(syncExpandedTextEditorViewport, 0);
+      setTimeout(syncExpandedTextEditorViewport, 120);
+    }}
+  }});
+  document.addEventListener('DOMContentLoaded', function() {{
+    document.querySelectorAll('.expanded-editor-source').forEach(function(source) {{
+      if (source.id) syncExpandedEditorPreview(source.id);
+    }});
+  }});
   </script>
   <main class="shell">
     {flash_html}
@@ -1805,12 +1870,29 @@ pub fn render_admin_page(
             <span>Edit this prompt</span>
           </label>
           <div style="padding:0 var(--s-5) var(--s-5);">
+            <div class="chat-config-field-header">
+              <label class="chat-config-label" for="manager-review-prompt">Prompt</label>
+              <button
+                type="button"
+                class="btn-sm"
+                data-manager-edit-button="manager-review-prompt"
+                onclick="return openExpandedTextEditor('manager-review-prompt')"
+                title="Edit Review Latest Output Prompt"{manager_review_disabled}>{edit_icon}</button>
+            </div>
+            <div
+              class="chat-config-textarea expanded-editor-preview"
+              data-expanded-editor-preview-for="manager-review-prompt"
+              onclick="return openExpandedTextEditor('manager-review-prompt')"></div>
             <textarea
               id="manager-review-prompt"
               name="review_latest_output_text"
-              class="chat-config-textarea"
+              class="chat-config-textarea expanded-editor-source"
+              data-editor-label="Review Latest Output Prompt"
               data-manager-default="{manager_review_default}"
-              style="min-height: 10rem;"{manager_review_disabled}>{manager_review_text}</textarea>
+              placeholder="Used on normal manager turns between periodic checks."
+              readonly
+              onclick="return openExpandedTextEditor('manager-review-prompt')"
+              style="display:none;"{manager_review_disabled}>{manager_review_text}</textarea>
           </div>
 
           <div class="panel-header">
@@ -1828,12 +1910,29 @@ pub fn render_admin_page(
             <span>Edit this prompt</span>
           </label>
           <div style="padding:0 var(--s-5) var(--s-5);">
+            <div class="chat-config-field-header">
+              <label class="chat-config-label" for="manager-periodic-prompt">Prompt</label>
+              <button
+                type="button"
+                class="btn-sm"
+                data-manager-edit-button="manager-periodic-prompt"
+                onclick="return openExpandedTextEditor('manager-periodic-prompt')"
+                title="Edit Run Periodic Checks Prompt"{manager_periodic_disabled}>{edit_icon}</button>
+            </div>
+            <div
+              class="chat-config-textarea expanded-editor-preview"
+              data-expanded-editor-preview-for="manager-periodic-prompt"
+              onclick="return openExpandedTextEditor('manager-periodic-prompt')"></div>
             <textarea
               id="manager-periodic-prompt"
               name="run_periodic_checks_text"
-              class="chat-config-textarea"
+              class="chat-config-textarea expanded-editor-source"
+              data-editor-label="Run Periodic Checks Prompt"
               data-manager-default="{manager_periodic_default}"
-              style="min-height: 9rem;"{manager_periodic_disabled}>{manager_periodic_text}</textarea>
+              placeholder="Used when the manager should ask the agent to run periodic verification."
+              readonly
+              onclick="return openExpandedTextEditor('manager-periodic-prompt')"
+              style="display:none;"{manager_periodic_disabled}>{manager_periodic_text}</textarea>
           </div>
 
           <div class="panel-header">
@@ -1851,12 +1950,29 @@ pub fn render_admin_page(
             <span>Edit this prompt</span>
           </label>
           <div style="padding:0 var(--s-5) var(--s-5);">
+            <div class="chat-config-field-header">
+              <label class="chat-config-label" for="manager-validate-prompt">Prompt</label>
+              <button
+                type="button"
+                class="btn-sm"
+                data-manager-edit-button="manager-validate-prompt"
+                onclick="return openExpandedTextEditor('manager-validate-prompt')"
+                title="Edit Validate Periodic Check Results Prompt"{manager_validate_disabled}>{edit_icon}</button>
+            </div>
+            <div
+              class="chat-config-textarea expanded-editor-preview"
+              data-expanded-editor-preview-for="manager-validate-prompt"
+              onclick="return openExpandedTextEditor('manager-validate-prompt')"></div>
             <textarea
               id="manager-validate-prompt"
               name="validate_periodic_checks_text"
-              class="chat-config-textarea"
+              class="chat-config-textarea expanded-editor-source"
+              data-editor-label="Validate Periodic Check Results Prompt"
               data-manager-default="{manager_validate_default}"
-              style="min-height: 9rem;"{manager_validate_disabled}>{manager_validate_text}</textarea>
+              placeholder="Used after the agent reports back from a periodic-check turn."
+              readonly
+              onclick="return openExpandedTextEditor('manager-validate-prompt')"
+              style="display:none;"{manager_validate_disabled}>{manager_validate_text}</textarea>
           </div>
 
           <div style="padding:0 var(--s-5) var(--s-5);">
@@ -2127,13 +2243,20 @@ pub fn render_admin_page(
         var targetId = toggle.getAttribute('data-manager-target');
         if (!targetId) return;
         var textarea = document.getElementById(targetId);
+        var editButton = document.querySelector('[data-manager-edit-button="' + targetId + '"]');
+        var preview = document.querySelector('[data-expanded-editor-preview-for="' + targetId + '"]');
         if (!textarea) return;
         if (toggle.checked) {{
           textarea.disabled = false;
+          if (editButton) editButton.disabled = false;
+          if (preview) preview.classList.remove('is-disabled');
         }} else {{
           textarea.value = textarea.getAttribute('data-manager-default') || '';
           textarea.disabled = true;
+          if (editButton) editButton.disabled = true;
+          if (preview) preview.classList.add('is-disabled');
         }}
+        syncExpandedEditorPreview(targetId);
       }}
       document.querySelectorAll('[data-manager-prompt-toggle]').forEach(function(toggle) {{
         syncManagerPromptEditor(toggle);
@@ -2360,6 +2483,7 @@ pub fn render_admin_page(
         } else {
             " disabled"
         },
+        edit_icon = ICON_EDIT,
         manager_review_text = escape_text(manager_review_text),
         manager_periodic_text = escape_text(manager_periodic_text),
         manager_validate_text = escape_text(manager_validate_text),
@@ -7290,7 +7414,22 @@ fn render_doc_block(
         "block-header-btn"
     };
 
+    let uses_expanded_editor = can_write && block.block_type == crate::model::BlockType::Markdown;
+
     let header_actions = if can_write {
+        let inline_edit_actions = if uses_expanded_editor {
+            String::new()
+        } else {
+            format!(
+                r#"
+  <button type="button" class="block-header-btn" title="Save" onclick="document.querySelector('#edit-{block_id} form').submit();">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+  </button>
+  <button type="button" class="block-header-btn" title="Cancel" onclick="cancelBlockEdit('{block_id}')">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  </button>"#,
+            )
+        };
         format!(
             r##"<div class="block-header-actions">
   <button type="button" class="block-header-btn danger" title="Delete" onclick="if(confirm('Delete this block? This cannot be undone.')){{document.getElementById('del-{block_id}').submit();}}">
@@ -7300,12 +7439,7 @@ fn render_doc_block(
   <button type="button" class="{pin_class}" title="{pin_title}" onclick="document.getElementById('pin-{block_id}').submit();">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
   </button>
-  <button type="button" class="block-header-btn" title="Save" onclick="document.querySelector('#edit-{block_id} form').submit();">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-  </button>
-  <button type="button" class="block-header-btn" title="Cancel" onclick="cancelBlockEdit('{block_id}')">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-  </button>
+  {inline_edit_actions}
   <form id="del-{block_id}" method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/delete" style="display:none;">
     <input type="hidden" name="csrf_token" value="{csrf}">
   </form>
@@ -7313,6 +7447,7 @@ fn render_doc_block(
     <input type="hidden" name="csrf_token" value="{csrf}">
   </form>
 </div>"##,
+            inline_edit_actions = inline_edit_actions,
         )
     } else {
         format!(r##"<div class="block-header-actions">{copy_link_btn}</div>"##,)
@@ -7320,7 +7455,7 @@ fn render_doc_block(
 
     let block_type_label = format!("{:?}", block.block_type).to_lowercase();
     let body_html = render_block_body_with_doc(block, Some(doc_id));
-    let edit_panel = if can_write && block.block_type == crate::model::BlockType::Markdown {
+    let edit_panel = if uses_expanded_editor {
         format!(
             r#"<textarea name="content" id="block-edit-content-{block_id}" class="expanded-editor-source" data-editor-label="Edit Markdown" data-editor-save="block" data-editor-action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/edit" data-editor-block-type="markdown" style="display:none;">{content}</textarea>"#,
             content = escape_text(&block.content),
@@ -7372,8 +7507,13 @@ fn render_doc_block(
         String::new()
     };
 
+    let meta_display = if uses_expanded_editor {
+        "none"
+    } else {
+        "display:none;"
+    };
     let meta_html = format!(
-        r#"<div class="block-meta" id="meta-{block_id}" style="display:none;">
+        r#"<div class="block-meta" id="meta-{block_id}" style="{meta_display}">
   <span class="pill">{block_type_label}</span>
   {header_actions}
 </div>"#,
@@ -10143,6 +10283,20 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .expanded-editor-source:hover {
       border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
     }
+    .expanded-editor-preview {
+      min-height: 9rem;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      cursor: pointer;
+      background: var(--bg-secondary, var(--bg));
+    }
+    .expanded-editor-preview:hover {
+      border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+    }
+    .expanded-editor-preview.is-placeholder {
+      color: var(--fg-muted);
+      font-style: italic;
+    }
     body.expanded-editor-open {
       overflow: hidden;
     }
@@ -10152,6 +10306,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       z-index: 1000;
       background: color-mix(in srgb, var(--bg) 78%, black 22%);
       display: none;
+      align-items: stretch;
+      justify-content: stretch;
+      overflow: hidden;
     }
     .expanded-editor-shell {
       width: 100%;
@@ -10200,6 +10357,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       bottom: 0;
       padding-top: var(--s-2);
       background: linear-gradient(to top, var(--bg) 72%, transparent);
+      flex-shrink: 0;
     }
     .expanded-editor-actions {
       display: flex;
@@ -12198,6 +12356,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     @media (max-width: 640px) {
       .expanded-editor-shell {
         padding: max(var(--s-4), env(safe-area-inset-top)) var(--s-3) max(var(--s-4), env(safe-area-inset-bottom));
+        gap: var(--s-3);
+      }
+
+      .expanded-editor-input {
+        padding: var(--s-3);
       }
 
       .expanded-editor-actions-desktop {
@@ -12216,8 +12379,12 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 mod tests {
     use super::*;
     use crate::config::{ColorMode, ExternalScheme, ServerConfig, UiTheme};
+    use crate::librarian::LibrarianConfig;
+    use crate::manager::ManagerPromptConfig;
     use crate::model::{BlockType, NewBlock};
     use crate::store::FileBlockStore;
+    use crate::updater::AutoUpdateConfig;
+    use crate::versioning::GitExportConfig;
     use tempfile::tempdir;
 
     #[test]
@@ -12236,7 +12403,6 @@ mod tests {
                 image_upload: None,
             })
             .unwrap();
-
         // Project link resolves
         let html = format!(r#"<a href="lore://{}">My Docs</a>"#, info.id);
         let resolved = resolve_lore_links_in_html(&html, &store);
@@ -12271,6 +12437,7 @@ mod tests {
                 image_upload: None,
             })
             .unwrap();
+        let block_id = block.id.clone();
 
         let html = render_document_page(
             UiTheme::Parchment,
@@ -12298,6 +12465,17 @@ mod tests {
         assert!(html.contains(
             "var directSource = document.getElementById('block-edit-content-' + blockId);"
         ));
+        assert!(html.contains(format!(r#"id="block-edit-content-{}""#, block_id).as_str()));
+        assert!(!html.contains(format!(r#"id="edit-{}""#, block_id).as_str()));
+        assert!(
+            !html.contains(
+                format!(
+                    r#"document.querySelector('#edit-{} form').submit();"#,
+                    block_id
+                )
+                .as_str()
+            )
+        );
     }
 
     #[test]
@@ -12570,9 +12748,70 @@ mod tests {
         assert!(html.contains("function saveExpandedTextEditor() {"));
         assert!(html.contains(r#"data-editor-save="pinned""#));
         assert!(html.contains(r#"data-editor-save="manage""#));
+        assert!(html.contains("function syncExpandedTextEditorViewport() {"));
+        assert!(html.contains("scheduleExpandedTextEditorViewportSync();"));
+        assert!(html.contains("window.visualViewport.addEventListener('resize'"));
         assert!(html.contains(".expanded-editor-actions-desktop {"));
         assert!(html.contains(".expanded-editor-actions-mobile {"));
+        assert!(html.contains(".expanded-editor-overlay {"));
+        assert!(html.contains("overflow: hidden;"));
         assert!(html.contains("@media (max-width: 640px) {"));
+    }
+
+    #[test]
+    fn admin_manager_special_case_fields_use_expanded_editor() {
+        let html = render_admin_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &ServerConfig::new(
+                ExternalScheme::Https,
+                "example.com".into(),
+                443,
+                UiTheme::Parchment,
+            )
+            .unwrap(),
+            &crate::config::ExternalAuthConfig::default(),
+            &crate::config::OidcConfig::default(),
+            &AutoUpdateConfig::default(),
+            &ManagerPromptConfig::default(),
+            &LibrarianConfig::default(),
+            &[],
+            &GitExportConfig::default(),
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            "manager",
+        );
+
+        assert!(html.contains(r#"data-manager-edit-button="manager-review-prompt""#));
+        assert!(html.contains(r#"data-manager-edit-button="manager-periodic-prompt""#));
+        assert!(html.contains(r#"data-manager-edit-button="manager-validate-prompt""#));
+        assert!(html.contains(r#"data-expanded-editor-preview-for="manager-review-prompt""#));
+        assert!(html.contains(r#"data-expanded-editor-preview-for="manager-periodic-prompt""#));
+        assert!(html.contains(r#"data-expanded-editor-preview-for="manager-validate-prompt""#));
+        assert!(html.contains(r#"class="chat-config-textarea expanded-editor-source""#));
+        assert!(html.contains(r#"style="display:none;""#));
+        assert!(html.contains(r#"data-editor-label="Review Latest Output Prompt""#));
+        assert!(html.contains(r#"data-editor-label="Run Periodic Checks Prompt""#));
+        assert!(html.contains(r#"data-editor-label="Validate Periodic Check Results Prompt""#));
+        assert!(
+            html.contains(r#"onclick="return openExpandedTextEditor('manager-review-prompt')""#)
+        );
+        assert!(html.contains("function syncExpandedEditorPreview(sourceId) {"));
+        assert!(html.contains(
+            r#"var editButton = document.querySelector('[data-manager-edit-button="' + targetId + '"]');"#
+        ));
     }
 
     #[test]
