@@ -157,20 +157,41 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
   {csrf_hidden}
   <script>
   var expandedTextEditorState = null;
+  var expandedTextEditorScrollY = 0;
   function syncExpandedTextEditorViewport() {{
     var overlay = document.getElementById('expanded-text-editor');
+    var shell = overlay ? overlay.querySelector('.expanded-editor-shell') : null;
     if (!overlay) return;
+    overlay.style.top = '';
+    overlay.style.right = '';
+    overlay.style.bottom = '';
+    overlay.style.left = '';
+    overlay.style.width = '';
+    overlay.style.height = '';
+    if (!shell) return;
     if (!document.body.classList.contains('expanded-editor-open')) {{
-      overlay.style.top = '';
-      overlay.style.height = '';
+      shell.style.top = '';
+      shell.style.right = '';
+      shell.style.bottom = '';
+      shell.style.left = '';
+      shell.style.width = '';
+      shell.style.height = '';
       return;
     }}
     if (window.visualViewport) {{
-      overlay.style.top = Math.max(0, Math.round(window.visualViewport.offsetTop)) + 'px';
-      overlay.style.height = Math.max(0, Math.round(window.visualViewport.height)) + 'px';
+      shell.style.top = Math.max(0, Math.round(window.visualViewport.offsetTop)) + 'px';
+      shell.style.right = 'auto';
+      shell.style.bottom = 'auto';
+      shell.style.left = Math.max(0, Math.round(window.visualViewport.offsetLeft)) + 'px';
+      shell.style.width = Math.max(0, Math.round(window.visualViewport.width)) + 'px';
+      shell.style.height = Math.max(0, Math.round(window.visualViewport.height)) + 'px';
     }} else {{
-      overlay.style.top = '';
-      overlay.style.height = '';
+      shell.style.top = '';
+      shell.style.right = '';
+      shell.style.bottom = '';
+      shell.style.left = '';
+      shell.style.width = '';
+      shell.style.height = '';
     }}
   }}
   function scheduleExpandedTextEditorViewportSync() {{
@@ -183,9 +204,30 @@ pub fn render_shell(shell: PageShell, content: String) -> String {
   }}
   function setExpandedTextEditorOpen(open) {{
     var overlay = document.getElementById('expanded-text-editor');
+    var wasOpen = document.body.classList.contains('expanded-editor-open');
+    if (open && !wasOpen) {{
+      expandedTextEditorScrollY = window.scrollY || document.documentElement.scrollTop || 0;
+      document.documentElement.style.overflow = 'hidden';
+      document.body.style.position = 'fixed';
+      document.body.style.top = '-' + expandedTextEditorScrollY + 'px';
+      document.body.style.left = '0';
+      document.body.style.right = '0';
+      document.body.style.width = '100%';
+    }}
     if (overlay) overlay.style.display = open ? 'flex' : 'none';
     document.body.classList.toggle('expanded-editor-open', !!open);
     syncExpandedTextEditorViewport();
+    if (!open && wasOpen) {{
+      var restoreY = expandedTextEditorScrollY;
+      document.documentElement.style.overflow = '';
+      document.body.style.position = '';
+      document.body.style.top = '';
+      document.body.style.left = '';
+      document.body.style.right = '';
+      document.body.style.width = '';
+      expandedTextEditorScrollY = 0;
+      window.scrollTo(0, restoreY);
+    }}
   }}
   function openExpandedTextEditor(sourceId) {{
     var source = document.getElementById(sourceId);
@@ -5790,7 +5832,7 @@ var backendModels = {{
 var backendEfforts = {{
   claude: ['default', 'low', 'medium', 'high', 'max'],
   gemini: [],
-  codex: [],
+  codex: ['default', 'minimal', 'low', 'medium', 'high', 'xhigh'],
   openai: []
 }};
 
@@ -10308,26 +10350,33 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     }
     body.expanded-editor-open {
       overflow: hidden;
+      overscroll-behavior: none;
     }
     .expanded-editor-overlay {
       position: fixed;
       inset: 0;
+      width: 100%;
+      max-width: 100vw;
       z-index: 1000;
-      background: color-mix(in srgb, var(--bg) 78%, black 22%);
+      background: var(--bg);
       display: none;
-      align-items: stretch;
-      justify-content: stretch;
       overflow: hidden;
+      overscroll-behavior: none;
     }
     .expanded-editor-shell {
+      position: absolute;
+      inset: 0;
       width: 100%;
+      max-width: 100%;
       height: 100%;
       min-height: 0;
+      min-width: 0;
       display: flex;
       flex-direction: column;
       gap: var(--s-4);
       padding: max(var(--s-5), env(safe-area-inset-top)) var(--s-5) max(var(--s-5), env(safe-area-inset-bottom));
       background: var(--bg);
+      overflow: hidden;
     }
     .expanded-editor-header {
       display: flex;
@@ -10349,7 +10398,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .expanded-editor-input {
       flex: 1;
       min-height: 0;
+      min-width: 0;
       width: 100%;
+      max-width: 100%;
       padding: var(--s-4);
       border: 1px solid var(--line);
       border-radius: var(--radius);
@@ -10360,6 +10411,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-size: 0.95rem;
       line-height: 1.55;
       resize: none;
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      -webkit-overflow-scrolling: touch;
+      touch-action: pan-y;
     }
     .expanded-editor-footer {
       position: sticky;
@@ -12852,13 +12908,30 @@ mod tests {
         assert!(html.contains("function saveExpandedTextEditor() {"));
         assert!(html.contains(r#"data-editor-save="pinned""#));
         assert!(html.contains(r#"data-editor-save="manage""#));
+        assert!(html.contains("codex: ['default', 'minimal', 'low', 'medium', 'high', 'xhigh']"));
         assert!(html.contains("function syncExpandedTextEditorViewport() {"));
         assert!(html.contains("scheduleExpandedTextEditorViewportSync();"));
         assert!(html.contains("window.visualViewport.addEventListener('resize'"));
+        assert!(html.contains(
+            "var shell = overlay ? overlay.querySelector('.expanded-editor-shell') : null;"
+        ));
+        assert!(html.contains(
+            "shell.style.left = Math.max(0, Math.round(window.visualViewport.offsetLeft)) + 'px';"
+        ));
+        assert!(html.contains(
+            "shell.style.width = Math.max(0, Math.round(window.visualViewport.width)) + 'px';"
+        ));
+        assert!(html.contains("document.body.style.position = 'fixed';"));
+        assert!(html.contains("window.scrollTo(0, restoreY);"));
         assert!(html.contains(".expanded-editor-actions-desktop {"));
         assert!(html.contains(".expanded-editor-actions-mobile {"));
         assert!(html.contains(".expanded-editor-overlay {"));
+        assert!(html.contains("background: var(--bg);"));
+        assert!(html.contains(".expanded-editor-shell {"));
+        assert!(html.contains("position: absolute;"));
         assert!(html.contains("overflow: hidden;"));
+        assert!(html.contains("overscroll-behavior: contain;"));
+        assert!(html.contains("-webkit-overflow-scrolling: touch;"));
         assert!(html.contains("@media (max-width: 640px) {"));
     }
 

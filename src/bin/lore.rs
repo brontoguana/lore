@@ -6097,17 +6097,7 @@ async fn spawn_backend(
             cmd.spawn()?
         }
         AgentBackend::Codex => {
-            let mut args = vec![
-                "exec".to_string(),
-                "--json".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--ephemeral".to_string(),
-                "-".to_string(),
-            ];
-            if let Some(m) = model {
-                args.push("--model".to_string());
-                args.push(m.to_string());
-            }
+            let args = codex_exec_args(model, effort);
             let mut cmd =
                 tokio::process::Command::new(resolve_backend_executable(AgentBackend::Codex));
             cmd.args(&args)
@@ -6134,6 +6124,25 @@ async fn spawn_backend(
     }
 
     Ok(child)
+}
+
+fn codex_exec_args(model: Option<&str>, effort: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "exec".to_string(),
+        "--json".to_string(),
+        "--dangerously-bypass-approvals-and-sandbox".to_string(),
+        "--ephemeral".to_string(),
+    ];
+    if let Some(m) = model {
+        args.push("--model".to_string());
+        args.push(m.to_string());
+    }
+    if let Some(e) = effort {
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort=\"{e}\""));
+    }
+    args.push("-".to_string());
+    args
 }
 
 fn parse_backend_line(backend: AgentBackend, parsed: &serde_json::Value) -> Vec<BackendEvent> {
@@ -7200,7 +7209,7 @@ async fn service_handle_create_agent(
 mod tests {
     use super::{
         Cli, Command, DocWriteArgs, ProjectSource, ResolvedProject, append_assistant_segment,
-        append_new_stream_text, count_history_exchanges, find_cwd_project_file,
+        append_new_stream_text, codex_exec_args, count_history_exchanges, find_cwd_project_file,
         history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
         load_doc_write_content, next_service_update_retry_delay_secs, parse_cli_version_output,
         parse_codex_line, recent_history_exchange_tail, remove_owned_service_pid_file,
@@ -7633,5 +7642,17 @@ mod tests {
         let content =
             super::decode_numbered_block_chunk("1\tfirst line\n2\t\n3\tthird\twith tab").unwrap();
         assert_eq!(content, "first line\n\nthird\twith tab");
+    }
+
+    #[test]
+    fn codex_exec_args_include_reasoning_effort_override() {
+        let args = codex_exec_args(Some("gpt-5.4"), Some("xhigh"));
+
+        assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-5.4"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-c", "model_reasoning_effort=\"xhigh\""])
+        );
+        assert_eq!(args.last().map(String::as_str), Some("-"));
     }
 }

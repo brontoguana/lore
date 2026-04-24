@@ -14319,6 +14319,21 @@ struct ChatSaveConfigForm {
     endpoint_id: Option<String>,
 }
 
+const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "max"];
+const CODEX_EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+
+fn effort_options_text(current: &str, levels: &[&str]) -> String {
+    let options = levels
+        .iter()
+        .map(|level| format!("  /effort {level}"))
+        .chain(std::iter::once(
+            "  /effort default -- reset to default".to_string(),
+        ))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Current effort: {current}\n\nOptions:\n{options}")
+}
+
 async fn chat_get_config(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -14622,7 +14637,7 @@ async fn chat_slash_command(
 
     let response_text = match cmd.as_str() {
         "/help" => {
-            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /prompt -- show full agent prompt and context\n    /context -- show message count and summary\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- add to pinned context\n    /pins -- show pinned context\n    /unpin <id> -- remove a pin by id\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /clear -- clear messages, keep context\n\n  MODEL\n    /model <name> -- switch model (process agents)\n    /effort <level> -- low/medium/high/max/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- side question (separate process)\n    /hi -- check if agent is working\n\nManage mode can be configured in the manage panel (people icon).".to_string()
+            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /prompt -- show full agent prompt and context\n    /context -- show message count and summary\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- add to pinned context\n    /pins -- show pinned context\n    /unpin <id> -- remove a pin by id\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /clear -- clear messages, keep context\n\n  MODEL\n    /model <name> -- switch model (process agents)\n    /effort <level> -- backend-specific effort/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- side question (separate process)\n    /hi -- check if agent is working\n\nManage mode can be configured in the manage panel (people icon).".to_string()
         }
         "/status" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
@@ -14895,17 +14910,22 @@ async fn chat_slash_command(
         "/effort" => {
             let agent_token = agents.iter().find(|a| a.name == agent_name);
             let is_api = agent_token.map(|a| a.endpoint_id.is_some()).unwrap_or(false);
-            let is_anthropic = if is_api {
+            let effort_levels = if is_api {
                 let ep_id = agent_token.and_then(|a| a.endpoint_id.as_deref()).unwrap_or("");
                 state.endpoint_store.get(ep_id).ok().flatten()
-                    .map(|ep| matches!(ep.kind, EndpointKind::Anthropic))
-                    .unwrap_or(false)
+                    .and_then(|ep| if matches!(ep.kind, EndpointKind::Anthropic) {
+                        Some(CLAUDE_EFFORT_LEVELS)
+                    } else {
+                        None
+                    })
             } else {
-                agent_token.map(|a| a.backend.to_string() == "claude").unwrap_or(false)
+                match agent_token.map(|a| a.backend.to_string()).as_deref() {
+                    Some("claude") => Some(CLAUDE_EFFORT_LEVELS),
+                    Some("codex") => Some(CODEX_EFFORT_LEVELS),
+                    _ => None,
+                }
             };
-            if !is_anthropic {
-                "Effort is only supported for Anthropic/Claude.".to_string()
-            } else {
+            if let Some(levels) = effort_levels {
                 let pref_key = if is_api {
                     format!("endpoint:{}", agent_token.and_then(|a| a.endpoint_id.as_deref()).unwrap_or(""))
                 } else {
@@ -14914,9 +14934,7 @@ async fn chat_slash_command(
                 let (_, current_effort) = state.chat.get_backend_prefs(owner, &pref_key).unwrap_or((None, None));
                 if args.is_empty() {
                     let current = current_effort.as_deref().unwrap_or("default");
-                    format!(
-                        "Current effort: {current}\n\nOptions:\n  /effort low -- minimal thinking\n  /effort medium -- balanced\n  /effort high -- deeper reasoning\n  /effort max -- maximum thinking\n  /effort default -- reset to default"
-                    )
+                    effort_options_text(current, levels)
                 } else {
                     let lower = args.to_lowercase();
                     if lower == "default" || lower == "off" || lower == "none" {
@@ -14926,7 +14944,7 @@ async fn chat_slash_command(
                             state.chat.set_backend_effort(owner, &pref_key, None)?;
                             "Effort reset to default. Next message will use it.".to_string()
                         }
-                    } else if ["low", "medium", "high", "max"].contains(&lower.as_str()) {
+                    } else if levels.contains(&lower.as_str()) {
                         if current_effort.as_deref() == Some(&lower) {
                             format!("Already using {lower} effort.")
                         } else {
@@ -14934,8 +14952,17 @@ async fn chat_slash_command(
                             format!("Effort set to {lower}. Next message will use it.")
                         }
                     } else {
-                        "Invalid effort level. Options: low, medium, high, max, default".to_string()
+                        format!(
+                            "Invalid effort level. Options: {}, default",
+                            levels.join(", ")
+                        )
                     }
+                }
+            } else {
+                if is_api {
+                    "Effort is only supported for Anthropic endpoints.".to_string()
+                } else {
+                    "Effort is only supported for Claude and Codex process agents.".to_string()
                 }
             }
         }
