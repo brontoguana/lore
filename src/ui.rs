@@ -4555,19 +4555,34 @@ function resizeChatInput() {{
   var headerBottom = 0;
   var prevHeight = input.offsetHeight;
   var prevOverflow = input.style.overflowY;
+  var valueLength = (input.value || '').length;
+  var prevValueLength = parseInt(input.dataset.chatComposerValueLength || '0', 10);
   var wasFollowing = chatShouldFollow(messages, chatFollowScroll);
   if (header) {{
     var headerRect = header.getBoundingClientRect();
     headerBottom = Math.max(0, headerRect.bottom);
   }}
-  input.style.height = 'auto';
+  var computed = window.getComputedStyle ? window.getComputedStyle(input) : null;
+  var borderY = computed
+    ? (parseFloat(computed.borderTopWidth) || 0) + (parseFloat(computed.borderBottomWidth) || 0)
+    : 0;
+  var isBorderBox = !computed || computed.boxSizing === 'border-box';
+  if (valueLength < prevValueLength || valueLength === 0 || !input.style.height) {{
+    input.style.height = 'auto';
+  }}
   var formChrome = form ? Math.max(0, form.offsetHeight - input.offsetHeight) : 0;
   var minHeight = 38;
   var maxHeight = Math.max(120, Math.floor(viewportHeight - headerBottom - formChrome - 16));
-  var nextHeight = Math.max(minHeight, Math.min(input.scrollHeight, maxHeight));
-  var nextOverflow = input.scrollHeight > maxHeight ? 'auto' : 'hidden';
-  input.style.height = nextHeight + 'px';
+  var measuredHeight = input.scrollHeight + (isBorderBox ? borderY : 0);
+  var nextHeight = Math.max(minHeight, Math.min(measuredHeight, maxHeight));
+  var nextOverflow = measuredHeight > maxHeight ? 'auto' : 'hidden';
+  if (Math.abs(nextHeight - prevHeight) > 1) {{
+    input.style.height = nextHeight + 'px';
+  }} else if (!input.style.height) {{
+    input.style.height = prevHeight + 'px';
+  }}
   input.style.overflowY = nextOverflow;
+  input.dataset.chatComposerValueLength = String(valueLength);
   if (sendBtn) {{
     // Match the textarea's real rendered box, not just the requested height,
     // so the button stays flush when browser text metrics round differently.
@@ -13168,6 +13183,35 @@ mod tests {
         assert!(html.contains("if (isMobileChatLayout()) return true;"));
         assert!(html.contains("form.requestSubmit();"));
         assert!(html.contains(r#"onkeydown="return handleChatKey(event)"></textarea>"#));
+    }
+
+    #[test]
+    fn chat_composer_autosize_avoids_per_character_height_probe() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf123",
+            true,
+            &[],
+            Some("agent-main"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("var valueLength = (input.value || '').length;"));
+        assert!(
+            html.contains("var prevValueLength = parseInt(input.dataset.chatComposerValueLength")
+        );
+        assert!(html.contains(
+            "if (valueLength < prevValueLength || valueLength === 0 || !input.style.height)"
+        ));
+        assert!(
+            html.contains("var measuredHeight = input.scrollHeight + (isBorderBox ? borderY : 0);")
+        );
+        assert!(html.contains("input.dataset.chatComposerValueLength = String(valueLength);"));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 - Made desktop chat composer Enter submit the message while Shift+Enter still inserts a newline; mobile keeps the existing return-key newline behavior.
 - Combined the desktop agent chat toolbar metadata into the centered folder slot as backend/model/effort/folder, with the folder shortened to its basename.
 - Widened agent chat config and manager large text fields so their inline summary surfaces span the available panel width while staying clamped to the device width on mobile.
+- Stabilized agent chat composer autosizing so the message field no longer bounces between heights while typing.
 
 ## 2026-04-24
 
