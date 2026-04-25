@@ -29,7 +29,6 @@ const ICON_STOP: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill=
 const ICON_RESTART: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>"#;
 const ICON_CHECK: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>"#;
 const ICON_CLOSE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"#;
-const ICON_EDIT: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4Z"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 const ICON_MANAGER: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
 const ICON_STATUS_DONE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>"#;
@@ -1921,18 +1920,7 @@ pub fn render_admin_page(
             <span>Edit this prompt</span>
           </label>
           <div style="padding:0 var(--s-5) var(--s-5);">
-            <div class="chat-config-field-header">
-              <label class="chat-config-label" for="manager-review-prompt">Prompt</label>
-              <span class="chat-config-field-actions">
-                <button
-                  type="button"
-                  class="btn-sm manager-prompt-edit-button"
-                  data-manager-edit-button="manager-review-prompt"
-                  onclick="return openManagerPromptEditor('manager-review-prompt')"
-                  title="Edit Review Latest Output Prompt"
-                  aria-disabled="{manager_review_aria_disabled}">{edit_icon}</button>
-              </span>
-            </div>
+            <label class="chat-config-label" for="manager-review-prompt">Prompt</label>
             <div
               class="chat-config-textarea expanded-editor-preview"
               data-expanded-editor-preview-for="manager-review-prompt"
@@ -1964,18 +1952,7 @@ pub fn render_admin_page(
             <span>Edit this prompt</span>
           </label>
           <div style="padding:0 var(--s-5) var(--s-5);">
-            <div class="chat-config-field-header">
-              <label class="chat-config-label" for="manager-periodic-prompt">Prompt</label>
-              <span class="chat-config-field-actions">
-                <button
-                  type="button"
-                  class="btn-sm manager-prompt-edit-button"
-                  data-manager-edit-button="manager-periodic-prompt"
-                  onclick="return openManagerPromptEditor('manager-periodic-prompt')"
-                  title="Edit Run Periodic Checks Prompt"
-                  aria-disabled="{manager_periodic_aria_disabled}">{edit_icon}</button>
-              </span>
-            </div>
+            <label class="chat-config-label" for="manager-periodic-prompt">Prompt</label>
             <div
               class="chat-config-textarea expanded-editor-preview"
               data-expanded-editor-preview-for="manager-periodic-prompt"
@@ -2007,18 +1984,7 @@ pub fn render_admin_page(
             <span>Edit this prompt</span>
           </label>
           <div style="padding:0 var(--s-5) var(--s-5);">
-            <div class="chat-config-field-header">
-              <label class="chat-config-label" for="manager-validate-prompt">Prompt</label>
-              <span class="chat-config-field-actions">
-                <button
-                  type="button"
-                  class="btn-sm manager-prompt-edit-button"
-                  data-manager-edit-button="manager-validate-prompt"
-                  onclick="return openManagerPromptEditor('manager-validate-prompt')"
-                  title="Edit Validate Periodic Check Results Prompt"
-                  aria-disabled="{manager_validate_aria_disabled}">{edit_icon}</button>
-              </span>
-            </div>
+            <label class="chat-config-label" for="manager-validate-prompt">Prompt</label>
             <div
               class="chat-config-textarea expanded-editor-preview"
               data-expanded-editor-preview-for="manager-validate-prompt"
@@ -2303,19 +2269,16 @@ pub fn render_admin_page(
         var targetId = toggle.getAttribute('data-manager-target');
         if (!targetId) return;
         var textarea = document.getElementById(targetId);
-        var editButton = document.querySelector('[data-manager-edit-button="' + targetId + '"]');
         var preview = document.querySelector('[data-expanded-editor-preview-for="' + targetId + '"]');
         if (!textarea) return;
         if (toggle.checked) {{
           textarea.disabled = false;
           textarea.removeAttribute('disabled');
-          if (editButton) editButton.setAttribute('aria-disabled', 'false');
           if (preview) preview.classList.remove('is-disabled');
         }} else {{
           textarea.value = textarea.getAttribute('data-manager-default') || '';
           textarea.disabled = true;
           textarea.setAttribute('disabled', 'disabled');
-          if (editButton) editButton.setAttribute('aria-disabled', 'true');
           if (preview) preview.classList.add('is-disabled');
         }}
         syncExpandedEditorPreview(targetId);
@@ -2556,22 +2519,6 @@ pub fn render_admin_page(
         } else {
             " disabled"
         },
-        manager_review_aria_disabled = if manager_prompt_config.review_latest_output.enabled {
-            "false"
-        } else {
-            "true"
-        },
-        manager_periodic_aria_disabled = if manager_prompt_config.run_periodic_checks.enabled {
-            "false"
-        } else {
-            "true"
-        },
-        manager_validate_aria_disabled = if manager_prompt_config.validate_periodic_checks.enabled {
-            "false"
-        } else {
-            "true"
-        },
-        edit_icon = ICON_EDIT,
         manager_review_text = escape_text(manager_review_text),
         manager_periodic_text = escape_text(manager_periodic_text),
         manager_validate_text = escape_text(manager_validate_text),
@@ -3650,6 +3597,14 @@ pub struct ChatAgentSummary {
     pub git_branch: Option<String>,
 }
 
+fn chat_folder_name(cwd: &str) -> String {
+    cwd.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 fn chat_agent_status_indicator(
     status: &str,
     manage_enabled: bool,
@@ -3752,38 +3707,16 @@ pub fn render_chat_main_panel(
                 )
             })
             .unwrap_or_default();
-        let cwd_html = {
-            let cwd_short = selected_agent_data
+        let metadata_html = {
+            let folder = selected_agent_data
                 .and_then(|a| a.cwd.as_ref())
-                .map(|cwd| {
-                    let parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
-                    if parts.len() > 3 {
-                        format!(".../{}", parts[parts.len() - 3..].join("/"))
-                    } else {
-                        parts.join("/")
-                    }
-                })
+                .map(|cwd| chat_folder_name(cwd))
                 .unwrap_or_default();
-            let branch = selected_agent_data
-                .and_then(|a| a.git_branch.as_ref())
-                .cloned()
-                .unwrap_or_default();
-            let mut label = cwd_short;
-            if !branch.is_empty() {
-                if !label.is_empty() {
-                    label = format!("{} ({})", label, branch);
-                } else {
-                    label = format!("({})", branch);
-                }
-            }
-            if label.is_empty() {
-                r#"<span class="chat-header-cwd" id="chat-agent-cwd"></span>"#.to_string()
-            } else {
-                format!(
-                    r#"<span class="chat-header-cwd" id="chat-agent-cwd">{}</span>"#,
-                    escape_text(&label)
-                )
-            }
+            format!(
+                r#"<span class="chat-header-cwd" id="chat-agent-cwd" data-folder="{}">{}</span>"#,
+                escape_attribute(&folder),
+                escape_text(&folder)
+            )
         };
         return format!(
             r#"<div class="chat-header">
@@ -3791,7 +3724,7 @@ pub fn render_chat_main_panel(
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
   </button>
   {header_avatar}<span class="chat-header-name">{display_name}</span>
-  {cwd_html}
+  {metadata_html}
   <div class="chat-header-actions">
     <span class="chat-header-status" id="chat-agent-status"></span>
     <button type="button" class="btn-sm button-link" id="chat-manage-btn" onclick="toggleManagePanel()" title="Manage">{ICON_MANAGER}</button>
@@ -3816,18 +3749,15 @@ pub fn render_chat_main_panel(
       <label class="chat-config-label">Effort</label>
       <select id="cfg-effort" class="chat-config-select" onchange="onConfigChange()"></select>
     </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <div class="chat-config-label-row">
-        <label class="chat-config-label" for="cfg-pinned-context">Pinned Context</label>
-        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('cfg-pinned-context')" title="Edit Pinned Context">{edit_icon}</button>
-      </div>
+    <div class="chat-config-field chat-config-field-wide">
+      <label class="chat-config-label" for="cfg-pinned-context">Pinned Context</label>
       <textarea id="cfg-pinned-context" class="chat-config-textarea expanded-editor-source" data-editor-label="Pinned Context" data-editor-save="pinned" placeholder="Context sent with every message to this agent..." readonly onclick="return openExpandedTextEditor('cfg-pinned-context')"></textarea>
     </div>
-    <div class="chat-config-field" id="cfg-project-context-field" style="flex:1;display:flex;flex-direction:column;display:none;">
+    <div class="chat-config-field chat-config-field-wide" id="cfg-project-context-field" style="display:none;">
       <label class="chat-config-label">Project Context</label>
       <textarea id="cfg-project-context" class="chat-config-textarea" readonly placeholder="No project context set."></textarea>
     </div>
-    <div class="chat-config-field" id="cfg-errors-field" style="flex:1;display:flex;flex-direction:column;">
+    <div class="chat-config-field chat-config-field-wide" id="cfg-errors-field">
       <label class="chat-config-label">Error Log <span id="cfg-errors-count" style="color:var(--fg-muted);font-weight:normal;"></span></label>
       <div id="cfg-errors-list" class="chat-errors-list"></div>
     </div>
@@ -3839,32 +3769,20 @@ pub fn render_chat_main_panel(
       <label class="chat-config-label">Manager Backend</label>
       <select id="mgr-backend" class="chat-config-select" onchange="onManageChange()"></select>
     </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <div class="chat-config-label-row">
-        <label class="chat-config-label" for="mgr-goals">Goals</label>
-        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('mgr-goals')" title="Edit Goals">{edit_icon}</button>
-      </div>
+    <div class="chat-config-field chat-config-field-wide">
+      <label class="chat-config-label" for="mgr-goals">Goals</label>
       <textarea id="mgr-goals" class="chat-config-textarea expanded-editor-source" data-editor-label="Goals" data-editor-save="manage" placeholder="What should the agent accomplish?" readonly onclick="return openExpandedTextEditor('mgr-goals')"></textarea>
     </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <div class="chat-config-label-row">
-        <label class="chat-config-label" for="mgr-stopping">Stopping Point</label>
-        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('mgr-stopping')" title="Edit Stopping Point">{edit_icon}</button>
-      </div>
+    <div class="chat-config-field chat-config-field-wide">
+      <label class="chat-config-label" for="mgr-stopping">Stopping Point</label>
       <textarea id="mgr-stopping" class="chat-config-textarea expanded-editor-source" data-editor-label="Stopping Point" data-editor-save="manage" placeholder="When should the manager stop the agent?" readonly onclick="return openExpandedTextEditor('mgr-stopping')"></textarea>
     </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <div class="chat-config-label-row">
-        <label class="chat-config-label" for="mgr-checks">Periodic Checks</label>
-        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('mgr-checks')" title="Edit Periodic Checks">{edit_icon}</button>
-      </div>
+    <div class="chat-config-field chat-config-field-wide">
+      <label class="chat-config-label" for="mgr-checks">Periodic Checks</label>
       <textarea id="mgr-checks" class="chat-config-textarea expanded-editor-source" data-editor-label="Periodic Checks" data-editor-save="manage" placeholder="What should the agent verify every few turns?" readonly onclick="return openExpandedTextEditor('mgr-checks')"></textarea>
     </div>
-    <div class="chat-config-field" style="flex:1;display:flex;flex-direction:column;">
-      <div class="chat-config-label-row">
-        <label class="chat-config-label" for="mgr-redflags">Red Flags</label>
-        <button type="button" class="btn-sm" onclick="return openExpandedTextEditor('mgr-redflags')" title="Edit Red Flags">{edit_icon}</button>
-      </div>
+    <div class="chat-config-field chat-config-field-wide">
+      <label class="chat-config-label" for="mgr-redflags">Red Flags</label>
       <textarea id="mgr-redflags" class="chat-config-textarea expanded-editor-source" data-editor-label="Red Flags" data-editor-save="manage" placeholder="What should cause the manager to halt the agent?" readonly onclick="return openExpandedTextEditor('mgr-redflags')"></textarea>
     </div>
     <div class="chat-config-field">
@@ -3902,9 +3820,8 @@ pub fn render_chat_main_panel(
 "#,
             header_avatar = header_avatar,
             display_name = escape_text(display),
-            cwd_html = cwd_html,
+            metadata_html = metadata_html,
             settings_icon = ICON_SETTINGS,
-            edit_icon = ICON_EDIT,
             close_icon = ICON_CLOSE,
             check_icon = ICON_CHECK,
             csrf_token = escape_attribute(csrf_token),
@@ -5163,7 +5080,19 @@ document.addEventListener('keydown', function(e) {{
 }});
 
 function handleChatKey(e) {{
-  return true;
+  if (!e || e.key !== 'Enter') return true;
+  if (e.shiftKey || e.isComposing || e.keyCode === 229) return true;
+  if (isMobileChatLayout()) return true;
+  e.preventDefault();
+  var form = e.target && e.target.form;
+  if (form) {{
+    if (typeof form.requestSubmit === 'function') {{
+      form.requestSubmit();
+    }} else {{
+      form.dispatchEvent(new Event('submit', {{ bubbles: true, cancelable: true }}));
+    }}
+  }}
+  return false;
 }}
 
 function applyExcludedChatMessage(data, messageId) {{
@@ -5502,13 +5431,20 @@ function sendMessage(e) {{
 }}
 
 function updateHeaderStatus() {{
-  var el = document.getElementById('chat-agent-status');
-  if (!el) return;
+  var statusEl = document.getElementById('chat-agent-status');
+  var metaEl = document.getElementById('chat-agent-cwd');
+  if (!statusEl && !metaEl) return;
   var parts = [];
-  if (agentConfig.backend) parts.push(agentConfig.backend);
-  if (agentConfig.model) parts.push(agentConfig.model);
-  if (agentConfig.effort && backendEfforts[agentConfig.backend] && backendEfforts[agentConfig.backend].length > 0) parts.push(agentConfig.effort);
-  if (agentStatus) parts.push(agentStatus);
+  if (agentConfig.backend) {{
+    parts.push(agentConfig.backend);
+    parts.push(agentConfig.model || 'default');
+    if (backendEfforts[agentConfig.backend] && backendEfforts[agentConfig.backend].length > 0) {{
+      parts.push(agentConfig.effort || 'default');
+    }}
+  }}
+  var folder = metaEl && metaEl.dataset ? (metaEl.dataset.folder || '') : '';
+  if (folder) parts.push(folder);
+  if (metaEl) metaEl.textContent = parts.join(' \u00b7 ');
   var statusClass = chatStatusClass(agentStatus);
   var useManagerGlyph = shouldUseManagerGlyph(currentAgent, statusClass);
   var statusTitle = agentStatus === 'idle' ? 'Finished' : agentStatus === 'thinking' ? 'Working' : agentStatus === 'restarting' ? 'Restarting' : 'Stopped';
@@ -5521,9 +5457,7 @@ function updateHeaderStatus() {{
     : agentStatus === 'restarting'
     ? '{ICON_RESTART}'
     : '{ICON_STATUS_STOPPED}';
-  el.innerHTML = '<span class="chat-status-glyph ' + statusClass + '" title="' + statusTitle + '">' + glyphHtml + '</span><span class="chat-header-status-text"></span>';
-  var textEl = el.querySelector('.chat-header-status-text');
-  if (textEl) textEl.textContent = parts.join(' \u00b7 ');
+  if (statusEl) statusEl.innerHTML = '<span class="chat-status-glyph ' + statusClass + '" title="' + statusTitle + '">' + glyphHtml + '</span>';
 }}
 
 function shouldUseManagerGlyph(agent, statusClass) {{
@@ -5830,12 +5764,9 @@ function connectSSE() {{
         if (evt.data.cwd) {{
           var cwdEl = document.getElementById('chat-agent-cwd');
           if (cwdEl) {{
-            var parts = evt.data.cwd.split('/').filter(function(s){{ return s.length > 0; }});
-            var short = parts.length > 3 ? '.../' + parts.slice(-3).join('/') : parts.join('/');
-            var branch = evt.data.git_branch || '';
-            var label = short;
-            if (branch) label = label ? label + ' (' + branch + ')' : '(' + branch + ')';
-            cwdEl.textContent = label;
+            var parts = evt.data.cwd.split(/[\/\\\\]/).filter(function(s){{ return s.length > 0; }});
+            cwdEl.dataset.folder = parts.length ? parts[parts.length - 1] : '';
+            updateHeaderStatus();
           }}
         }}
       }}
@@ -10231,7 +10162,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       white-space: nowrap;
     }
     .chat-header-actions {
-      margin-left: auto;
+      margin-left: 0;
       display: inline-flex;
       align-items: center;
       gap: var(--s-2);
@@ -10251,18 +10182,15 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       line-height: 1.3;
       min-width: 28px;
     }
-    .chat-header-status-text {
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
     .chat-header-cwd {
-      margin-left: auto;
+      flex: 1 1 auto;
+      min-width: 0;
+      margin: 0 var(--s-3);
       font-size: 0.82rem;
       color: var(--fg-muted);
       display: block;
       line-height: 1.3;
+      text-align: center;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -10341,12 +10269,16 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-config-panel {
       flex: 1;
       min-height: 0;
+      min-width: 0;
       overflow-y: auto;
+      overflow-x: hidden;
       overscroll-behavior: none;
       padding: var(--s-5);
     }
     .chat-config-inner {
-      max-width: 400px;
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
       display: flex;
       flex-direction: column;
       gap: var(--s-4);
@@ -10356,30 +10288,13 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       flex-direction: column;
       gap: var(--s-1);
-    }
-    .chat-config-label-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: var(--s-2);
-    }
-    .chat-config-field-header {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: center;
-      gap: var(--s-2);
       width: 100%;
-    }
-    .chat-config-field-header .chat-config-label {
+      max-width: 400px;
       min-width: 0;
+      box-sizing: border-box;
     }
-    .chat-config-field-actions {
-      justify-self: end;
-      display: inline-flex;
-      align-items: center;
-      justify-content: flex-end;
-      gap: var(--s-1);
-      min-width: 28px;
+    .chat-config-field-wide {
+      max-width: none;
     }
     .chat-config-label {
       font-size: 0.85rem;
@@ -10387,6 +10302,9 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       color: var(--fg-muted);
     }
     .chat-config-select {
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
       padding: var(--s-2) var(--s-3);
       border: 1px solid var(--line);
       border-radius: var(--radius);
@@ -10396,6 +10314,10 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       font-family: var(--font-sans);
     }
     .chat-config-textarea {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      box-sizing: border-box;
       flex: 1;
       min-height: 120px;
       padding: var(--s-3);
@@ -10430,8 +10352,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .expanded-editor-preview:hover {
       border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
     }
-    .expanded-editor-preview.is-disabled,
-    .manager-prompt-edit-button[aria-disabled="true"] {
+    .expanded-editor-preview.is-disabled {
       opacity: 0.45;
       cursor: default;
     }
@@ -12485,9 +12406,8 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       .chat-header .chat-avatar-sm-wrap { margin-right: 0; margin-left: 0; }
       .chat-header .chat-avatar-header { margin: 0; }
       .chat-header-cwd { display: none; }
-      .chat-header-actions { gap: var(--s-2); }
+      .chat-header-actions { margin-left: auto; gap: var(--s-2); }
       .chat-header-status { gap: 0; }
-      .chat-header-status-text { display: none; }
       .chat-messages {
         overflow-y: scroll;
         overflow-x: hidden;
@@ -12814,10 +12734,9 @@ mod tests {
             String::new(),
         );
         assert!(html.contains(".chat-header-actions {"));
-        assert!(html.contains("margin-left: auto;"));
+        assert!(html.contains("margin-left: 0;"));
         assert!(html.contains("display: inline-flex;"));
-        assert!(html.contains(".chat-header-actions { gap: var(--s-2); }"));
-        assert!(html.contains(".chat-header-status-text { display: none; }"));
+        assert!(html.contains(".chat-header-actions { margin-left: auto; gap: var(--s-2); }"));
         assert!(html.contains(".chat-header-status { gap: 0; }"));
 
         let panel = render_chat_main_panel(
@@ -12842,6 +12761,56 @@ mod tests {
             panel.contains(r#"<span class="chat-header-status" id="chat-agent-status"></span>"#)
         );
         assert!(panel.contains(r#"id="chat-manage-btn""#));
+    }
+
+    #[test]
+    fn desktop_chat_header_combines_backend_model_effort_and_folder() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[ChatAgentSummary {
+                name: "worker".into(),
+                display_name: "Worker".into(),
+                owner: "admin".into(),
+                status: "idle".into(),
+                manage_enabled: false,
+                last_message: None,
+                last_message_time: None,
+                profile_url: None,
+                cwd: Some("/home/main/Documents/Lore/project-alpha".into()),
+                git_branch: Some("main".into()),
+            }],
+            Some("worker"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(
+            html.contains(
+                r#"id="chat-agent-cwd" data-folder="project-alpha">project-alpha</span>"#
+            )
+        );
+        assert!(!html.contains("Documents/Lore/project-alpha"));
+        assert!(!html.contains("project-alpha (main)"));
+        assert!(html.contains("parts.push(agentConfig.backend);"));
+        assert!(html.contains("parts.push(agentConfig.model || 'default');"));
+        assert!(html.contains("parts.push(agentConfig.effort || 'default');"));
+        assert!(html.contains("if (folder) parts.push(folder);"));
+        assert!(html.contains("metaEl.textContent = parts.join(' \\u00b7 ');"));
+        assert!(
+            html.contains("statusEl.innerHTML = '<span class=\"chat-status-glyph ' + statusClass")
+        );
+        assert!(!html.contains("chat-header-status-text"));
+        assert!(
+            html.contains("cwdEl.dataset.folder = parts.length ? parts[parts.length - 1] : '';")
+        );
+        assert!(html.contains(".chat-header-cwd {\n      flex: 1 1 auto;"));
+        assert!(html.contains("text-align: center;"));
     }
 
     #[test]
@@ -13011,6 +12980,30 @@ mod tests {
         assert!(html.contains(r#"data-editor-save="pinned""#));
         assert!(html.contains(r#"data-editor-save="manage""#));
         assert!(html.contains(
+            r#"<div class="chat-config-field chat-config-field-wide">
+      <label class="chat-config-label" for="cfg-pinned-context">Pinned Context</label>"#
+        ));
+        assert!(html.contains(
+            r#"<div class="chat-config-field chat-config-field-wide" id="cfg-project-context-field" style="display:none;">"#
+        ));
+        assert!(html.contains(
+            r#"<div class="chat-config-field chat-config-field-wide">
+      <label class="chat-config-label" for="mgr-goals">Goals</label>"#
+        ));
+        assert!(html.contains(r#"for="mgr-stopping">Stopping Point</label>"#));
+        assert!(html.contains(r#"for="mgr-checks">Periodic Checks</label>"#));
+        assert!(html.contains(r#"for="mgr-redflags">Red Flags</label>"#));
+        assert!(html.contains(".chat-config-inner {\n      width: 100%;\n      max-width: 100%;"));
+        assert!(html.contains(".chat-config-field {\n      display: flex;\n      flex-direction: column;\n      gap: var(--s-1);\n      width: 100%;\n      max-width: 400px;"));
+        assert!(html.contains(".chat-config-field-wide {\n      max-width: none;"));
+        assert!(html.contains(".chat-config-textarea {\n      width: 100%;\n      max-width: 100%;\n      min-width: 0;"));
+        assert!(html.contains("overflow-x: hidden;\n      overscroll-behavior: none;"));
+        assert!(!html.contains(r#"title="Edit Pinned Context""#));
+        assert!(!html.contains(r#"title="Edit Goals""#));
+        assert!(!html.contains(r#"title="Edit Stopping Point""#));
+        assert!(!html.contains(r#"title="Edit Periodic Checks""#));
+        assert!(!html.contains(r#"title="Edit Red Flags""#));
+        assert!(html.contains(
             "codex: ['default', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2']"
         ));
         assert!(html.contains("function applyBackendModelOptions(options) {"));
@@ -13078,9 +13071,6 @@ mod tests {
             "manager",
         );
 
-        assert!(html.contains(r#"data-manager-edit-button="manager-review-prompt""#));
-        assert!(html.contains(r#"data-manager-edit-button="manager-periodic-prompt""#));
-        assert!(html.contains(r#"data-manager-edit-button="manager-validate-prompt""#));
         assert!(html.contains(r#"data-expanded-editor-preview-for="manager-review-prompt""#));
         assert!(html.contains(r#"data-expanded-editor-preview-for="manager-periodic-prompt""#));
         assert!(html.contains(r#"data-expanded-editor-preview-for="manager-validate-prompt""#));
@@ -13092,19 +13082,17 @@ mod tests {
         assert!(
             html.contains(r#"onclick="return openManagerPromptEditor('manager-review-prompt')""#)
         );
-        assert!(html.contains(r#"aria-disabled="true""#));
+        assert!(!html.contains(r#"data-manager-edit-button="#));
+        assert!(!html.contains(r#"class="btn-sm manager-prompt-edit-button""#));
+        assert!(!html.contains(r#"aria-disabled="true""#));
         assert!(html.contains("window.openManagerPromptEditor = function(targetId) {"));
         assert!(html.contains("syncManagerPromptEditor(toggle);"));
         assert!(html.contains("return openExpandedTextEditor(targetId);"));
-        assert!(html.contains(".chat-config-field-header {"));
-        assert!(html.contains("grid-template-columns: minmax(0, 1fr) auto;"));
-        assert!(html.contains(".chat-config-field-actions {"));
-        assert!(html.contains("justify-self: end;"));
-        assert!(html.contains(".manager-prompt-edit-button[aria-disabled=\"true\"]"));
+        assert!(!html.contains(".chat-config-field-header {"));
+        assert!(!html.contains(".chat-config-field-actions {"));
+        assert!(!html.contains(".manager-prompt-edit-button[aria-disabled=\"true\"]"));
         assert!(html.contains("function syncExpandedEditorPreview(sourceId) {"));
-        assert!(html.contains(
-	            r#"var editButton = document.querySelector('[data-manager-edit-button="' + targetId + '"]');"#
-	        ));
+        assert!(!html.contains("var editButton = document.querySelector("));
         assert!(html.contains("textarea.removeAttribute('disabled');"));
         assert!(html.contains("textarea.setAttribute('disabled', 'disabled');"));
     }
@@ -13154,6 +13142,32 @@ mod tests {
         assert!(html.contains(".chat-messages {\n      height: 100%;"));
         assert!(html.contains(".chat-msg {\n      max-width: 80%;"));
         assert!(html.contains(".chat-input {\n      flex: 1;"));
+    }
+
+    #[test]
+    fn chat_page_submits_on_desktop_enter_but_keeps_shift_enter_newline() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf123",
+            true,
+            &[],
+            Some("agent-main"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("function handleChatKey(e) {"));
+        assert!(html.contains("if (!e || e.key !== 'Enter') return true;"));
+        assert!(
+            html.contains("if (e.shiftKey || e.isComposing || e.keyCode === 229) return true;")
+        );
+        assert!(html.contains("if (isMobileChatLayout()) return true;"));
+        assert!(html.contains("form.requestSubmit();"));
+        assert!(html.contains(r#"onkeydown="return handleChatKey(event)"></textarea>"#));
     }
 
     #[test]

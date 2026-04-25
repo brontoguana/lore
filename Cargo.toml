@@ -1,6 +1,6 @@
 [package]
 name = "lore-core"
-version = "0.1.65-rc121"
+version = "0.1.65-rc122"
 edition = "2024"
 autobins = false
 

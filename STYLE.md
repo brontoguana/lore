@@ -274,12 +274,14 @@ Do not keep these fields as the primary inline editing surface inside dense pane
 - `Cancel` discards the overlay edits and returns to the previous page state
 - `Save` commits the new value back to the source field and runs that field's normal save/update flow
 - The source field remains in place underneath as the summary/preview surface
+- Open the editor by clicking/tapping the multiline field or preview surface itself; do not add a separate edit button beside expanded text areas unless a specific workflow needs an alternate action.
 
 ### Layout
 
 - Full-screen overlay, edge to edge
 - Field label/title at the top
 - One large mono textarea filling most of the height
+- Inline summary/preview surfaces should span the full width of their parent container while remaining `max-width: 100%` on mobile
 - Fixed bottom action row
 - Respect safe-area insets on mobile
 
@@ -294,7 +296,7 @@ Do not keep these fields as the primary inline editing surface inside dense pane
 
 - Reuse one shared expanded-editor shell instead of inventing field-specific fullscreen editors
 - Keep typography and textarea styling consistent with the underlying field
-- Prefer opening the expanded editor from tapping/clicking the multiline field itself, optionally with a small edit glyph for clarity
+- Open the expanded editor from tapping/clicking the multiline field itself; avoid separate edit glyphs for expanded text areas.
 - Treat this as the default target for multiline editing; inline typing inside cramped config panels should be the exception, not the rule
 
 ---

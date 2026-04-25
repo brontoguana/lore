@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-04-25
+
+- Removed redundant expanded-editor launch glyph buttons from chat/manager config and admin manager prompt fields, keeping the multiline textarea or preview surface as the editor entry point.
+- Made desktop chat composer Enter submit the message while Shift+Enter still inserts a newline; mobile keeps the existing return-key newline behavior.
+- Combined the desktop agent chat toolbar metadata into the centered folder slot as backend/model/effort/folder, with the folder shortened to its basename.
+- Widened agent chat config and manager large text fields so their inline summary surfaces span the available panel width while staying clamped to the device width on mobile.
+
 ## 2026-04-24
 
 - Removed the obsolete inline markdown block edit state from document pages so markdown edit lines use only the fullscreen expanded editor and browser back cannot surface the intermediate form.
