@@ -1595,7 +1595,10 @@ pub fn render_admin_page(
     };
 
     let content = format!(
-        r#"<h1 class="page-title">Admin</h1>
+        r#"<div class="admin-page-header">
+      <h1 class="page-title">Admin</h1>
+      <p class="admin-version">Lore v{current_version}</p>
+    </div>
 
     <div class="admin-sidebar-layout">
       <nav class="admin-nav" id="admin-nav">
@@ -3766,6 +3769,10 @@ pub fn render_chat_main_panel(
 <div class="chat-config-panel" id="chat-manage-panel" style="display:none;">
   <div class="chat-config-inner">
     <div class="chat-config-field">
+      <button type="button" class="btn-lg" id="mgr-toggle" onclick="toggleManageMode()">Enable</button>
+      <span id="mgr-status" style="margin-left:var(--s-2);font-size:0.85em;color:var(--fg-muted);"></span>
+    </div>
+    <div class="chat-config-field">
       <label class="chat-config-label">Manager Backend</label>
       <select id="mgr-backend" class="chat-config-select" onchange="onManageChange()"></select>
     </div>
@@ -3784,10 +3791,6 @@ pub fn render_chat_main_panel(
     <div class="chat-config-field chat-config-field-wide">
       <label class="chat-config-label" for="mgr-redflags">Red Flags</label>
       <textarea id="mgr-redflags" class="chat-config-textarea expanded-editor-source" data-editor-label="Red Flags" data-editor-save="manage" placeholder="What should cause the manager to halt the agent?" readonly onclick="return openExpandedTextEditor('mgr-redflags')"></textarea>
-    </div>
-    <div class="chat-config-field">
-      <button type="button" class="btn-lg" id="mgr-toggle" onclick="toggleManageMode()">Enable</button>
-      <span id="mgr-status" style="margin-left:var(--s-2);font-size:0.85em;color:var(--fg-muted);"></span>
     </div>
   </div>
 </div>
@@ -4132,6 +4135,11 @@ var chatLastStreamEventAt = Date.now();
 var chatWasBackgrounded = false;
 var chatSendInFlight = false;
 var chatSendMaxAttempts = 3;
+var chatRestoreInFlight = false;
+var chatPanelRequestSeq = 0;
+var CHAT_PANEL_CACHE_LIMIT = 100;
+var chatPanelCache = {{}};
+var chatPanelCacheOrder = [];
 
 function isMobileChatLayout() {{
   return !!(window.matchMedia && window.matchMedia('(max-width: 860px)').matches);
@@ -4307,6 +4315,74 @@ function updateAgentListPreview(agent, content, timeText) {{
   }}
 }}
 
+function touchChatPanelCache(agent) {{
+  if (!agent || agent === 'librarian') return;
+  chatPanelCacheOrder = chatPanelCacheOrder.filter(function(name) {{ return name !== agent; }});
+  chatPanelCacheOrder.push(agent);
+  while (chatPanelCacheOrder.length > CHAT_PANEL_CACHE_LIMIT) {{
+    var evict = chatPanelCacheOrder.shift();
+    if (evict && evict !== currentAgent) {{
+      delete chatPanelCache[evict];
+    }} else if (evict) {{
+      chatPanelCacheOrder.push(evict);
+      break;
+    }}
+  }}
+}}
+
+function cacheChatPanelState(agent, state) {{
+  if (!agent || agent === 'librarian' || !state) return;
+  var existing = chatPanelCache[agent] || {{}};
+  chatPanelCache[agent] = Object.assign(existing, {{
+    selected_agent: agent,
+    panel_html: typeof state.panel_html === 'string' ? state.panel_html : existing.panel_html || '',
+    messages: Array.isArray(state.messages) ? state.messages : existing.messages || [],
+    agent_status: typeof state.agent_status === 'string' ? state.agent_status : existing.agent_status || '',
+    active_turn_user_id: state.active_turn_user_id || 0,
+    profile_url: state.profile_url || null,
+    cached_at: Date.now()
+  }});
+  touchChatPanelCache(agent);
+}}
+
+function cacheCurrentChatPanelState(includePanelHtml) {{
+  if (!currentAgent || isLibrarian) return;
+  var main = document.getElementById('chat-main');
+  cacheChatPanelState(currentAgent, {{
+    panel_html: includePanelHtml && main ? main.innerHTML : undefined,
+    messages: chatMessages || [],
+    agent_status: agentStatus || '',
+    active_turn_user_id: activeTurnUserId || 0,
+    profile_url: agentProfileUrl || null
+  }});
+}}
+
+function cacheChatPanelResponse(data) {{
+  if (!data || !data.ok || !data.selected_agent || data.selected_agent === 'librarian') return;
+  cacheChatPanelState(data.selected_agent, {{
+    panel_html: data.panel_html || '',
+    messages: data.messages || [],
+    agent_status: data.agent_status || '',
+    active_turn_user_id: data.active_turn_user_id || 0,
+    profile_url: data.profile_url || null
+  }});
+}}
+
+function applyCachedChatPanel(agent, pushHistory) {{
+  var cached = agent && chatPanelCache[agent];
+  if (!cached || !cached.panel_html) return false;
+  applyChatPanelResponse({{
+    ok: true,
+    selected_agent: agent,
+    panel_html: cached.panel_html,
+    messages: cached.messages || [],
+    agent_status: cached.agent_status || '',
+    active_turn_user_id: cached.active_turn_user_id || 0,
+    profile_url: cached.profile_url || null
+  }}, pushHistory, true);
+  return true;
+}}
+
 function initializeChatPanel() {{
   isLibrarian = currentAgent === 'librarian';
   streamingContent = '';
@@ -4376,12 +4452,12 @@ function initializeChatPanel() {{
     }});
 }}
 
-function applyChatPanelResponse(data, pushHistory) {{
+function applyChatPanelResponse(data, pushHistory, fromCache) {{
   if (!data || !data.ok) return;
   var main = document.getElementById('chat-main');
   if (!main) return;
   var list = document.getElementById('chat-agent-list');
-  if (list && typeof data.agent_list_html === 'string') {{
+  if (!fromCache && list && typeof data.agent_list_html === 'string') {{
     list.innerHTML = data.agent_list_html;
   }}
   main.innerHTML = data.panel_html || '';
@@ -4395,20 +4471,71 @@ function applyChatPanelResponse(data, pushHistory) {{
   }} else {{
     localStorage.removeItem('lastChatAgent');
   }}
-  if (pushHistory) {{
+  if (pushHistory === 'replace') {{
+    history.replaceState({{ agent: currentAgent }}, '', currentChatUrl(currentAgent));
+  }} else if (pushHistory) {{
     history.pushState({{ agent: currentAgent }}, '', currentChatUrl(currentAgent));
   }}
+  if (!fromCache) cacheChatPanelResponse(data);
   initializeChatPanel();
   applyChatViewportFix();
 }}
 
-function loadDesktopChatPanel(agent, pushHistory) {{
-  persistCurrentChatDraft();
+function fetchDesktopChatPanel(agent, pushHistory, applyMode, requestSeq) {{
+  var requestedAgent = agent || null;
   var url = '/ui/chat/panel';
   if (agent) url += '?agent=' + encodeURIComponent(agent);
-  fetch(url, {{ cache: 'no-store' }})
+  return fetch(url, {{ cache: 'no-store' }})
     .then(function(r) {{ return r.json(); }})
-    .then(function(data) {{ applyChatPanelResponse(data, pushHistory); }});
+    .then(function(data) {{
+      cacheChatPanelResponse(data);
+      if (applyMode === 'background' && currentAgent !== requestedAgent) return data;
+      if (requestSeq && requestSeq !== chatPanelRequestSeq) return data;
+      if (applyMode === 'background' && (chatConfigOpen || chatManageOpen || expandedTextEditorState)) return data;
+      persistCurrentChatDraft();
+      applyChatPanelResponse(data, applyMode === 'cached' ? false : pushHistory, false);
+      return data;
+    }});
+}}
+
+function loadDesktopChatPanel(agent, pushHistory) {{
+  persistCurrentChatDraft();
+  cacheCurrentChatPanelState(true);
+  var requestSeq = ++chatPanelRequestSeq;
+  var usedCache = false;
+  if (agent && !isMobileChatLayout()) {{
+    usedCache = applyCachedChatPanel(agent, pushHistory);
+  }}
+  return fetchDesktopChatPanel(agent, pushHistory, usedCache ? 'background' : 'normal', requestSeq);
+}}
+
+function readLastChatAgent() {{
+  try {{
+    return localStorage.getItem('lastChatAgent') || '';
+  }} catch (e) {{
+    return '';
+  }}
+}}
+
+function canRestoreChatAgent(agent) {{
+  if (!agent) return false;
+  return !!document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(agent) + '"]');
+}}
+
+function restorePersistedChatAgentSelection(historyMode) {{
+  if (currentAgent || isMobileChatLayout()) return false;
+  if (chatRestoreInFlight) return true;
+  var savedAgent = readLastChatAgent();
+  if (!savedAgent) return false;
+  if (!canRestoreChatAgent(savedAgent)) {{
+    try {{ localStorage.removeItem('lastChatAgent'); }} catch (e) {{}}
+    return false;
+  }}
+  chatRestoreInFlight = true;
+  loadDesktopChatPanel(savedAgent, historyMode || false)
+    .catch(function() {{}})
+    .finally(function() {{ chatRestoreInFlight = false; }});
+  return true;
 }}
 
 function markChatStreamAlive() {{
@@ -4440,11 +4567,9 @@ function refreshChatOnResume(force) {{
   chatResumeRefreshInFlight = true;
   chatLastResumeRefreshAt = Date.now();
   reconnectChatStreamForResume();
-  var url = '/ui/chat/panel';
-  if (currentAgent) url += '?agent=' + encodeURIComponent(currentAgent);
-  fetch(url, {{ cache: 'no-store' }})
-    .then(function(r) {{ return r.json(); }})
-    .then(function(data) {{ applyChatPanelResponse(data, false); }})
+  var refreshAgent = currentAgent;
+  var requestSeq = ++chatPanelRequestSeq;
+  fetchDesktopChatPanel(refreshAgent, false, 'normal', requestSeq)
     .catch(function() {{
       reconnectChatStreamForResume();
     }})
@@ -4544,6 +4669,32 @@ function scheduleChatViewportFix() {{
   }});
 }}
 
+function measureChatInputContentHeight(input, isBorderBox, borderY, useClone) {{
+  if (!useClone) return input.scrollHeight + (isBorderBox ? borderY : 0);
+  var clone = input.cloneNode(false);
+  var rect = input.getBoundingClientRect();
+  clone.removeAttribute('id');
+  clone.removeAttribute('name');
+  clone.setAttribute('aria-hidden', 'true');
+  clone.tabIndex = -1;
+  clone.value = input.value || '';
+  clone.style.position = 'absolute';
+  clone.style.visibility = 'hidden';
+  clone.style.pointerEvents = 'none';
+  clone.style.left = '-10000px';
+  clone.style.top = '0';
+  clone.style.zIndex = '-1';
+  clone.style.width = Math.max(1, Math.round(rect.width || input.offsetWidth || 1)) + 'px';
+  clone.style.height = 'auto';
+  clone.style.minHeight = '0';
+  clone.style.maxHeight = 'none';
+  clone.style.overflowY = 'hidden';
+  document.body.appendChild(clone);
+  var measuredHeight = clone.scrollHeight + (isBorderBox ? borderY : 0);
+  clone.remove();
+  return measuredHeight;
+}}
+
 function resizeChatInput() {{
   var input = document.getElementById('chat-input');
   if (!input) return false;
@@ -4567,13 +4718,11 @@ function resizeChatInput() {{
     ? (parseFloat(computed.borderTopWidth) || 0) + (parseFloat(computed.borderBottomWidth) || 0)
     : 0;
   var isBorderBox = !computed || computed.boxSizing === 'border-box';
-  if (valueLength < prevValueLength || valueLength === 0 || !input.style.height) {{
-    input.style.height = 'auto';
-  }}
+  var needsShrinkProbe = !!input.style.height && valueLength <= prevValueLength;
   var formChrome = form ? Math.max(0, form.offsetHeight - input.offsetHeight) : 0;
   var minHeight = 38;
   var maxHeight = Math.max(120, Math.floor(viewportHeight - headerBottom - formChrome - 16));
-  var measuredHeight = input.scrollHeight + (isBorderBox ? borderY : 0);
+  var measuredHeight = measureChatInputContentHeight(input, isBorderBox, borderY, needsShrinkProbe);
   var nextHeight = Math.max(minHeight, Math.min(measuredHeight, maxHeight));
   var nextOverflow = measuredHeight > maxHeight ? 'auto' : 'hidden';
   if (Math.abs(nextHeight - prevHeight) > 1) {{
@@ -4767,6 +4916,7 @@ function renderMessages() {{
     restoreChatViewportAnchor(container, anchor, preservedScrollTop);
   }}
   updateChatJumpButton();
+  cacheCurrentChatPanelState(false);
 }}
 
 function chatToolLines(msg) {{
@@ -5643,6 +5793,118 @@ function normalizeChatMessageOrder() {{
   Array.prototype.push.apply(chatMessages, pending);
 }}
 
+function updateCachedChatPanelFromEvent(evt) {{
+  if (!evt || !evt.agent || evt.agent === currentAgent) return;
+  var cached = chatPanelCache[evt.agent];
+  if (!cached) return;
+  var savedMessages = chatMessages;
+  var savedActiveTurnUserId = activeTurnUserId;
+  var savedAgentStatus = agentStatus;
+  var savedStreamingContent = streamingContent;
+  chatMessages = cached.messages || [];
+  activeTurnUserId = cached.active_turn_user_id || 0;
+  agentStatus = cached.agent_status || '';
+  streamingContent = cached.streaming_content || '';
+  try {{
+    if (evt.event_type === 'message_sent' || (evt.event_type === 'message' && evt.data && evt.data.role === 'user')) {{
+      insertOrReconcileConfirmedUserMessage(evt.data || {{}});
+    }} else if (evt.event_type === 'message' && evt.data && evt.data.role === 'error') {{
+      agentStatus = 'thinking';
+      maybeRemoveFinishedMessage();
+      var updated = false;
+      for (var mi = chatMessages.length - 1; mi >= 0; mi--) {{
+        if (chatMessages[mi]._id === evt.data.id) {{
+          chatMessages[mi].content = evt.data.content;
+          updated = true;
+          break;
+        }}
+      }}
+      if (!updated) insertChatMessage({{ role: 'error', content: evt.data.content, _id: evt.data.id }});
+    }} else if (evt.event_type === 'message' && evt.data && evt.data.role === 'assistant') {{
+      agentStatus = 'thinking';
+      maybeRemoveFinishedMessage();
+      var lastIdx = findLastNonQueuedMessageIndex();
+      var lastMsg = lastIdx >= 0 ? chatMessages[lastIdx] : null;
+      if (lastMsg && lastMsg.role === 'assistant' && lastMsg.streaming) {{
+        lastMsg.streaming = false;
+        if (!lastMsg.content) chatMessages.splice(lastIdx, 1);
+      }}
+      streamingContent = '';
+      insertChatMessage({{ role: 'assistant', content: evt.data.content || '', _id: evt.data.id }});
+    }} else if (evt.event_type === 'tool_use') {{
+      agentStatus = 'thinking';
+      maybeRemoveFinishedMessage();
+      var detail = '\u{{1F527}} ' + evt.data.detail;
+      var toolIdx = findLastNonQueuedMessageIndex();
+      var toolMsg = toolIdx >= 0 ? chatMessages[toolIdx] : null;
+      if (toolMsg && toolMsg.role === 'tool') {{
+        var lines = toolMsg.content.split('\n');
+        var prevLine = lines[lines.length - 1];
+        var prevMatch = prevLine.match(/^(.+?)( \(x(\d+)\))?$/);
+        if (prevMatch && prevMatch[1] === detail) {{
+          var count = prevMatch[3] ? parseInt(prevMatch[3]) + 1 : 2;
+          lines[lines.length - 1] = detail + ' (x' + count + ')';
+          toolMsg.content = lines.join('\n');
+        }} else {{
+          toolMsg.content += '\n' + detail;
+        }}
+      }} else {{
+        insertChatMessage({{ role: 'tool', content: detail }});
+      }}
+    }} else if (evt.event_type === 'chunk') {{
+      agentStatus = 'thinking';
+      maybeRemoveFinishedMessage();
+      streamingContent += evt.data.text || '';
+      var chunkIdx = findLastNonQueuedMessageIndex();
+      var chunkMsg = chunkIdx >= 0 ? chatMessages[chunkIdx] : null;
+      if (chunkMsg && chunkMsg.role === 'assistant' && chunkMsg.streaming) {{
+        chunkMsg.content = streamingContent;
+      }} else {{
+        insertChatMessage({{ role: 'assistant', content: streamingContent, streaming: true }});
+      }}
+    }} else if (evt.event_type === 'response_complete') {{
+      var responseIdx = findLastNonQueuedMessageIndex();
+      var responseMsg = responseIdx >= 0 ? chatMessages[responseIdx] : null;
+      if (responseMsg && responseMsg.streaming) {{
+        responseMsg.streaming = false;
+        responseMsg.content = evt.data.content || responseMsg.content;
+      }} else if (evt.data && evt.data.content) {{
+        insertChatMessage({{ role: 'assistant', content: evt.data.content, _id: evt.data.id }});
+      }}
+      streamingContent = '';
+    }} else if (evt.event_type === 'auto_message') {{
+      insertChatMessage({{ role: 'user', content: evt.data.content }});
+    }} else if (evt.event_type === 'command_response') {{
+      insertChatMessage({{ role: 'system', content: evt.data.response }});
+    }} else if (evt.event_type === 'status') {{
+      var prevActiveTurnUserId = activeTurnUserId;
+      agentStatus = evt.data && evt.data.status ? evt.data.status : '';
+      if (evt.data && typeof evt.data.active_turn_user_id !== 'undefined') {{
+        activeTurnUserId = evt.data.active_turn_user_id || 0;
+      }}
+      var activeTurnAdvancedWhileThinking = agentStatus === 'thinking' && activeTurnUserId > prevActiveTurnUserId;
+      syncQueuedFollowUpFlags(activeTurnAdvancedWhileThinking);
+      if (agentStatus === 'idle') {{
+        maybeAppendFinishedMessage();
+      }} else {{
+        maybeRemoveFinishedMessage();
+      }}
+    }}
+    normalizeChatMessageOrder();
+    cached.messages = chatMessages;
+    cached.active_turn_user_id = activeTurnUserId;
+    cached.agent_status = agentStatus;
+    cached.streaming_content = streamingContent;
+    cached.cached_at = Date.now();
+    touchChatPanelCache(evt.agent);
+  }} finally {{
+    chatMessages = savedMessages;
+    activeTurnUserId = savedActiveTurnUserId;
+    agentStatus = savedAgentStatus;
+    streamingContent = savedStreamingContent;
+  }}
+}}
+
 function connectSSE() {{
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/ui/chat/stream');
@@ -5670,7 +5932,10 @@ function connectSSE() {{
       }} else if (evt.event_type === 'status') {{
         updateAgentListStatus(evt.agent, evt.data && evt.data.status ? evt.data.status : '');
       }}
-      if (evt.agent !== currentAgent) return;
+      if (evt.agent !== currentAgent) {{
+        updateCachedChatPanelFromEvent(evt);
+        return;
+      }}
       if (evt.event_type === 'message' && evt.data && evt.data.role === 'error') {{
         markAgentActivity(evt.agent);
         var updated = false;
@@ -6456,9 +6721,12 @@ function toggleLibOption(opt) {{
   btn.classList.toggle('active');
 }}
 
-initializeChatPanel();
+if (!restorePersistedChatAgentSelection('replace')) {{
+  initializeChatPanel();
+}}
 
 window.addEventListener('pageshow', function(e) {{
+  if (restorePersistedChatAgentSelection('replace')) return;
   if (isMobileChatLayout() && e.persisted) {{
     closeAllPanels();
     setActiveAgentInList(currentAgent);
@@ -6479,6 +6747,7 @@ document.addEventListener('visibilitychange', function() {{
     return;
   }}
   if (document.visibilityState === 'visible') {{
+    if (restorePersistedChatAgentSelection('replace')) return;
     refreshChatOnResume(false);
   }}
 }});
@@ -9810,6 +10079,23 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       margin: 0 0 var(--s-5) 0;
     }
 
+    .admin-page-header {
+      display: grid;
+      gap: var(--s-1);
+      margin: 0 0 var(--s-5) 0;
+    }
+
+    .admin-page-header .page-title {
+      margin: 0;
+    }
+
+    .admin-version {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.85rem;
+      line-height: 1.4;
+    }
+
     .editable-title {
       cursor: pointer;
       border-radius: 4px;
@@ -12966,11 +13252,116 @@ mod tests {
         assert!(html.contains("function reconnectChatStreamForResume() {"));
         assert!(html.contains("eventSource.close();"));
         assert!(html.contains("connectSSE();"));
-        assert!(html.contains("reconnectChatStreamForResume();\n  var url = '/ui/chat/panel';"));
+        assert!(html.contains("reconnectChatStreamForResume();\n  var refreshAgent = currentAgent;\n  var requestSeq = ++chatPanelRequestSeq;\n  fetchDesktopChatPanel(refreshAgent, false, 'normal', requestSeq)"));
         assert!(html.contains(".catch(function() {\n      reconnectChatStreamForResume();"));
         assert!(html.contains(
-            "if (document.visibilityState === 'visible') {\n    refreshChatOnResume(false);"
+            "if (document.visibilityState === 'visible') {\n    if (restorePersistedChatAgentSelection('replace')) return;\n    refreshChatOnResume(false);"
         ));
+    }
+
+    #[test]
+    fn desktop_chat_restores_persisted_agent_selection() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[ChatAgentSummary {
+                name: "worker".into(),
+                display_name: "Worker".into(),
+                owner: "admin".into(),
+                status: "idle".into(),
+                manage_enabled: false,
+                last_message: None,
+                last_message_time: None,
+                profile_url: None,
+                cwd: None,
+                git_branch: None,
+            }],
+            None,
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("function readLastChatAgent() {"));
+        assert!(html.contains("localStorage.getItem('lastChatAgent') || '';"));
+        assert!(html.contains("function canRestoreChatAgent(agent) {"));
+        assert!(html.contains(
+            "document.querySelector('.chat-agent-item[data-agent=\"' + CSS.escape(agent) + '\"]')"
+        ));
+        assert!(html.contains("function restorePersistedChatAgentSelection(historyMode) {"));
+        assert!(html.contains("if (currentAgent || isMobileChatLayout()) return false;"));
+        assert!(html.contains("if (chatRestoreInFlight) return true;"));
+        assert!(html.contains("chatRestoreInFlight = true;"));
+        assert!(html.contains(
+            "loadDesktopChatPanel(savedAgent, historyMode || false)\n    .catch(function() {})"
+        ));
+        assert!(html.contains(".finally(function() { chatRestoreInFlight = false; });"));
+        assert!(html.contains(
+            "if (!restorePersistedChatAgentSelection('replace')) {\n  initializeChatPanel();\n}"
+        ));
+        assert!(html.contains("if (restorePersistedChatAgentSelection('replace')) return;"));
+        assert!(html.contains(
+            "history.replaceState({ agent: currentAgent }, '', currentChatUrl(currentAgent));"
+        ));
+        assert!(html.contains(r#"<div class="chat-empty">"#));
+        assert!(html.contains(r#"data-agent="worker""#));
+        assert!(html.contains("var currentAgent = null;"));
+    }
+
+    #[test]
+    fn desktop_chat_switches_from_memory_cache_and_refreshes_in_background() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[ChatAgentSummary {
+                name: "worker".into(),
+                display_name: "Worker".into(),
+                owner: "admin".into(),
+                status: "idle".into(),
+                manage_enabled: false,
+                last_message: None,
+                last_message_time: None,
+                profile_url: None,
+                cwd: None,
+                git_branch: None,
+            }],
+            Some("worker"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("var CHAT_PANEL_CACHE_LIMIT = 100;"));
+        assert!(html.contains("var chatPanelCache = {};"));
+        assert!(html.contains("function cacheCurrentChatPanelState(includePanelHtml) {"));
+        assert!(html.contains("function applyCachedChatPanel(agent, pushHistory) {"));
+        assert!(html.contains("usedCache = applyCachedChatPanel(agent, pushHistory);"));
+        assert!(html.contains(
+            "return fetchDesktopChatPanel(agent, pushHistory, usedCache ? 'background' : 'normal', requestSeq);"
+        ));
+        assert!(html.contains(
+            "if (applyMode === 'background' && currentAgent !== requestedAgent) return data;"
+        ));
+        assert!(html.contains(
+            "if (applyMode === 'background' && (chatConfigOpen || chatManageOpen || expandedTextEditorState)) return data;"
+        ));
+        assert!(
+            html.contains("if (requestSeq && requestSeq !== chatPanelRequestSeq) return data;")
+        );
+        assert!(html.contains("cacheChatPanelResponse(data);"));
+        assert!(html.contains("function updateCachedChatPanelFromEvent(evt) {"));
+        assert!(html.contains(
+            "if (evt.agent !== currentAgent) {\n        updateCachedChatPanelFromEvent(evt);\n        return;\n      }"
+        ));
+        assert!(html.contains("cacheCurrentChatPanelState(false);"));
     }
 
     #[test]
@@ -13008,6 +13399,17 @@ mod tests {
         assert!(html.contains(r#"for="mgr-stopping">Stopping Point</label>"#));
         assert!(html.contains(r#"for="mgr-checks">Periodic Checks</label>"#));
         assert!(html.contains(r#"for="mgr-redflags">Red Flags</label>"#));
+        let manage_panel_pos = html
+            .find(r#"id="chat-manage-panel""#)
+            .expect("manager panel");
+        let manage_toggle_pos = html.find(r#"id="mgr-toggle""#).expect("manager toggle");
+        let manage_backend_pos = html
+            .find(r#"id="mgr-backend""#)
+            .expect("manager backend select");
+        let manage_goals_pos = html.find(r#"id="mgr-goals""#).expect("manager goals field");
+        assert!(manage_panel_pos < manage_toggle_pos);
+        assert!(manage_toggle_pos < manage_backend_pos);
+        assert!(manage_toggle_pos < manage_goals_pos);
         assert!(html.contains(".chat-config-inner {\n      width: 100%;\n      max-width: 100%;"));
         assert!(html.contains(".chat-config-field {\n      display: flex;\n      flex-direction: column;\n      gap: var(--s-1);\n      width: 100%;\n      max-width: 400px;"));
         assert!(html.contains(".chat-config-field-wide {\n      max-width: none;"));
@@ -13048,6 +13450,52 @@ mod tests {
         assert!(html.contains("overscroll-behavior: contain;"));
         assert!(html.contains("-webkit-overflow-scrolling: touch;"));
         assert!(html.contains("@media (max-width: 640px) {"));
+    }
+
+    #[test]
+    fn admin_page_shows_lore_version_under_header() {
+        let html = render_admin_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &ServerConfig::new(
+                ExternalScheme::Https,
+                "example.com".into(),
+                443,
+                UiTheme::Parchment,
+            )
+            .unwrap(),
+            &crate::config::ExternalAuthConfig::default(),
+            &crate::config::OidcConfig::default(),
+            &AutoUpdateConfig::default(),
+            &ManagerPromptConfig::default(),
+            &LibrarianConfig::default(),
+            &[],
+            &GitExportConfig::default(),
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            "users",
+        );
+
+        assert!(html.contains(r#"<div class="admin-page-header">"#));
+        assert!(html.contains(r#"<h1 class="page-title">Admin</h1>"#));
+        assert!(html.contains(&format!(
+            r#"<p class="admin-version">Lore v{}</p>"#,
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(html.contains(".admin-version {"));
+        assert!(html.contains("font-size: 0.85rem;"));
     }
 
     #[test]
@@ -13206,11 +13654,18 @@ mod tests {
             html.contains("var prevValueLength = parseInt(input.dataset.chatComposerValueLength")
         );
         assert!(html.contains(
-            "if (valueLength < prevValueLength || valueLength === 0 || !input.style.height)"
+            "function measureChatInputContentHeight(input, isBorderBox, borderY, useClone)"
         ));
         assert!(
-            html.contains("var measuredHeight = input.scrollHeight + (isBorderBox ? borderY : 0);")
+            html.contains(
+                "if (!useClone) return input.scrollHeight + (isBorderBox ? borderY : 0);"
+            )
         );
+        assert!(html.contains(
+            "var needsShrinkProbe = !!input.style.height && valueLength <= prevValueLength;"
+        ));
+        assert!(html.contains("var measuredHeight = measureChatInputContentHeight(input, isBorderBox, borderY, needsShrinkProbe);"));
+        assert!(!html.contains("input.style.height = 'auto';"));
         assert!(html.contains("input.dataset.chatComposerValueLength = String(valueLength);"));
     }
 

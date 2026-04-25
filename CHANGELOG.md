@@ -7,6 +7,12 @@
 - Combined the desktop agent chat toolbar metadata into the centered folder slot as backend/model/effort/folder, with the folder shortened to its basename.
 - Widened agent chat config and manager large text fields so their inline summary surfaces span the available panel width while staying clamped to the device width on mobile.
 - Stabilized agent chat composer autosizing so the message field no longer bounces between heights while typing.
+- Added a small Lore version line directly under the Admin page header.
+- Restored the last selected desktop chat agent when returning to `/ui/chat` without an explicit agent query, including refresh/resume paths.
+- Reconciled machine-assigned agents from the server during service polling so locally missing agents can be re-imported into `agents.json` from the local token cache and reported as missing when they cannot be restored.
+- Moved the agent chat manager enable/disable control to the top of the manager config panel.
+- Added a generous desktop in-memory cache for agent chat panels so previously loaded agents switch instantly while a no-store refresh reconciles in the background.
+- Stopped multiline chat composer Backspace from visibly jiggling the textarea by measuring shrink candidates in a hidden clone instead of collapsing the live field.
 
 ## 2026-04-24
 

@@ -6316,11 +6316,21 @@ struct ManagedAgent {
     backend: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct DesiredMachineAgent {
+    name: String,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
 struct ServiceState {
     agents: Vec<ManagedAgent>,
     state_dir: PathBuf,
     /// Runtime task handles for each agent, keyed by agent name.
     tasks: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    desired_agent_errors: std::collections::HashMap<String, String>,
 }
 
 impl ServiceState {
@@ -6338,6 +6348,7 @@ impl ServiceState {
             agents,
             state_dir: state_dir.to_path_buf(),
             tasks: std::collections::HashMap::new(),
+            desired_agent_errors: std::collections::HashMap::new(),
         }
     }
 
@@ -6374,7 +6385,8 @@ impl ServiceState {
     }
 
     fn agent_statuses(&self) -> Vec<serde_json::Value> {
-        self.agents
+        let mut statuses: Vec<serde_json::Value> = self
+            .agents
             .iter()
             .map(|a| {
                 let running = self
@@ -6390,7 +6402,101 @@ impl ServiceState {
                     "folder": a.folder,
                 })
             })
-            .collect()
+            .collect();
+        for (name, error) in &self.desired_agent_errors {
+            if self.agents.iter().any(|a| a.name == *name) {
+                continue;
+            }
+            statuses.push(serde_json::json!({
+                "name": name,
+                "pid": std::process::id(),
+                "status": error,
+            }));
+        }
+        statuses
+    }
+
+    fn reconcile_desired_agents(
+        &mut self,
+        context: &CliContext,
+        desired_agents: &[DesiredMachineAgent],
+    ) {
+        let config = match load_cli_config() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("[service] Cannot reconcile desired agents: {e}");
+                return;
+            }
+        };
+        self.reconcile_desired_agents_from_config(Some(context), desired_agents, &config);
+    }
+
+    fn reconcile_desired_agents_from_config(
+        &mut self,
+        context: Option<&CliContext>,
+        desired_agents: &[DesiredMachineAgent],
+        config: &CliConfig,
+    ) {
+        let desired_names: HashSet<String> = desired_agents
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect();
+        self.desired_agent_errors
+            .retain(|name, _| desired_names.contains(name));
+
+        let mut changed = false;
+        for desired in desired_agents {
+            if self.agents.iter().any(|agent| agent.name == desired.name) {
+                self.desired_agent_errors.remove(&desired.name);
+                continue;
+            }
+
+            let Some(token) = config.agent_tokens.get(&desired.name).cloned() else {
+                eprintln!(
+                    "[service] Desired agent '{}' is assigned here but missing from local token config",
+                    desired.name
+                );
+                self.desired_agent_errors
+                    .insert(desired.name.clone(), "missing_token".to_string());
+                continue;
+            };
+
+            let folder_source = desired.cwd.as_deref().unwrap_or("~");
+            let folder = match resolve_existing_service_path(folder_source) {
+                Ok((_, folder)) => folder.to_string_lossy().into_owned(),
+                Err(e) => {
+                    eprintln!(
+                        "[service] Desired agent '{}' has unusable folder '{}': {e}",
+                        desired.name, folder_source
+                    );
+                    self.desired_agent_errors
+                        .insert(desired.name.clone(), "invalid_folder".to_string());
+                    continue;
+                }
+            };
+
+            let managed = ManagedAgent {
+                name: desired.name.clone(),
+                pid: 0,
+                folder,
+                token,
+                backend: desired.backend.clone(),
+            };
+            eprintln!(
+                "[service] Reconciled desired agent '{}' into local management",
+                desired.name
+            );
+            self.agents.push(managed);
+            self.desired_agent_errors.remove(&desired.name);
+            changed = true;
+        }
+
+        if changed {
+            self.save();
+            if let Some(context) = context {
+                self.start_agent_tasks(context);
+            }
+        }
     }
 
     fn stop_agent(&mut self, name: &str) -> serde_json::Value {
@@ -6943,6 +7049,10 @@ async fn service_poll_and_execute(
     }
     let body: serde_json::Value = resp.error_for_status()?.json().await?;
 
+    let desired_agents: Vec<DesiredMachineAgent> =
+        serde_json::from_value(body["desired_agents"].clone()).unwrap_or_default();
+    svc_state.reconcile_desired_agents(context, &desired_agents);
+
     // Check for self-update request
     if let Some(target_version) = body["update_to"].as_str() {
         let repo = body["update_repo"]
@@ -7340,6 +7450,61 @@ mod tests {
 
         remove_owned_service_pid_file(dir.path(), 12345);
         assert!(!pid_path.exists());
+    }
+
+    #[test]
+    fn service_reconciles_missing_desired_agent_from_local_token_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = super::ServiceState {
+            agents: Vec::new(),
+            state_dir: dir.path().to_path_buf(),
+            tasks: std::collections::HashMap::new(),
+            desired_agent_errors: std::collections::HashMap::new(),
+        };
+        let mut config = super::CliConfig::default();
+        config
+            .agent_tokens
+            .insert("marketing".into(), "lore_at_test".into());
+        let desired = vec![super::DesiredMachineAgent {
+            name: "marketing".into(),
+            backend: Some("claude".into()),
+            cwd: None,
+        }];
+
+        state.reconcile_desired_agents_from_config(None, &desired, &config);
+
+        assert_eq!(state.agents.len(), 1);
+        assert_eq!(state.agents[0].name, "marketing");
+        assert_eq!(state.agents[0].token, "lore_at_test");
+        assert_eq!(state.agents[0].backend.as_deref(), Some("claude"));
+        assert!(state.desired_agent_errors.is_empty());
+        let saved = fs::read_to_string(dir.path().join("agents.json")).unwrap();
+        assert!(saved.contains("\"name\": \"marketing\""));
+    }
+
+    #[test]
+    fn service_reports_desired_agent_missing_token_without_importing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = super::ServiceState {
+            agents: Vec::new(),
+            state_dir: dir.path().to_path_buf(),
+            tasks: std::collections::HashMap::new(),
+            desired_agent_errors: std::collections::HashMap::new(),
+        };
+        let config = super::CliConfig::default();
+        let desired = vec![super::DesiredMachineAgent {
+            name: "marketing".into(),
+            backend: Some("claude".into()),
+            cwd: None,
+        }];
+
+        state.reconcile_desired_agents_from_config(None, &desired, &config);
+
+        assert!(state.agents.is_empty());
+        let statuses = state.agent_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["name"], json!("marketing"));
+        assert_eq!(statuses[0]["status"], json!("missing_token"));
     }
 
     #[test]

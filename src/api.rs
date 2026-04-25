@@ -6984,6 +6984,32 @@ fn machine_agent_process_status(
         .find(|entry| entry["name"].as_str() == Some(agent_name))
         .and_then(|entry| entry["status"].as_str())
         .map(str::to_string)
+        .or_else(|| Some("missing".to_string()))
+}
+
+fn desired_machine_agents(
+    state: &AppState,
+    owner: &UserName,
+    machine_name: &str,
+) -> Result<Vec<Value>, LoreError> {
+    let tokens = state.auth.list_agent_tokens_for_user(owner)?;
+    let mut desired = Vec::new();
+    for token in tokens {
+        if token.machine_name.as_deref() != Some(machine_name) {
+            continue;
+        }
+        let cwd = state
+            .chat
+            .load_conversation(owner.as_str(), &token.name)
+            .ok()
+            .and_then(|conv| conv.cwd);
+        desired.push(json!({
+            "name": token.name,
+            "backend": token.backend.to_string(),
+            "cwd": cwd,
+        }));
+    }
+    Ok(desired)
 }
 
 fn server_config_summary(config: &ServerConfig) -> ServerConfigSummary {
@@ -15509,9 +15535,14 @@ async fn machine_service_poll(
     } else {
         None
     };
+    let desired_agents =
+        desired_machine_agents(&state, &machine.user.username, &machine.machine_name)?;
 
     let build_response = |commands: Vec<MachineCommand>| -> Json<Value> {
-        let mut resp = json!({ "commands": commands });
+        let mut resp = json!({
+            "commands": commands,
+            "desired_agents": desired_agents.clone(),
+        });
         if let Some(ref ver) = update_to {
             resp["update_to"] = json!(ver);
             if let Some(ref config) = update_config {
@@ -16063,6 +16094,60 @@ mod tests {
     fn parse_agent_grants_allows_empty_access() {
         let grants = parse_agent_grants("").unwrap();
         assert!(grants.is_empty());
+    }
+
+    #[test]
+    fn desired_machine_agents_include_assigned_agent_metadata_without_tokens() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let owner = UserName::new("admin").unwrap();
+        state
+            .auth
+            .bootstrap_admin(owner.clone(), "correct-horse-battery".into())
+            .unwrap();
+        let created = state
+            .auth
+            .provision_agent(
+                &owner,
+                "Marketing",
+                Vec::new(),
+                Some(AgentBackend::Claude),
+                Some("Loom"),
+            )
+            .unwrap();
+        let mut conv = ChatConversation::default();
+        conv.cwd = Some("/home/main/Documents/SHMarketing".into());
+        state
+            .chat
+            .save_conversation(owner.as_str(), &created.stored.name, &conv)
+            .unwrap();
+
+        let desired = super::desired_machine_agents(&state, &owner, "Loom").unwrap();
+
+        assert_eq!(desired.len(), 1);
+        assert_eq!(desired[0]["name"], json!("marketing"));
+        assert_eq!(desired[0]["backend"], json!("claude"));
+        assert_eq!(desired[0]["cwd"], json!("/home/main/Documents/SHMarketing"));
+        assert!(desired[0].get("token").is_none());
+    }
+
+    #[test]
+    fn machine_agent_status_marks_assigned_but_unreported_agents_missing() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        state.machine_agent_statuses.lock().unwrap().insert(
+            "admin_Loom".into(),
+            vec![json!({ "name": "other", "status": "running" })],
+        );
+
+        assert_eq!(
+            super::machine_agent_process_status(&state, "admin", "marketing", Some("Loom")),
+            Some("missing".to_string())
+        );
+        assert_eq!(
+            super::machine_agent_process_status(&state, "admin", "marketing", Some("Desk")),
+            None
+        );
     }
 
     #[test]
