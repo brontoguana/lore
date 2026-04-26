@@ -784,6 +784,7 @@ fn build_app_with_librarian(
         .route("/ui/chat/{agent}/errors", get(chat_errors_list))
         .route("/ui/settings", get(settings_page))
         .route("/ui/settings/theme", post(update_theme_from_ui))
+        .route("/ui/settings/password", post(update_own_password_from_ui))
         .route("/ui/admin", get(admin_page))
         .route("/ui/admin/audit", get(admin_audit_page))
         .route("/ui/admin/errors", get(admin_errors_page))
@@ -1433,6 +1434,14 @@ struct UpdateThemeUiForm {
     theme: String,
     #[serde(default)]
     color_mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangePasswordUiForm {
+    csrf_token: String,
+    current_password: String,
+    password: String,
+    confirm_password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5160,6 +5169,60 @@ async fn update_theme_from_ui(
         ),
     )?;
     Ok(Redirect::to("/ui/settings?flash=Theme%20saved"))
+}
+
+async fn update_own_password_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ChangePasswordUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+
+    if form.password != form.confirm_password {
+        return Ok(settings_flash_redirect("Error: passwords do not match"));
+    }
+
+    if state
+        .auth
+        .authenticate(session.user.username.as_str(), &form.current_password)
+        .is_err()
+    {
+        return Ok(settings_flash_redirect("Incorrect current password"));
+    }
+
+    match state
+        .auth
+        .update_user_password(&session.user.username, form.password)
+    {
+        Ok(_) => {}
+        Err(LoreError::Validation(message)) => {
+            return Ok(settings_flash_redirect(&format!("Error: {message}")));
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    let revoked = state
+        .auth
+        .revoke_sessions_for_user_except(&session.user.username, &session.token)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "change own password",
+        Some(session.user.username.as_str().to_string()),
+        Some(format!("other_sessions_revoked={revoked}")),
+    )?;
+    Ok(settings_flash_redirect("Password changed"))
+}
+
+fn settings_flash_redirect(message: &str) -> Redirect {
+    Redirect::to(&format!(
+        "/ui/settings?flash={}",
+        urlencoding::encode(message)
+    ))
 }
 
 async fn update_librarian_from_ui(
@@ -17754,6 +17817,127 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("--accent: #0f8f6f;"));
         assert!(html.contains("Settings"));
+    }
+
+    #[tokio::test]
+    async fn logged_in_user_can_change_own_password_from_settings() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+
+        let second_login = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("username=admin&password=correct-horse-battery"))
+            .unwrap();
+        let second_response = app.clone().oneshot(second_login).await.unwrap();
+        assert_eq!(second_response.status(), StatusCode::SEE_OTHER);
+        let second_cookie = second_response
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let username = UserName::new("admin".to_string()).unwrap();
+        assert_eq!(
+            LocalAuthStore::new(dir.path())
+                .active_session_count(&username)
+                .unwrap(),
+            2
+        );
+
+        let wrong_current = Request::builder()
+            .method("POST")
+            .uri("/ui/settings/password")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}&current_password=wrong-password&password={}&confirm_password={}",
+                urlencoding::encode(&csrf_token),
+                urlencoding::encode("new-correct-horse-battery"),
+                urlencoding::encode("new-correct-horse-battery")
+            )))
+            .unwrap();
+        let wrong_response = app.clone().oneshot(wrong_current).await.unwrap();
+        assert_eq!(wrong_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            wrong_response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "/ui/settings?flash=Incorrect%20current%20password"
+        );
+        assert!(
+            LocalAuthStore::new(dir.path())
+                .authenticate("admin", "correct-horse-battery")
+                .is_ok()
+        );
+
+        let change = Request::builder()
+            .method("POST")
+            .uri("/ui/settings/password")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}&current_password={}&password={}&confirm_password={}",
+                urlencoding::encode(&csrf_token),
+                urlencoding::encode("correct-horse-battery"),
+                urlencoding::encode("new-correct-horse-battery"),
+                urlencoding::encode("new-correct-horse-battery")
+            )))
+            .unwrap();
+        let change_response = app.clone().oneshot(change).await.unwrap();
+        assert_eq!(change_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            change_response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "/ui/settings?flash=Password%20changed"
+        );
+
+        let auth = LocalAuthStore::new(dir.path());
+        assert!(auth.authenticate("admin", "correct-horse-battery").is_err());
+        assert!(
+            auth.authenticate("admin", "new-correct-horse-battery")
+                .is_ok()
+        );
+        assert_eq!(auth.active_session_count(&username).unwrap(), 1);
+
+        let current_session_page = Request::builder()
+            .method("GET")
+            .uri("/ui/settings")
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(current_session_page)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let revoked_session_page = Request::builder()
+            .method("GET")
+            .uri("/ui/settings")
+            .header("cookie", &second_cookie)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(revoked_session_page).await.unwrap().status(),
+            StatusCode::SEE_OTHER
+        );
     }
 
     #[tokio::test]

@@ -3511,8 +3511,25 @@ pub fn render_settings_page(
       <div class="panel-header">
         <h2>Account</h2>
       </div>
-      <div class="padded">
-        <form method="post" action="/logout">
+      <div class="padded meta-stack">
+        <p><strong>Signed in as</strong><br>{signed_in_username}</p>
+        <form method="post" action="/ui/settings/password">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>
+            Current password
+            <input type="password" name="current_password" autocomplete="current-password" required>
+          </label>
+          <label>
+            New password
+            <input type="password" name="password" autocomplete="new-password" required>
+          </label>
+          <label>
+            Confirm new password
+            <input type="password" name="confirm_password" autocomplete="new-password" required>
+          </label>
+          <button type="submit" class="btn-lg">Change password</button>
+        </form>
+        <form method="post" action="/logout" style="margin-top:var(--s-5);">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
           <button type="submit" class="btn-lg" style="background:var(--danger, #c53030); color:#fff;">Sign out</button>
         </form>
@@ -3566,6 +3583,7 @@ pub fn render_settings_page(
         preference_label = escape_text(preference_label),
         mode_label = escape_text(mode_label),
         server_default_label = escape_text(server_default_theme.display_name()),
+        signed_in_username = escape_text(username),
         theme_selector_cards =
             render_theme_selector_cards(selected_theme, server_default_theme, theme),
         mode_options = mode_options,
@@ -13537,6 +13555,30 @@ mod tests {
         )));
         assert!(html.contains(".admin-version {"));
         assert!(html.contains("font-size: 0.85rem;"));
+    }
+
+    #[test]
+    fn settings_page_renders_change_password_form() {
+        let html = render_settings_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "antony",
+            "csrf-token",
+            None,
+            None,
+            UiTheme::Parchment,
+            true,
+            None,
+        );
+
+        assert!(html.contains(r#"<h2>Account</h2>"#));
+        assert!(html.contains("Signed in as"));
+        assert!(html.contains("antony"));
+        assert!(html.contains(r#"action="/ui/settings/password""#));
+        assert!(html.contains(r#"name="current_password" autocomplete="current-password""#));
+        assert!(html.contains(r#"name="password" autocomplete="new-password""#));
+        assert!(html.contains(r#"name="confirm_password" autocomplete="new-password""#));
+        assert!(html.contains(r#"<button type="submit" class="btn-lg">Change password</button>"#));
     }
 
     #[test]

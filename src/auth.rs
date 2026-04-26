@@ -1555,6 +1555,25 @@ impl LocalAuthStore {
         Ok(removed)
     }
 
+    pub fn revoke_sessions_for_user_except(
+        &self,
+        username: &UserName,
+        keep_token: &str,
+    ) -> Result<usize> {
+        let keep_hash = hash_session_token(keep_token);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let removed = conn
+            .execute(
+                "DELETE FROM sessions WHERE username = ?1 AND token_hash != ?2",
+                params![username.as_str(), keep_hash],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(removed)
+    }
+
     pub fn active_session_count(&self, username: &UserName) -> Result<usize> {
         let now = fmt_dt(&OffsetDateTime::now_utc());
         let conn = self
