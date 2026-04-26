@@ -534,6 +534,13 @@ impl ServerConfig {
     pub fn mcp_url(&self) -> String {
         format!("{}/mcp", self.base_url())
     }
+
+    fn normalized(mut self) -> Self {
+        if self.external_scheme == ExternalScheme::Http && self.external_port == 443 {
+            self.external_scheme = ExternalScheme::Https;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -553,7 +560,8 @@ impl ServerConfigStore {
     pub fn load(&self) -> Result<ServerConfig> {
         let path = self.config_path();
         if path.exists() {
-            return Ok(serde_json::from_slice(&fs::read(path)?)?);
+            let config: ServerConfig = serde_json::from_slice(&fs::read(path)?)?;
+            return Ok(config.normalized());
         }
         // Auto-detect Caddy domain when no config has been saved yet
         if let Some(domain) = self.detect_caddy_domain() {
@@ -586,7 +594,8 @@ impl ServerConfigStore {
         default_theme: UiTheme,
     ) -> Result<ServerConfig> {
         let config =
-            ServerConfig::new(external_scheme, external_host, external_port, default_theme)?;
+            ServerConfig::new(external_scheme, external_host, external_port, default_theme)?
+                .normalized();
         self.ensure_layout()?;
         write_json_atomic(self.config_path(), &config)?;
         Ok(config)
@@ -787,6 +796,23 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded.base_url(), "https://lore.example.com");
         assert_eq!(loaded.default_theme, UiTheme::Graphite);
+    }
+
+    #[test]
+    fn normalizes_http_port_443_to_https() {
+        let dir = tempdir().unwrap();
+        let store = ServerConfigStore::new(dir.path(), 7043);
+        store
+            .update(
+                ExternalScheme::Http,
+                "lore.example.com".into(),
+                443,
+                UiTheme::Parchment,
+            )
+            .unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.external_scheme, ExternalScheme::Https);
+        assert_eq!(loaded.base_url(), "https://lore.example.com");
     }
 
     #[test]

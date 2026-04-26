@@ -101,7 +101,54 @@ install -d -o ${q_user} -g ${q_user} -m 0755 ${q_bin_dir} ${q_data} ${q_updates}
 if [ -f ${q_bin} ]; then
     chown ${q_user}:${q_user} ${q_bin}
     chmod 0755 ${q_bin}
-fi"
+	fi"
+}
+
+configure_remote_setup_address() {
+    ssh "$SERVER" "DATA_DIR=$(remote_quote "$REMOTE_DATA_DIR") DOMAIN=$(remote_quote "$DOMAIN") python3 - <<'PY'
+import datetime
+import json
+import os
+import tempfile
+
+data_dir = os.environ['DATA_DIR']
+domain = os.environ['DOMAIN']
+config_dir = os.path.join(data_dir, 'config')
+path = os.path.join(config_dir, 'server.json')
+os.makedirs(config_dir, mode=0o700, exist_ok=True)
+
+config = {}
+if os.path.exists(path):
+    with open(path, 'r', encoding='utf-8') as fh:
+        config = json.load(fh)
+
+now = datetime.datetime.now(datetime.timezone.utc)
+config['external_scheme'] = 'https'
+config['external_host'] = domain
+config['external_port'] = 443
+config['default_theme'] = config.get('default_theme') or 'parchment'
+config['updated_at'] = config.get('updated_at') or [
+    now.year,
+    int(now.strftime('%j')),
+    now.hour,
+    now.minute,
+    now.second,
+    now.microsecond * 1000,
+    0,
+    0,
+    0,
+]
+
+fd, tmp = tempfile.mkstemp(prefix='server.', suffix='.json', dir=config_dir)
+with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+    json.dump(config, fh, indent=2)
+    fh.write('\n')
+os.replace(tmp, path)
+PY
+chown -R $(remote_quote "$REMOTE_SERVICE_USER"):$(remote_quote "$REMOTE_SERVICE_USER") $(remote_quote "$REMOTE_DATA_DIR")/config
+chmod 0700 $(remote_quote "$REMOTE_DATA_DIR")/config
+chmod 0600 $(remote_quote "$REMOTE_DATA_DIR")/config/server.json
+"
 }
 
 write_remote_service() {
@@ -325,6 +372,7 @@ TAG_CREATED=1
 
 # --- Deploy ---
 run_step "Preparing remote service account and directories" ensure_remote_layout
+run_step "Configuring public setup address" configure_remote_setup_address
 
 echo "Uploading server binary to ${SERVER}..."
 scp -q target/release/lore-server "${SERVER}:${REMOTE_UPLOAD}"

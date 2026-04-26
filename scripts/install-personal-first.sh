@@ -27,6 +27,49 @@ fi
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$SERVICE_HOME"
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$(dirname "$SERVER_BIN")"
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$DATA_DIR" "$UPDATE_DIR"
+DATA_DIR="$DATA_DIR" DOMAIN="$DOMAIN" python3 - <<'PY'
+import datetime
+import json
+import os
+import tempfile
+
+data_dir = os.environ["DATA_DIR"]
+domain = os.environ["DOMAIN"]
+config_dir = os.path.join(data_dir, "config")
+path = os.path.join(config_dir, "server.json")
+os.makedirs(config_dir, mode=0o700, exist_ok=True)
+
+config = {}
+if os.path.exists(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        config = json.load(fh)
+
+now = datetime.datetime.now(datetime.timezone.utc)
+config["external_scheme"] = "https"
+config["external_host"] = domain
+config["external_port"] = 443
+config["default_theme"] = config.get("default_theme") or "parchment"
+config["updated_at"] = config.get("updated_at") or [
+    now.year,
+    int(now.strftime("%j")),
+    now.hour,
+    now.minute,
+    now.second,
+    now.microsecond * 1000,
+    0,
+    0,
+    0,
+]
+
+fd, tmp = tempfile.mkstemp(prefix="server.", suffix=".json", dir=config_dir)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, path)
+PY
+chown -R "$SERVICE_USER:$SERVICE_USER" "${DATA_DIR}/config"
+chmod 0700 "${DATA_DIR}/config"
+chmod 0600 "${DATA_DIR}/config/server.json"
 
 if [ -f "$SERVER_BIN" ]; then
     chown "$SERVICE_USER:$SERVICE_USER" "$SERVER_BIN"

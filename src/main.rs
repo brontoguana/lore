@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use lore_core::{
     AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore, DEFAULT_UPDATE_REPO,
-    FileBlockStore, LocalAuthStore, UserName, build_app, maybe_apply_self_update,
+    ExternalScheme, FileBlockStore, LocalAuthStore, ServerConfigStore, UiTheme, UserName,
+    build_app, maybe_apply_self_update,
 };
 use std::env;
 use std::fs;
@@ -596,6 +597,20 @@ fn daemon_install(data_root: &str, bind: &str, domain: &str, manage_caddy: bool)
 
     let user = current_username();
 
+    let config_store = ServerConfigStore::new(&data_root_abs, bind_port(bind));
+    let default_theme = config_store
+        .load()
+        .map(|config| config.default_theme)
+        .unwrap_or(UiTheme::Parchment);
+    if let Err(err) = config_store.update(
+        ExternalScheme::Https,
+        domain.to_string(),
+        443,
+        default_theme,
+    ) {
+        eprintln!("warning: could not save public setup address: {err}");
+    }
+
     // --- migrate from old user-level services if present ---
     migrate_user_services();
 
@@ -928,6 +943,14 @@ fn caddy_reverse_proxy_block(domain: &str, bind: &str) -> String {
     format!("{domain} {{\n    reverse_proxy {bind}\n}}\n")
 }
 
+fn bind_port(bind: &str) -> u16 {
+    bind.rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(7043)
+}
+
 fn write_caddyfile(data_root: &str, domain: &str, bind: &str) -> PathBuf {
     let caddyfile_path = PathBuf::from(data_root).join("Caddyfile");
     let content = caddy_reverse_proxy_block(domain, bind);
@@ -1084,6 +1107,13 @@ mod tests {
             caddy_reverse_proxy_block("lore.armino.me", "127.0.0.1:7043"),
             "lore.armino.me {\n    reverse_proxy 127.0.0.1:7043\n}\n"
         );
+    }
+
+    #[test]
+    fn bind_port_reads_trailing_port() {
+        assert_eq!(bind_port("127.0.0.1:7043"), 7043);
+        assert_eq!(bind_port("[::1]:8123"), 8123);
+        assert_eq!(bind_port("bad"), 7043);
     }
 
     #[test]
