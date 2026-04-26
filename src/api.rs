@@ -537,6 +537,13 @@ fn build_app_with_librarian(
         .route("/logout", post(logout_submit))
         .route("/setup", get(setup_page))
         .route("/setup.txt", get(setup_text))
+        .route("/install-cli.sh", get(install_cli_sh))
+        .route("/install-cli.ps1", get(install_cli_ps1))
+        .route("/downloads/lore/{target}", get(public_cli_binary_download))
+        .route(
+            "/downloads/lore/{target}/sha256",
+            get(public_cli_binary_checksum),
+        )
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
         .route("/v1/health", get(health_check))
         .route("/v1/blocks", post(create_block).get(list_blocks))
@@ -2181,6 +2188,20 @@ async fn health_check() -> axum::response::Json<serde_json::Value> {
 async fn setup_text(State(state): State<AppState>) -> UiResult<Response> {
     let config = state.config.load()?;
     let body = build_agent_setup_instruction(&config, None);
+    let content_type = HeaderValue::from_static("text/plain; charset=utf-8");
+    Ok(([(header::CONTENT_TYPE, content_type)], body).into_response())
+}
+
+async fn install_cli_sh(State(state): State<AppState>) -> UiResult<Response> {
+    let config = state.config.load()?;
+    let body = build_server_cli_install_sh(&config);
+    let content_type = HeaderValue::from_static("text/x-shellscript; charset=utf-8");
+    Ok(([(header::CONTENT_TYPE, content_type)], body).into_response())
+}
+
+async fn install_cli_ps1(State(state): State<AppState>) -> UiResult<Response> {
+    let config = state.config.load()?;
+    let body = build_server_cli_install_ps1(&config);
     let content_type = HeaderValue::from_static("text/plain; charset=utf-8");
     Ok(([(header::CONTENT_TYPE, content_type)], body).into_response())
 }
@@ -6859,6 +6880,324 @@ fn build_agent_setup_instruction(config: &ServerConfig, token: Option<&str>) -> 
         config.base_url(),
         config.mcp_url(),
         auth_block
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn build_server_cli_install_sh(config: &ServerConfig) -> String {
+    let base_url = shell_single_quote(&config.base_url());
+    let server_version = shell_single_quote(&format!("v{}", env!("CARGO_PKG_VERSION")));
+    format!(
+        r#"#!/bin/sh
+set -eu
+
+SERVER_URL={base_url}
+SERVER_VERSION={server_version}
+VERSION="${{1:-${{LORE_VERSION:-latest}}}}"
+INSTALL_DIR="${{LORE_INSTALL_DIR:-$HOME/.local/bin}}"
+BINARY_NAME="lore"
+LORE_SERVICE_DIR="${{LORE_SERVICE_DIR:-$HOME/.lore-service}}"
+LEGACY_LORE_SERVICE_DIR="${{LEGACY_LORE_SERVICE_DIR:-$HOME/lore-service}}"
+SERVICE_PID_FILE="$LORE_SERVICE_DIR/service.pid"
+LEGACY_SERVICE_PID_FILE="$LEGACY_LORE_SERVICE_DIR/service.pid"
+
+detect_target() {{
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  case "$os" in
+    Linux) os="unknown-linux-gnu" ;;
+    Darwin) os="apple-darwin" ;;
+    *) echo "unsupported operating system: $os" >&2; exit 1 ;;
+  esac
+  case "$arch" in
+    x86_64|amd64) arch="x86_64" ;;
+    arm64|aarch64) arch="aarch64" ;;
+    *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+  esac
+  printf "%s-%s" "$arch" "$os"
+}}
+
+fetch() {{
+  url="$1"
+  output="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$output"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$output" "$url"
+  else
+    echo "curl or wget is required" >&2
+    exit 1
+  fi
+}}
+
+verify_checksum() {{
+  file="$1"
+  checksum_file="$2"
+  expected="$(cut -d' ' -f1 "$checksum_file")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$file" | cut -d' ' -f1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+  else
+    echo "sha256sum or shasum is required" >&2
+    exit 1
+  fi
+  if [ "$expected" != "$actual" ]; then
+    echo "checksum mismatch for $BINARY_NAME" >&2
+    exit 1
+  fi
+}}
+
+get_current_version() {{
+  if [ -x "$INSTALL_DIR/$BINARY_NAME" ]; then
+    "$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null | sed "s/^$BINARY_NAME //" || echo "unknown"
+  else
+    echo "not installed"
+  fi
+}}
+
+is_service_running() {{
+  for pid_file in "$SERVICE_PID_FILE" "$LEGACY_SERVICE_PID_FILE"; do
+    if [ ! -f "$pid_file" ]; then
+      continue
+    fi
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}}
+
+migrate_legacy_service_dir_if_present() {{
+  if [ -d "$LEGACY_LORE_SERVICE_DIR" ] && [ ! -e "$LORE_SERVICE_DIR" ]; then
+    mv "$LEGACY_LORE_SERVICE_DIR" "$LORE_SERVICE_DIR"
+  fi
+}}
+
+restart_service_if_running() {{
+  if is_service_running; then
+    echo "restarting lore machine service..."
+    if "$INSTALL_DIR/$BINARY_NAME" service >/dev/null 2>&1; then
+      echo "lore machine service restarted"
+    else
+      echo "warning: failed to restart lore machine service; run 'lore service' manually" >&2
+    fi
+  else
+    echo "lore machine service is not running; start it with 'lore service' to reconnect this machine"
+  fi
+}}
+
+case "$VERSION" in
+  latest) REMOTE_VERSION="$SERVER_VERSION" ;;
+  v*) REMOTE_VERSION="$VERSION" ;;
+  *) REMOTE_VERSION="v$VERSION" ;;
+esac
+
+if [ "$(echo "$REMOTE_VERSION" | sed 's/^v//')" != "$(echo "$SERVER_VERSION" | sed 's/^v//')" ]; then
+  echo "this Lore server currently serves $SERVER_VERSION, not $REMOTE_VERSION" >&2
+  exit 1
+fi
+
+CURRENT_VERSION="$(get_current_version)"
+current_cmp="$(echo "$CURRENT_VERSION" | sed 's/^v//')"
+remote_cmp="$(echo "$REMOTE_VERSION" | sed 's/^v//')"
+if [ "$CURRENT_VERSION" != "not installed" ] && [ "$current_cmp" = "$remote_cmp" ]; then
+  echo "$BINARY_NAME is already at version $CURRENT_VERSION - nothing to do."
+  exit 0
+fi
+
+TARGET="$(detect_target)"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
+
+BIN="$TMP_DIR/$BINARY_NAME"
+CHECKSUM="$TMP_DIR/$BINARY_NAME.sha256"
+DOWNLOAD_BASE="${{LORE_DOWNLOAD_BASE:-$SERVER_URL/downloads/lore}}"
+
+if [ "$CURRENT_VERSION" != "not installed" ]; then
+  echo "updating $BINARY_NAME: $CURRENT_VERSION -> $REMOTE_VERSION"
+else
+  echo "installing $BINARY_NAME $REMOTE_VERSION"
+fi
+
+fetch "$DOWNLOAD_BASE/$TARGET" "$BIN" || {{
+  echo "error: this Lore server has no CLI binary for $TARGET" >&2
+  exit 1
+}}
+fetch "$DOWNLOAD_BASE/$TARGET/sha256" "$CHECKSUM"
+verify_checksum "$BIN" "$CHECKSUM"
+
+mkdir -p "$INSTALL_DIR"
+install "$BIN" "$INSTALL_DIR/$BINARY_NAME"
+migrate_legacy_service_dir_if_present
+
+INSTALLED_VERSION="$(get_current_version)"
+installed_cmp="$(echo "$INSTALLED_VERSION" | sed 's/^v//')"
+if [ "$installed_cmp" != "$remote_cmp" ]; then
+  echo "error: installed binary reports $INSTALLED_VERSION but expected $REMOTE_VERSION" >&2
+  exit 1
+fi
+
+restart_service_if_running
+
+if [ "$CURRENT_VERSION" != "not installed" ]; then
+  echo "updated $BINARY_NAME to $REMOTE_VERSION (was $CURRENT_VERSION)"
+else
+  echo "installed $BINARY_NAME $REMOTE_VERSION to $INSTALL_DIR/$BINARY_NAME"
+  case ":$PATH:" in
+    *":$INSTALL_DIR:"*) ;;
+    *) echo "add $INSTALL_DIR to your PATH: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
+  esac
+  echo "quick start: lore setup $SERVER_URL"
+fi
+"#,
+        base_url = base_url,
+        server_version = server_version
+    )
+}
+
+fn build_server_cli_install_ps1(config: &ServerConfig) -> String {
+    let base_url = powershell_single_quote(&config.base_url());
+    let server_version = powershell_single_quote(&format!("v{}", env!("CARGO_PKG_VERSION")));
+    format!(
+        r#"$ErrorActionPreference = "Stop"
+
+$ServerUrl = {base_url}
+$ServerVersion = {server_version}
+$Version = if ($env:LORE_VERSION) {{ $env:LORE_VERSION }} else {{ "latest" }}
+$InstallDir = if ($env:LORE_INSTALL_DIR) {{ $env:LORE_INSTALL_DIR }} else {{ "$env:LOCALAPPDATA\lore\bin" }}
+$BinaryName = "lore"
+$DownloadBase = if ($env:LORE_DOWNLOAD_BASE) {{ $env:LORE_DOWNLOAD_BASE }} else {{ "$ServerUrl/downloads/lore" }}
+$LoreServiceDir = if ($env:LORE_SERVICE_DIR) {{ $env:LORE_SERVICE_DIR }} else {{ "$HOME\.lore-service" }}
+$LegacyLoreServiceDir = if ($env:LEGACY_LORE_SERVICE_DIR) {{ $env:LEGACY_LORE_SERVICE_DIR }} else {{ "$HOME\lore-service" }}
+$ServicePidFile = Join-Path $LoreServiceDir "service.pid"
+$LegacyServicePidFile = Join-Path $LegacyLoreServiceDir "service.pid"
+
+function Test-ServiceRunning {{
+    foreach ($pidFile in @($ServicePidFile, $LegacyServicePidFile)) {{
+        if (-not (Test-Path $pidFile)) {{
+            continue
+        }}
+        try {{
+            $pid = (Get-Content $pidFile -ErrorAction Stop | Select-Object -First 1).Trim()
+            if (-not $pid) {{
+                continue
+            }}
+            Get-Process -Id ([int]$pid) -ErrorAction Stop | Out-Null
+            return $true
+        }} catch {{
+            continue
+        }}
+    }}
+    return $false
+}}
+
+function Move-LegacyServiceDirIfPresent {{
+    if ((Test-Path $LegacyLoreServiceDir) -and -not (Test-Path $LoreServiceDir)) {{
+        Move-Item -Path $LegacyLoreServiceDir -Destination $LoreServiceDir
+    }}
+}}
+
+function Restart-ServiceIfRunning {{
+    if (Test-ServiceRunning) {{
+        Write-Host "Restarting lore machine service..."
+        try {{
+            & (Join-Path $InstallDir "$BinaryName.exe") service | Out-Null
+            Write-Host "Lore machine service restarted"
+        }} catch {{
+            Write-Warning "Failed to restart lore machine service; run 'lore service' manually"
+        }}
+    }} else {{
+        Write-Host "Lore machine service is not running; start it with 'lore service' to reconnect this machine"
+    }}
+}}
+
+if ($Version -eq "latest") {{
+    $RemoteVersion = $ServerVersion
+}} elseif ($Version.StartsWith("v")) {{
+    $RemoteVersion = $Version
+}} else {{
+    $RemoteVersion = "v$Version"
+}}
+
+if (($RemoteVersion -replace "^v", "") -ne ($ServerVersion -replace "^v", "")) {{
+    throw "this Lore server currently serves $ServerVersion, not $RemoteVersion"
+}}
+
+$Target = "x86_64-pc-windows-msvc"
+$ExePath = Join-Path $InstallDir "$BinaryName.exe"
+$CurrentVersion = "not installed"
+if (Test-Path $ExePath) {{
+    try {{
+        $CurrentVersion = ((& $ExePath --version 2>&1) -replace "^$BinaryName ", "").Trim()
+    }} catch {{
+        $CurrentVersion = "unknown"
+    }}
+}}
+
+if ($CurrentVersion -ne "not installed" -and (($CurrentVersion -replace "^v", "") -eq ($RemoteVersion -replace "^v", ""))) {{
+    Write-Host "$BinaryName is already at version $CurrentVersion - nothing to do."
+    exit 0
+}}
+
+if ($CurrentVersion -ne "not installed") {{
+    Write-Host "Updating $BinaryName`: $CurrentVersion -> $RemoteVersion"
+}} else {{
+    Write-Host "Installing $BinaryName $RemoteVersion"
+}}
+
+$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "lore-install-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+
+try {{
+    $TmpExe = Join-Path $TmpDir "$BinaryName.exe"
+    $TmpChecksum = Join-Path $TmpDir "$BinaryName.sha256"
+    Invoke-WebRequest -Uri "$DownloadBase/$Target" -OutFile $TmpExe -UseBasicParsing
+    Invoke-WebRequest -Uri "$DownloadBase/$Target/sha256" -OutFile $TmpChecksum -UseBasicParsing
+
+    $Expected = (Get-Content $TmpChecksum).Split(" ")[0].ToLower()
+    $Actual = (Get-FileHash -Path $TmpExe -Algorithm SHA256).Hash.ToLower()
+    if ($Expected -ne $Actual) {{
+        throw "checksum mismatch for $BinaryName"
+    }}
+
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    Copy-Item -Path $TmpExe -Destination $ExePath -Force
+    Move-LegacyServiceDirIfPresent
+
+    $InstalledVersion = ((& $ExePath --version 2>&1) -replace "^$BinaryName ", "").Trim()
+    if (($InstalledVersion -replace "^v", "") -ne ($RemoteVersion -replace "^v", "")) {{
+        throw "installed binary reports $InstalledVersion but expected $RemoteVersion"
+    }}
+
+    Restart-ServiceIfRunning
+
+    if ($CurrentVersion -ne "not installed") {{
+        Write-Host "Updated $BinaryName to $RemoteVersion (was $CurrentVersion)"
+    }} else {{
+        Write-Host "Installed $BinaryName $RemoteVersion to $ExePath"
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if ($userPath -notlike "*$InstallDir*") {{
+            [Environment]::SetEnvironmentVariable("Path", "$userPath;$InstallDir", "User")
+            $env:Path = "$env:Path;$InstallDir"
+            Write-Host "Added $InstallDir to your PATH. Restart your terminal for PATH changes to take effect."
+        }}
+        Write-Host "Quick start: lore setup $ServerUrl"
+    }}
+}} finally {{
+    Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+}}
+"#,
+        base_url = base_url,
+        server_version = server_version
     )
 }
 
@@ -15878,6 +16217,69 @@ async fn machine_binary_download_for_target(
     machine_binary_download_inner(&state, &headers, Some(target.as_str())).await
 }
 
+async fn public_cli_binary_download(
+    State(state): State<AppState>,
+    Path(target): Path<String>,
+) -> Result<Response, ApiError> {
+    let Some(binary_path) = machine_binary_path(&state, Some(target.as_str())) else {
+        return Ok(axum::http::StatusCode::NOT_FOUND.into_response());
+    };
+    public_cli_binary_response(&binary_path).await
+}
+
+async fn public_cli_binary_checksum(
+    State(state): State<AppState>,
+    Path(target): Path<String>,
+) -> Result<Response, ApiError> {
+    let Some(binary_path) = machine_binary_path(&state, Some(target.as_str())) else {
+        return Ok(axum::http::StatusCode::NOT_FOUND.into_response());
+    };
+    if !binary_path.exists() {
+        return Ok(axum::http::StatusCode::NOT_FOUND.into_response());
+    }
+    let bytes = tokio::fs::read(&binary_path)
+        .await
+        .map_err(|e| ApiError(LoreError::Io(e)))?;
+    let filename = binary_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("lore");
+    let body = format!("{}  {}\n", hex_sha256(&bytes), filename);
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )],
+        body,
+    )
+        .into_response())
+}
+
+async fn public_cli_binary_response(binary_path: &std::path::Path) -> Result<Response, ApiError> {
+    if !binary_path.exists() {
+        return Ok(axum::http::StatusCode::NOT_FOUND.into_response());
+    }
+    let bytes = tokio::fs::read(binary_path)
+        .await
+        .map_err(|e| ApiError(LoreError::Io(e)))?;
+    let sha256 = hex_sha256(&bytes);
+    let mut response = Response::new(Body::from(bytes));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-lore-binary-sha256"),
+        HeaderValue::from_str(&sha256)
+            .map_err(|e| ApiError(LoreError::Validation(e.to_string())))?,
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-lore-binary-version"),
+        HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    Ok(response)
+}
+
 async fn machine_binary_download_inner(
     state: &AppState,
     headers: &HeaderMap,
@@ -18089,6 +18491,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"mac-arm64");
+    }
+
+    #[tokio::test]
+    async fn public_cli_install_endpoints_use_staged_server_binary() {
+        let dir = tempdir().unwrap();
+        crate::config::ServerConfigStore::new(dir.path(), 7043)
+            .update(
+                crate::ExternalScheme::Https,
+                "lore.example.com".into(),
+                443,
+                crate::UiTheme::Parchment,
+            )
+            .unwrap();
+        fs::create_dir_all(dir.path().join("updates")).unwrap();
+        fs::write(
+            dir.path().join("updates").join("lore-aarch64-apple-darwin"),
+            b"mac-arm64",
+        )
+        .unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+
+        let script = Request::builder()
+            .method("GET")
+            .uri("/install-cli.sh")
+            .body(Body::empty())
+            .unwrap();
+        let script_response = app.clone().oneshot(script).await.unwrap();
+        assert_eq!(script_response.status(), StatusCode::OK);
+        let script_body = axum::body::to_bytes(script_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let script_text = String::from_utf8(script_body.to_vec()).unwrap();
+        assert!(script_text.contains("SERVER_URL='https://lore.example.com'"));
+        assert!(script_text.contains("$SERVER_URL/downloads/lore"));
+        assert!(!script_text.contains("github.com/brontoguana/lore"));
+
+        let binary = Request::builder()
+            .method("GET")
+            .uri("/downloads/lore/aarch64-apple-darwin")
+            .body(Body::empty())
+            .unwrap();
+        let binary_response = app.clone().oneshot(binary).await.unwrap();
+        assert_eq!(binary_response.status(), StatusCode::OK);
+        assert_eq!(
+            binary_response
+                .headers()
+                .get("x-lore-binary-sha256")
+                .and_then(|value| value.to_str().ok()),
+            Some(hex_sha256(b"mac-arm64").as_str())
+        );
+        let binary_body = axum::body::to_bytes(binary_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&binary_body[..], b"mac-arm64");
+
+        let checksum = Request::builder()
+            .method("GET")
+            .uri("/downloads/lore/aarch64-apple-darwin/sha256")
+            .body(Body::empty())
+            .unwrap();
+        let checksum_response = app.oneshot(checksum).await.unwrap();
+        assert_eq!(checksum_response.status(), StatusCode::OK);
+        let checksum_body = axum::body::to_bytes(checksum_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let checksum_text = String::from_utf8(checksum_body.to_vec()).unwrap();
+        assert_eq!(
+            checksum_text,
+            format!("{}  lore-aarch64-apple-darwin\n", hex_sha256(b"mac-arm64"))
+        );
     }
 
     #[tokio::test]

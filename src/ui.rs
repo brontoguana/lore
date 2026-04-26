@@ -2643,10 +2643,8 @@ pub fn render_agents_page(
 ) -> String {
     let base_url = config.base_url();
     let mcp_url = config.mcp_url();
-    let install_script_url =
-        "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh";
-    let install_ps1_url =
-        "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.ps1";
+    let install_script_url = format!("{}/install-cli.sh", base_url.trim_end_matches('/'));
+    let install_ps1_url = format!("{}/install-cli.ps1", base_url.trim_end_matches('/'));
 
     // Agent list
     let agent_list_html = if agents.is_empty() {
@@ -2855,8 +2853,8 @@ pub fn render_agents_page(
             let setup_instruction = build_agent_setup_instruction_text(
                 &base_url,
                 &mcp_url,
-                install_script_url,
-                install_ps1_url,
+                &install_script_url,
+                &install_ps1_url,
                 "YOUR_TOKEN",
                 server_version,
             );
@@ -3864,10 +3862,8 @@ pub fn render_agent_guide_page(
     csrf_token: &str,
 ) -> String {
     let base_url = config.base_url();
-    let install_script_url =
-        "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.sh";
-    let install_ps1_url =
-        "https://raw.githubusercontent.com/brontoguana/lore/main/scripts/install-cli.ps1";
+    let install_script_url = format!("{}/install-cli.sh", base_url.trim_end_matches('/'));
+    let install_ps1_url = format!("{}/install-cli.ps1", base_url.trim_end_matches('/'));
 
     let content = format!(
         r#"<h1 class="page-title">Machine &amp; Agent Setup</h1>
@@ -3946,7 +3942,8 @@ pub fn render_agent_guide_page(
     </section>
 
     <p style="margin-top:var(--s-5);"><a href="/ui/agents">&larr; Back to Agents</a></p>"#,
-        install_script_url = escape_attribute(install_script_url),
+        install_script_url = escape_attribute(&install_script_url),
+        install_ps1_url = escape_attribute(&install_ps1_url),
         base_url = escape_text(&base_url),
         server_version = env!("CARGO_PKG_VERSION"),
     );
@@ -13060,6 +13057,58 @@ mod tests {
         assert!(html.contains(r#"title="Finished""#));
         assert!(html.contains(r#"chat-status-running"#));
         assert!(!html.contains("agent-status-badge"));
+    }
+
+    #[test]
+    fn agent_setup_uses_server_hosted_cli_installer() {
+        let config = ServerConfig::new(
+            ExternalScheme::Https,
+            "lore.example.com".into(),
+            443,
+            UiTheme::Parchment,
+        )
+        .unwrap();
+        let agents = vec![AgentTokenSummary {
+            name: "worker".into(),
+            display_name: "Worker".into(),
+            owner: Some("admin".into()),
+            grants: Vec::new(),
+            backend: "codex".into(),
+            endpoint_id: None,
+            machine_name: Some("desk".into()),
+            process_status: Some("running".into()),
+            status: "idle".into(),
+            created_at: time::OffsetDateTime::now_utc(),
+        }];
+
+        let agents_html = render_agents_page(
+            &config,
+            "admin",
+            true,
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "csrf",
+            &agents,
+            &[],
+            &[],
+            &[],
+            Some("worker"),
+            None,
+        );
+        let guide_html = render_agent_guide_page(
+            &config,
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            true,
+            "csrf",
+        );
+
+        for html in [&agents_html, &guide_html] {
+            assert!(html.contains("https:&#x2f;&#x2f;lore.example.com&#x2f;install-cli.sh"));
+            assert!(html.contains("https:&#x2f;&#x2f;lore.example.com&#x2f;install-cli.ps1"));
+            assert!(!html.contains("raw.githubusercontent.com/brontoguana/lore"));
+        }
     }
 
     #[test]

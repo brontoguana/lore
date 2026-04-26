@@ -2,6 +2,7 @@
 
 ## 2026-04-26
 
+- Changed agent setup CLI install advice to use server-hosted `/install-cli.sh` and `/install-cli.ps1` endpoints, backed by the server's staged `/downloads/lore/{target}` CLI artifacts, instead of raw GitHub installer URLs.
 - Added a Settings account form for changing your own password with current-password verification, confirmation matching, and other-session revocation.
 - Added a long-idle wake refresh for agent chat so returning to a stale browser tab forces a no-store panel refresh on focus/visibility or first user activity after stream silence.
 - Added `lore-server install --no-caddy` for installing only the Lore systemd service behind an existing external Caddy reverse proxy.
