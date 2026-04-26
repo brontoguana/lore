@@ -27,6 +27,28 @@ This will:
 
 Then open `https://yourdomain.com/setup` for agent-oriented setup instructions.
 
+If the machine already has a Caddy service that should keep owning ports 80/443, install Lore without the bundled Caddy service:
+
+```sh
+lore-server install --domain lore.example.com --no-caddy
+```
+
+This installs only `lore-server` on the local bind address and prints the Caddy `reverse_proxy` site block to add to your existing Caddyfile.
+
+For the personal BOX host, run the first-install host bootstrap once on the box:
+
+```sh
+sudo /usr/local/sbin/install-lore-first.sh
+```
+
+That creates the `lore` service user, directories, `lore-server.service`, and restart sudoers rule without touching the existing system Caddy service. After that, use the dedicated quick deploy path from this repo:
+
+```sh
+scripts/quick-deploy-personal.sh
+```
+
+The deploy script builds and tests the same way as `scripts/quick-deploy.sh`, then uploads or updates `lore-server` on `lore.armino.me` behind the existing system Caddy service.
+
 Other server commands:
 
 ```sh

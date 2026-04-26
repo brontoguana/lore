@@ -182,6 +182,8 @@ else
   echo ""
   echo "quick start:"
   echo "  lore-server install        # set up daemon + HTTPS (prompts for domain)"
+  echo "  lore-server install --domain lore.example.com --no-caddy"
+  echo "                             # set up only the daemon for an existing Caddy proxy"
   echo "  lore-server status         # check if everything is running"
   echo "  lore-server uninstall      # remove services (keeps data)"
   echo ""

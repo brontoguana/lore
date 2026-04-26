@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-04-26
+
+- Added a long-idle wake refresh for agent chat so returning to a stale browser tab forces a no-store panel refresh on focus/visibility or first user activity after stream silence.
+- Added `lore-server install --no-caddy` for installing only the Lore systemd service behind an existing external Caddy reverse proxy.
+- Added `scripts/quick-deploy-personal.sh` to build, test, bootstrap, and update Lore on the personal `lore.armino.me` box without managing Caddy.
+- Added `scripts/install-personal-first.sh` and installed it on BOX_PERSONAL as `/usr/local/sbin/install-lore-first.sh` for one-time sudo service setup before normal personal quick deploys.
+
 ## 2026-04-25
 
 - Removed redundant expanded-editor launch glyph buttons from chat/manager config and admin manager prompt fields, keeping the multiline textarea or preview surface as the editor entry point.

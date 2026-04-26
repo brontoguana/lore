@@ -37,11 +37,14 @@ struct Cli {
 enum ServerCommand {
     /// Start the server (default if no command given)
     Start,
-    /// Install lore-server and Caddy HTTPS proxy as system daemons
+    /// Install lore-server as a system daemon
     Install {
         /// Domain name for HTTPS (e.g. lore.example.com) — prompted if not given
         #[arg(long)]
         domain: Option<String>,
+        /// Do not install/manage Lore's bundled Caddy proxy; print a Caddy reverse-proxy snippet instead
+        #[arg(long)]
+        no_caddy: bool,
     },
     /// Remove lore-server and Caddy daemons
     Uninstall,
@@ -77,11 +80,11 @@ async fn main() {
             prompt_initial_admin_if_needed(&data_root);
             run_server(data_root, bind).await;
         }
-        ServerCommand::Install { domain } => {
+        ServerCommand::Install { domain, no_caddy } => {
             ensure_data_dir(&data_root);
             prompt_initial_admin_if_needed(&data_root);
             let domain = domain.unwrap_or_else(|| prompt_domain());
-            daemon_install(&data_root, &bind, &domain);
+            daemon_install(&data_root, &bind, &domain, !no_caddy);
         }
         ServerCommand::Uninstall => daemon_uninstall(&data_root),
         ServerCommand::Status => daemon_status(&data_root),
@@ -494,11 +497,18 @@ fn find_command_path(command: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn install_restart_sudoers(user: &str) -> bool {
+fn restart_sudoers_content(user: &str, systemctl: &str, include_caddy: bool) -> String {
+    let mut commands = vec![format!("{systemctl} restart {SERVICE_NAME}")];
+    if include_caddy {
+        commands.push(format!("{systemctl} restart {CADDY_SERVICE_NAME}"));
+    }
+    commands.push(format!("{systemctl} daemon-reload"));
+    format!("{user} ALL=(root) NOPASSWD: {}\n", commands.join(", "))
+}
+
+fn install_restart_sudoers(user: &str, include_caddy: bool) -> bool {
     let systemctl = find_command_path("systemctl").unwrap_or_else(|| "/bin/systemctl".to_string());
-    let sudoers = format!(
-        "{user} ALL=(root) NOPASSWD: {systemctl} restart {SERVICE_NAME}, {systemctl} restart {CADDY_SERVICE_NAME}, {systemctl} daemon-reload\n"
-    );
+    let sudoers = restart_sudoers_content(user, &systemctl, include_caddy);
     let path = sudoers_path();
     if !sudo_write_file(&path, &sudoers) {
         return false;
@@ -567,7 +577,7 @@ fn migrate_user_services() {
     eprintln!("old user services removed");
 }
 
-fn daemon_install(data_root: &str, bind: &str, domain: &str) {
+fn daemon_install(data_root: &str, bind: &str, domain: &str, manage_caddy: bool) {
     let exe = env::current_exe().unwrap_or_else(|err| {
         eprintln!("error: cannot determine executable path: {err}");
         std::process::exit(1);
@@ -589,25 +599,32 @@ fn daemon_install(data_root: &str, bind: &str, domain: &str) {
     // --- migrate from old user-level services if present ---
     migrate_user_services();
 
-    // --- download caddy ---
-    let caddy_path = match find_caddy_binary() {
-        Some(path) => {
-            eprintln!("found caddy at {}", path.display());
-            path
-        }
-        None => {
-            eprintln!("caddy not found, downloading...");
-            download_caddy().unwrap_or_else(|err| {
-                eprintln!("error: {err}");
-                std::process::exit(1);
-            })
-        }
+    let caddy_path = if manage_caddy {
+        // --- download caddy ---
+        Some(match find_caddy_binary() {
+            Some(path) => {
+                eprintln!("found caddy at {}", path.display());
+                path
+            }
+            None => {
+                eprintln!("caddy not found, downloading...");
+                download_caddy().unwrap_or_else(|err| {
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                })
+            }
+        })
+    } else {
+        eprintln!("external proxy mode: skipping Lore-managed Caddy install");
+        None
     };
 
-    // --- write Caddyfile (user-writable data dir) ---
-    write_caddyfile(data_root, domain);
-    let _ = fs::create_dir_all(data_root_abs.join("caddy-data"));
-    let _ = fs::create_dir_all(data_root_abs.join("caddy-config"));
+    if manage_caddy {
+        // --- write Caddyfile (user-writable data dir) ---
+        write_caddyfile(data_root, domain, bind);
+        let _ = fs::create_dir_all(data_root_abs.join("caddy-data"));
+        let _ = fs::create_dir_all(data_root_abs.join("caddy-config"));
+    }
 
     // --- install system services (requires sudo) ---
     eprintln!();
@@ -633,8 +650,9 @@ WantedBy=multi-user.target
         data_dir = data_root_abs.display(),
     );
 
-    let caddy_unit = format!(
-        "\
+    let caddy_unit = caddy_path.as_ref().map(|caddy_path| {
+        format!(
+            "\
 [Unit]
 Description=Caddy reverse proxy for Lore
 After=network.target {SERVICE_NAME}.service
@@ -653,11 +671,12 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ",
-        caddy = caddy_path.display(),
-        caddyfile = data_root_abs.join("Caddyfile").display(),
-        caddy_data = data_root_abs.join("caddy-data").display(),
-        caddy_config = data_root_abs.join("caddy-config").display(),
-    );
+            caddy = caddy_path.display(),
+            caddyfile = data_root_abs.join("Caddyfile").display(),
+            caddy_data = data_root_abs.join("caddy-data").display(),
+            caddy_config = data_root_abs.join("caddy-config").display(),
+        )
+    });
 
     let lore_unit_path = system_unit_path(SERVICE_NAME);
     let caddy_unit_path = system_unit_path(CADDY_SERVICE_NAME);
@@ -671,13 +690,23 @@ WantedBy=multi-user.target
     }
     println!("wrote {}", lore_unit_path.display());
 
-    if !sudo_write_file(&caddy_unit_path, &caddy_unit) {
-        eprintln!("error: could not write {}", caddy_unit_path.display());
-        std::process::exit(1);
+    if let Some(caddy_unit) = &caddy_unit {
+        if !sudo_write_file(&caddy_unit_path, caddy_unit) {
+            eprintln!("error: could not write {}", caddy_unit_path.display());
+            std::process::exit(1);
+        }
+        println!("wrote {}", caddy_unit_path.display());
+    } else {
+        println!("skipped {}", caddy_unit_path.display());
+        if caddy_unit_path.exists() {
+            eprintln!(
+                "warning: existing {} remains installed; --no-caddy did not modify it",
+                caddy_unit_path.display()
+            );
+        }
     }
-    println!("wrote {}", caddy_unit_path.display());
 
-    if install_restart_sudoers(&user) {
+    if install_restart_sudoers(&user, manage_caddy) {
         println!("wrote {}", sudoers_path().display());
     } else {
         eprintln!("warning: could not write {}", sudoers_path().display());
@@ -692,24 +721,42 @@ WantedBy=multi-user.target
         eprintln!("warning: could not start lore-server service");
     }
 
-    if sudo_systemctl(&["enable", "--now", CADDY_SERVICE_NAME]) {
-        println!("caddy started");
-    } else {
-        eprintln!("warning: could not start caddy service");
+    if manage_caddy {
+        if sudo_systemctl(&["enable", "--now", CADDY_SERVICE_NAME]) {
+            println!("caddy started");
+        } else {
+            eprintln!("warning: could not start caddy service");
+        }
     }
 
     println!();
     println!("lore installed:");
     println!("  server:    http://{bind} (local only)");
-    println!("  public:    https://{domain}");
+    if manage_caddy {
+        println!("  public:    https://{domain}");
+    } else {
+        println!("  public:    https://{domain} (after you wire your external proxy)");
+    }
     println!("  data:      {}", data_root_abs.display());
+    if !manage_caddy {
+        println!();
+        println!("add this Caddy site block to your existing Caddyfile:");
+        println!();
+        print!("{}", caddy_reverse_proxy_block(domain, bind));
+    }
     println!();
     println!("useful commands:");
     println!("  lore-server status");
     println!("  lore-server uninstall");
     println!("  lore-server update");
     println!();
-    println!("future lore-server update runs can restart services without another sudo prompt");
+    if manage_caddy {
+        println!("future lore-server update runs can restart services without another sudo prompt");
+    } else {
+        println!(
+            "future lore-server update runs can restart lore-server without another sudo prompt"
+        );
+    }
 }
 
 fn daemon_uninstall(data_root: &str) {
@@ -877,9 +924,13 @@ fn download_caddy() -> Result<PathBuf, String> {
     Ok(dest)
 }
 
-fn write_caddyfile(data_root: &str, domain: &str) -> PathBuf {
+fn caddy_reverse_proxy_block(domain: &str, bind: &str) -> String {
+    format!("{domain} {{\n    reverse_proxy {bind}\n}}\n")
+}
+
+fn write_caddyfile(data_root: &str, domain: &str, bind: &str) -> PathBuf {
     let caddyfile_path = PathBuf::from(data_root).join("Caddyfile");
-    let content = format!("{domain} {{\n    reverse_proxy 127.0.0.1:7043\n}}\n");
+    let content = caddy_reverse_proxy_block(domain, bind);
     fs::write(&caddyfile_path, content).unwrap_or_else(|err| {
         eprintln!("error: cannot write {}: {err}", caddyfile_path.display());
         std::process::exit(1);
@@ -1000,5 +1051,54 @@ fn relaunch_current_process(executable_path: &std::path::Path) {
             eprintln!("warning: failed to relaunch updated server: {err}");
         }
         std::process::exit(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_command_accepts_no_caddy_external_proxy_mode() {
+        let cli = Cli::try_parse_from([
+            "lore-server",
+            "install",
+            "--domain",
+            "lore.armino.me",
+            "--no-caddy",
+        ])
+        .expect("install --no-caddy should parse");
+
+        match cli.command.expect("subcommand") {
+            ServerCommand::Install { domain, no_caddy } => {
+                assert_eq!(domain.as_deref(), Some("lore.armino.me"));
+                assert!(no_caddy);
+            }
+            _ => panic!("expected install command"),
+        }
+    }
+
+    #[test]
+    fn external_proxy_caddy_snippet_points_at_configured_bind() {
+        assert_eq!(
+            caddy_reverse_proxy_block("lore.armino.me", "127.0.0.1:7043"),
+            "lore.armino.me {\n    reverse_proxy 127.0.0.1:7043\n}\n"
+        );
+    }
+
+    #[test]
+    fn no_caddy_sudoers_rule_excludes_lore_caddy_restart() {
+        let sudoers = restart_sudoers_content("lore", "/usr/bin/systemctl", false);
+        assert!(sudoers.contains("/usr/bin/systemctl restart lore-server"));
+        assert!(sudoers.contains("/usr/bin/systemctl daemon-reload"));
+        assert!(!sudoers.contains("lore-caddy"));
+    }
+
+    #[test]
+    fn managed_caddy_sudoers_rule_includes_lore_caddy_restart() {
+        let sudoers = restart_sudoers_content("lore", "/usr/bin/systemctl", true);
+        assert!(sudoers.contains("/usr/bin/systemctl restart lore-server"));
+        assert!(sudoers.contains("/usr/bin/systemctl restart lore-caddy"));
+        assert!(sudoers.contains("/usr/bin/systemctl daemon-reload"));
     }
 }
