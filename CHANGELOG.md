@@ -2,6 +2,7 @@
 
 ## 2026-04-27
 
+- Fixed machine-service reconciliation so server-assigned agents update and restart when the server-side backend changes, preventing stale local Claude overrides after switching an agent to Codex.
 - Fixed UI HTML escaping so renderer output preserves literal `/` characters in document/setup text while still escaping XSS-sensitive characters.
 
 ## 2026-04-26

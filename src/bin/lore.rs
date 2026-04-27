@@ -6446,8 +6446,28 @@ impl ServiceState {
 
         let mut changed = false;
         for desired in desired_agents {
-            if self.agents.iter().any(|agent| agent.name == desired.name) {
+            if let Some(index) = self
+                .agents
+                .iter()
+                .position(|agent| agent.name == desired.name)
+            {
                 self.desired_agent_errors.remove(&desired.name);
+                if self.agents[index].backend != desired.backend {
+                    eprintln!(
+                        "[service] Updating desired agent '{}' backend from {:?} to {:?}",
+                        desired.name, self.agents[index].backend, desired.backend
+                    );
+                    self.agents[index].backend = desired.backend.clone();
+                    changed = true;
+                    if let Some(context) = context {
+                        if let Some(handle) = self.tasks.remove(&desired.name) {
+                            handle.abort();
+                        }
+                        let agent = self.agents[index].clone();
+                        let handle = spawn_agent_task(context, &agent);
+                        self.tasks.insert(desired.name.clone(), handle);
+                    }
+                }
                 continue;
             }
 
@@ -7480,6 +7500,36 @@ mod tests {
         assert!(state.desired_agent_errors.is_empty());
         let saved = fs::read_to_string(dir.path().join("agents.json")).unwrap();
         assert!(saved.contains("\"name\": \"marketing\""));
+    }
+
+    #[test]
+    fn service_updates_existing_desired_agent_backend_from_server_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = super::ServiceState {
+            agents: vec![super::ManagedAgent {
+                name: "website".into(),
+                pid: 0,
+                folder: "/tmp".into(),
+                token: "lore_at_test".into(),
+                backend: Some("claude".into()),
+            }],
+            state_dir: dir.path().to_path_buf(),
+            tasks: std::collections::HashMap::new(),
+            desired_agent_errors: std::collections::HashMap::new(),
+        };
+        let config = super::CliConfig::default();
+        let desired = vec![super::DesiredMachineAgent {
+            name: "website".into(),
+            backend: Some("codex".into()),
+            cwd: None,
+        }];
+
+        state.reconcile_desired_agents_from_config(None, &desired, &config);
+
+        assert_eq!(state.agents.len(), 1);
+        assert_eq!(state.agents[0].backend.as_deref(), Some("codex"));
+        let saved = fs::read_to_string(dir.path().join("agents.json")).unwrap();
+        assert!(saved.contains("\"backend\": \"codex\""));
     }
 
     #[test]
