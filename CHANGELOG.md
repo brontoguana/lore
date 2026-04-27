@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-04-27
+
+- Fixed UI HTML escaping so renderer output preserves literal `/` characters in document/setup text while still escaping XSS-sensitive characters.
+
 ## 2026-04-26
 
 - Changed agent setup CLI install advice to use server-hosted `/install-cli.sh` and `/install-cli.ps1` endpoints, backed by the server's staged `/downloads/lore/{target}` CLI artifacts, instead of raw GitHub installer URLs.

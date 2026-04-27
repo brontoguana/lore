@@ -9481,7 +9481,18 @@ fn flash_message(flash: Option<&str>) -> String {
 }
 
 fn escape_text(value: &str) -> String {
-    v_htmlescape::escape(value).to_string()
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn escape_attribute(value: &str) -> String {
@@ -12820,6 +12831,18 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn html_escaping_preserves_slashes_without_dropping_safety_escapes() {
+        let escaped = escape_text(r#"https://lore.example.com/a?x=1&name=<tag>"'"#);
+        assert_eq!(
+            escaped,
+            "https://lore.example.com/a?x=1&amp;name=&lt;tag&gt;&quot;&#x27;"
+        );
+
+        let escaped_attr = escape_attribute(r#"/docs/"quoted"&one=<two>"#);
+        assert_eq!(escaped_attr, "/docs/&quot;quoted&quot;&amp;one=&lt;two&gt;");
+    }
+
+    #[test]
     fn lore_links_resolve_in_rendered_markdown() {
         let dir = tempdir().unwrap();
         let store = FileBlockStore::new(dir.path());
@@ -13105,8 +13128,8 @@ mod tests {
         );
 
         for html in [&agents_html, &guide_html] {
-            assert!(html.contains("https:&#x2f;&#x2f;lore.example.com&#x2f;install-cli.sh"));
-            assert!(html.contains("https:&#x2f;&#x2f;lore.example.com&#x2f;install-cli.ps1"));
+            assert!(html.contains("https://lore.example.com/install-cli.sh"));
+            assert!(html.contains("https://lore.example.com/install-cli.ps1"));
             assert!(!html.contains("raw.githubusercontent.com/brontoguana/lore"));
         }
     }
