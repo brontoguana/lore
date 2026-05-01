@@ -11037,13 +11037,14 @@ fn parse_project_grants(input: &str) -> Result<Vec<ProjectGrant>, LoreError> {
             .to_ascii_lowercase()
             .replace([' ', '-'], "_");
         let permission = match permission.as_str() {
-            "" | "none" | "no_access" => continue,
+            "" | "none" | "no_access" | "noaccess" | "off" | "false" | "0" => continue,
             "read" | "read_only" | "readonly" => ProjectPermission::Read,
             "read_write" | "readwrite" | "read/write" => ProjectPermission::ReadWrite,
             _ => {
-                return Err(LoreError::Validation(
-                    "permission must be read or read_write".into(),
-                ));
+                return Err(LoreError::Validation(format!(
+                    "permission must be read, read_write, or no_access; got {:?}",
+                    permission
+                )));
             }
         };
         grants.push(ProjectGrant {
@@ -16748,6 +16749,18 @@ mod tests {
     fn parse_agent_grants_allows_empty_access() {
         let grants = parse_agent_grants("").unwrap();
         assert!(grants.is_empty());
+    }
+
+    #[test]
+    fn parse_agent_grants_skips_no_access_rows() {
+        let grants = parse_agent_grants(
+            "alpha.docs:read_write\nbeta.docs:no access\ngamma.docs:NoAccess\ndelta.docs:off\nepsilon.docs:false\nzeta.docs:0\n",
+        )
+        .unwrap();
+
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].project.as_str(), "alpha.docs");
+        assert_eq!(grants[0].permission, ProjectPermission::ReadWrite);
     }
 
     #[test]
