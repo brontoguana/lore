@@ -16343,14 +16343,28 @@ async fn machine_list_dir_json(
 ) -> Json<Value> {
     let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
         Ok(session) => session,
-        Err(error) => return json_error(error),
+        Err(error) => {
+            return machine_action_error("list_dir", &machine_name, None, None, error);
+        }
     };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
     let params = json!({ "path": req.path });
     match queue_machine_command_and_wait(&state, &machine_key, "list_dir", params).await {
-        Ok(data) => Json(data),
-        Err(e) => json_error(e),
+        Ok(data) => machine_action_result(
+            "list_dir",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            None,
+            data,
+        ),
+        Err(e) => machine_action_error(
+            "list_dir",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            None,
+            e,
+        ),
     }
 }
 
@@ -16379,7 +16393,15 @@ async fn machine_create_agent_json(
 ) -> Json<Value> {
     let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
         Ok(session) => session,
-        Err(error) => return json_error(error),
+        Err(error) => {
+            return machine_action_error(
+                "create_agent",
+                &machine_name,
+                None,
+                Some(&req.agent_name),
+                error,
+            );
+        }
     };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
     let grants = match parse_agent_grants(&req.grants).and_then(|grants| {
@@ -16387,7 +16409,15 @@ async fn machine_create_agent_json(
         Ok(grants)
     }) {
         Ok(grants) => grants,
-        Err(error) => return json_error(error),
+        Err(error) => {
+            return machine_action_error(
+                "create_agent",
+                &machine_name,
+                Some(session.user.username.as_str()),
+                Some(&req.agent_name),
+                error,
+            );
+        }
     };
 
     let backend = req.backend.as_deref().unwrap_or("claude");
@@ -16398,8 +16428,20 @@ async fn machine_create_agent_json(
         "grants": grants,
     });
     match queue_machine_command_and_wait(&state, &machine_key, "create_agent", params).await {
-        Ok(data) => Json(data),
-        Err(e) => json_error(e),
+        Ok(data) => machine_action_result(
+            "create_agent",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            Some(&req.agent_name),
+            data,
+        ),
+        Err(e) => machine_action_error(
+            "create_agent",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            Some(&req.agent_name),
+            e,
+        ),
     }
 }
 
@@ -16411,7 +16453,9 @@ async fn machine_mkdir_json(
 ) -> Json<Value> {
     let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
         Ok(session) => session,
-        Err(error) => return json_error(error),
+        Err(error) => {
+            return machine_action_error("mkdir", &machine_name, None, None, error);
+        }
     };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
@@ -16420,8 +16464,20 @@ async fn machine_mkdir_json(
         "name": req.name,
     });
     match queue_machine_command_and_wait(&state, &machine_key, "mkdir", params).await {
-        Ok(data) => Json(data),
-        Err(e) => json_error(e),
+        Ok(data) => machine_action_result(
+            "mkdir",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            None,
+            data,
+        ),
+        Err(e) => machine_action_error(
+            "mkdir",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            None,
+            e,
+        ),
     }
 }
 
@@ -16439,14 +16495,34 @@ async fn machine_stop_agent_json(
 ) -> Json<Value> {
     let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
         Ok(session) => session,
-        Err(error) => return json_error(error),
+        Err(error) => {
+            return machine_action_error(
+                "stop_agent",
+                &machine_name,
+                None,
+                Some(&req.agent_name),
+                error,
+            );
+        }
     };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
     let params = json!({ "agent_name": req.agent_name });
     match queue_machine_command_and_wait(&state, &machine_key, "stop_agent", params).await {
-        Ok(data) => Json(data),
-        Err(e) => json_error(e),
+        Ok(data) => machine_action_result(
+            "stop_agent",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            Some(&req.agent_name),
+            data,
+        ),
+        Err(e) => machine_action_error(
+            "stop_agent",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            Some(&req.agent_name),
+            e,
+        ),
     }
 }
 
@@ -16458,14 +16534,34 @@ async fn machine_restart_agent_json(
 ) -> Json<Value> {
     let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
         Ok(session) => session,
-        Err(error) => return json_error(error),
+        Err(error) => {
+            return machine_action_error(
+                "restart_agent",
+                &machine_name,
+                None,
+                Some(&req.agent_name),
+                error,
+            );
+        }
     };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
     let params = json!({ "agent_name": req.agent_name });
     match queue_machine_command_and_wait(&state, &machine_key, "restart_agent", params).await {
-        Ok(data) => Json(data),
-        Err(e) => json_error(e),
+        Ok(data) => machine_action_result(
+            "restart_agent",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            Some(&req.agent_name),
+            data,
+        ),
+        Err(e) => machine_action_error(
+            "restart_agent",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            Some(&req.agent_name),
+            e,
+        ),
     }
 }
 
@@ -16477,14 +16573,34 @@ async fn machine_remove_agent_json(
 ) -> Json<Value> {
     let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
         Ok(session) => session,
-        Err(error) => return json_error(error),
+        Err(error) => {
+            return machine_action_error(
+                "remove_agent",
+                &machine_name,
+                None,
+                Some(&req.agent_name),
+                error,
+            );
+        }
     };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
     let params = json!({ "agent_name": req.agent_name });
     match queue_machine_command_and_wait(&state, &machine_key, "remove_agent", params).await {
-        Ok(data) => Json(data),
-        Err(e) => json_error(e),
+        Ok(data) => machine_action_result(
+            "remove_agent",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            Some(&req.agent_name),
+            data,
+        ),
+        Err(e) => machine_action_error(
+            "remove_agent",
+            &machine_name,
+            Some(session.user.username.as_str()),
+            Some(&req.agent_name),
+            e,
+        ),
     }
 }
 
@@ -16500,6 +16616,48 @@ fn require_json_ui_session(
 
 fn json_error(error: impl ToString) -> Json<Value> {
     Json(json!({ "error": error.to_string() }))
+}
+
+fn machine_action_result(
+    action: &str,
+    machine_name: &str,
+    username: Option<&str>,
+    agent_name: Option<&str>,
+    data: Value,
+) -> Json<Value> {
+    if let Some(error) = data.get("error").and_then(Value::as_str) {
+        log_machine_action_failure(action, machine_name, username, agent_name, error);
+    }
+    Json(data)
+}
+
+fn machine_action_error(
+    action: &str,
+    machine_name: &str,
+    username: Option<&str>,
+    agent_name: Option<&str>,
+    error: LoreError,
+) -> Json<Value> {
+    let message = error.to_string();
+    log_machine_action_failure(action, machine_name, username, agent_name, &message);
+    json_error(message)
+}
+
+fn log_machine_action_failure(
+    action: &str,
+    machine_name: &str,
+    username: Option<&str>,
+    agent_name: Option<&str>,
+    error: &str,
+) {
+    eprintln!(
+        "machine action failed: action={} user={} machine={} agent={} error={}",
+        action,
+        username.unwrap_or("(unknown)"),
+        machine_name,
+        agent_name.unwrap_or("(none)"),
+        error
+    );
 }
 
 #[cfg(test)]
