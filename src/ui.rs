@@ -3132,7 +3132,7 @@ pub fn render_agents_page(
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify({{ csrf_token: getCsrf(machine), path: path }})
-      }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+      }}).then(readJsonResponse).then(function(data) {{
         if (data.error) {{
           browser.innerHTML = '<div class="hint" style="padding:var(--s-2); color:var(--danger);">' + escapeHtml(data.error) + '</div>';
           return;
@@ -3177,6 +3177,22 @@ pub fn render_agents_page(
       return s.replace(/\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
     }}
 
+    function readJsonResponse(response) {{
+      return response.text().then(function(text) {{
+        var data = null;
+        if (text) {{
+          try {{ data = JSON.parse(text); }} catch (err) {{}}
+        }}
+        if (!data) {{
+          return {{ error: text || ('Request failed: HTTP ' + response.status) }};
+        }}
+        if (!response.ok && !data.error) {{
+          data.error = 'Request failed: HTTP ' + response.status;
+        }}
+        return data;
+      }});
+    }}
+
     function createFolder(machine) {{
       var pathInput = document.getElementById('create-path-' + machine);
       var nameInput = document.getElementById('create-mkdir-name-' + machine);
@@ -3196,7 +3212,7 @@ pub fn render_agents_page(
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify({{ csrf_token: getCsrf(machine), path: currentPath, name: name }})
-      }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+      }}).then(readJsonResponse).then(function(data) {{
         if (data.error) {{
           setTextStatus(statusId, data.error, true);
           return;
@@ -3263,7 +3279,7 @@ pub fn render_agents_page(
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify({{ csrf_token: csrf, agent_name: agentName }})
-      }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+      }}).then(readJsonResponse).then(function(data) {{
         if (data.error) {{
           alert(data.error);
           if (btn) btn.disabled = false;
@@ -3314,7 +3330,7 @@ pub fn render_agents_page(
           backend: backend,
           grants: grants.join('\\n')
         }})
-      }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+      }}).then(readJsonResponse).then(function(data) {{
         if (data.error) {{
           if (statusEl) {{ statusEl.textContent = data.error; statusEl.style.color = 'var(--danger)'; }}
         }} else {{

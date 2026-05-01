@@ -129,7 +129,7 @@ impl EndpointStore {
             id: Uuid::new_v4().to_string(),
             name: name.trim().to_string(),
             kind,
-            url: url.trim().to_string(),
+            url: normalize_endpoint_url(kind, &url),
             model: model.trim().to_string(),
             api_key: api_key
                 .map(|k| k.trim().to_string())
@@ -160,7 +160,7 @@ impl EndpointStore {
         };
         endpoint.name = name.trim().to_string();
         endpoint.kind = kind;
-        endpoint.url = url.trim().to_string();
+        endpoint.url = normalize_endpoint_url(kind, &url);
         endpoint.model = model.trim().to_string();
         match api_key {
             ApiKeyUpdate::Preserve => {}
@@ -1176,10 +1176,69 @@ fn build_provider_request_body(
     }
 }
 
+pub fn normalize_endpoint_url(kind: EndpointKind, value: &str) -> String {
+    let mut url = value.trim().to_string();
+    if url.is_empty() {
+        return url;
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        url = format!("https://{}", url.trim_start_matches('/'));
+    }
+    match kind {
+        EndpointKind::OpenAi => {
+            normalize_url_with_suffix(&url, "/v1/chat/completions", "/chat/completions")
+        }
+        EndpointKind::Anthropic => normalize_url_with_suffix(&url, "/v1/messages", "/messages"),
+        EndpointKind::Gemini => url.trim_end_matches('/').to_string(),
+    }
+}
+
+fn normalize_url_with_suffix(url: &str, root_suffix: &str, suffix: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return append_suffix_to_url_text(url, root_suffix, suffix);
+    };
+    let path = parsed.path().to_string();
+    let path_trimmed = path.trim_end_matches('/').to_string();
+    let suffix_lower = suffix.to_ascii_lowercase();
+    if path_trimmed.to_ascii_lowercase().ends_with(&suffix_lower) {
+        if path != path_trimmed {
+            parsed.set_path(&path_trimmed);
+        }
+        return parsed.to_string();
+    }
+
+    let next_path = if path_trimmed.is_empty() {
+        root_suffix.to_string()
+    } else {
+        format!("{path_trimmed}{suffix}")
+    };
+    parsed.set_path(&next_path);
+    parsed.to_string()
+}
+
+fn append_suffix_to_url_text(url: &str, root_suffix: &str, suffix: &str) -> String {
+    let base = url.trim_end_matches('/');
+    if base.is_empty() {
+        return String::new();
+    }
+    if base
+        .to_ascii_lowercase()
+        .ends_with(&suffix.to_ascii_lowercase())
+    {
+        return base.to_string();
+    }
+    if base.ends_with("://") {
+        format!("{base}{}", root_suffix.trim_start_matches('/'))
+    } else {
+        format!("{base}{suffix}")
+    }
+}
+
 fn build_provider_url(endpoint: &Endpoint) -> String {
     match endpoint.kind {
         EndpointKind::Gemini => {
-            let base = endpoint.url.trim_end_matches('/');
+            let normalized = normalize_endpoint_url(endpoint.kind, &endpoint.url);
+            let base = normalized.trim_end_matches('/');
             let url = format!("{base}/v1beta/models/{}:generateContent", endpoint.model);
             if let Some(ref api_key) = endpoint.api_key {
                 format!("{url}?key={api_key}")
@@ -1187,7 +1246,7 @@ fn build_provider_url(endpoint: &Endpoint) -> String {
                 url
             }
         }
-        _ => endpoint.url.clone(),
+        _ => normalize_endpoint_url(endpoint.kind, &endpoint.url),
     }
 }
 
@@ -1247,12 +1306,38 @@ fn extract_provider_response_text(
 }
 
 pub fn extract_provider_error(value: &serde_json::Value) -> String {
-    value
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .unwrap_or("provider request failed")
-        .to_string()
+    provider_error_candidate(value, &["error", "message"])
+        .or_else(|| provider_error_candidate(value, &["error", "detail"]))
+        .or_else(|| provider_error_candidate(value, &["detail"]))
+        .or_else(|| provider_error_candidate(value, &["message"]))
+        .or_else(|| provider_error_candidate(value, &["error"]))
+        .unwrap_or_else(|| "provider request failed".to_string())
+}
+
+fn provider_error_candidate(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    json_error_text(cursor)
+}
+
+fn json_error_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    if value.is_null() {
+        return None;
+    }
+    if value.is_object() || value.is_array() {
+        let text = serde_json::to_string(value).ok()?;
+        if text == "{}" || text == "[]" {
+            return None;
+        }
+        return Some(text);
+    }
+    Some(value.to_string())
 }
 
 fn extract_content_text(value: &serde_json::Value) -> Option<&str> {
@@ -1456,7 +1541,8 @@ fn validate_endpoint_url(value: &str) -> Result<()> {
             "librarian endpoint url must be 1..={MAX_ENDPOINT_URL_LEN} characters"
         )));
     }
-    if !(value.starts_with("http://") || value.starts_with("https://")) {
+    let normalized = normalize_endpoint_url(EndpointKind::OpenAi, value);
+    if !(normalized.starts_with("http://") || normalized.starts_with("https://")) {
         return Err(LoreError::Validation(
             "librarian endpoint url must start with http:// or https://".into(),
         ));
@@ -1786,7 +1872,7 @@ pub fn build_proxy_request(
                     body["tools"] = json!(tools);
                 }
             }
-            (endpoint.url.clone(), body)
+            (normalize_endpoint_url(endpoint.kind, &endpoint.url), body)
         }
         EndpointKind::Anthropic => {
             let (system, messages, tools) =
@@ -2486,5 +2572,76 @@ mod tests {
         let config = store.load().unwrap();
         assert!(config.needs_migration());
         assert!(!config.is_configured());
+    }
+
+    #[test]
+    fn openai_endpoint_url_normalization_accepts_base_and_bare_hosts() {
+        assert_eq!(
+            normalize_endpoint_url(EndpointKind::OpenAi, "https://api.deepinfra.com/v1/openai"),
+            "https://api.deepinfra.com/v1/openai/chat/completions"
+        );
+        assert_eq!(
+            normalize_endpoint_url(EndpointKind::OpenAi, "api.openai.com"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_endpoint_url(
+                EndpointKind::OpenAi,
+                "https://api.example.com/v1/chat/completions/"
+            ),
+            "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn openai_proxy_request_uses_normalized_chat_completions_url() {
+        let endpoint = Endpoint {
+            id: "ep".into(),
+            name: "DeepInfra".into(),
+            kind: EndpointKind::OpenAi,
+            url: "https://api.deepinfra.com/v1/openai".into(),
+            model: "zai-org/GLM-5.1".into(),
+            api_key: Some("secret".into()),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let req = ProxyChatRequest {
+            messages: vec![ProxyChatMessage {
+                role: "user".into(),
+                content: Some(json!("hello")),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            model: None,
+            stream: Some(false),
+            tools: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+        };
+
+        let (url, body) = build_proxy_request(&endpoint, &req, false);
+
+        assert_eq!(url, "https://api.deepinfra.com/v1/openai/chat/completions");
+        assert_eq!(body["model"], "zai-org/GLM-5.1");
+    }
+
+    #[test]
+    fn provider_error_extracts_detail_when_error_message_is_empty() {
+        assert_eq!(
+            extract_provider_error(&json!({
+                "error": {"message": ""},
+                "detail": "Not Found",
+            })),
+            "Not Found"
+        );
+        assert_eq!(
+            extract_provider_error(&json!({
+                "detail": [{"loc": ["body", "model"], "msg": "field required"}],
+            })),
+            r#"[{"loc":["body","model"],"msg":"field required"}]"#
+        );
     }
 }

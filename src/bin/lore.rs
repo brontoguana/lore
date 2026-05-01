@@ -229,6 +229,10 @@ enum DocsCommand {
     Read(DocReadArgs),
     /// Write a document from block-marker text
     Write(DocWriteArgs),
+    /// Append a new block to the end of a document
+    Append(DocAppendArgs),
+    /// Insert a new block after a matching markdown heading
+    InsertAfterHeading(DocInsertAfterHeadingArgs),
     /// Create a new document
     Create(DocCreateArgs),
     /// Rename a document
@@ -265,6 +269,66 @@ struct DocWriteArgs {
     /// Permit empty input (otherwise empty stdin/file is rejected)
     #[arg(long)]
     allow_empty: bool,
+    /// Show what would change without writing
+    #[arg(long)]
+    dry_run: bool,
+    /// Print a text diff before writing, or with --dry-run
+    #[arg(long)]
+    diff: bool,
+}
+
+#[derive(Args)]
+#[command(
+    after_help = "Content sources:\n  lore docs append <doc-id> 'Short note'\n  lore docs append <doc-id> --file /tmp/note.md\n  lore docs append <doc-id> --stdin < /tmp/note.md\n\nUse --dry-run --diff to preview without creating a block."
+)]
+struct DocAppendArgs {
+    /// Document ID (UUID)
+    doc_id: String,
+    /// Block content to append
+    content: Option<String>,
+    /// Block type
+    #[arg(long = "type", value_enum, default_value_t = CliBlockType::Markdown)]
+    block_type: CliBlockType,
+    /// Read content from this file
+    #[arg(long)]
+    file: Option<String>,
+    /// Read content from stdin
+    #[arg(long)]
+    stdin: bool,
+    /// Show what would change without writing
+    #[arg(long)]
+    dry_run: bool,
+    /// Print a text diff before writing, or with --dry-run
+    #[arg(long)]
+    diff: bool,
+}
+
+#[derive(Args)]
+#[command(
+    after_help = "Heading matching:\n  The heading can be the literal markdown line (`## Notes`) or just its text (`Notes`).\n  The match must be unique across markdown blocks.\n\nContent sources:\n  lore docs insert-after-heading <doc-id> Notes 'Short note'\n  lore docs insert-after-heading <doc-id> '## Notes' --stdin < /tmp/note.md"
+)]
+struct DocInsertAfterHeadingArgs {
+    /// Document ID (UUID)
+    doc_id: String,
+    /// Heading text or literal markdown heading line to insert after
+    heading: String,
+    /// Block content to insert
+    content: Option<String>,
+    /// Block type
+    #[arg(long = "type", value_enum, default_value_t = CliBlockType::Markdown)]
+    block_type: CliBlockType,
+    /// Read content from this file
+    #[arg(long)]
+    file: Option<String>,
+    /// Read content from stdin
+    #[arg(long)]
+    stdin: bool,
+    /// Show what would change without writing
+    #[arg(long)]
+    dry_run: bool,
+    /// Print a text diff before writing, or with --dry-run
+    #[arg(long)]
+    diff: bool,
 }
 
 #[derive(Args)]
@@ -304,6 +368,8 @@ enum BlocksCommand {
     Create(BlockCreateArgs),
     /// Replace a block's entire content
     Update(BlockUpdateArgs),
+    /// Append text to the end of an existing block
+    Append(BlockAppendArgs),
     /// Apply a find-and-replace within a block
     Edit(BlockEditArgs),
     /// Move a block to a new position within a document
@@ -375,6 +441,12 @@ struct BlockCreateArgs {
     /// Place after this block ID (required with --position after)
     #[arg(long)]
     after: Option<String>,
+    /// Show what would change without writing
+    #[arg(long)]
+    dry_run: bool,
+    /// Print a text diff before writing, or with --dry-run
+    #[arg(long)]
+    diff: bool,
 }
 
 #[derive(Args)]
@@ -398,9 +470,47 @@ struct BlockUpdateArgs {
     /// Read content from stdin
     #[arg(long)]
     stdin: bool,
+    /// Show what would change without writing
+    #[arg(long)]
+    dry_run: bool,
+    /// Print a text diff before writing, or with --dry-run
+    #[arg(long)]
+    diff: bool,
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Content sources:\n  lore blocks append <block-id> --doc <doc-id> 'More text'\n  lore blocks append <block-id> --doc <doc-id> --file /tmp/note.md\n  lore blocks append <block-id> --doc <doc-id> --stdin < /tmp/note.md\n\nBy default Lore inserts one newline between existing content and appended content. Use --separator '' to append directly."
+)]
+struct BlockAppendArgs {
+    /// Block ID (UUID)
+    id: String,
+    /// Content to append
+    content: Option<String>,
+    /// Document ID (UUID)
+    #[arg(long)]
+    doc: String,
+    /// Read content from this file
+    #[arg(long)]
+    file: Option<String>,
+    /// Read content from stdin
+    #[arg(long)]
+    stdin: bool,
+    /// Separator inserted between existing content and appended content
+    #[arg(long, default_value = "\n")]
+    separator: String,
+    /// Show what would change without writing
+    #[arg(long)]
+    dry_run: bool,
+    /// Print a text diff before writing, or with --dry-run
+    #[arg(long)]
+    diff: bool,
+}
+
+#[derive(Args)]
+#[command(
+    after_help = "Robust text sources:\n  lore blocks edit <block-id> --doc <doc-id> --old 'old' --new '- bullet'\n  lore blocks edit <block-id> --doc <doc-id> --old-file /tmp/old.txt --new-file /tmp/new.txt\n  lore blocks edit <block-id> --doc <doc-id> --old 'old' --new-stdin < /tmp/new.txt\n\nIf shell parsing is still ambiguous, use --new=-value or --new-file/--new-stdin."
+)]
 struct BlockEditArgs {
     /// Block ID (UUID)
     id: String,
@@ -408,11 +518,29 @@ struct BlockEditArgs {
     #[arg(long)]
     doc: String,
     /// Exact text to find (must be unique within the block)
-    #[arg(long)]
-    old: String,
+    #[arg(long, allow_hyphen_values = true)]
+    old: Option<String>,
+    /// Read exact text to find from this file
+    #[arg(long = "old-file")]
+    old_file: Option<String>,
+    /// Read exact text to find from stdin
+    #[arg(long = "old-stdin")]
+    old_stdin: bool,
     /// Replacement text
+    #[arg(long, allow_hyphen_values = true)]
+    new: Option<String>,
+    /// Read replacement text from this file
+    #[arg(long = "new-file")]
+    new_file: Option<String>,
+    /// Read replacement text from stdin
+    #[arg(long = "new-stdin")]
+    new_stdin: bool,
+    /// Show what would change without writing
     #[arg(long)]
-    new: String,
+    dry_run: bool,
+    /// Print a text diff before writing, or with --dry-run
+    #[arg(long)]
+    diff: bool,
 }
 
 #[derive(Args)]
@@ -1212,6 +1340,22 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
                 project.as_str(),
                 args.doc_id
             );
+            if args.dry_run || args.diff {
+                let before: serde_json::Value = context.get_json(&path).await?;
+                let before_text = before["content"].as_str().unwrap_or("");
+                print_project_context(&project);
+                println!(
+                    "{}: document {} would be rewritten.",
+                    preview_label(args.dry_run),
+                    args.doc_id
+                );
+                if args.diff {
+                    print_text_diff("document", before_text, &content);
+                }
+                if args.dry_run {
+                    return Ok(());
+                }
+            }
             let resp: serde_json::Value = context
                 .send_json(
                     Method::PUT,
@@ -1222,9 +1366,94 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
             let created = resp["created"].as_array().map(|a| a.len()).unwrap_or(0);
             let updated = resp["updated"].as_array().map(|a| a.len()).unwrap_or(0);
             let deleted = resp["deleted"].as_array().map(|a| a.len()).unwrap_or(0);
+            print_project_context(&project);
             println!(
                 "Document updated: {} created, {} updated, {} deleted.",
                 created, updated, deleted
+            );
+        }
+        DocsCommand::Append(args) => {
+            let project = context.resolve_project_for_document(&args.doc_id).await?;
+            let content = load_cli_text_input(
+                args.content.as_ref(),
+                args.file.as_ref(),
+                args.stdin,
+                "docs append",
+            )?;
+            let blocks = list_doc_blocks(context, &project, &args.doc_id).await?;
+            let after_block_id = blocks.last().map(|block| block.id.as_str().to_string());
+            if args.dry_run || args.diff {
+                print_project_context(&project);
+                println!(
+                    "{}: document {} would receive a new {} block{}.",
+                    preview_label(args.dry_run),
+                    args.doc_id,
+                    block_type_api_label(args.block_type),
+                    after_block_id
+                        .as_ref()
+                        .map(|id| format!(" after {id}"))
+                        .unwrap_or_else(|| " at start".to_string())
+                );
+                if args.diff {
+                    print_text_diff("new block", "", &content);
+                }
+                if args.dry_run {
+                    return Ok(());
+                }
+            }
+            let block = create_doc_block(
+                context,
+                &project,
+                &args.doc_id,
+                args.block_type,
+                content,
+                after_block_id,
+            )
+            .await?;
+            print_project_context(&project);
+            println!("Appended block {}.", block.id);
+        }
+        DocsCommand::InsertAfterHeading(args) => {
+            let project = context.resolve_project_for_document(&args.doc_id).await?;
+            let content = load_cli_text_input(
+                args.content.as_ref(),
+                args.file.as_ref(),
+                args.stdin,
+                "docs insert-after-heading",
+            )?;
+            let blocks = list_doc_blocks(context, &project, &args.doc_id).await?;
+            let anchor = find_unique_heading_block(&blocks, &args.heading)?;
+            let after_block_id = Some(anchor.id.as_str().to_string());
+            if args.dry_run || args.diff {
+                print_project_context(&project);
+                println!(
+                    "{}: document {} would receive a new {} block after heading {:?} in block {}.",
+                    preview_label(args.dry_run),
+                    args.doc_id,
+                    block_type_api_label(args.block_type),
+                    args.heading,
+                    anchor.id
+                );
+                if args.diff {
+                    print_text_diff("new block", "", &content);
+                }
+                if args.dry_run {
+                    return Ok(());
+                }
+            }
+            let block = create_doc_block(
+                context,
+                &project,
+                &args.doc_id,
+                args.block_type,
+                content,
+                after_block_id,
+            )
+            .await?;
+            print_project_context(&project);
+            println!(
+                "Inserted block {} after heading {:?}.",
+                block.id, args.heading
             );
         }
         DocsCommand::Create(args) => {
@@ -1246,6 +1475,7 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
                 .await?;
             let id = resp["id"].as_str().unwrap_or("?");
             let name = resp["name"].as_str().unwrap_or("?");
+            print_project_context(&project);
             println!("Created document \"{}\" ({}).", name, id);
         }
         DocsCommand::Rename(args) => {
@@ -1262,6 +1492,7 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
                     &serde_json::json!({ "name": args.name }),
                 )
                 .await?;
+            print_project_context(&project);
             println!("Renamed document {} to \"{}\".", args.doc_id, args.name);
         }
         DocsCommand::Delete(args) => {
@@ -1275,6 +1506,7 @@ async fn docs_command(context: &CliContext, command: DocsCommand) -> CliResult<(
                 args.doc_id
             );
             context.send_no_content(Method::DELETE, &path).await?;
+            print_project_context(&project);
             println!("Deleted document {}.", args.doc_id);
         }
     }
@@ -1291,6 +1523,90 @@ fn print_doc_tree(docs: &[serde_json::Value], depth: usize) {
             print_doc_tree(children, depth + 1);
         }
     }
+}
+
+async fn list_doc_blocks(
+    context: &CliContext,
+    project: &ProjectName,
+    doc_id: &str,
+) -> CliResult<Vec<Block>> {
+    let path = format!(
+        "/v1/projects/{}/documents/{}/blocks",
+        project.as_str(),
+        doc_id
+    );
+    context.get_json(&path).await
+}
+
+async fn create_doc_block(
+    context: &CliContext,
+    project: &ProjectName,
+    doc_id: &str,
+    block_type: CliBlockType,
+    content: String,
+    after_block_id: Option<String>,
+) -> CliResult<Block> {
+    let path = format!(
+        "/v1/projects/{}/documents/{}/blocks",
+        project.as_str(),
+        doc_id
+    );
+    context
+        .send_json(
+            Method::POST,
+            &path,
+            &serde_json::json!({
+                "block_type": block_type_api_label(block_type),
+                "content": content,
+                "after_block_id": after_block_id
+            }),
+        )
+        .await
+}
+
+fn find_unique_heading_block<'a>(blocks: &'a [Block], heading: &str) -> CliResult<&'a Block> {
+    let matches: Vec<&Block> = blocks
+        .iter()
+        .filter(|block| block.block_type == BlockType::Markdown)
+        .filter(|block| {
+            block
+                .content
+                .lines()
+                .any(|line| markdown_heading_matches(line, heading))
+        })
+        .collect();
+    match matches.as_slice() {
+        [block] => Ok(*block),
+        [] => Err(format!("heading {:?} not found in markdown blocks", heading).into()),
+        _ => Err(format!(
+            "heading {:?} matched {} blocks -- must be unique",
+            heading,
+            matches.len()
+        )
+        .into()),
+    }
+}
+
+fn markdown_heading_matches(line: &str, heading: &str) -> bool {
+    let trimmed_line = line.trim();
+    let trimmed_heading = heading.trim();
+    if trimmed_line.starts_with('#') && trimmed_line == trimmed_heading {
+        return true;
+    }
+    let level = trimmed_line.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&level) {
+        return false;
+    }
+    let text = trimmed_line[level..].trim();
+    !text.is_empty() && text == trimmed_heading
+}
+
+fn print_project_context(project: &ProjectName) {
+    println!("Project: {}", project.as_str());
+}
+
+fn preview_label(dry_run: bool) -> &'static str {
+    if dry_run { "Dry run" } else { "Preview" }
 }
 
 async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResult<()> {
@@ -1364,6 +1680,25 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                 "blocks create",
             )?;
             let after_block_id = resolve_block_create_after(context, &project, &args).await?;
+            if args.dry_run || args.diff {
+                print_project_context(&project);
+                println!(
+                    "{}: document {} would receive a new {} block{}.",
+                    preview_label(args.dry_run),
+                    args.doc,
+                    block_type_api_label(args.block_type),
+                    after_block_id
+                        .as_ref()
+                        .map(|id| format!(" after {id}"))
+                        .unwrap_or_else(|| " at start".to_string())
+                );
+                if args.diff {
+                    print_text_diff("new block", "", &content);
+                }
+                if args.dry_run {
+                    return Ok(());
+                }
+            }
             let path = format!(
                 "/v1/projects/{}/documents/{}/blocks",
                 project.as_str(),
@@ -1380,6 +1715,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                     }),
                 )
                 .await?;
+            print_project_context(&project);
             println!("Created block {}.", block.id);
         }
         BlocksCommand::Update(args) => {
@@ -1390,6 +1726,22 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                 args.stdin,
                 "blocks update",
             )?;
+            if args.dry_run || args.diff {
+                let before =
+                    read_full_block_content(context, &project, &args.doc, &args.id).await?;
+                print_project_context(&project);
+                println!(
+                    "{}: block {} would be updated.",
+                    preview_label(args.dry_run),
+                    args.id
+                );
+                if args.diff {
+                    print_text_diff("block", &before, &content);
+                }
+                if args.dry_run {
+                    return Ok(());
+                }
+            }
             let path = format!(
                 "/v1/projects/{}/documents/{}/blocks/{}",
                 project.as_str(),
@@ -1401,10 +1753,91 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                 body["block_type"] = serde_json::json!(block_type_api_label(bt));
             }
             let block: Block = context.send_json(Method::PATCH, &path, &body).await?;
+            print_project_context(&project);
             println!("Updated block {}.", block.id);
+        }
+        BlocksCommand::Append(args) => {
+            let project = context.resolve_project_for_document(&args.doc).await?;
+            let appended = load_cli_text_input(
+                args.content.as_ref(),
+                args.file.as_ref(),
+                args.stdin,
+                "blocks append",
+            )?;
+            let before = read_full_block_content(context, &project, &args.doc, &args.id).await?;
+            let content = append_block_content(&before, &appended, &args.separator);
+            if args.dry_run || args.diff {
+                print_project_context(&project);
+                println!(
+                    "{}: block {} would be appended.",
+                    preview_label(args.dry_run),
+                    args.id
+                );
+                if args.diff {
+                    print_text_diff("block", &before, &content);
+                }
+                if args.dry_run {
+                    return Ok(());
+                }
+            }
+            let path = format!(
+                "/v1/projects/{}/documents/{}/blocks/{}",
+                project.as_str(),
+                args.doc,
+                args.id
+            );
+            let block: Block = context
+                .send_json(
+                    Method::PATCH,
+                    &path,
+                    &serde_json::json!({ "content": content }),
+                )
+                .await?;
+            print_project_context(&project);
+            println!("Appended block {}.", block.id);
         }
         BlocksCommand::Edit(args) => {
             let project = context.resolve_project_for_document(&args.doc).await?;
+            if args.old_stdin && args.new_stdin {
+                return Err("blocks edit cannot read both --old-stdin and --new-stdin from the same stdin stream; use --old-file or --new-file for one side".into());
+            }
+            let old_string = load_required_text_arg(
+                "blocks edit",
+                "old",
+                args.old.as_ref(),
+                args.old_file.as_ref(),
+                args.old_stdin,
+            )?;
+            let new_string = load_required_text_arg(
+                "blocks edit",
+                "new",
+                args.new.as_ref(),
+                args.new_file.as_ref(),
+                args.new_stdin,
+            )?;
+            let before = read_full_block_content(context, &project, &args.doc, &args.id).await?;
+            let count = before.matches(&old_string).count();
+            if count == 0 {
+                return Err("old string not found in block".into());
+            }
+            if count > 1 {
+                return Err(format!("old string found {count} times -- must be unique").into());
+            }
+            let after = before.replacen(&old_string, &new_string, 1);
+            if args.dry_run || args.diff {
+                print_project_context(&project);
+                println!(
+                    "{}: block {} would be edited.",
+                    preview_label(args.dry_run),
+                    args.id
+                );
+                if args.diff {
+                    print_text_diff("block", &before, &after);
+                }
+                if args.dry_run {
+                    return Ok(());
+                }
+            }
             let path = format!(
                 "/v1/projects/{}/documents/{}/blocks/{}/edit",
                 project.as_str(),
@@ -1416,11 +1849,12 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                     Method::POST,
                     &path,
                     &serde_json::json!({
-                        "old_string": args.old,
-                        "new_string": args.new
+                        "old_string": old_string,
+                        "new_string": new_string
                     }),
                 )
                 .await?;
+            print_project_context(&project);
             println!("Edited block {}.", block.id);
         }
         BlocksCommand::Move(args) => {
@@ -1438,6 +1872,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                     &serde_json::json!({ "after_block_id": args.after }),
                 )
                 .await?;
+            print_project_context(&project);
             println!("Moved block {} to order {}.", block.id, block.order);
         }
         BlocksCommand::Delete(args) => {
@@ -1452,6 +1887,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                 args.id
             );
             context.send_no_content(Method::DELETE, &path).await?;
+            print_project_context(&project);
             println!("Deleted block {}.", args.id);
         }
         BlocksCommand::Split(args) => {
@@ -1471,6 +1907,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                 .await?;
             let original = resp["original"]["id"].as_str().unwrap_or("?");
             let new_block = resp["new_block"]["id"].as_str().unwrap_or("?");
+            print_project_context(&project);
             println!("Split block {} -> {} + {}.", args.id, original, new_block);
         }
         BlocksCommand::Combine(args) => {
@@ -1490,6 +1927,7 @@ async fn blocks_command(context: &CliContext, command: BlocksCommand) -> CliResu
                     &serde_json::json!({ "block_ids": args.ids }),
                 )
                 .await?;
+            print_project_context(&project);
             println!("Combined into block {}.", block.id);
         }
     }
@@ -4254,6 +4692,91 @@ fn load_cli_text_input(
     Ok(read_text_from_stdin()?)
 }
 
+fn load_required_text_arg(
+    command_name: &str,
+    label: &str,
+    value: Option<&String>,
+    file: Option<&String>,
+    stdin: bool,
+) -> CliResult<String> {
+    let source_count =
+        usize::from(value.is_some()) + usize::from(file.is_some()) + usize::from(stdin);
+    if source_count == 0 {
+        return Err(format!(
+            "{command_name} requires --{label}, --{label}-file, or --{label}-stdin. For values beginning with '-', prefer --{label}=-value, --{label}-file, or --{label}-stdin."
+        )
+        .into());
+    }
+    if source_count > 1 {
+        return Err(format!(
+            "{command_name} accepts only one source for {label}: --{label}, --{label}-file, or --{label}-stdin"
+        )
+        .into());
+    }
+    load_cli_text_input(value, file, stdin, &format!("{command_name} --{label}"))
+}
+
+fn append_block_content(existing: &str, appended: &str, separator: &str) -> String {
+    if existing.is_empty() {
+        return appended.to_string();
+    }
+    if appended.is_empty() {
+        return existing.to_string();
+    }
+    format!("{existing}{separator}{appended}")
+}
+
+fn print_text_diff(label: &str, before: &str, after: &str) {
+    println!("--- {label}:before");
+    println!("+++ {label}:after");
+    if before == after {
+        println!("  (no changes)");
+        return;
+    }
+
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+    let mut prefix_len = 0;
+    while prefix_len < before_lines.len()
+        && prefix_len < after_lines.len()
+        && before_lines[prefix_len] == after_lines[prefix_len]
+    {
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0;
+    while suffix_len + prefix_len < before_lines.len()
+        && suffix_len + prefix_len < after_lines.len()
+        && before_lines[before_lines.len() - 1 - suffix_len]
+            == after_lines[after_lines.len() - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    let context_start = prefix_len.saturating_sub(3);
+    if context_start > 0 {
+        println!("  ... {} unchanged line(s) omitted", context_start);
+    }
+    for line in &before_lines[context_start..prefix_len] {
+        println!("  {line}");
+    }
+    for line in &before_lines[prefix_len..before_lines.len() - suffix_len] {
+        println!("- {line}");
+    }
+    for line in &after_lines[prefix_len..after_lines.len() - suffix_len] {
+        println!("+ {line}");
+    }
+    let suffix_start = before_lines.len() - suffix_len;
+    let suffix_context_end = (suffix_start + 3).min(before_lines.len());
+    for line in &before_lines[suffix_start..suffix_context_end] {
+        println!("  {line}");
+    }
+    let omitted_suffix = before_lines.len().saturating_sub(suffix_context_end);
+    if omitted_suffix > 0 {
+        println!("  ... {omitted_suffix} unchanged line(s) omitted");
+    }
+}
+
 fn load_doc_write_content(args: &DocWriteArgs) -> CliResult<String> {
     if args.file.is_some() && args.stdin {
         return Err("docs write accepts only one input source: --file or --stdin".into());
@@ -4386,7 +4909,9 @@ Project info:
 Documents:
   lore docs list                         List documents (shows doc tree with IDs)
   lore docs read <doc-id> [--from <block-id>] [--to <block-id>]   Read entire document as text with markers like @@block id=<id> type=<type>
-  lore docs write <doc-id> [--file <path>|--stdin] [--allow-empty]   Write document from that marker format; new blocks still need id=<placeholder>
+  lore docs write <doc-id> [--file <path>|--stdin] [--allow-empty] [--dry-run --diff]   Write document from marker format
+  lore docs append <doc-id> [<content>|--file <path>|--stdin] [--dry-run --diff]   Append a new block
+  lore docs insert-after-heading <doc-id> <heading> [<content>|--file <path>|--stdin]   Insert a new block after a unique heading
   lore docs create <name> [--parent <doc-id>]   Create a new document
   lore docs rename <doc-id> <new-name>   Rename a document
   lore docs delete <doc-id> --yes        Delete a document and all its contents
@@ -4397,9 +4922,10 @@ Blocks (reading):
   lore blocks around <id> [--before N] [--after N]   Read a block with surrounding context
 
 Blocks (writing):
-  lore blocks create --doc <doc-id> [<content>|--file <path>|--stdin] [--type markdown|html|svg|image] [--position start|append|after] [--after <id>]
-  lore blocks update <id> --doc <doc-id> [<content>|--file <path>|--stdin] [--type markdown|html|svg|image]
-  lore blocks edit <id> --doc <doc-id> --old <text> --new <text>
+  lore blocks create --doc <doc-id> [<content>|--file <path>|--stdin] [--type markdown|html|svg|image] [--position start|append|after] [--after <id>] [--dry-run --diff]
+  lore blocks update <id> --doc <doc-id> [<content>|--file <path>|--stdin] [--type markdown|html|svg|image] [--dry-run --diff]
+  lore blocks append <id> --doc <doc-id> [<content>|--file <path>|--stdin] [--separator <text>] [--dry-run --diff]
+  lore blocks edit <id> --doc <doc-id> (--old <text>|--old-file <path>|--old-stdin) (--new <text>|--new-file <path>|--new-stdin) [--dry-run --diff]
   lore blocks move <id> --doc <doc-id> [--after <id>]
   lore blocks delete <id> --doc <doc-id> --yes
   lore blocks split <id> --doc <doc-id> --position N
@@ -7338,13 +7864,16 @@ async fn service_handle_create_agent(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, DocWriteArgs, ProjectSource, ResolvedProject, append_assistant_segment,
-        append_new_stream_text, codex_exec_args, count_history_exchanges, find_cwd_project_file,
-        history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
-        load_doc_write_content, next_service_update_retry_delay_secs, parse_cli_version_output,
-        parse_codex_line, recent_history_exchange_tail, remove_owned_service_pid_file,
-        resolve_context_project, reuse_or_clear_staged_binary, service_update_target,
+        BlocksCommand, Cli, Command, DocWriteArgs, ProjectSource, ResolvedProject,
+        append_assistant_segment, append_block_content, append_new_stream_text, codex_exec_args,
+        count_history_exchanges, find_cwd_project_file, history_compaction_split_index,
+        history_messages_excluding_pending, load_cli_text_input, load_doc_write_content,
+        load_required_text_arg, markdown_heading_matches, next_service_update_retry_delay_secs,
+        parse_cli_version_output, parse_codex_line, recent_history_exchange_tail,
+        remove_owned_service_pid_file, resolve_context_project, reuse_or_clear_staged_binary,
+        service_update_target,
     };
+    use clap::Parser;
     use serde_json::json;
     use std::collections::HashSet;
     use std::fs;
@@ -7743,6 +8272,8 @@ mod tests {
             file: Some(file.path().display().to_string()),
             stdin: false,
             allow_empty: false,
+            dry_run: false,
+            diff: false,
         };
         let err = load_doc_write_content(&args).unwrap_err();
         assert!(err.to_string().contains("refused empty input"));
@@ -7756,6 +8287,8 @@ mod tests {
             file: Some(file.path().display().to_string()),
             stdin: false,
             allow_empty: true,
+            dry_run: false,
+            diff: false,
         };
         let loaded = load_doc_write_content(&args).unwrap();
         assert!(loaded.is_empty());
@@ -7769,9 +8302,53 @@ mod tests {
             file: Some(file.path().display().to_string()),
             stdin: true,
             allow_empty: false,
+            dry_run: false,
+            diff: false,
         };
         let err = load_doc_write_content(&args).unwrap_err();
         assert!(err.to_string().contains("only one input source"));
+    }
+
+    #[test]
+    fn blocks_edit_parser_accepts_leading_dash_replacement() {
+        let cli = Cli::try_parse_from([
+            "lore", "blocks", "edit", "block-id", "--doc", "doc-id", "--old", "item", "--new",
+            "- bullet",
+        ])
+        .unwrap();
+        let Command::Blocks { command } = cli.command else {
+            panic!("expected blocks command");
+        };
+        let BlocksCommand::Edit(args) = command else {
+            panic!("expected blocks edit command");
+        };
+        assert_eq!(args.old.as_deref(), Some("item"));
+        assert_eq!(args.new.as_deref(), Some("- bullet"));
+    }
+
+    #[test]
+    fn blocks_edit_text_sources_explain_missing_values() {
+        let err = load_required_text_arg("blocks edit", "new", None, None, false).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("--new-file"));
+        assert!(message.contains("beginning with '-'"));
+    }
+
+    #[test]
+    fn append_block_content_uses_separator_only_between_non_empty_sides() {
+        assert_eq!(append_block_content("", "added", "\n"), "added");
+        assert_eq!(append_block_content("base", "", "\n"), "base");
+        assert_eq!(append_block_content("base", "added", "\n"), "base\nadded");
+        assert_eq!(append_block_content("base", "added", ""), "baseadded");
+    }
+
+    #[test]
+    fn markdown_heading_match_accepts_literal_or_plain_heading_text() {
+        assert!(markdown_heading_matches("## Notes", "Notes"));
+        assert!(markdown_heading_matches("## Notes", "## Notes"));
+        assert!(markdown_heading_matches("  ### Follow ups  ", "Follow ups"));
+        assert!(!markdown_heading_matches("Not a heading", "Not a heading"));
+        assert!(!markdown_heading_matches("####### Too deep", "Too deep"));
     }
 
     #[test]

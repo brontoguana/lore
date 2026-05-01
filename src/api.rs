@@ -16340,15 +16340,17 @@ async fn machine_list_dir_json(
     headers: HeaderMap,
     Path(machine_name): Path<String>,
     Json(req): Json<MachineListDirRequest>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
-    verify_csrf(&session, &req.csrf_token)?;
+) -> Json<Value> {
+    let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
+        Ok(session) => session,
+        Err(error) => return json_error(error),
+    };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
     let params = json!({ "path": req.path });
     match queue_machine_command_and_wait(&state, &machine_key, "list_dir", params).await {
-        Ok(data) => Ok(Json(data)),
-        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+        Ok(data) => Json(data),
+        Err(e) => json_error(e),
     }
 }
 
@@ -16374,12 +16376,19 @@ async fn machine_create_agent_json(
     headers: HeaderMap,
     Path(machine_name): Path<String>,
     Json(req): Json<MachineCreateAgentRequest>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
-    verify_csrf(&session, &req.csrf_token)?;
+) -> Json<Value> {
+    let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
+        Ok(session) => session,
+        Err(error) => return json_error(error),
+    };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
-    let grants = parse_agent_grants(&req.grants)?;
-    validate_user_grants(&state, &session.user, &grants)?;
+    let grants = match parse_agent_grants(&req.grants).and_then(|grants| {
+        validate_user_grants(&state, &session.user, &grants)?;
+        Ok(grants)
+    }) {
+        Ok(grants) => grants,
+        Err(error) => return json_error(error),
+    };
 
     let backend = req.backend.as_deref().unwrap_or("claude");
     let params = json!({
@@ -16389,8 +16398,8 @@ async fn machine_create_agent_json(
         "grants": grants,
     });
     match queue_machine_command_and_wait(&state, &machine_key, "create_agent", params).await {
-        Ok(data) => Ok(Json(data)),
-        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+        Ok(data) => Json(data),
+        Err(e) => json_error(e),
     }
 }
 
@@ -16399,9 +16408,11 @@ async fn machine_mkdir_json(
     headers: HeaderMap,
     Path(machine_name): Path<String>,
     Json(req): Json<MachineMkdirRequest>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
-    verify_csrf(&session, &req.csrf_token)?;
+) -> Json<Value> {
+    let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
+        Ok(session) => session,
+        Err(error) => return json_error(error),
+    };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
     let params = json!({
@@ -16409,8 +16420,8 @@ async fn machine_mkdir_json(
         "name": req.name,
     });
     match queue_machine_command_and_wait(&state, &machine_key, "mkdir", params).await {
-        Ok(data) => Ok(Json(data)),
-        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+        Ok(data) => Json(data),
+        Err(e) => json_error(e),
     }
 }
 
@@ -16425,15 +16436,17 @@ async fn machine_stop_agent_json(
     headers: HeaderMap,
     Path(machine_name): Path<String>,
     Json(req): Json<MachineAgentCommandRequest>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
-    verify_csrf(&session, &req.csrf_token)?;
+) -> Json<Value> {
+    let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
+        Ok(session) => session,
+        Err(error) => return json_error(error),
+    };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
     let params = json!({ "agent_name": req.agent_name });
     match queue_machine_command_and_wait(&state, &machine_key, "stop_agent", params).await {
-        Ok(data) => Ok(Json(data)),
-        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+        Ok(data) => Json(data),
+        Err(e) => json_error(e),
     }
 }
 
@@ -16442,15 +16455,17 @@ async fn machine_restart_agent_json(
     headers: HeaderMap,
     Path(machine_name): Path<String>,
     Json(req): Json<MachineAgentCommandRequest>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
-    verify_csrf(&session, &req.csrf_token)?;
+) -> Json<Value> {
+    let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
+        Ok(session) => session,
+        Err(error) => return json_error(error),
+    };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
     let params = json!({ "agent_name": req.agent_name });
     match queue_machine_command_and_wait(&state, &machine_key, "restart_agent", params).await {
-        Ok(data) => Ok(Json(data)),
-        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+        Ok(data) => Json(data),
+        Err(e) => json_error(e),
     }
 }
 
@@ -16459,16 +16474,32 @@ async fn machine_remove_agent_json(
     headers: HeaderMap,
     Path(machine_name): Path<String>,
     Json(req): Json<MachineAgentCommandRequest>,
-) -> UiResult<Json<Value>> {
-    let session = require_ui_session(&state, &headers)?;
-    verify_csrf(&session, &req.csrf_token)?;
+) -> Json<Value> {
+    let session = match require_json_ui_session(&state, &headers, &req.csrf_token) {
+        Ok(session) => session,
+        Err(error) => return json_error(error),
+    };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
 
     let params = json!({ "agent_name": req.agent_name });
     match queue_machine_command_and_wait(&state, &machine_key, "remove_agent", params).await {
-        Ok(data) => Ok(Json(data)),
-        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
+        Ok(data) => Json(data),
+        Err(e) => json_error(e),
     }
+}
+
+fn require_json_ui_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    csrf_token: &str,
+) -> Result<UiSession, LoreError> {
+    let session = require_ui_session(state, headers)?;
+    verify_csrf(&session, csrf_token)?;
+    Ok(session)
+}
+
+fn json_error(error: impl ToString) -> Json<Value> {
+    Json(json!({ "error": error.to_string() }))
 }
 
 #[cfg(test)]
@@ -18373,6 +18404,51 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json[0]["name"], "worker-alpha");
         assert_eq!(json[0]["grants"][0]["project"], "alpha.docs");
+    }
+
+    #[tokio::test]
+    async fn machine_create_agent_json_errors_are_json() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        store.create_project("Alpha Docs", None).unwrap();
+        let app = build_app(store);
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+
+        let missing_session = Request::builder()
+            .method("POST")
+            .uri("/ui/agents/machines/desk/create-agent")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"csrf_token":"missing","agent_name":"worker","folder":"/tmp","grants":""}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(missing_session).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "permission denied");
+
+        let invalid_grants = Request::builder()
+            .method("POST")
+            .uri("/ui/agents/machines/desk/create-agent")
+            .header("cookie", &session_cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"csrf_token":"{csrf_token}","agent_name":"worker","folder":"/tmp","grants":"not-a-grant"}}"#
+            )))
+            .unwrap();
+        let response = app.oneshot(invalid_grants).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"],
+            "validation failed: grants must use one project:permission pair per line"
+        );
     }
 
     #[tokio::test]

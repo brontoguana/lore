@@ -1531,6 +1531,59 @@ async fn chat_proxy_completions_with_mock_llm() {
 }
 
 #[tokio::test]
+async fn api_agent_proxy_accepts_openai_base_url_endpoint() {
+    let dir = tempdir().unwrap();
+    let (llm_addr, _shutdown) = spawn_mock_llm().await;
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    let endpoint_id = create_endpoint(
+        &client,
+        &addr,
+        "base-url-endpoint",
+        &format!("http://{llm_addr}/v1"),
+        "mock-model",
+    )
+    .await;
+
+    let resp = client
+        .post(url(&addr, "/v1/admin/agent-tokens"))
+        .header("authorization", basic_auth(ADMIN_USER, ADMIN_PASS))
+        .json(&json!({
+            "name": "base-url-agent",
+            "owner": ADMIN_USER,
+            "endpoint_id": endpoint_id,
+            "grants": [{"project": "base.proj", "permission": "read_write"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "create API agent token failed");
+    let body: Value = resp.json().await.unwrap();
+    let token = body["token"].as_str().unwrap();
+
+    let resp = client
+        .post(url(&addr, "/v1/chat/completions"))
+        .header("x-lore-key", token)
+        .json(&json!({
+            "messages": [{"role": "user", "content": "Hello from API agent"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+
+    assert_eq!(status, 200, "proxy completions failed: {body}");
+    let json: Value =
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("proxy response not JSON: {body}"));
+    assert_eq!(
+        json["choices"][0]["message"]["content"],
+        "Hello! I'm the mock LLM responding to your message."
+    );
+}
+
+#[tokio::test]
 async fn librarian_ask_via_ui_with_mock_llm() {
     let dir = tempdir().unwrap();
     let (llm_addr, _shutdown) = spawn_mock_llm().await;

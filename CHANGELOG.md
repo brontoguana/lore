@@ -1,7 +1,16 @@
 # Changelog
 
+## 2026-05-01
+
+- Fixed machine-agent create/control JSON error handling on the Agents page. Machine list/create/mkdir/stop/restart/remove endpoints now return JSON errors for early session, CSRF and validation failures instead of generic HTML UI error pages, and the browser surfaces non-JSON response bodies instead of only showing "Failed to create agent".
+
+## 2026-04-30
+
+- Improved Lore CLI document-edit ergonomics with robust `blocks edit` text sources for leading-dash/multiline replacements, native `docs append`, `docs insert-after-heading`, and `blocks append` workflows, dry-run/diff previews, and project labels on write outputs.
+
 ## 2026-04-27
 
+- Fixed librarian/API-agent provider endpoint handling so OpenAI-compatible base URLs and bare hosts are normalized to chat-completions URLs when possible, and provider `detail` errors are surfaced when `error.message` is empty.
 - Fixed machine-service reconciliation so server-assigned agents update and restart when the server-side backend changes, preventing stale local Claude overrides after switching an agent to Codex.
 - Fixed UI HTML escaping so renderer output preserves literal `/` characters in document/setup text while still escaping XSS-sensitive characters.
 
