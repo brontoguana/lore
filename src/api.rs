@@ -11028,7 +11028,15 @@ fn parse_agent_grants(input: &str) -> Result<Vec<ProjectGrant>, LoreError> {
 
 fn parse_project_grants(input: &str) -> Result<Vec<ProjectGrant>, LoreError> {
     let mut grants = Vec::new();
-    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    let normalized_input = input
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n");
+    for line in normalized_input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         let (project, permission) = line.split_once(':').ok_or_else(|| {
             LoreError::Validation("grants must use one project:permission pair per line".into())
         })?;
@@ -16761,6 +16769,17 @@ mod tests {
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].project.as_str(), "alpha.docs");
         assert_eq!(grants[0].permission, ProjectPermission::ReadWrite);
+    }
+
+    #[test]
+    fn parse_agent_grants_accepts_literal_escaped_newline_separators() {
+        let grants = parse_agent_grants("company:read\\ndevelopment:read").unwrap();
+
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[0].project.as_str(), "company");
+        assert_eq!(grants[0].permission, ProjectPermission::Read);
+        assert_eq!(grants[1].project.as_str(), "development");
+        assert_eq!(grants[1].permission, ProjectPermission::Read);
     }
 
     #[test]

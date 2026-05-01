@@ -3328,7 +3328,7 @@ pub fn render_agents_page(
           agent_name: agentName,
           folder: folder,
           backend: backend,
-          grants: grants.join('\\n')
+          grants: grants.join('\n')
         }})
       }}).then(readJsonResponse).then(function(data) {{
         if (data.error) {{
@@ -12837,6 +12837,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UserName;
     use crate::config::{ColorMode, ExternalScheme, ServerConfig, UiTheme};
     use crate::librarian::LibrarianConfig;
     use crate::manager::ManagerPromptConfig;
@@ -13148,6 +13149,55 @@ mod tests {
             assert!(html.contains("https://lore.example.com/install-cli.ps1"));
             assert!(!html.contains("raw.githubusercontent.com/brontoguana/lore"));
         }
+    }
+
+    #[test]
+    fn agents_page_create_agent_joins_grants_with_newline_escape() {
+        let config = ServerConfig::new(
+            ExternalScheme::Https,
+            "lore.example.com".into(),
+            443,
+            UiTheme::Parchment,
+        )
+        .unwrap();
+        let machines = vec![StoredMachine {
+            name: "desk".into(),
+            username: UserName::new("admin").unwrap(),
+            token_hash: "hash".into(),
+            created_at: time::OffsetDateTime::now_utc(),
+            cli_version: Some("0.1.65-test".into()),
+            pending_update: false,
+        }];
+        let projects = vec![
+            UserProjectAccess {
+                slug: "company".into(),
+                display_name: "Company".into(),
+                max_permission: ProjectPermission::ReadWrite,
+            },
+            UserProjectAccess {
+                slug: "development".into(),
+                display_name: "Development".into(),
+                max_permission: ProjectPermission::Read,
+            },
+        ];
+
+        let html = render_agents_page(
+            &config,
+            "admin",
+            true,
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "csrf",
+            &[],
+            &machines,
+            &projects,
+            &[],
+            None,
+            None,
+        );
+
+        assert!(html.contains("grants: grants.join('\\n')"));
+        assert!(!html.contains("grants: grants.join('\\\\n')"));
     }
 
     #[test]

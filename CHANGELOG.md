@@ -5,6 +5,7 @@
 - Fixed machine-agent create/control JSON error handling on the Agents page. Machine list/create/mkdir/stop/restart/remove endpoints now return JSON errors for early session, CSRF and validation failures instead of generic HTML UI error pages, and the browser surfaces non-JSON response bodies instead of only showing "Failed to create agent".
 - Added server journal logging for failed machine JSON actions, including machine-returned `{error}` payloads from create/list/mkdir/control operations.
 - Fixed agent/role grant parsing so "No access" style values are accepted as omitted grants during agent creation instead of failing validation.
+- Fixed machine-agent project grant parsing to tolerate literal escaped newline separators from already-loaded Agents pages, and corrected the create-agent UI to join selected project grants with a real newline separator.
 
 ## 2026-04-30
 
