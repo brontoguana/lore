@@ -810,6 +810,10 @@ struct BlockWindow {
 struct GrepMatch {
     block: Block,
     preview: String,
+    #[serde(default)]
+    document_id: Option<String>,
+    #[serde(default)]
+    document_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1949,10 +1953,16 @@ async fn grep_command(context: &CliContext, args: GrepArgs) -> CliResult<()> {
         return Ok(());
     }
     for entry in matches {
+        let source = match (&entry.document_name, &entry.document_id) {
+            (Some(name), Some(id)) => format!("  doc={} ({})", id, name),
+            (None, Some(id)) => format!("  doc={id}"),
+            _ => String::new(),
+        };
         println!(
-            "{}  {:<8}  {}",
+            "{}  {:<8}{}  {}",
             entry.block.id,
             block_type_label(entry.block.block_type),
+            source,
             entry.preview
         );
     }

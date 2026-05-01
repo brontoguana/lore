@@ -611,6 +611,7 @@ impl FileBlockStore {
         let mut blocks = self.list_blocks(project)?;
         blocks.retain(|block| {
             block.content.to_lowercase().contains(&needle)
+                || block.id.as_str().to_lowercase().contains(&needle)
                 || block.order.as_str().to_lowercase().contains(&needle)
                 || format!("{:?}", block.block_type)
                     .to_lowercase()
@@ -2872,6 +2873,30 @@ mod tests {
         let results = store.search_blocks(&project, "decision").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "Architecture decision record");
+    }
+
+    #[test]
+    fn searches_blocks_by_id_fragment() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = ProjectName::new("alpha.docs").unwrap();
+
+        let block = store
+            .create_block(NewBlock {
+                project: project.clone(),
+                block_type: BlockType::Markdown,
+                content: "No numeric marker in content".into(),
+                author_key: "owner-key".into(),
+                left: None,
+                right: None,
+                image_upload: None,
+            })
+            .unwrap();
+
+        let fragment = &block.id.as_str()[0..8];
+        let results = store.search_blocks(&project, fragment).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, block.id);
     }
 
     #[test]

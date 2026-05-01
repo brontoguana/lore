@@ -613,6 +613,73 @@ async fn grep_doc_blocks() {
 }
 
 #[tokio::test]
+async fn project_grep_includes_document_blocks_and_block_id_fragments() {
+    let dir = tempdir().unwrap();
+    let (addr, client) = spawn_server(dir.path()).await;
+    let token = api_create_agent_token(
+        &client,
+        &addr,
+        "project-grep-agent",
+        &[("grep.proj", "read_write")],
+    )
+    .await;
+
+    let resp = client
+        .post(url(&addr, "/v1/projects/grep.proj/documents"))
+        .header("x-lore-key", &token)
+        .json(&json!({"name": "Project Grep Test"}))
+        .send()
+        .await
+        .unwrap();
+    let doc: Value = resp.json().await.unwrap();
+    let doc_id = doc["id"].as_str().unwrap();
+
+    let resp = client
+        .post(url(
+            &addr,
+            &format!("/v1/projects/grep.proj/documents/{doc_id}/blocks"),
+        ))
+        .header("x-lore-key", &token)
+        .json(&json!({"block_type": "markdown", "content": "Invoice number 987654 appears only in a document"}))
+        .send()
+        .await
+        .unwrap();
+    let block: Value = resp.json().await.unwrap();
+    let block_id = block["id"].as_str().unwrap();
+
+    let resp = client
+        .get(url(&addr, "/v1/projects/grep.proj/grep?q=987654"))
+        .header("x-lore-key", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let results: Value = resp.json().await.unwrap();
+    let arr = results.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "project grep should include document blocks");
+    assert_eq!(arr[0]["document_id"], doc_id);
+    assert_eq!(arr[0]["block"]["id"], block_id);
+
+    let id_fragment = &block_id[0..8];
+    let resp = client
+        .get(url(
+            &addr,
+            &format!("/v1/projects/grep.proj/grep?q={id_fragment}"),
+        ))
+        .header("x-lore-key", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let results: Value = resp.json().await.unwrap();
+    assert_eq!(
+        results.as_array().unwrap().len(),
+        1,
+        "project grep should match document block id fragments from docs read markers"
+    );
+}
+
+#[tokio::test]
 async fn reserved_blocks() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;

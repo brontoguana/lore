@@ -6,6 +6,7 @@
 - Added server journal logging for failed machine JSON actions, including machine-returned `{error}` payloads from create/list/mkdir/control operations.
 - Fixed agent/role grant parsing so "No access" style values are accepted as omitted grants during agent creation instead of failing validation.
 - Fixed machine-agent project grant parsing to tolerate literal escaped newline separators from already-loaded Agents pages, and corrected the create-agent UI to join selected project grants with a real newline separator.
+- Fixed project-level `lore grep` coverage so it searches document blocks as well as legacy project blocks, includes document source metadata in results, and can match block ID fragments from `docs read` markers.
 
 ## 2026-04-30
 

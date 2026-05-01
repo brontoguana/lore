@@ -1741,6 +1741,10 @@ struct BlockWindow {
 struct GrepMatch {
     block: Block,
     preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2428,7 +2432,7 @@ async fn grep_blocks(
         query.author.as_deref(),
         query.since_days,
     )?;
-    let matches = state
+    let mut matches: Vec<GrepMatch> = state
         .store
         .search_blocks(&project, &query.q)?
         .into_iter()
@@ -2436,9 +2440,54 @@ async fn grep_blocks(
         .map(|block| GrepMatch {
             preview: grep_preview(&block.content, &query.q),
             block,
+            document_id: None,
+            document_name: None,
         })
         .collect();
+    let docs = state.store.list_documents(&project)?;
+    append_document_grep_matches(&state, &project, &docs, &query.q, &filters, &mut matches);
     Ok(Json(matches))
+}
+
+fn append_document_grep_matches(
+    state: &AppState,
+    project: &ProjectName,
+    docs: &[crate::store::DocumentInfo],
+    query: &str,
+    filters: &BlockFilterOptions,
+    matches: &mut Vec<GrepMatch>,
+) {
+    let needle = query.trim().to_lowercase();
+    for doc in docs {
+        if let Ok(blocks) = state.store.list_doc_blocks(project, &doc.id) {
+            matches.extend(
+                blocks
+                    .into_iter()
+                    .filter(|block| block_matches_filters(block, filters))
+                    .filter(|block| block_matches_project_grep(block, &needle))
+                    .map(|block| GrepMatch {
+                        preview: grep_preview(&block.content, query),
+                        block,
+                        document_id: Some(doc.id.as_str().to_string()),
+                        document_name: Some(doc.display_name.clone()),
+                    }),
+            );
+        }
+        append_document_grep_matches(state, project, &doc.children, query, filters, matches);
+    }
+}
+
+fn block_matches_project_grep(block: &Block, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    block.content.to_lowercase().contains(needle)
+        || block.id.as_str().to_lowercase().contains(needle)
+        || block.order.as_str().to_lowercase().contains(needle)
+        || format!("{:?}", block.block_type)
+            .to_lowercase()
+            .contains(needle)
+        || block.author.as_str().to_lowercase().contains(needle)
 }
 
 // ---- Document endpoints ----
