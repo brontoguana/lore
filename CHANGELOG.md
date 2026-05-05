@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-05-05
+
+- Fixed chat panel refresh reconciliation so a queued follow-up message keeps its visible end-of-chat position when the agent claims it, instead of jumping back to its raw database insertion point.
+
+## 2026-05-04
+
+- Fixed mobile chat scroll restoration during iPhone rotation so conversations that are already at the end stay anchored to the newest message after viewport height changes.
+
 ## 2026-05-01
 
 - Fixed machine-agent create/control JSON error handling on the Agents page. Machine list/create/mkdir/stop/restart/remove endpoints now return JSON errors for early session, CSRF and validation failures instead of generic HTML UI error pages, and the browser surfaces non-JSON response bodies instead of only showing "Failed to create agent".

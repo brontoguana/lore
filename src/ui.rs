@@ -4160,6 +4160,8 @@ var activeTurnUserId = {active_turn_user_id};
 var isLibrarian = currentAgent === 'librarian';
 var libProject = '';
 var chatFollowScroll = true;
+var chatViewportResizeRestorePending = false;
+var chatViewportResizeRestoreSeq = 0;
 var chatResumeRefreshInFlight = false;
 var chatLastResumeRefreshAt = 0;
 var chatLastStreamEventAt = Date.now();
@@ -4393,9 +4395,14 @@ function cacheCurrentChatPanelState(includePanelHtml) {{
 
 function cacheChatPanelResponse(data) {{
   if (!data || !data.ok || !data.selected_agent || data.selected_agent === 'librarian') return;
+  var incomingMessages = Array.isArray(data.messages) ? data.messages : [];
+  var cached = chatPanelCache[data.selected_agent];
+  if (cached && Array.isArray(cached.messages) && cached.messages.length) {{
+    incomingMessages = mergeChatMessagesPreservingVisibleOrder(cached.messages, incomingMessages);
+  }}
   cacheChatPanelState(data.selected_agent, {{
     panel_html: data.panel_html || '',
-    messages: data.messages || [],
+    messages: incomingMessages,
     agent_status: data.agent_status || '',
     active_turn_user_id: data.active_turn_user_id || 0,
     profile_url: data.profile_url || null
@@ -4490,13 +4497,18 @@ function applyChatPanelResponse(data, pushHistory, fromCache) {{
   if (!data || !data.ok) return;
   var main = document.getElementById('chat-main');
   if (!main) return;
+  var selectedAgent = data.selected_agent || null;
+  var incomingMessages = Array.isArray(data.messages) ? data.messages : [];
+  if (selectedAgent && selectedAgent === currentAgent && Array.isArray(chatMessages) && chatMessages.length) {{
+    incomingMessages = mergeChatMessagesPreservingVisibleOrder(chatMessages, incomingMessages);
+  }}
   var list = document.getElementById('chat-agent-list');
   if (!fromCache && list && typeof data.agent_list_html === 'string') {{
     list.innerHTML = data.agent_list_html;
   }}
   main.innerHTML = data.panel_html || '';
-  currentAgent = data.selected_agent || null;
-  chatMessages = data.messages || [];
+  currentAgent = selectedAgent;
+  chatMessages = incomingMessages;
   agentStatus = data.agent_status || '';
   activeTurnUserId = data.active_turn_user_id || 0;
   agentProfileUrl = data.profile_url || null;
@@ -4819,19 +4831,34 @@ function initChatComposer() {{
 if (window.visualViewport) {{
   var _lastVVH = window.visualViewport.height;
   window.visualViewport.addEventListener('resize', function() {{
+    var snapshot = captureChatResizeScrollSnapshot();
     var h = window.visualViewport.height;
     if (h > _lastVVH) {{
       window.scrollTo(0, 0);
     }}
     resizeChatInput();
     applyChatViewportFix();
+    scheduleChatResizeScrollRestore(snapshot);
     _lastVVH = h;
   }});
   window.visualViewport.addEventListener('scroll', function() {{
+    var snapshot = captureChatResizeScrollSnapshot();
     resizeChatInput();
     applyChatViewportFix();
+    scheduleChatResizeScrollRestore(snapshot);
   }});
 }}
+
+window.addEventListener('resize', function() {{
+  var snapshot = captureChatResizeScrollSnapshot();
+  resizeChatInput();
+  applyChatViewportFix();
+  scheduleChatResizeScrollRestore(snapshot);
+}});
+window.addEventListener('orientationchange', function() {{
+  var snapshot = captureChatResizeScrollSnapshot();
+  scheduleChatResizeScrollRestore(snapshot);
+}});
 
 document.addEventListener('focusin', function(e) {{
   if (e.target && e.target.id === 'chat-input') {{
@@ -5078,6 +5105,10 @@ function bindChatScrollState() {{
   if (container.dataset.scrollBound !== '1') {{
     container.dataset.scrollBound = '1';
     container.addEventListener('scroll', function() {{
+      if (chatViewportResizeRestorePending) {{
+        updateChatJumpButton();
+        return;
+      }}
       chatFollowScroll = chatShouldFollow(container, chatFollowScroll);
       updateChatJumpButton();
     }});
@@ -5093,6 +5124,52 @@ function jumpToChatLatest() {{
   container.scrollTop = container.scrollHeight;
   updateChatJumpButton();
   return false;
+}}
+
+function captureChatResizeScrollSnapshot() {{
+  var container = document.getElementById('chat-messages');
+  if (!container) return null;
+  return {{
+    follow: !!chatFollowScroll || chatIsNearBottom(container, 96),
+    anchor: captureChatViewportAnchor(container),
+    scrollTop: container.scrollTop
+  }};
+}}
+
+function restoreChatResizeScrollSnapshot(snapshot) {{
+  var container = document.getElementById('chat-messages');
+  if (!container || !snapshot) return;
+  if (snapshot.follow) {{
+    chatFollowScroll = true;
+    container.scrollTop = container.scrollHeight;
+  }} else {{
+    chatFollowScroll = false;
+    restoreChatViewportAnchor(container, snapshot.anchor, snapshot.scrollTop || 0);
+  }}
+  updateChatJumpButton();
+}}
+
+function scheduleChatResizeScrollRestore(snapshot) {{
+  if (!snapshot) return;
+  var restoreSeq = ++chatViewportResizeRestoreSeq;
+  chatViewportResizeRestorePending = true;
+  var restore = function() {{
+    restoreChatResizeScrollSnapshot(snapshot);
+  }};
+  restore();
+  requestAnimationFrame(function() {{
+    restore();
+    requestAnimationFrame(function() {{
+      restore();
+      setTimeout(restore, 80);
+      setTimeout(function() {{
+        restore();
+        if (restoreSeq === chatViewportResizeRestoreSeq) {{
+          chatViewportResizeRestorePending = false;
+        }}
+      }}, 220);
+    }});
+  }});
 }}
 
 function escapeHtml(text) {{
@@ -5751,6 +5828,38 @@ function chatMessageId(msg) {{
   var id = msg._id || msg.id || 0;
   if (typeof id === 'string') id = parseInt(id, 10);
   return Number.isFinite(id) ? id : 0;
+}}
+
+function chatMessageStableKey(msg) {{
+  var id = chatMessageId(msg);
+  return id > 0 ? ('id:' + id) : '';
+}}
+
+function mergeChatMessagesPreservingVisibleOrder(existingMessages, incomingMessages) {{
+  if (!Array.isArray(incomingMessages) || !incomingMessages.length) return incomingMessages || [];
+  if (!Array.isArray(existingMessages) || !existingMessages.length) return incomingMessages;
+  var incomingByKey = {{}};
+  for (var i = 0; i < incomingMessages.length; i++) {{
+    var key = chatMessageStableKey(incomingMessages[i]);
+    if (key) incomingByKey[key] = incomingMessages[i];
+  }}
+  var merged = [];
+  var used = {{}};
+  for (var j = 0; j < existingMessages.length; j++) {{
+    var existingKey = chatMessageStableKey(existingMessages[j]);
+    if (!existingKey || !incomingByKey[existingKey]) continue;
+    var next = Object.assign({{}}, existingMessages[j], incomingByKey[existingKey]);
+    merged.push(next);
+    used[existingKey] = true;
+  }}
+  for (var k = 0; k < incomingMessages.length; k++) {{
+    var incomingKey = chatMessageStableKey(incomingMessages[k]);
+    if (!incomingKey || !used[incomingKey]) {{
+      merged.push(incomingMessages[k]);
+      if (incomingKey) used[incomingKey] = true;
+    }}
+  }}
+  return merged;
 }}
 
 function chatMessageCanMutate(msg) {{
@@ -13394,6 +13503,32 @@ mod tests {
     }
 
     #[test]
+    fn chat_page_preserves_visible_message_order_across_panel_refreshes() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("lore"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains(
+            "function mergeChatMessagesPreservingVisibleOrder(existingMessages, incomingMessages) {"
+        ));
+        assert!(
+            html.contains("Object.assign({}, existingMessages[j], incomingByKey[existingKey])")
+        );
+        assert!(html.contains("incomingMessages = mergeChatMessagesPreservingVisibleOrder(chatMessages, incomingMessages);"));
+        assert!(html.contains("incomingMessages = mergeChatMessagesPreservingVisibleOrder(cached.messages, incomingMessages);"));
+    }
+
+    #[test]
     fn chat_page_updates_agent_list_preview_for_assistant_message_events() {
         let html = render_chat_page(
             UiTheme::Parchment,
@@ -13826,6 +13961,34 @@ mod tests {
         assert!(html.contains(".chat-messages {\n      height: 100%;"));
         assert!(html.contains(".chat-msg {\n      max-width: 80%;"));
         assert!(html.contains(".chat-input {\n      flex: 1;"));
+    }
+
+    #[test]
+    fn chat_page_preserves_bottom_scroll_across_mobile_viewport_resize() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf123",
+            true,
+            &[],
+            Some("agent-main"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("var chatViewportResizeRestorePending = false;"));
+        assert!(html.contains("var chatViewportResizeRestoreSeq = 0;"));
+        assert!(html.contains("function captureChatResizeScrollSnapshot() {"));
+        assert!(html.contains("follow: !!chatFollowScroll || chatIsNearBottom(container, 96),"));
+        assert!(html.contains("container.scrollTop = container.scrollHeight;"));
+        assert!(html.contains("function scheduleChatResizeScrollRestore(snapshot) {"));
+        assert!(html.contains("if (chatViewportResizeRestorePending) {\n        updateChatJumpButton();\n        return;"));
+        assert!(html.contains("window.addEventListener('resize', function() {"));
+        assert!(html.contains("window.addEventListener('orientationchange', function() {"));
+        assert!(html.contains("scheduleChatResizeScrollRestore(snapshot);"));
     }
 
     #[test]
