@@ -2,6 +2,9 @@
 
 ## 2026-05-06
 
+- Fixed CLI backend auth-prompt hangs. Agent and manager CLI runners now watch backend stdout/stderr for non-JSON login, OAuth, and API-key prompts, report a visible chat error, terminate the child process, and finalize the active turn instead of leaving the agent stuck in thinking.
+- Fixed CLI backend executable resolution to prefer explicit user-local installs such as `~/.npm-global/bin/gemini` before system `PATH` binaries, and report Gemini startup blockers such as disabled YOLO mode as visible agent errors.
+- Fixed CLI backend spawn retry loops so identical failures for the same claimed user turn stop after three attempts, report a final visible error, and finalize that turn instead of retrying indefinitely.
 - Fixed live chat sidebar ordering so assistant/error/tool activity updates previews and status without moving conversations; only user-authored messages affect conversation recency.
 - Fixed chat sidebar previews so empty agent completion events no longer overwrite the last assistant preview with "No messages yet"; completions with content still update to the final response text.
 

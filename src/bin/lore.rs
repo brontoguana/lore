@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -27,25 +28,40 @@ const LORE_SERVICE_HANDOFF_READY_ENV: &str = "LORE_SERVICE_HANDOFF_READY";
 const LORE_SERVICE_HANDOFF_PARENT_PID_ENV: &str = "LORE_SERVICE_HANDOFF_PARENT_PID";
 const LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV: &str = "LORE_SERVICE_HANDOFF_CANONICAL_EXE";
 const LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV: &str = "LORE_SERVICE_HANDOFF_TARGET_VERSION";
+const CLI_BACKEND_TURN_FAILURE_LIMIT: u32 = 3;
 
 fn resolve_executable_path(executable: &str, fallback_relative_paths: &[&str]) -> PathBuf {
+    resolve_executable_path_from(
+        executable,
+        fallback_relative_paths,
+        env::var_os("HOME").as_deref(),
+        env::var_os("PATH").as_deref(),
+    )
+}
+
+fn resolve_executable_path_from(
+    executable: &str,
+    fallback_relative_paths: &[&str],
+    home: Option<&OsStr>,
+    path: Option<&OsStr>,
+) -> PathBuf {
     if executable.contains(std::path::MAIN_SEPARATOR) {
         return PathBuf::from(executable);
     }
 
-    if let Some(path) = env::var_os("PATH") {
-        for dir in env::split_paths(&path) {
-            let candidate = dir.join(executable);
+    if let Some(home) = home {
+        let home = PathBuf::from(home);
+        for relative in fallback_relative_paths {
+            let candidate = home.join(relative);
             if candidate.is_file() {
                 return candidate;
             }
         }
     }
 
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        for relative in fallback_relative_paths {
-            let candidate = home.join(relative);
+    if let Some(path) = path {
+        for dir in env::split_paths(path) {
+            let candidate = dir.join(executable);
             if candidate.is_file() {
                 return candidate;
             }
@@ -3721,12 +3737,14 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
     AGENT_CWD
         .scope(folder, async move {
             let mut consecutive_errors: u32 = 0;
+            let mut turn_failure_tracker = AgentTurnFailureTracker::default();
             loop {
                 match agent_poll_and_process(
                     &agent_context,
                     &args.name,
                     cli_backend_override,
                     false,
+                    &mut turn_failure_tracker,
                 )
                 .await
                 {
@@ -3762,6 +3780,35 @@ enum AgentPollAction {
     /// Server says an update is available — the *service* handles the actual
     /// update; standalone agents just stop.
     UpdateAvailable,
+}
+
+#[derive(Debug, Default)]
+struct AgentTurnFailureTracker {
+    key: Option<String>,
+    count: u32,
+}
+
+impl AgentTurnFailureTracker {
+    fn reset(&mut self) {
+        self.key = None;
+        self.count = 0;
+    }
+
+    fn record_failure(&mut self, backend: AgentBackend, message_ids: &[u64], detail: &str) -> u32 {
+        let ids = message_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let key = format!("{backend}:{ids}:{detail}");
+        if self.key.as_deref() == Some(key.as_str()) {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.key = Some(key);
+            self.count = 1;
+        }
+        self.count
+    }
 }
 
 async fn take_stop_request(context: &CliContext) -> bool {
@@ -3825,6 +3872,7 @@ async fn agent_poll_and_process(
     agent_name: &str,
     cli_backend_override: Option<AgentBackend>,
     service_managed: bool,
+    turn_failure_tracker: &mut AgentTurnFailureTracker,
 ) -> CliResult<AgentPollAction> {
     let token = context.token.as_deref().ok_or("no token configured")?;
 
@@ -4267,23 +4315,54 @@ async fn agent_poll_and_process(
         {
             Ok(c) => c,
             Err(e) => {
-                let rec = AgentErrorRecord::new("cli", format!("spawn {} failed: {e}", backend));
+                let detail = format!("spawn {} failed: {e}", backend);
+                let failure_count =
+                    turn_failure_tracker.record_failure(backend, &current_message_ids, &detail);
+                if failure_count >= CLI_BACKEND_TURN_FAILURE_LIMIT {
+                    let rec = AgentErrorRecord::new(
+                        "cli",
+                        format!(
+                            "{detail}; stopping retries after {failure_count} failed attempts for this user turn. Fix the {backend} CLI or backend configuration, then send a new message to retry."
+                        ),
+                    );
+                    record_agent_error(context, agent_name, rec).await;
+                    let _ = context
+                        .client
+                        .post(format!("{}/v1/chat/respond", context.url))
+                        .header("x-lore-key", token)
+                        .json(&serde_json::json!({ "complete": true }))
+                        .send()
+                        .await;
+                    turn_failure_tracker.reset();
+                    return Ok(AgentPollAction::Continue);
+                }
+                let rec = AgentErrorRecord::new("cli", detail);
                 record_agent_error(context, agent_name, rec).await;
                 return Err(e);
             }
         };
+        turn_failure_tracker.reset();
 
         let stdout = child.stdout.take().ok_or("no stdout")?;
+        let stderr = child.stderr.take().ok_or("no stderr")?;
         let reader = tokio::io::BufReader::new(stdout);
+        let stderr_reader = tokio::io::BufReader::new(stderr);
         let mut lines = reader.lines();
+        let mut stderr_lines = stderr_reader.lines();
         let mut response = String::new();
         let mut emitted_assistant_messages = false;
+        let mut stdout_done = false;
+        let mut stderr_done = false;
 
         loop {
+            if stdout_done && stderr_done {
+                break;
+            }
             tokio::select! {
-                line = lines.next_line() => {
+                line = lines.next_line(), if !stdout_done => {
                     let Some(line) = line? else {
-                        break;
+                        stdout_done = true;
+                        continue;
                     };
                     let line = line.trim().to_string();
                     if line.is_empty() {
@@ -4291,7 +4370,22 @@ async fn agent_poll_and_process(
                     }
                     let parsed: serde_json::Value = match serde_json::from_str(&line) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(_) => {
+                            if let Some(record) = classify_cli_non_json_output(backend, "stdout", &line) {
+                                eprintln!("[agent] {}", record.detail);
+                                terminate_child_process_tree(&mut child).await;
+                                record_agent_error(context, agent_name, record).await;
+                                let _ = context
+                                    .client
+                                    .post(format!("{}/v1/chat/respond", context.url))
+                                    .header("x-lore-key", token)
+                                    .json(&serde_json::json!({ "complete": true }))
+                                    .send()
+                                    .await;
+                                return Ok(AgentPollAction::Continue);
+                            }
+                            continue;
+                        },
                     };
                     for event in parse_backend_line(backend, &parsed) {
                         match event {
@@ -4323,6 +4417,29 @@ async fn agent_poll_and_process(
                             }
                             BackendEvent::Skip => {}
                         }
+                    }
+                }
+                line = stderr_lines.next_line(), if !stderr_done => {
+                    let Some(line) = line? else {
+                        stderr_done = true;
+                        continue;
+                    };
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(record) = classify_cli_non_json_output(backend, "stderr", &line) {
+                        eprintln!("[agent] {}", record.detail);
+                        terminate_child_process_tree(&mut child).await;
+                        record_agent_error(context, agent_name, record).await;
+                        let _ = context
+                            .client
+                            .post(format!("{}/v1/chat/respond", context.url))
+                            .header("x-lore-key", token)
+                            .json(&serde_json::json!({ "complete": true }))
+                            .send()
+                            .await;
+                        return Ok(AgentPollAction::Continue);
                     }
                 }
                 _ = wait_for_stop_request(context) => {
@@ -4550,31 +4667,65 @@ async fn run_manager_cli(
     };
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
+    let stderr = child.stderr.take().ok_or("no stderr")?;
     let reader = tokio::io::BufReader::new(stdout);
+    let stderr_reader = tokio::io::BufReader::new(stderr);
     let mut lines = reader.lines();
+    let mut stderr_lines = stderr_reader.lines();
     let mut full_response = String::new();
 
     let read_output = async {
-        while let Some(line) = lines.next_line().await? {
-            let line = line.trim().to_string();
-            if line.is_empty() {
-                continue;
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        loop {
+            if stdout_done && stderr_done {
+                break;
             }
-            let parsed: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for event in parse_backend_line(backend, &parsed) {
-                match event {
-                    BackendEvent::Text(text) => {
-                        let _ = append_new_stream_text(&mut full_response, &text);
+            tokio::select! {
+                line = lines.next_line(), if !stdout_done => {
+                    let Some(line) = line? else {
+                        stdout_done = true;
+                        continue;
+                    };
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
                     }
-                    BackendEvent::Result(text) => {
-                        if full_response.is_empty() && !text.is_empty() {
-                            full_response = text;
+                    let parsed: serde_json::Value = match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            if let Some(record) = classify_cli_non_json_output(backend, "stdout", &line) {
+                                return Err(record.detail.into());
+                            }
+                            continue;
+                        },
+                    };
+                    for event in parse_backend_line(backend, &parsed) {
+                        match event {
+                            BackendEvent::Text(text) => {
+                                let _ = append_new_stream_text(&mut full_response, &text);
+                            }
+                            BackendEvent::Result(text) => {
+                                if full_response.is_empty() && !text.is_empty() {
+                                    full_response = text;
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    _ => {}
+                }
+                line = stderr_lines.next_line(), if !stderr_done => {
+                    let Some(line) = line? else {
+                        stderr_done = true;
+                        continue;
+                    };
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(record) = classify_cli_non_json_output(backend, "stderr", &line) {
+                        return Err(record.detail.into());
+                    }
                 }
             }
         }
@@ -4587,6 +4738,7 @@ async fn run_manager_cli(
             eprintln!("[manager] CLI read error: {e}");
             let rec = AgentErrorRecord::new("manager", format!("cli stdout read error: {e}"));
             record_agent_error(context, agent_name, rec).await;
+            terminate_child_process_tree(&mut child).await;
         }
         Err(_) => {
             eprintln!("[manager] CLI timed out after 5 minutes, killing process tree");
@@ -5027,6 +5179,95 @@ impl AgentErrorRecord {
     fn with_preview_response(mut self, s: impl Into<String>) -> Self {
         self.preview_response = Some(truncate_preview(&s.into()));
         self
+    }
+}
+
+fn classify_cli_non_json_output(
+    backend: AgentBackend,
+    stream_name: &str,
+    line: &str,
+) -> Option<AgentErrorRecord> {
+    let preview = sanitize_cli_output_preview(line);
+    let detail = if looks_like_cli_auth_prompt(line) {
+        format!(
+            "{backend} emitted a non-JSON {stream_name} authentication prompt. Configure {backend} authentication for the service user or set a headless API-key auth path before retrying. Prompt: {preview}"
+        )
+    } else if looks_like_cli_startup_blocker(line) {
+        format!(
+            "{backend} emitted a non-JSON {stream_name} startup blocker. Check the installed {backend} CLI version and service configuration before retrying. Output: {preview}"
+        )
+    } else {
+        return None;
+    };
+    Some(AgentErrorRecord::new("cli", detail).with_preview_response(preview))
+}
+
+fn looks_like_cli_startup_blocker(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("yolo mode is disabled")
+        || lower.contains("disabled by your administrator")
+        || lower.contains("securemodeenabled")
+    {
+        return true;
+    }
+    false
+}
+
+fn looks_like_cli_auth_prompt(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let mentions_auth = lower.contains("oauth")
+        || lower.contains("auth")
+        || lower.contains("login")
+        || lower.contains("log in")
+        || lower.contains("sign in")
+        || lower.contains("authenticate")
+        || lower.contains("authentication")
+        || lower.contains("authorization")
+        || lower.contains("api key")
+        || lower.contains("google account");
+    if !mentions_auth {
+        return false;
+    }
+    lower.contains("browser")
+        || lower.contains("visit")
+        || lower.contains("open ")
+        || lower.contains("url")
+        || lower.contains("code")
+        || lower.contains("please")
+        || lower.contains("must")
+        || lower.contains("need")
+        || lower.contains("required")
+        || lower.contains("credential")
+        || lower.contains("failed")
+        || lower.contains("missing")
+        || lower.contains("account")
+        || lower.contains("key")
+        || lower.contains("permission")
+        || lower.contains("token")
+}
+
+fn sanitize_cli_output_preview(line: &str) -> String {
+    let mut out = Vec::new();
+    for part in line.split_whitespace() {
+        if part.starts_with("http://") || part.starts_with("https://") {
+            out.push("[url]".to_string());
+        } else if part.len() > 80 {
+            out.push(format!(
+                "{}...[redacted]",
+                part.chars().take(24).collect::<String>()
+            ));
+        } else {
+            out.push(part.to_string());
+        }
+    }
+    let collapsed = out.join(" ");
+    let count = collapsed.chars().count();
+    if count <= 300 {
+        collapsed
+    } else {
+        let mut shortened: String = collapsed.chars().take(300).collect();
+        shortened.push_str("...");
+        shortened
     }
 }
 
@@ -6804,30 +7045,66 @@ async fn run_compaction(
             let mut child =
                 spawn_backend(backend, prompt, None, None, context.token.as_deref()).await?;
             let stdout = child.stdout.take().ok_or("no stdout")?;
+            let stderr = child.stderr.take().ok_or("no stderr")?;
             let reader = tokio::io::BufReader::new(stdout);
+            let stderr_reader = tokio::io::BufReader::new(stderr);
             let mut lines = reader.lines();
+            let mut stderr_lines = stderr_reader.lines();
             let mut result = String::new();
+            let mut stdout_done = false;
+            let mut stderr_done = false;
 
-            while let Some(line) = lines.next_line().await? {
-                let line = line.trim().to_string();
-                if line.is_empty() {
-                    continue;
+            loop {
+                if stdout_done && stderr_done {
+                    break;
                 }
-                let parsed: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                for event in parse_backend_line(backend, &parsed) {
-                    match event {
-                        BackendEvent::Text(text) => {
-                            let _ = append_new_stream_text(&mut result, &text);
+                tokio::select! {
+                    line = lines.next_line(), if !stdout_done => {
+                        let Some(line) = line? else {
+                            stdout_done = true;
+                            continue;
+                        };
+                        let line = line.trim().to_string();
+                        if line.is_empty() {
+                            continue;
                         }
-                        BackendEvent::Result(text) => {
-                            if result.is_empty() && !text.is_empty() {
-                                result = text;
+                        let parsed: serde_json::Value = match serde_json::from_str(&line) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                if let Some(record) = classify_cli_non_json_output(backend, "stdout", &line) {
+                                    terminate_child_process_tree(&mut child).await;
+                                    return Err(record.detail.into());
+                                }
+                                continue;
+                            },
+                        };
+                        for event in parse_backend_line(backend, &parsed) {
+                            match event {
+                                BackendEvent::Text(text) => {
+                                    let _ = append_new_stream_text(&mut result, &text);
+                                }
+                                BackendEvent::Result(text) => {
+                                    if result.is_empty() && !text.is_empty() {
+                                        result = text;
+                                    }
+                                }
+                                BackendEvent::ToolUse(_) | BackendEvent::Skip => {}
                             }
                         }
-                        BackendEvent::ToolUse(_) | BackendEvent::Skip => {}
+                    }
+                    line = stderr_lines.next_line(), if !stderr_done => {
+                        let Some(line) = line? else {
+                            stderr_done = true;
+                            continue;
+                        };
+                        let line = line.trim().to_string();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Some(record) = classify_cli_non_json_output(backend, "stderr", &line) {
+                            terminate_child_process_tree(&mut child).await;
+                            return Err(record.detail.into());
+                        }
                     }
                 }
             }
@@ -7137,8 +7414,16 @@ fn spawn_agent_task(context: &CliContext, agent: &ManagedAgent) -> tokio::task::
     tokio::spawn(AGENT_CWD.scope(folder, async move {
         eprintln!("[agent] Task started for '{}'", name);
         let mut consecutive_errors: u32 = 0;
+        let mut turn_failure_tracker = AgentTurnFailureTracker::default();
         loop {
-            let outcome = agent_poll_and_process(&ctx, &name, backend_override, true).await;
+            let outcome = agent_poll_and_process(
+                &ctx,
+                &name,
+                backend_override,
+                true,
+                &mut turn_failure_tracker,
+            )
+            .await;
             match outcome {
                 Ok(AgentPollAction::Continue) => {
                     consecutive_errors = 0;
@@ -7878,12 +8163,14 @@ mod tests {
         append_assistant_segment, append_block_content, append_new_stream_text, codex_exec_args,
         count_history_exchanges, find_cwd_project_file, history_compaction_split_index,
         history_messages_excluding_pending, load_cli_text_input, load_doc_write_content,
-        load_required_text_arg, markdown_heading_matches, next_service_update_retry_delay_secs,
-        parse_cli_version_output, parse_codex_line, recent_history_exchange_tail,
-        remove_owned_service_pid_file, resolve_context_project, reuse_or_clear_staged_binary,
+        load_required_text_arg, looks_like_cli_auth_prompt, markdown_heading_matches,
+        next_service_update_retry_delay_secs, parse_cli_version_output, parse_codex_line,
+        recent_history_exchange_tail, remove_owned_service_pid_file, resolve_context_project,
+        resolve_executable_path_from, reuse_or_clear_staged_binary, sanitize_cli_output_preview,
         service_update_target,
     };
     use clap::Parser;
+    use lore_core::AgentBackend;
     use serde_json::json;
     use std::collections::HashSet;
     use std::fs;
@@ -7977,6 +8264,172 @@ mod tests {
             parse_cli_version_output("lore 0.1.65-rc110\n"),
             Some("0.1.65-rc110".to_string())
         );
+    }
+
+    #[test]
+    fn backend_executable_resolution_prefers_user_local_fallbacks() {
+        let home = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let fallback = home.path().join(".npm-global/bin/gemini");
+        fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        fs::write(&fallback, "").unwrap();
+        let system = path_dir.path().join("gemini");
+        fs::write(&system, "").unwrap();
+        let path = std::env::join_paths([path_dir.path()]).unwrap();
+
+        assert_eq!(
+            resolve_executable_path_from(
+                "gemini",
+                &[".local/bin/gemini", ".npm-global/bin/gemini"],
+                Some(home.path().as_os_str()),
+                Some(path.as_os_str())
+            ),
+            fallback
+        );
+    }
+
+    #[test]
+    fn backend_executable_resolution_uses_path_when_no_user_local_fallback_exists() {
+        let home = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let system = path_dir.path().join("gemini");
+        fs::write(&system, "").unwrap();
+        let path = std::env::join_paths([path_dir.path()]).unwrap();
+
+        assert_eq!(
+            resolve_executable_path_from(
+                "gemini",
+                &[".local/bin/gemini", ".npm-global/bin/gemini"],
+                Some(home.path().as_os_str()),
+                Some(path.as_os_str())
+            ),
+            system
+        );
+    }
+
+    #[test]
+    fn agent_turn_failure_tracker_caps_identical_backend_turn_failures() {
+        let mut tracker = super::AgentTurnFailureTracker::default();
+        let message_ids = [269];
+        let detail = "spawn gemini failed: Broken pipe (os error 32)";
+
+        assert_eq!(
+            tracker.record_failure(AgentBackend::Gemini, &message_ids, detail),
+            1
+        );
+        assert_eq!(
+            tracker.record_failure(AgentBackend::Gemini, &message_ids, detail),
+            2
+        );
+        assert_eq!(
+            tracker.record_failure(AgentBackend::Gemini, &message_ids, detail),
+            super::CLI_BACKEND_TURN_FAILURE_LIMIT
+        );
+    }
+
+    #[test]
+    fn agent_turn_failure_tracker_resets_for_new_turn_or_error() {
+        let mut tracker = super::AgentTurnFailureTracker::default();
+
+        assert_eq!(
+            tracker.record_failure(
+                AgentBackend::Gemini,
+                &[269],
+                "spawn gemini failed: Broken pipe"
+            ),
+            1
+        );
+        assert_eq!(
+            tracker.record_failure(
+                AgentBackend::Gemini,
+                &[270],
+                "spawn gemini failed: Broken pipe"
+            ),
+            1
+        );
+        assert_eq!(
+            tracker.record_failure(
+                AgentBackend::Gemini,
+                &[270],
+                "spawn gemini failed: permission denied"
+            ),
+            1
+        );
+        assert_eq!(
+            tracker.record_failure(
+                AgentBackend::Gemini,
+                &[270],
+                "spawn gemini failed: permission denied"
+            ),
+            2
+        );
+        tracker.reset();
+        assert_eq!(
+            tracker.record_failure(
+                AgentBackend::Gemini,
+                &[270],
+                "spawn gemini failed: permission denied"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn cli_auth_prompt_detection_matches_oauth_login_prompts() {
+        assert!(looks_like_cli_auth_prompt(
+            "OAuth login required. Open https://example.test/auth and enter the code."
+        ));
+        assert!(looks_like_cli_auth_prompt(
+            "Please login to continue using the Gemini CLI."
+        ));
+        assert!(super::classify_cli_non_json_output(
+            AgentBackend::Gemini,
+            "stdout",
+            "To continue, sign in with your Google Account by visiting https://example.test/login"
+        )
+        .unwrap()
+        .detail
+        .contains("gemini emitted a non-JSON stdout authentication prompt"));
+    }
+
+    #[test]
+    fn cli_non_json_detection_matches_gemini_startup_blockers() {
+        let record = super::classify_cli_non_json_output(
+            AgentBackend::Gemini,
+            "stdout",
+            "YOLO mode is disabled by your administrator.",
+        )
+        .unwrap();
+
+        assert!(record.detail.contains("startup blocker"));
+        assert!(record.detail.contains("gemini emitted a non-JSON stdout"));
+    }
+
+    #[test]
+    fn cli_auth_prompt_detection_ignores_plain_non_json_noise() {
+        assert!(!looks_like_cli_auth_prompt(
+            "Loaded cached model preferences from disk"
+        ));
+        assert!(
+            super::classify_cli_non_json_output(
+                AgentBackend::Codex,
+                "stderr",
+                "Loaded cached model preferences from disk"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cli_auth_prompt_preview_redacts_urls_and_long_tokens() {
+        let preview = sanitize_cli_output_preview(&format!(
+            "Visit https://example.test/auth?code=abc and enter {} to login",
+            "a".repeat(100)
+        ));
+
+        assert!(preview.contains("[url]"));
+        assert!(!preview.contains("https://example.test"));
+        assert!(preview.contains("[redacted]"));
     }
 
     #[test]
