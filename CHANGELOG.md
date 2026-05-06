@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-05-06
+
+- Fixed live chat sidebar ordering so assistant/error/tool activity updates previews and status without moving conversations; only user-authored messages affect conversation recency.
+- Fixed chat sidebar previews so empty agent completion events no longer overwrite the last assistant preview with "No messages yet"; completions with content still update to the final response text.
+
 ## 2026-05-05
 
 - Fixed chat panel refresh reconciliation so a queued follow-up message keeps its visible end-of-chat position when the agent claims it, instead of jumping back to its raw database insertion point.

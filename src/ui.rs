@@ -6085,10 +6085,9 @@ function connectSSE() {{
           renderMessages();
         }}
       }} else if (evt.event_type === 'message' && evt.data) {{
-        moveAgentItemToTop(evt.agent);
         updateAgentListPreview(evt.agent, evt.data.content || '');
-      }} else if (evt.event_type === 'response_complete') {{
-        updateAgentListPreview(evt.agent, evt.data && evt.data.content ? evt.data.content : '');
+      }} else if (evt.event_type === 'response_complete' && evt.data && evt.data.content) {{
+        updateAgentListPreview(evt.agent, evt.data.content);
       }} else if (evt.event_type === 'status') {{
         updateAgentListStatus(evt.agent, evt.data && evt.data.status ? evt.data.status : '');
       }}
@@ -13545,7 +13544,19 @@ mod tests {
         );
 
         assert!(html.contains("updateAgentListPreview(evt.agent, evt.data.content || '');"));
+        assert!(html.contains(
+            "} else if (evt.event_type === 'response_complete' && evt.data && evt.data.content) {\n        updateAgentListPreview(evt.agent, evt.data.content);"
+        ));
         assert!(html.contains("moveAgentItemToTop(evt.agent);"));
+        assert!(html.contains(
+            "if (evt.event_type === 'message_sent' || (evt.event_type === 'message' && evt.data && evt.data.role === 'user'))"
+        ));
+        assert!(!html.contains(
+            "}} else if (evt.event_type === 'message' && evt.data) {{\n        moveAgentItemToTop(evt.agent);"
+        ));
+        assert!(!html.contains(
+            "} else if (evt.event_type === 'response_complete') {\n        updateAgentListPreview(evt.agent, evt.data && evt.data.content ? evt.data.content : '');"
+        ));
     }
 
     #[test]

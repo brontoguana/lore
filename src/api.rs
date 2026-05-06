@@ -17028,6 +17028,8 @@ mod tests {
         let expected_bravo_time = super::format_chat_time(bravo_user_at);
         let expected_alpha_time = super::format_chat_time(alpha_user_at);
         assert_eq!(ordered_names, vec!["bravo", "alpha"]);
+        assert_eq!(agents[0].last_message.as_deref(), Some("bravo assistant"));
+        assert_eq!(agents[1].last_message.as_deref(), Some("alpha assistant"));
         assert_eq!(
             agents[0].last_message_time.as_deref(),
             Some(expected_bravo_time.as_str())
