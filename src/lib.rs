@@ -7,6 +7,7 @@ pub mod librarian;
 pub mod manager;
 pub mod model;
 pub mod order;
+pub mod prompt;
 pub mod store;
 pub mod ui;
 pub mod updater;
@@ -30,6 +31,7 @@ pub use model::{
     reserved_block_display_name, slugify,
 };
 pub use order::generate_order_key;
+pub use prompt::{current_datetime_prompt_line, current_datetime_prompt_line_at};
 pub use store::{
     DocumentWriteEntry, DocumentWriteResult, FileBlockStore, parse_document_text,
     serialize_blocks_to_text,

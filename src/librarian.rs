@@ -1355,7 +1355,8 @@ fn extract_content_text(value: &serde_json::Value) -> Option<&str> {
 
 pub fn build_prompt(request: &LibrarianRequest) -> String {
     let mut prompt = format!(
-        "Project: {}\nQuestion: {}\n\nUse only the Lore blocks below.\n",
+        "{}\n\nProject: {}\nQuestion: {}\n\nUse only the Lore blocks below.\n",
+        crate::prompt::current_datetime_prompt_line(),
         request.project.as_str(),
         request.question.trim()
     );
@@ -1402,7 +1403,8 @@ pub fn build_prompt_multi_project(
 ) -> String {
     let project_names: Vec<&str> = projects_context.iter().map(|(p, _)| p.as_str()).collect();
     let mut prompt = format!(
-        "Projects: {}\nQuestion: {}\n\nUse only the Lore blocks below. Reference project names where relevant.\n",
+        "{}\n\nProjects: {}\nQuestion: {}\n\nUse only the Lore blocks below. Reference project names where relevant.\n",
+        crate::prompt::current_datetime_prompt_line(),
         project_names.join(", "),
         question.trim(),
     );
@@ -1450,7 +1452,8 @@ pub fn build_prompt_multi_project(
 
 pub fn build_action_prompt(request: &ProjectLibrarianRequest) -> String {
     let mut prompt = format!(
-        "Project: {}\nInstruction: {}\n\nUse only this project context.\nReturn JSON with this shape:\n{{\"summary\":\"...\",\"operations\":[...]}}\n\nOperation examples:\n{{\"type\":\"create_block\",\"block_type\":\"markdown\",\"content\":\"text\",\"after_block_id\":null}}\n{{\"type\":\"update_block\",\"block_id\":\"...\",\"block_type\":\"markdown\",\"content\":\"new text\",\"after_block_id\":null}}\n{{\"type\":\"move_block\",\"block_id\":\"...\",\"after_block_id\":\"...\"}}\n{{\"type\":\"delete_block\",\"block_id\":\"...\"}}\n",
+        "{}\n\nProject: {}\nInstruction: {}\n\nUse only this project context.\nReturn JSON with this shape:\n{{\"summary\":\"...\",\"operations\":[...]}}\n\nOperation examples:\n{{\"type\":\"create_block\",\"block_type\":\"markdown\",\"content\":\"text\",\"after_block_id\":null}}\n{{\"type\":\"update_block\",\"block_id\":\"...\",\"block_type\":\"markdown\",\"content\":\"new text\",\"after_block_id\":null}}\n{{\"type\":\"move_block\",\"block_id\":\"...\",\"after_block_id\":\"...\"}}\n{{\"type\":\"delete_block\",\"block_id\":\"...\"}}\n",
+        crate::prompt::current_datetime_prompt_line(),
         request.project.as_str(),
         request.instruction.trim()
     );
@@ -2643,5 +2646,31 @@ mod tests {
             })),
             r#"[{"loc":["body","model"],"msg":"field required"}]"#
         );
+    }
+
+    #[test]
+    fn librarian_prompts_include_current_datetime_context() {
+        let project = ProjectName::new("alpha.docs").unwrap();
+        let answer_prompt = build_prompt(&LibrarianRequest {
+            project: project.clone(),
+            question: "What changed?".into(),
+            context_blocks: Vec::new(),
+            context_errors: None,
+        });
+        assert!(answer_prompt.starts_with("Current date and time: "));
+        assert!(answer_prompt.contains(" UTC\n\nProject: alpha.docs"));
+
+        let multi_prompt =
+            build_prompt_multi_project(&[(project.clone(), Vec::new())], "Status?", None);
+        assert!(multi_prompt.starts_with("Current date and time: "));
+        assert!(multi_prompt.contains(" UTC\n\nProjects: alpha.docs"));
+
+        let action_prompt = build_action_prompt(&ProjectLibrarianRequest {
+            project,
+            instruction: "Update the note".into(),
+            context_blocks: Vec::new(),
+        });
+        assert!(action_prompt.starts_with("Current date and time: "));
+        assert!(action_prompt.contains(" UTC\n\nProject: alpha.docs"));
     }
 }

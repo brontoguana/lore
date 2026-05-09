@@ -2,7 +2,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use lore_core::updater::{download_update_to_path, hex_sha256};
 use lore_core::{
     AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, ReleaseStream,
-    SelfUpdateOutcome, check_for_update, manager::extract_manager_delay_prefix,
+    SelfUpdateOutcome, check_for_update, current_datetime_prompt_line,
+    current_datetime_prompt_line_at, manager::extract_manager_delay_prefix,
     maybe_apply_self_update, slugify,
 };
 use reqwest::{Method, StatusCode};
@@ -4102,38 +4103,8 @@ async fn agent_poll_and_process(
 
     let mut prompt_parts: Vec<String> = Vec::new();
 
-    // Current date/time
     let now = time::OffsetDateTime::now_utc();
-    let weekday = match now.weekday() {
-        time::Weekday::Monday => "Monday",
-        time::Weekday::Tuesday => "Tuesday",
-        time::Weekday::Wednesday => "Wednesday",
-        time::Weekday::Thursday => "Thursday",
-        time::Weekday::Friday => "Friday",
-        time::Weekday::Saturday => "Saturday",
-        time::Weekday::Sunday => "Sunday",
-    };
-    let month = match now.month() {
-        time::Month::January => "January",
-        time::Month::February => "February",
-        time::Month::March => "March",
-        time::Month::April => "April",
-        time::Month::May => "May",
-        time::Month::June => "June",
-        time::Month::July => "July",
-        time::Month::August => "August",
-        time::Month::September => "September",
-        time::Month::October => "October",
-        time::Month::November => "November",
-        time::Month::December => "December",
-    };
-    prompt_parts.push(format!(
-        "Current date and time: {weekday}, {month} {}, {} at {:02}:{:02} UTC",
-        now.day(),
-        now.year(),
-        now.hour(),
-        now.minute()
-    ));
+    prompt_parts.push(current_datetime_prompt_line_at(now));
 
     // Git repository context (gathered locally from the agent's working directory)
     // All git commands use async process to avoid blocking tokio threads.
@@ -6490,7 +6461,7 @@ async fn do_compact(
     input.push_str("</messages_to_compact>");
 
     // Run compaction through the agent's backend
-    let full_prompt = format!("{COMPACTION_SYSTEM_PROMPT}\n\n{input}");
+    let full_prompt = build_compaction_prompt(&input);
     let new_summary = run_compaction(context, backend, &full_prompt).await?;
 
     if new_summary.is_empty() {
@@ -7008,6 +6979,13 @@ fn parse_codex_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
         Some("turn.completed") => vec![BackendEvent::Result(String::new())],
         _ => vec![BackendEvent::Skip],
     }
+}
+
+fn build_compaction_prompt(input: &str) -> String {
+    format!(
+        "{}\n\n{COMPACTION_SYSTEM_PROMPT}\n\n{input}",
+        current_datetime_prompt_line()
+    )
 }
 
 /// Run a prompt through the backend and collect the full text output.
@@ -8160,14 +8138,14 @@ async fn service_handle_create_agent(
 mod tests {
     use super::{
         BlocksCommand, Cli, Command, DocWriteArgs, ProjectSource, ResolvedProject,
-        append_assistant_segment, append_block_content, append_new_stream_text, codex_exec_args,
-        count_history_exchanges, find_cwd_project_file, history_compaction_split_index,
-        history_messages_excluding_pending, load_cli_text_input, load_doc_write_content,
-        load_required_text_arg, looks_like_cli_auth_prompt, markdown_heading_matches,
-        next_service_update_retry_delay_secs, parse_cli_version_output, parse_codex_line,
-        recent_history_exchange_tail, remove_owned_service_pid_file, resolve_context_project,
-        resolve_executable_path_from, reuse_or_clear_staged_binary, sanitize_cli_output_preview,
-        service_update_target,
+        append_assistant_segment, append_block_content, append_new_stream_text,
+        build_compaction_prompt, codex_exec_args, count_history_exchanges, find_cwd_project_file,
+        history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
+        load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
+        markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
+        parse_codex_line, recent_history_exchange_tail, remove_owned_service_pid_file,
+        resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
+        sanitize_cli_output_preview, service_update_target,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
@@ -8244,6 +8222,14 @@ mod tests {
             Some("\n\nSecond update".to_string())
         );
         assert_eq!(accumulated, "First update\n\nSecond update");
+    }
+
+    #[test]
+    fn cli_compaction_prompt_includes_current_datetime_context() {
+        let prompt =
+            build_compaction_prompt("<messages_to_compact>\nUser: hello\n</messages_to_compact>");
+        assert!(prompt.starts_with("Current date and time: "));
+        assert!(prompt.contains(" UTC\n\nYou are compacting conversation history"));
     }
 
     #[test]

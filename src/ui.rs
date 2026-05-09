@@ -4163,6 +4163,8 @@ var chatFollowScroll = true;
 var chatViewportResizeRestorePending = false;
 var chatViewportResizeRestoreSeq = 0;
 var chatResumeRefreshInFlight = false;
+var chatResumeRefreshTimer = null;
+var chatResumeRefreshSeq = 0;
 var chatLastResumeRefreshAt = 0;
 var chatLastStreamEventAt = Date.now();
 var chatLastFullPanelRefreshAt = Date.now();
@@ -4172,8 +4174,11 @@ var chatSendMaxAttempts = 3;
 var chatRestoreInFlight = false;
 var chatPanelRequestSeq = 0;
 var CHAT_PANEL_CACHE_LIMIT = 100;
+var CHAT_PANEL_FETCH_TIMEOUT_MS = 15000;
 var CHAT_RESUME_STALE_AFTER_MS = 10000;
 var CHAT_WAKE_ACTIVITY_REFRESH_AFTER_MS = 60000;
+var CHAT_FOREGROUND_RECONCILE_AFTER_MS = 300000;
+var CHAT_FOREGROUND_RECONCILE_INTERVAL_MS = 30000;
 var chatPanelCache = {{}};
 var chatPanelCacheOrder = [];
 
@@ -4409,6 +4414,20 @@ function cacheChatPanelResponse(data) {{
   }});
 }}
 
+function fetchChatJson(url, options, timeoutMs) {{
+  var fetchOptions = Object.assign({{}}, options || {{}});
+  var timer = null;
+  var controller = null;
+  if (typeof AbortController !== 'undefined' && timeoutMs > 0) {{
+    controller = new AbortController();
+    fetchOptions.signal = controller.signal;
+    timer = setTimeout(function() {{ controller.abort(); }}, timeoutMs);
+  }}
+  var request = fetch(url, fetchOptions);
+  if (!timer) return request;
+  return request.finally(function() {{ clearTimeout(timer); }});
+}}
+
 function applyCachedChatPanel(agent, pushHistory) {{
   var cached = agent && chatPanelCache[agent];
   if (!cached || !cached.panel_html) return false;
@@ -4531,7 +4550,7 @@ function fetchDesktopChatPanel(agent, pushHistory, applyMode, requestSeq) {{
   var requestedAgent = agent || null;
   var url = '/ui/chat/panel';
   if (agent) url += '?agent=' + encodeURIComponent(agent);
-  return fetch(url, {{ cache: 'no-store' }})
+  return fetchChatJson(url, {{ cache: 'no-store' }}, CHAT_PANEL_FETCH_TIMEOUT_MS)
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
       if (data && data.ok) chatLastFullPanelRefreshAt = Date.now();
@@ -4608,20 +4627,37 @@ function reconnectChatStreamForResume() {{
   connectSSE();
 }}
 
+function finishChatResumeRefresh(resumeSeq) {{
+  if (resumeSeq && resumeSeq !== chatResumeRefreshSeq) return;
+  if (chatResumeRefreshTimer) {{
+    clearTimeout(chatResumeRefreshTimer);
+    chatResumeRefreshTimer = null;
+  }}
+  chatResumeRefreshInFlight = false;
+}}
+
 function refreshChatOnResume(force) {{
   if (!shouldRefreshChatOnResume(force)) return;
   chatWasBackgrounded = false;
   chatResumeRefreshInFlight = true;
   chatLastResumeRefreshAt = Date.now();
   reconnectChatStreamForResume();
+  var resumeSeq = ++chatResumeRefreshSeq;
   var refreshAgent = currentAgent;
   var requestSeq = ++chatPanelRequestSeq;
+  if (chatResumeRefreshTimer) clearTimeout(chatResumeRefreshTimer);
+  chatResumeRefreshTimer = setTimeout(function() {{
+    if (resumeSeq !== chatResumeRefreshSeq) return;
+    chatResumeRefreshInFlight = false;
+    chatResumeRefreshTimer = null;
+    reconnectChatStreamForResume();
+  }}, CHAT_PANEL_FETCH_TIMEOUT_MS + 5000);
   fetchDesktopChatPanel(refreshAgent, false, 'normal', requestSeq)
     .catch(function() {{
       reconnectChatStreamForResume();
     }})
     .finally(function() {{
-      chatResumeRefreshInFlight = false;
+      finishChatResumeRefresh(resumeSeq);
     }});
 }}
 
@@ -4633,12 +4669,23 @@ function shouldRefreshChatAfterWakeActivity() {{
   if (chatWasBackgrounded) return true;
   if (!eventSource) return true;
   if (typeof EventSource !== 'undefined' && eventSource.readyState === EventSource.CLOSED) return true;
-  return (now - Math.max(chatLastStreamEventAt, chatLastFullPanelRefreshAt, chatLastResumeRefreshAt)) > CHAT_WAKE_ACTIVITY_REFRESH_AFTER_MS;
+  if (now - chatLastFullPanelRefreshAt > CHAT_WAKE_ACTIVITY_REFRESH_AFTER_MS) return true;
+  return (now - Math.max(chatLastStreamEventAt, chatLastResumeRefreshAt)) > CHAT_WAKE_ACTIVITY_REFRESH_AFTER_MS;
 }}
 
 function refreshChatAfterWakeActivity() {{
   if (!shouldRefreshChatAfterWakeActivity()) return;
   refreshChatOnResume(true);
+}}
+
+function reconcileVisibleChatIfStale() {{
+  if (!currentAgent || isLibrarian) return;
+  if (document.visibilityState && document.visibilityState === 'hidden') return;
+  if (chatResumeRefreshInFlight) return;
+  var now = Date.now();
+  if (now - chatLastFullPanelRefreshAt > CHAT_FOREGROUND_RECONCILE_AFTER_MS) {{
+    refreshChatOnResume(true);
+  }}
 }}
 
 if (currentAgent) {{
@@ -6069,6 +6116,12 @@ function connectSSE() {{
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/ui/chat/stream');
   markChatStreamAlive();
+  eventSource.onopen = function() {{
+    markChatStreamAlive();
+  }};
+  eventSource.addEventListener('heartbeat', function() {{
+    markChatStreamAlive();
+  }});
   eventSource.onmessage = function(e) {{
     try {{
       markChatStreamAlive();
@@ -6920,9 +6973,14 @@ window.addEventListener('focus', function() {{
   refreshChatOnResume(false);
 }});
 
+window.addEventListener('online', function() {{
+  refreshChatOnResume(true);
+}});
+
 window.addEventListener('pointerdown', refreshChatAfterWakeActivity, {{ capture: true, passive: true }});
 window.addEventListener('touchstart', refreshChatAfterWakeActivity, {{ capture: true, passive: true }});
 window.addEventListener('keydown', refreshChatAfterWakeActivity, true);
+setInterval(reconcileVisibleChatIfStale, CHAT_FOREGROUND_RECONCILE_INTERVAL_MS);
 
 window.addEventListener('popstate', function() {{
   if (isMobileChatLayout()) return;
@@ -13579,16 +13637,35 @@ mod tests {
         assert!(html.contains("eventSource.close();"));
         assert!(html.contains("connectSSE();"));
         assert!(html.contains("var chatLastFullPanelRefreshAt = Date.now();"));
+        assert!(html.contains("var CHAT_PANEL_FETCH_TIMEOUT_MS = 15000;"));
         assert!(html.contains("var CHAT_WAKE_ACTIVITY_REFRESH_AFTER_MS = 60000;"));
-        assert!(html.contains("reconnectChatStreamForResume();\n  var refreshAgent = currentAgent;\n  var requestSeq = ++chatPanelRequestSeq;\n  fetchDesktopChatPanel(refreshAgent, false, 'normal', requestSeq)"));
+        assert!(html.contains("var CHAT_FOREGROUND_RECONCILE_AFTER_MS = 300000;"));
+        assert!(html.contains("var CHAT_FOREGROUND_RECONCILE_INTERVAL_MS = 30000;"));
+        assert!(html.contains("function fetchChatJson(url, options, timeoutMs) {"));
+        assert!(html.contains("controller.abort();"));
+        assert!(html.contains("reconnectChatStreamForResume();\n  var resumeSeq = ++chatResumeRefreshSeq;\n  var refreshAgent = currentAgent;\n  var requestSeq = ++chatPanelRequestSeq;"));
+        assert!(html.contains("fetchDesktopChatPanel(refreshAgent, false, 'normal', requestSeq)"));
+        assert!(html.contains("chatResumeRefreshTimer = setTimeout(function() {"));
+        assert!(html.contains("finishChatResumeRefresh(resumeSeq);"));
         assert!(html.contains(".catch(function() {\n      reconnectChatStreamForResume();"));
         assert!(html.contains(
             "return (now - Math.max(chatLastStreamEventAt, chatLastFullPanelRefreshAt)) > CHAT_RESUME_STALE_AFTER_MS;"
         ));
         assert!(html.contains("function refreshChatAfterWakeActivity() {"));
         assert!(html.contains(
-            "return (now - Math.max(chatLastStreamEventAt, chatLastFullPanelRefreshAt, chatLastResumeRefreshAt)) > CHAT_WAKE_ACTIVITY_REFRESH_AFTER_MS;"
+            "if (now - chatLastFullPanelRefreshAt > CHAT_WAKE_ACTIVITY_REFRESH_AFTER_MS) return true;"
         ));
+        assert!(html.contains(
+            "return (now - Math.max(chatLastStreamEventAt, chatLastResumeRefreshAt)) > CHAT_WAKE_ACTIVITY_REFRESH_AFTER_MS;"
+        ));
+        assert!(html.contains("function reconcileVisibleChatIfStale() {"));
+        assert!(html.contains(
+            "if (now - chatLastFullPanelRefreshAt > CHAT_FOREGROUND_RECONCILE_AFTER_MS) {"
+        ));
+        assert!(html.contains(
+            "eventSource.addEventListener('heartbeat', function() {\n    markChatStreamAlive();"
+        ));
+        assert!(html.contains("window.addEventListener('online', function() {"));
         assert!(html.contains(
             "window.addEventListener('pointerdown', refreshChatAfterWakeActivity, { capture: true, passive: true });"
         ));
@@ -13597,6 +13674,9 @@ mod tests {
                 "window.addEventListener('keydown', refreshChatAfterWakeActivity, true);"
             )
         );
+        assert!(html.contains(
+            "setInterval(reconcileVisibleChatIfStale, CHAT_FOREGROUND_RECONCILE_INTERVAL_MS);"
+        ));
         assert!(html.contains(
             "if (document.visibilityState === 'visible') {\n    if (restorePersistedChatAgentSelection('replace')) return;\n    refreshChatOnResume(false);"
         ));

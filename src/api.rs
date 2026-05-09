@@ -12151,17 +12151,28 @@ async fn chat_sse_stream(State(state): State<AppState>, headers: HeaderMap) -> U
 
     let stream = async_stream::stream! {
         let mut rx = rx;
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        yield Ok::<_, std::convert::Infallible>(
-                            format!("data: {json}\n\n")
-                        );
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Ok(event) => {
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                yield Ok::<_, std::convert::Infallible>(
+                                    format!("data: {json}\n\n")
+                                );
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                _ = heartbeat.tick() => {
+                    yield Ok::<_, std::convert::Infallible>(
+                        "event: heartbeat\ndata: {}\n\n".to_string()
+                    );
+                }
             }
         }
     };
@@ -13689,6 +13700,14 @@ Keep it concise. A few dense paragraphs are better than an exhaustive log. If th
 summary, integrate the new messages into it \u{2014} update or replace outdated information rather \
 than appending.";
 
+fn build_exchange_compaction_system_prompt() -> String {
+    format!(
+        "{}\n\n{}",
+        crate::prompt::current_datetime_prompt_line(),
+        COMPACTION_SYSTEM_PROMPT
+    )
+}
+
 /// Exchange-based compaction. Returns Ok(message) on success, Err(message) on failure.
 async fn do_exchange_compact(
     state: &AppState,
@@ -13760,7 +13779,7 @@ async fn do_exchange_compact(
     let summary_messages = vec![
         crate::librarian::ProxyChatMessage {
             role: "system".into(),
-            content: Some(json!(COMPACTION_SYSTEM_PROMPT)),
+            content: Some(json!(build_exchange_compaction_system_prompt())),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -13881,7 +13900,10 @@ fn build_manager_prompt(
         _ => unreachable!(),
     };
     let stage_prompt = prompt_config.prompt_for_stage(stage);
-    format!("{base}{sentinel}\n\n{context}{stage_prompt}")
+    format!(
+        "{}\n\n{base}{sentinel}\n\n{context}{stage_prompt}",
+        crate::prompt::current_datetime_prompt_line()
+    )
 }
 
 fn manager_request_summary(turn_in_cycle: u32) -> &'static str {
@@ -14196,6 +14218,7 @@ fn build_api_agent_system_prompt(
     conv: &crate::auth::ChatConversation,
 ) -> String {
     let mut parts = Vec::new();
+    parts.push(crate::prompt::current_datetime_prompt_line());
     parts.push("You are a Lore knowledge base agent with tools to navigate projects, manage documents, and read/write content.\n\n\
         Lore organizes knowledge into projects and documents. Each project has an Overview, File Map, and Agent Context accessible via dedicated tools. Documents contain typed blocks (the content itself).\n\n\
         Guidelines:\n\
@@ -14257,6 +14280,53 @@ fn build_api_agent_system_prompt(
     }
 
     parts.join("\n")
+}
+
+fn build_api_btw_system_prompt(
+    state: &AppState,
+    agent: &AuthenticatedAgent,
+    conv: &ChatConversation,
+) -> String {
+    let mut system_parts = vec![
+        crate::prompt::current_datetime_prompt_line(),
+        "You are handling a side question (btw) for a Lore knowledge base agent. \
+         You have full tool access but DO NOT create, update, move, or delete any content \
+         unless the user's message explicitly asks you to make a change. \
+         Read and search freely. Be concise."
+            .to_string(),
+    ];
+
+    let project_context = collect_project_context(state, &agent.grants);
+    if !project_context.is_empty() {
+        system_parts.push(format!("\n## Project Context\n{project_context}"));
+    }
+    if !conv.pinned_context.is_empty() {
+        system_parts.push(format!("\n## Pinned Context\n{}", conv.pinned_context));
+    }
+    if !conv.summary.is_empty() {
+        system_parts.push(format!("\n## Conversation Summary\n{}", conv.summary));
+    }
+
+    let accessible: Vec<String> = agent
+        .grants
+        .iter()
+        .map(|g| {
+            let perm = if g.permission.allows_write() {
+                "read-write"
+            } else {
+                "read"
+            };
+            format!("- {} ({})", g.project.as_str(), perm)
+        })
+        .collect();
+    if !accessible.is_empty() {
+        system_parts.push(format!(
+            "\n## Accessible Projects\n{}",
+            accessible.join("\n")
+        ));
+    }
+
+    system_parts.join("\n")
 }
 
 fn build_api_agent_tools() -> Vec<Value> {
@@ -14433,43 +14503,7 @@ async fn run_api_btw(
         Err(_) => return,
     };
 
-    let mut system_parts = vec![
-        "You are handling a side question (btw) for a Lore knowledge base agent. \
-         You have full tool access but DO NOT create, update, move, or delete any content \
-         unless the user's message explicitly asks you to make a change. \
-         Read and search freely. Be concise."
-            .to_string(),
-    ];
-
-    let project_context = collect_project_context(&state, &agent.grants);
-    if !project_context.is_empty() {
-        system_parts.push(format!("\n## Project Context\n{project_context}"));
-    }
-    if !conv.pinned_context.is_empty() {
-        system_parts.push(format!("\n## Pinned Context\n{}", conv.pinned_context));
-    }
-    if !conv.summary.is_empty() {
-        system_parts.push(format!("\n## Conversation Summary\n{}", conv.summary));
-    }
-
-    let accessible: Vec<String> = agent
-        .grants
-        .iter()
-        .map(|g| {
-            let perm = if g.permission.allows_write() {
-                "read-write"
-            } else {
-                "read"
-            };
-            format!("- {} ({})", g.project.as_str(), perm)
-        })
-        .collect();
-    if !accessible.is_empty() {
-        system_parts.push(format!(
-            "\n## Accessible Projects\n{}",
-            accessible.join("\n")
-        ));
-    }
+    let system_prompt = build_api_btw_system_prompt(&state, &agent, &conv);
 
     let tools = build_api_agent_tools();
     let tool_count = tools.len();
@@ -14477,7 +14511,7 @@ async fn run_api_btw(
     let mut messages = vec![
         crate::librarian::ProxyChatMessage {
             role: "system".into(),
-            content: Some(json!(system_parts.join("\n"))),
+            content: Some(json!(system_prompt)),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -16750,8 +16784,8 @@ mod tests {
     use crate::store::FileBlockStore;
     use crate::updater::{AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream, hex_sha256};
     use crate::{
-        AgentBackend, BlockType, LocalAuthStore, NewAgentToken, ProjectGrant, ProjectName,
-        ProjectPermission, UserName,
+        AgentBackend, AuthenticatedAgent, BlockType, LocalAuthStore, NewAgentToken, ProjectGrant,
+        ProjectName, ProjectPermission, UserName,
     };
 
     #[test]
@@ -21412,6 +21446,8 @@ mod tests {
         let prompt_config = ManagerPromptConfig::default();
 
         let review = super::build_manager_prompt(&mc, &prompt_config, 0);
+        assert!(review.starts_with("Current date and time: "));
+        assert!(review.contains(" UTC\n\nYou are a manager"));
         assert!(review.contains("direct instructions to the agent"));
         assert!(review.contains("Do not ask the user for input"));
         assert!(review.contains("WAIT_FOR_SECONDS: <1-600>"));
@@ -21425,6 +21461,35 @@ mod tests {
         assert!(validate.contains("tell the agent exactly what to do next"));
         assert!(validate.contains("Do not ask the user for input"));
         assert!(validate.contains("WAIT_FOR_SECONDS: <1-600>"));
+    }
+
+    #[test]
+    fn api_agent_prompts_include_current_datetime_context() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let agent = AuthenticatedAgent {
+            token: "token".into(),
+            name: "agent-main".into(),
+            owner: Some(UserName::new("admin").unwrap()),
+            owner_is_admin: true,
+            grants: Vec::new(),
+            backend: AgentBackend::OpenAi,
+            endpoint_id: Some("endpoint".into()),
+            machine_name: None,
+        };
+        let conv = ChatConversation::default();
+
+        let system_prompt = super::build_api_agent_system_prompt(&state, &agent, &conv);
+        assert!(system_prompt.starts_with("Current date and time: "));
+        assert!(system_prompt.contains(" UTC\nYou are a Lore knowledge base agent"));
+
+        let btw_prompt = super::build_api_btw_system_prompt(&state, &agent, &conv);
+        assert!(btw_prompt.starts_with("Current date and time: "));
+        assert!(btw_prompt.contains(" UTC\nYou are handling a side question"));
+
+        let compact_prompt = super::build_exchange_compaction_system_prompt();
+        assert!(compact_prompt.starts_with("Current date and time: "));
+        assert!(compact_prompt.contains(" UTC\n\nYou are compacting conversation history"));
     }
 
     #[test]

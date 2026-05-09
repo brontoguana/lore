@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-05-09
+
+- Added current date/time context to all Lore LLM prompt builders: process-agent turns, manager prompts, API agents, API side questions, CLI/API compaction, and librarian answer/action prompts now include a UTC line with weekday, date, and time.
+- Hardened agent chat resume updates after long idle/browser sleep. The chat UI now times out stale panel fetches, reconnects SSE with heartbeat awareness, refreshes on online/wake activity, and periodically reconciles the visible selected chat from the no-store panel endpoint.
+
 ## 2026-05-06
 
 - Fixed CLI backend auth-prompt hangs. Agent and manager CLI runners now watch backend stdout/stderr for non-JSON login, OAuth, and API-key prompts, report a visible chat error, terminate the child process, and finalize the active turn instead of leaving the agent stuck in thinking.
