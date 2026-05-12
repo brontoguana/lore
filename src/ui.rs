@@ -4173,6 +4173,7 @@ var chatSendInFlight = false;
 var chatSendMaxAttempts = 3;
 var chatRestoreInFlight = false;
 var chatPanelRequestSeq = 0;
+var chatPanelRefreshScrollSnapshot = null;
 var CHAT_PANEL_CACHE_LIMIT = 100;
 var CHAT_PANEL_FETCH_TIMEOUT_MS = 15000;
 var CHAT_RESUME_STALE_AFTER_MS = 10000;
@@ -4309,6 +4310,50 @@ function persistCurrentChatDraft() {{
   if (!input || !currentAgent) return;
   setChatDraft(currentAgent, input.value || '');
   syncChatSendToken(currentAgent, input.value || '');
+}}
+
+function captureChatComposerState() {{
+  var input = document.getElementById('chat-input');
+  if (!input) return null;
+  return {{
+    agent: currentAgent,
+    focused: input === document.activeElement,
+    value: input.value || '',
+    selectionStart: typeof input.selectionStart === 'number' ? input.selectionStart : null,
+    selectionEnd: typeof input.selectionEnd === 'number' ? input.selectionEnd : null,
+    scrollTop: input.scrollTop || 0
+  }};
+}}
+
+function restoreChatComposerState(snapshot) {{
+  if (!snapshot || snapshot.agent !== currentAgent) return;
+  var input = document.getElementById('chat-input');
+  if (!input) return;
+  if (input.value !== snapshot.value) {{
+    input.value = snapshot.value || '';
+    setChatDraft(currentAgent, input.value);
+    syncChatSendToken(currentAgent, input.value);
+  }}
+  resizeChatInput();
+  input.scrollTop = snapshot.scrollTop || 0;
+  if (snapshot.focused) {{
+    try {{
+      input.focus({{ preventScroll: true }});
+    }} catch (_err) {{
+      input.focus();
+    }}
+    if (snapshot.selectionStart !== null && snapshot.selectionEnd !== null && input.setSelectionRange) {{
+      try {{
+        input.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
+      }} catch (_err) {{}}
+    }}
+  }}
+}}
+
+function shouldApplyChatRefreshWithoutPanelReplace(selectedAgent) {{
+  if (!selectedAgent || selectedAgent !== currentAgent) return false;
+  if (chatConfigOpen || chatManageOpen || expandedTextEditorState) return true;
+  return chatInputIsFocused();
 }}
 
 function clearActiveAgentInList() {{
@@ -4525,6 +4570,25 @@ function applyChatPanelResponse(data, pushHistory, fromCache) {{
   if (!fromCache && list && typeof data.agent_list_html === 'string') {{
     list.innerHTML = data.agent_list_html;
   }}
+  if (!fromCache && shouldApplyChatRefreshWithoutPanelReplace(selectedAgent)) {{
+    currentAgent = selectedAgent;
+    chatMessages = incomingMessages;
+    agentStatus = data.agent_status || '';
+    activeTurnUserId = data.active_turn_user_id || 0;
+    agentProfileUrl = data.profile_url || null;
+    if (currentAgent) localStorage.setItem('lastChatAgent', currentAgent);
+    var activeSnapshot = chatPanelRefreshScrollSnapshot || captureChatResizeScrollSnapshot();
+    chatPanelRefreshScrollSnapshot = null;
+    renderMessages();
+    updateHeaderStatus();
+    setActiveAgentInList(currentAgent);
+    applyChatViewportFix();
+    scheduleChatResizeScrollRestore(activeSnapshot);
+    return;
+  }}
+  var composerSnapshot = captureChatComposerState();
+  var scrollSnapshot = chatPanelRefreshScrollSnapshot || captureChatResizeScrollSnapshot();
+  chatPanelRefreshScrollSnapshot = null;
   main.innerHTML = data.panel_html || '';
   currentAgent = selectedAgent;
   chatMessages = incomingMessages;
@@ -4543,6 +4607,8 @@ function applyChatPanelResponse(data, pushHistory, fromCache) {{
   }}
   if (!fromCache) cacheChatPanelResponse(data);
   initializeChatPanel();
+  restoreChatComposerState(composerSnapshot);
+  scheduleChatResizeScrollRestore(scrollSnapshot);
   applyChatViewportFix();
 }}
 
@@ -4550,15 +4616,20 @@ function fetchDesktopChatPanel(agent, pushHistory, applyMode, requestSeq) {{
   var requestedAgent = agent || null;
   var url = '/ui/chat/panel';
   if (agent) url += '?agent=' + encodeURIComponent(agent);
+  var panelRefreshScrollSnapshot = requestedAgent === currentAgent
+    ? captureChatResizeScrollSnapshot()
+    : null;
   return fetchChatJson(url, {{ cache: 'no-store' }}, CHAT_PANEL_FETCH_TIMEOUT_MS)
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
       if (data && data.ok) chatLastFullPanelRefreshAt = Date.now();
       cacheChatPanelResponse(data);
+      if (!data || !data.ok) return data;
       if (applyMode === 'background' && currentAgent !== requestedAgent) return data;
       if (requestSeq && requestSeq !== chatPanelRequestSeq) return data;
       if (applyMode === 'background' && (chatConfigOpen || chatManageOpen || expandedTextEditorState)) return data;
       persistCurrentChatDraft();
+      chatPanelRefreshScrollSnapshot = panelRefreshScrollSnapshot;
       applyChatPanelResponse(data, applyMode === 'cached' ? false : pushHistory, false);
       return data;
     }});
@@ -13680,6 +13751,45 @@ mod tests {
         assert!(html.contains(
             "if (document.visibilityState === 'visible') {\n    if (restorePersistedChatAgentSelection('replace')) return;\n    refreshChatOnResume(false);"
         ));
+    }
+
+    #[test]
+    fn chat_page_refresh_preserves_focused_composer_and_bottom_scroll() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("worker"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("var chatPanelRefreshScrollSnapshot = null;"));
+        assert!(html.contains("function captureChatComposerState() {"));
+        assert!(html.contains("focused: input === document.activeElement,"));
+        assert!(html.contains("function restoreChatComposerState(snapshot) {"));
+        assert!(html.contains("input.focus({ preventScroll: true });"));
+        assert!(
+            html.contains("function shouldApplyChatRefreshWithoutPanelReplace(selectedAgent) {")
+        );
+        assert!(html.contains("return chatInputIsFocused();"));
+        assert!(html.contains(
+            "if (!fromCache && shouldApplyChatRefreshWithoutPanelReplace(selectedAgent)) {"
+        ));
+        assert!(html.contains(
+            "renderMessages();\n    updateHeaderStatus();\n    setActiveAgentInList(currentAgent);"
+        ));
+        assert!(html.contains("scheduleChatResizeScrollRestore(activeSnapshot);"));
+        assert!(html.contains("var composerSnapshot = captureChatComposerState();"));
+        assert!(html.contains("var scrollSnapshot = chatPanelRefreshScrollSnapshot || captureChatResizeScrollSnapshot();"));
+        assert!(html.contains("restoreChatComposerState(composerSnapshot);"));
+        assert!(html.contains("scheduleChatResizeScrollRestore(scrollSnapshot);"));
+        assert!(html.contains("chatPanelRefreshScrollSnapshot = panelRefreshScrollSnapshot;"));
     }
 
     #[test]

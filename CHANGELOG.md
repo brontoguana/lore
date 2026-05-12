@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-05-12
+
+- Fixed agent chat background refreshes so same-agent panel refreshes no longer replace the focused composer while the user is typing. Refreshes now update messages/status in place and preserve composer value, focus, selection, and bottom-follow scroll snapshots across full panel swaps.
+
 ## 2026-05-09
 
 - Added current date/time context to all Lore LLM prompt builders: process-agent turns, manager prompts, API agents, API side questions, CLI/API compaction, and librarian answer/action prompts now include a UTC line with weekday, date, and time.
