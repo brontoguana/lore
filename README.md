@@ -1,6 +1,6 @@
 # Lore
 
-![Lore agent chat screenshot](lore-screenshot.png)
+![Lore agent chat screenshot](lore-screenshot-2.jpg)
 
 Lore is a self-hosted project memory and agent workspace for people who want their projects to stay understandable over time.
 
