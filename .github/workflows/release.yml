@@ -12,6 +12,7 @@ jobs:
   build:
     if: ${{ !contains(github.ref_name, '-') }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
