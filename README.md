@@ -15,6 +15,7 @@ With Lore you can:
 - Keep project notes as ordered, typed blocks instead of one giant document
 - Ask a project librarian questions about your docs and project history
 - Chat with local or remote agents that already know the project context
+- Orchestrate multiple project agents from one browser-based control surface
 - Record decisions, debugging notes, changelog entries, and release history
 - Review reversible document history instead of losing track of edits
 - Link directly to documents and individual blocks with `lore://` links
@@ -29,6 +30,24 @@ Use it as a living notebook for anything that benefits from continuity: software
 
 The browser UI includes project documents, chat, agents, admin settings, account settings, history views, and setup pages. You do not need to use Git or the CLI for day-to-day reading and editing.
 
+## Agent Control and Orchestration
+
+Lore is not just a place to talk to an assistant. It is a control layer for project agents.
+
+From the browser you can create agents, attach them to projects, assign working folders, choose a backend, watch live status, and keep separate conversations for different streams of work. Lore handles the plumbing between the web UI, the server, the local machine service, and the CLI tools that do the actual work.
+
+That means an agent can run on the machine where the project lives, use the same project memory you maintain in Lore, and report progress back into a durable chat instead of disappearing into a terminal session. Lore tracks which machine owns the work, which message is active, what backend is being used, and whether the agent is thinking, streaming, complete, or blocked.
+
+This matters when you have more than one agent, more than one project, or more than one model backend. Lore gives you a single place to:
+
+- Route work to Claude, Codex, Gemini, or another compatible CLI backend
+- Keep agent conversations tied to project context and document history
+- See backend failures, auth problems, retries, and completion state in the UI
+- Avoid losing work when the browser sleeps, reconnects, or moves between devices
+- Let local machine services claim and run work without exposing every project directly to the server
+
+For general users, this makes agents feel like named collaborators attached to real projects. For developers, it turns local CLI agents into a managed, observable workflow instead of a pile of one-off terminal sessions.
+
 ## For Developers
 
 Lore is also built for agent-heavy development workflows.
@@ -39,6 +58,7 @@ Useful developer-facing features include:
 
 - Project-scoped agent context and setup instructions
 - Local machine agents backed by Claude, Codex, Gemini, or compatible CLI backends
+- Browser-managed agent routing, status, retries, and visible failure reporting
 - Agent tokens with scoped project access
 - Audit trails for auth, librarian activity, and project actions
 - Optional GitHub-release-backed self-update for the CLI and server

@@ -2,6 +2,7 @@
 
 ## 2026-05-14
 
+- Expanded the README's agent control and orchestration positioning, including browser-managed agents, backend routing, machine execution, visible failures, retries, and live status.
 - Switched the README hero screenshot to `lore-screenshot-2.jpg`.
 - Refreshed the README with a top-of-page product screenshot, a friendlier overview for general users, clearer developer positioning, and reorganized install/build sections.
 - Fixed Windows release builds by correcting a platform-only updater permission-copy parameter reference, and made full-release matrix builds continue other platform artifacts when one target fails.
