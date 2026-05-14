@@ -56,9 +56,12 @@ jobs:
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
       - name: Inject tag version into Cargo.toml
+        shell: pwsh
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          sed -i "s/^version = \".*\"/version = \"${TAG}\"/" Cargo.toml
+          $tag = $env:GITHUB_REF_NAME -replace '^v', ''
+          $text = Get-Content -Raw Cargo.toml
+          $text = [regex]::Replace($text, '(?m)^version = ".*"', "version = `"$tag`"", 1)
+          Set-Content -NoNewline -Path Cargo.toml -Value $text
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}

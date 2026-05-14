@@ -2,6 +2,7 @@
 
 ## 2026-05-14
 
+- Fixed full-release automation so GitHub release workflows inject tag versions portably on macOS/Linux/Windows runners, and the local release script no longer fails when `Cargo.lock` is intentionally ignored.
 - Installed a local user systemd unit for this machine's Lore client service so it is enabled under `default.target`, uses `/home/main/.local/bin/lore service --fg`, and can start after reboot via the user manager with lingering enabled.
 
 ## 2026-05-12
