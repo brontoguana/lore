@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-05-14
+
+- Installed a local user systemd unit for this machine's Lore client service so it is enabled under `default.target`, uses `/home/main/.local/bin/lore service --fg`, and can start after reboot via the user manager with lingering enabled.
+
 ## 2026-05-12
 
 - Fixed agent chat background refreshes so same-agent panel refreshes no longer replace the focused composer while the user is typing. Refreshes now update messages/status in place and preserve composer value, focus, selection, and bottom-follow scroll snapshots across full panel swaps.
