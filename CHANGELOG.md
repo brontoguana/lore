@@ -2,6 +2,7 @@
 
 ## 2026-05-14
 
+- Refreshed the README with a top-of-page product screenshot, a friendlier overview for general users, clearer developer positioning, and reorganized install/build sections.
 - Fixed Windows release builds by correcting a platform-only updater permission-copy parameter reference, and made full-release matrix builds continue other platform artifacts when one target fails.
 - Fixed full-release automation so GitHub release workflows inject tag versions portably on macOS/Linux/Windows runners, and the local release script no longer fails when `Cargo.lock` is intentionally ignored.
 - Installed a local user systemd unit for this machine's Lore client service so it is enabled under `default.target`, uses `/home/main/.local/bin/lore service --fg`, and can start after reboot via the user manager with lingering enabled.
