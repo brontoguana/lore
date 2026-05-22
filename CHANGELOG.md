@@ -2,7 +2,8 @@
 
 ## 2026-05-22
 
-- Reordered the Lore CLI top-level help so user setup commands (`setup-machine` and `setup-external`) appear first, ahead of content and agent/service daemon commands.
+- Moved external-agent token creation behind a collapsed button at the bottom of the Machines section. The agent name, project permissions, and final create action now appear only after choosing to create an external agent, and selected external agents now show real token setup only immediately after create/regenerate instead of placeholder token text.
+- Split the Lore CLI top-level help into explicit User Commands (`setup-machine`, `setup-external`) and Agent Commands sections so setup commands are clearly separated from external-agent and daemon operations.
 
 ## 2026-05-20
 

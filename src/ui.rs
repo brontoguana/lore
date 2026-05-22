@@ -2749,6 +2749,24 @@ pub fn render_agents_page(
         )
     };
 
+    let external_create_html = format!(
+        r#"<div class="external-agent-create" style="margin-top:var(--s-4); border-top:1px solid var(--line); padding-top:var(--s-4);">
+        <button type="button" class="btn-lg" onclick="toggleExternalAgentCreate()">Create external agent</button>
+        <form method="post" action="/ui/agents/external-agent" id="create-external-agent-form" style="display:none; margin-top:var(--s-4);">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>
+            <span style="font-size:0.8rem; color:var(--fg-2);">Agent name</span>
+            <input type="text" name="token_name" placeholder="codex-laptop" style="width:100%; margin-top:var(--s-1);">
+          </label>
+          <div style="margin-top:var(--s-3);">{external_grants_html}</div>
+          <textarea name="grants" id="external-grants-field" style="display:none"></textarea>
+          <button type="submit" class="btn-lg" style="margin-top:var(--s-3);">Create external agent token</button>
+        </form>
+      </div>"#,
+        csrf_token = escape_attribute(csrf_token),
+        external_grants_html = external_grants_html,
+    );
+
     // Machines list
     let server_version = env!("CARGO_PKG_VERSION");
     let machines_html = if machines.is_empty() {
@@ -3015,11 +3033,53 @@ pub fn render_agents_page(
                 )
             };
 
+            let setup_sections_html = if is_external_agent && created_token.is_none() {
+                format!(
+                    r##"<div class="panel-header"><h3>Token</h3><p>External agent tokens are only shown when created or regenerated.</p></div>
+                <div class="padded">
+                  <p class="hint" style="margin-bottom:var(--s-3);">Regenerate the token to show a new setup token for this external agent.</p>
+                  <form method="post" action="/ui/agents/{name_attr}/rotate" class="inline-form">
+                    <input type="hidden" name="csrf_token" value="{csrf_token}">
+                    <button type="submit" class="btn-lg">Regenerate token</button>
+                  </form>
+                </div>"##,
+                    name_attr = escape_attribute(&agent.name),
+                    csrf_token = escape_attribute(csrf_token),
+                )
+            } else {
+                format!(
+                    r##"{created_token_html}
+
+                <div class="panel-header"><h3>Setup instructions</h3><p>Copy and give to your agent.</p></div>
+                <div class="padded">
+                  <textarea readonly id="agent-instruction" style="min-height: 8rem; font-family: var(--font-mono); font-size: 0.85rem;">{setup_instruction}</textarea>
+                  <div style="margin-top: var(--s-3); text-align: right;">
+                    <form method="post" action="/ui/agents/{name_attr}/rotate" class="inline-form" style="margin-right:var(--s-2);">
+                      <input type="hidden" name="csrf_token" value="{csrf_token}">
+                      <button type="submit" class="btn-lg">Regenerate token</button>
+                    </form>
+                    <button type="button" class="btn-lg button-link" onclick="copyField('agent-instruction')">Copy setup</button>
+                  </div>
+                </div>
+
+                <div class="panel-header"><h3>MCP config</h3></div>
+                <div class="padded">
+                  <textarea readonly id="mcp-config" style="min-height:8rem; font-family:var(--font-mono); font-size:0.85rem;">{mcp_config_text}</textarea>
+                  <div style="margin-top: var(--s-2); text-align: right;">
+                    <button type="button" class="btn-lg button-link" onclick="copyField('mcp-config')">Copy MCP config</button>
+                  </div>
+                </div>"##,
+                    created_token_html = created_token_html,
+                    setup_instruction = escape_text(&setup_instruction),
+                    mcp_config_text = escape_text(&mcp_config_text),
+                    name_attr = escape_attribute(&agent.name),
+                    csrf_token = escape_attribute(csrf_token),
+                )
+            };
+
             format!(
                 r##"<section class="panel" style="margin-top: var(--s-5);">
                 <div class="panel-header"><h2>{display_name}</h2><p>{owner}-{slug}</p></div>
-
-                {created_token_html}
 
                 <div class="panel-header"><h3>Permissions</h3></div>
                 <form method="post" action="/ui/agents/{name_attr}/grants" id="edit-grants-form">
@@ -3047,25 +3107,7 @@ pub fn render_agents_page(
 
                 {backend_section_html}
 
-                <div class="panel-header"><h3>Setup instructions</h3><p>Copy and give to your agent.</p></div>
-                <div class="padded">
-                  <textarea readonly id="agent-instruction" style="min-height: 8rem; font-family: var(--font-mono); font-size: 0.85rem;">{setup_instruction}</textarea>
-                  <div style="margin-top: var(--s-3); text-align: right;">
-                    <form method="post" action="/ui/agents/{name_attr}/rotate" class="inline-form" style="margin-right:var(--s-2);">
-                      <input type="hidden" name="csrf_token" value="{csrf_token}">
-                      <button type="submit" class="btn-lg">Regenerate token</button>
-                    </form>
-                    <button type="button" class="btn-lg button-link" onclick="copyField('agent-instruction')">Copy setup</button>
-                  </div>
-                </div>
-
-                <div class="panel-header"><h3>MCP config</h3></div>
-                <div class="padded">
-                  <textarea readonly id="mcp-config" style="min-height:8rem; font-family:var(--font-mono); font-size:0.85rem;">{mcp_config_text}</textarea>
-                  <div style="margin-top: var(--s-2); text-align: right;">
-                    <button type="button" class="btn-lg button-link" onclick="copyField('mcp-config')">Copy MCP config</button>
-                  </div>
-                </div>
+                {setup_sections_html}
 
                 <div class="padded" style="border-top: 1px solid var(--line); margin-top: var(--s-4); padding-top: var(--s-4);">
                   <form method="post" action="/ui/agents/{name_attr}/delete" class="inline-form">
@@ -3081,9 +3123,7 @@ pub fn render_agents_page(
                 csrf_token = escape_attribute(csrf_token),
                 edit_grants_html = edit_grants_html,
                 backend_section_html = backend_section_html,
-                setup_instruction = escape_text(&setup_instruction),
-                mcp_config_text = escape_text(&mcp_config_text),
-                created_token_html = created_token_html,
+                setup_sections_html = setup_sections_html,
             )
         } else {
             String::new()
@@ -3101,6 +3141,7 @@ pub fn render_agents_page(
         <p>Registered machines that can provision agents for your account. <a href="/ui/agents/guide">Setup guide</a></p>
       </div>
       <div class="sel-list">{machines_html}</div>
+      {external_create_html}
     </section>
 
     <section class="panel" style="margin-top: var(--s-5);">
@@ -3108,16 +3149,6 @@ pub fn render_agents_page(
         <h2>Agents</h2>
         <p>Machine and API agents appear in chat. External agents use Lore from their own CLI and only receive scoped project access.</p>
       </div>
-      <form method="post" action="/ui/agents/external-agent" id="create-external-agent-form" style="margin-bottom:var(--s-4);">
-        <input type="hidden" name="csrf_token" value="{csrf_token}">
-        <label>
-          <span style="font-size:0.8rem; color:var(--fg-2);">External agent name</span>
-          <input type="text" name="token_name" placeholder="codex-laptop" style="width:100%; margin-top:var(--s-1);">
-        </label>
-        <div style="margin-top:var(--s-3);">{external_grants_html}</div>
-        <textarea name="grants" id="external-grants-field" style="display:none"></textarea>
-        <button type="submit" class="btn-lg" style="margin-top:var(--s-3);">Create External Agent</button>
-      </form>
       <div class="sel-list">{agent_list_html}</div>
     </section>
 
@@ -3131,6 +3162,17 @@ pub fn render_agents_page(
         var btn = event && event.target && event.target.closest('button');
         if (btn) {{ var orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(function(){{ btn.textContent = orig; }}, 1500); }}
       }});
+    }}
+
+    function toggleExternalAgentCreate() {{
+      var form = document.getElementById('create-external-agent-form');
+      if (!form) return;
+      var show = form.style.display === 'none';
+      form.style.display = show ? 'block' : 'none';
+      if (show) {{
+        var input = form.querySelector('input[name="token_name"]');
+        if (input) input.focus();
+      }}
     }}
 
     var externalAgentForm = document.getElementById('create-external-agent-form');
@@ -3442,9 +3484,8 @@ pub fn render_agents_page(
     </script>"##,
         agent_list_html = agent_list_html,
         machines_html = machines_html,
+        external_create_html = external_create_html,
         detail_html = detail_html,
-        csrf_token = escape_attribute(csrf_token),
-        external_grants_html = external_grants_html,
     );
 
     render_shell(
@@ -13550,6 +13591,15 @@ mod tests {
         assert!(html.contains("lines.join('\\n')"));
         assert!(html.contains("data-external-project-grant"));
         assert!(html.contains("row.getAttribute('data-external-project-grant')"));
+        assert!(html.contains(r#"onclick="toggleExternalAgentCreate()""#));
+        assert!(html.contains(r#"id="create-external-agent-form" style="display:none;"#));
+        assert!(html.contains("Create external agent token"));
+        assert!(!html.contains("External agent name"));
+        let machines_pos = html.find("<h2>Machines</h2>").unwrap();
+        let create_pos = html.find("Create external agent").unwrap();
+        let agents_pos = html.find("<h2>Agents</h2>").unwrap();
+        assert!(machines_pos < create_pos);
+        assert!(create_pos < agents_pos);
         assert!(!html.contains("grants: grants.join('\\\\n')"));
     }
 
@@ -13597,6 +13647,28 @@ mod tests {
         ));
         assert!(html.contains("Bearer lore_at_created_secret"));
         assert!(html.contains("external agent"));
+
+        let hidden_token_html = render_agents_page(
+            &config,
+            "admin",
+            true,
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "csrf",
+            &agents,
+            &[],
+            &[],
+            &[],
+            Some("codex-laptop"),
+            None,
+            None,
+        );
+        assert!(
+            hidden_token_html
+                .contains("External agent tokens are only shown when created or regenerated.")
+        );
+        assert!(hidden_token_html.contains("Regenerate the token to show a new setup token"));
+        assert!(!hidden_token_html.contains("YOUR_TOKEN"));
     }
 
     #[test]

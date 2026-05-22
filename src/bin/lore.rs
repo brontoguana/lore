@@ -33,6 +33,33 @@ const CLI_BACKEND_TURN_FAILURE_LIMIT: u32 = 3;
 const AGY_OAUTH_TOKEN_RELATIVE_PATH: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 const AGY_FILE_TOKEN_SSH_CONNECTION: &str = "127.0.0.1 0 127.0.0.1 0";
 const AGY_FILE_TOKEN_SSH_CLIENT: &str = "127.0.0.1 0 0";
+const TOP_LEVEL_HELP_TEMPLATE: &str = "\
+{before-help}{about-with-newline}
+{usage-heading} {usage}
+
+User Commands:
+  setup-machine   Register this machine for Lore-managed agents
+  setup-external  Configure this CLI with an external agent token without registering a machine
+
+Agent Commands:
+  config          Manage CLI configuration (url, token, project)
+  project         Manage the repo-local Lore project marker
+  projects        List all projects
+  overview        Read the project overview
+  file-map        Read or update the project file map
+  context         Show the current project's agent context
+  docs            List and manage documents
+  blocks          Read, create, edit, and manage blocks within documents
+  grep            Search blocks by content
+  librarian       Ask the librarian a question or request an action
+  history         View and manage block version history
+  self-update     Check for and apply CLI updates
+  agent           Run an agent daemon
+  service         Run the machine service daemon (manages agents, responds to server commands)
+  help            Print this message or the help of the given subcommand(s)
+
+Options:
+{options}{after-help}";
 
 fn resolve_executable_path(executable: &str, fallback_relative_paths: &[&str]) -> PathBuf {
     resolve_executable_path_from(
@@ -128,6 +155,7 @@ fn configure_agy_auth_env(cmd: &mut tokio::process::Command) {
 #[command(name = "lore")]
 #[command(about = "Lore CLI")]
 #[command(version)]
+#[command(help_template = TOP_LEVEL_HELP_TEMPLATE)]
 struct Cli {
     /// Server URL (overrides config)
     #[arg(long, global = true)]
