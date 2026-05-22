@@ -144,6 +144,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Register this machine for Lore-managed agents
+    #[command(name = "setup-machine", alias = "setup")]
+    SetupMachine(SetupArgs),
+    /// Configure this CLI with an external agent token without registering a machine
+    #[command(name = "setup-external", alias = "login")]
+    SetupExternal(SetupExternalArgs),
     /// Manage CLI configuration (url, token, project)
     Config {
         #[command(subcommand)]
@@ -192,8 +198,6 @@ enum Command {
         #[command(subcommand)]
         command: UpdateCommand,
     },
-    /// Connect to a Lore server (interactive setup)
-    Setup(SetupArgs),
     /// Run an agent daemon
     Agent(AgentArgs),
     /// Run the machine service daemon (manages agents, responds to server commands)
@@ -244,6 +248,21 @@ struct ConfigClearArgs {
     token: bool,
     #[arg(long)]
     project: bool,
+}
+
+#[derive(Args)]
+struct SetupExternalArgs {
+    /// Lore server URL
+    url: String,
+    /// External agent token. If omitted, prompts on stdin.
+    #[arg(long)]
+    token: Option<String>,
+    /// Optional legacy global project fallback. Prefer `lore project set-local`.
+    #[arg(long)]
+    project: Option<String>,
+    /// Save the token without checking it against the server.
+    #[arg(long)]
+    no_verify: bool,
 }
 
 #[derive(Subcommand)]
@@ -1001,95 +1020,11 @@ async fn run() -> CliResult<()> {
     let mut config = load_cli_config()?;
 
     match cli.command {
+        Command::SetupMachine(args) => return run_setup_machine(args, &mut config).await,
+        Command::SetupExternal(args) => return run_setup_external(args, &mut config).await,
         Command::Config { command } => return run_config(command, &mut config),
         Command::Project { command } => return run_project_command(command),
         Command::SelfUpdate { command } => return run_update(command, &mut config).await,
-        Command::Setup(args) => {
-            let url = normalize_url(&args.url);
-            // Interactive login
-            eprint!("Username: ");
-            let mut username = String::new();
-            io::stdin().read_line(&mut username)?;
-            let username = username.trim().to_string();
-            if username.is_empty() {
-                return Err("username cannot be empty".into());
-            }
-            let password = read_password_hidden("Password: ")?;
-            if password.is_empty() {
-                return Err("password cannot be empty".into());
-            }
-            // Machine name (default to hostname)
-            let default_machine = get_hostname();
-            eprint!("Machine name [{}]: ", default_machine);
-            let mut machine_name = String::new();
-            io::stdin().read_line(&mut machine_name)?;
-            let machine_name = machine_name.trim().to_string();
-            let machine_name = if machine_name.is_empty() {
-                default_machine
-            } else {
-                machine_name
-            };
-            // Register machine with server
-            let client = reqwest::Client::new();
-            let resp = client
-                .post(format!("{}/v1/machines/register", url))
-                .json(&serde_json::json!({
-                    "username": username,
-                    "password": password,
-                    "machine_name": machine_name,
-                }))
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(format!("registration failed ({}): {}", status, body).into());
-            }
-            let body: serde_json::Value = resp.json().await?;
-            let token = body["token"]
-                .as_str()
-                .ok_or("server did not return a token")?
-                .to_string();
-            config.url = Some(url.clone());
-            config.token = Some(token.clone());
-            config.machine_name = Some(machine_name.clone());
-            save_cli_config(&config)?;
-            println!("Registered machine \"{}\" on {}", machine_name, url);
-
-            // Auto-start the machine service daemon
-            println!("Starting machine service...");
-            let exe = resolved_current_exe()?;
-            let lore_dir = service_root_dir()?;
-            let log_path = lore_dir.join("service.log");
-            let pid_path = lore_dir.join("service.pid");
-
-            // Kill existing service processes — PID file first, then sweep for orphans
-            if pid_path.exists() {
-                if let Ok(pid_str) = fs::read_to_string(&pid_path) {
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        if is_process_running(pid) {
-                            kill_process(pid);
-                        }
-                    }
-                }
-                let _ = fs::remove_file(&pid_path);
-            }
-            #[cfg(unix)]
-            {
-                let _ = std::process::Command::new("pkill")
-                    .args(["-f", "lore.*service.*--fg"])
-                    .status();
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-
-            let child = spawn_service_daemon(&exe, &url, &token, &log_path, &[])?;
-            let pid = child.id();
-            write_service_pid_file(&lore_dir, pid)?;
-            println!("Service started (pid {})", pid);
-            println!("  Log: {}", log_path.display());
-
-            return Ok(());
-        }
         _ => {}
     }
 
@@ -1109,9 +1044,10 @@ async fn run() -> CliResult<()> {
         Command::Agent(args) => agent_command(&context, args).await?,
         Command::Service(args) => service_command(&context, args).await?,
         Command::Config { .. }
+        | Command::SetupExternal(_)
         | Command::Project { .. }
         | Command::SelfUpdate { .. }
-        | Command::Setup(_) => {}
+        | Command::SetupMachine(_) => {}
     }
     Ok(())
 }
@@ -1139,6 +1075,16 @@ fn run_config(command: ConfigCommand, config: &mut CliConfig) -> CliResult<()> {
             );
             println!("update repo: {}", config.update_repo);
             println!("update stream: {}", config.update_stream.as_str());
+            println!(
+                "mode: {}",
+                if config.machine_name.is_some() {
+                    "machine"
+                } else if config.token.is_some() {
+                    "external"
+                } else {
+                    "(unset)"
+                }
+            );
         }
         ConfigCommand::Set(args) => {
             let set_project = args.project.is_some();
@@ -1179,6 +1125,154 @@ fn run_config(command: ConfigCommand, config: &mut CliConfig) -> CliResult<()> {
             save_cli_config(config)?;
             println!("saved {}", cli_config_path()?.display());
         }
+    }
+    Ok(())
+}
+
+async fn run_setup_machine(args: SetupArgs, config: &mut CliConfig) -> CliResult<()> {
+    let url = normalize_url(&args.url);
+    eprint!("Username: ");
+    let mut username = String::new();
+    io::stdin().read_line(&mut username)?;
+    let username = username.trim().to_string();
+    if username.is_empty() {
+        return Err("username cannot be empty".into());
+    }
+    let password = read_password_hidden("Password: ")?;
+    if password.is_empty() {
+        return Err("password cannot be empty".into());
+    }
+    let default_machine = get_hostname();
+    eprint!("Machine name [{}]: ", default_machine);
+    let mut machine_name = String::new();
+    io::stdin().read_line(&mut machine_name)?;
+    let machine_name = machine_name.trim().to_string();
+    let machine_name = if machine_name.is_empty() {
+        default_machine
+    } else {
+        machine_name
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/machines/register", url))
+        .json(&serde_json::json!({
+            "username": username,
+            "password": password,
+            "machine_name": machine_name,
+        }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("registration failed ({}): {}", status, body).into());
+    }
+    let body: serde_json::Value = resp.json().await?;
+    let token = body["token"]
+        .as_str()
+        .ok_or("server did not return a token")?
+        .to_string();
+    config.url = Some(url.clone());
+    config.token = Some(token.clone());
+    config.machine_name = Some(machine_name.clone());
+    save_cli_config(config)?;
+    println!("Registered machine \"{}\" on {}", machine_name, url);
+
+    println!("Starting machine service...");
+    let exe = resolved_current_exe()?;
+    let lore_dir = service_root_dir()?;
+    let log_path = lore_dir.join("service.log");
+    let pid_path = lore_dir.join("service.pid");
+
+    if pid_path.exists() {
+        if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                if is_process_running(pid) {
+                    kill_process(pid);
+                }
+            }
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "lore.*service.*--fg"])
+            .status();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let child = spawn_service_daemon(&exe, &url, &token, &log_path, &[])?;
+    let pid = child.id();
+    write_service_pid_file(&lore_dir, pid)?;
+    println!("Service started (pid {})", pid);
+    println!("  Log: {}", log_path.display());
+
+    Ok(())
+}
+
+async fn run_setup_external(args: SetupExternalArgs, config: &mut CliConfig) -> CliResult<()> {
+    let url = normalize_url(&args.url);
+    let token = match args.token {
+        Some(token) => token,
+        None => read_password_hidden("External agent token: ")?,
+    };
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("token cannot be empty".into());
+    }
+    if token.starts_with("lore_mt_") {
+        return Err(
+            "setup-external expects an external agent token (lore_at_...), not a machine token; use lore setup-machine for managed machine agents"
+                .into(),
+        );
+    }
+
+    let project = args
+        .project
+        .map(|project| {
+            ProjectName::new(project.clone())?;
+            Ok::<String, Box<dyn Error + Send + Sync>>(project)
+        })
+        .transpose()?;
+
+    let client = reqwest::Client::builder().build()?;
+    let context = CliContext {
+        client,
+        url: url.clone(),
+        token: Some(token.clone()),
+        project: None,
+    };
+    let visible_projects = if args.no_verify {
+        Vec::new()
+    } else {
+        let projects: Vec<ProjectSummary> = context.get_json("/v1/projects").await?;
+        if let Some(project) = &project {
+            let has_project = projects.iter().any(|summary| summary.project == *project);
+            if !has_project {
+                return Err(format!("token cannot read project {project:?}").into());
+            }
+        }
+        projects
+    };
+
+    config.url = Some(url.clone());
+    config.token = Some(token);
+    config.project = project.clone();
+    config.machine_name = None;
+    config.agent_tokens.clear();
+    save_cli_config(config)?;
+
+    println!("Configured external-agent Lore CLI for {url}.");
+    println!("saved {}", cli_config_path()?.display());
+    if let Some(project) = project {
+        println!("project: {project}");
+    } else {
+        println!("project: use `lore project set-local <project>` inside each repo.");
+    }
+    if !args.no_verify {
+        println!("visible projects: {}", visible_projects.len());
     }
     Ok(())
 }
@@ -2358,9 +2452,12 @@ impl CliContext {
     }
 
     fn require_token(&self) -> CliResult<&str> {
-        self.token
-            .as_deref()
-            .ok_or_else(|| io::Error::other("set --token, LORE_TOKEN, or config token").into())
+        self.token.as_deref().ok_or_else(|| {
+            io::Error::other(
+                "run `lore setup-external <url> --token <token>`, set --token, or set LORE_TOKEN",
+            )
+            .into()
+        })
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> CliResult<T> {
@@ -3654,7 +3751,7 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
         let machine_token = context
             .token
             .as_deref()
-            .ok_or("no machine token configured. Run 'lore setup <url>' first.")?;
+            .ok_or("no machine token configured. Run 'lore setup-machine <url>' first.")?;
         let backend_str = args
             .backend
             .as_deref()
@@ -7597,7 +7694,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
     let machine_token = context
         .token
         .as_deref()
-        .ok_or("no machine token configured. Run 'lore setup <url>' first.")?;
+        .ok_or("no machine token configured. Run 'lore setup-machine <url>' first.")?;
 
     if !args.fg && !is_daemon {
         // Daemonize

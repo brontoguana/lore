@@ -1,9 +1,9 @@
 use crate::audit::{AuditActor, AuditActorKind, AuditStore, StoredAuditEvent};
 use crate::auth::{
     AgentBackend, AgentChatStatus, AuthenticatedAgent, AuthenticatedUser, ChatAuditLog,
-    ChatConversation, ChatMessage, ChatRole, ChatStore, CreatedAgentToken, LocalAuthStore,
-    ManageConfig, NewAgentToken, NewRole, NewSession, NewUser, PinnedChatItem, ProjectGrant,
-    ProjectPermission, RoleName, StoredAgentToken, StoredMachine, UserName, hash_agent_token,
+    ChatConversation, ChatMessage, ChatRole, ChatStore, LocalAuthStore, ManageConfig,
+    NewAgentToken, NewRole, NewSession, NewUser, PinnedChatItem, ProjectGrant, ProjectPermission,
+    RoleName, StoredAgentToken, StoredMachine, UserName, hash_agent_token,
 };
 use crate::config::{
     ColorMode, ExternalAuthSecretUpdate, ExternalAuthStore, ExternalScheme, OidcConfig,
@@ -746,6 +746,14 @@ fn build_app_with_librarian(
         .route("/ui/agents", get(agents_page))
         .route("/ui/agents/guide", get(agent_guide_page))
         .route(
+            "/ui/agents/external-agent",
+            post(create_external_agent_from_ui),
+        )
+        .route(
+            "/ui/agents/external-token",
+            post(create_external_agent_from_ui),
+        )
+        .route(
             "/ui/agents/machines/{name}/revoke",
             post(revoke_machine_from_ui),
         )
@@ -1098,6 +1106,7 @@ struct SettingsPageQuery {
 struct AgentsPageQuery {
     selected: Option<String>,
     flash: Option<String>,
+    created_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1399,6 +1408,13 @@ struct UserActionUiForm {
 #[derive(Debug, Deserialize)]
 struct UpdateAgentGrantsUiForm {
     csrf_token: String,
+    grants: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateExternalAgentUiForm {
+    csrf_token: String,
+    token_name: String,
     grants: String,
 }
 
@@ -4314,6 +4330,7 @@ async fn agents_page(
         &endpoints,
         query.selected.as_deref(),
         query.flash.as_deref(),
+        query.created_token.as_deref(),
     )))
 }
 
@@ -4342,7 +4359,7 @@ async fn update_agent_grants_from_ui(
     let session = require_ui_session(&state, &headers)?;
     verify_csrf(&session, &form.csrf_token)?;
     let grants = parse_agent_grants(&form.grants)?;
-    validate_user_grants(&state, &session.user, &grants)?;
+    validate_user_grants(&session.user, &grants)?;
     state
         .auth
         .update_agent_token_grants(&name, &session.user.username, grants)?;
@@ -4359,6 +4376,40 @@ async fn update_agent_grants_from_ui(
     Ok(Redirect::to(&format!(
         "/ui/agents?selected={}&flash=Agent%20updated",
         urlencoding::encode(&name),
+    ))
+    .into_response())
+}
+
+async fn create_external_agent_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateExternalAgentUiForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let grants = parse_agent_grants(&form.grants)?;
+    validate_user_grants(&session.user, &grants)?;
+    let created = state.auth.create_agent_token(NewAgentToken {
+        display_name: form.token_name.clone(),
+        owner: session.user.username.clone(),
+        grants,
+        backend: AgentBackend::default(),
+        endpoint_id: None,
+    })?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "create external agent",
+        Some(created.stored.name.clone()),
+        None,
+    )?;
+    Ok(Redirect::to(&format!(
+        "/ui/agents?selected={}&created_token={}&flash=External%20agent%20created.%20Copy%20the%20token%20now.",
+        urlencoding::encode(&created.stored.name),
+        urlencoding::encode(&created.token),
     ))
     .into_response())
 }
@@ -4464,7 +4515,6 @@ fn build_user_project_access(
 }
 
 fn validate_user_grants(
-    state: &AppState,
     user: &AuthenticatedUser,
     grants: &[ProjectGrant],
 ) -> Result<(), LoreError> {
@@ -6916,15 +6966,16 @@ fn default_external_port() -> u16 {
 
 fn build_agent_setup_instruction(config: &ServerConfig, token: Option<&str>) -> String {
     let auth_block = token.map_or_else(
-        || "Authentication is required. Ask the Lore admin for a scoped agent token, then use it as Authorization: Bearer <token> for HTTP and MCP.".to_string(),
+        || "Authentication is required. Ask the Lore admin for an external agent token, then use it with `lore setup-external <base-url> --token <token>` for CLI access or Authorization: Bearer <token> for HTTP and MCP.".to_string(),
         |token| {
             format!(
-                "Use this scoped agent token for both HTTP and MCP:\nAuthorization: Bearer {token}"
+                "Use this external agent token for CLI, HTTP, and MCP:\nCLI: lore setup-external {} --token {token}\nHTTP/MCP: Authorization: Bearer {token}",
+                config.base_url()
             )
         },
     );
     format!(
-        "Lore setup for agents\n\nVisit this URL first:\n{}\n\nUse HTTP when the agent runs as a command, shell wrapper, CI job, cron task, or any runtime that can make ordinary web requests but does not support MCP cleanly.\n\nUse MCP when the agent host supports MCP tool servers natively and you want Lore to appear as a discoverable tool server with familiar grep/read/edit-style tools.\n\nLore base URL:\n{}\n\nLore MCP endpoint:\n{}\n\n{}\n\nTell the agent to review the setup page, choose HTTP or MCP for the current runtime, and then propose the exact integration steps for that environment.",
+        "Lore setup for agents\n\nVisit this URL first:\n{}\n\nUse the Lore CLI when the agent runs in a shell and should read/write project memory with normal commands.\n\nUse HTTP when the agent runs as a command, shell wrapper, CI job, cron task, or any runtime that can make ordinary web requests but does not support MCP cleanly.\n\nUse MCP when the agent host supports MCP tool servers natively and you want Lore to appear as a discoverable tool server with familiar grep/read/edit-style tools.\n\nLore base URL:\n{}\n\nLore MCP endpoint:\n{}\n\n{}\n\nTell the agent to review the setup page, choose CLI, HTTP, or MCP for the current runtime, and then propose the exact integration steps for that environment.",
         config.setup_url(),
         config.base_url(),
         config.mcp_url(),
@@ -7105,7 +7156,8 @@ else
     *":$INSTALL_DIR:"*) ;;
     *) echo "add $INSTALL_DIR to your PATH: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
   esac
-  echo "quick start: lore setup $SERVER_URL"
+  echo "external-agent setup: lore setup-external $SERVER_URL --token <external-agent-token>"
+  echo "machine-agent setup: lore setup-machine $SERVER_URL"
 fi
 "#,
         base_url = base_url,
@@ -7239,7 +7291,8 @@ try {{
             $env:Path = "$env:Path;$InstallDir"
             Write-Host "Added $InstallDir to your PATH. Restart your terminal for PATH changes to take effect."
         }}
-        Write-Host "Quick start: lore setup $ServerUrl"
+        Write-Host "External-agent setup: lore setup-external $ServerUrl --token <external-agent-token>"
+        Write-Host "Machine-agent setup: lore setup-machine $ServerUrl"
     }}
 }} finally {{
     Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -7418,6 +7471,32 @@ fn agent_token_summary(state: &AppState, token: StoredAgentToken) -> AgentTokenS
         status,
         created_at: token.created_at,
     }
+}
+
+fn is_chat_agent_token(token: &StoredAgentToken) -> bool {
+    token.machine_name.is_some() || token.endpoint_id.is_some()
+}
+
+fn is_chat_authenticated_agent(agent: &AuthenticatedAgent) -> bool {
+    agent.machine_name.is_some() || agent.endpoint_id.is_some()
+}
+
+fn require_chat_authenticated_agent(agent: &AuthenticatedAgent) -> Result<(), LoreError> {
+    if is_chat_authenticated_agent(agent) {
+        Ok(())
+    } else {
+        Err(LoreError::PermissionDenied)
+    }
+}
+
+fn find_owned_chat_agent<'a>(
+    agents: &'a [StoredAgentToken],
+    agent_name: &str,
+) -> Result<&'a StoredAgentToken, LoreError> {
+    agents
+        .iter()
+        .find(|agent| agent.name == agent_name && is_chat_agent_token(agent))
+        .ok_or(LoreError::PermissionDenied)
 }
 
 fn machine_agent_process_status(
@@ -11276,6 +11355,9 @@ fn build_chat_agents(
     let agents: Vec<StoredAgentToken> = state.auth.list_agent_tokens_for_user(username)?;
     let mut chat_agents: Vec<(Option<OffsetDateTime>, ChatAgentSummary)> = Vec::new();
     for agent in &agents {
+        if !is_chat_agent_token(agent) {
+            continue;
+        }
         let owner = agent.owner.as_ref().map(|o| o.as_str()).unwrap_or("");
         let conv = state.chat.load_conversation(owner, &agent.name)?;
         let last_msg = conv
@@ -11333,6 +11415,14 @@ fn build_chat_agents(
     Ok(chat_agents.into_iter().map(|(_, agent)| agent).collect())
 }
 
+fn selected_chat_agent<'a>(
+    requested: Option<&'a str>,
+    chat_agents: &[ChatAgentSummary],
+) -> Option<&'a str> {
+    requested
+        .filter(|name| *name == "librarian" || chat_agents.iter().any(|agent| agent.name == *name))
+}
+
 fn load_chat_panel_data(
     state: &AppState,
     owner: &str,
@@ -11376,11 +11466,9 @@ async fn chat_page(
         .map(|p| (p.slug.as_str().to_string(), p.display_name.clone()))
         .collect();
 
-    let (messages, selected_owned, _selected_status, active_turn_user_id) = load_chat_panel_data(
-        &state,
-        session.user.username.as_str(),
-        query.agent.as_deref(),
-    )?;
+    let selected_requested = selected_chat_agent(query.agent.as_deref(), &chat_agents);
+    let (messages, selected_owned, _selected_status, active_turn_user_id) =
+        load_chat_panel_data(&state, session.user.username.as_str(), selected_requested)?;
     let messages_json = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into());
     let selected = selected_owned.as_deref();
 
@@ -11423,11 +11511,9 @@ async fn chat_panel_inner(
         .filter(|p| session.user.is_admin || session.user.can_read(&p.slug))
         .map(|p| (p.slug.as_str().to_string(), p.display_name.clone()))
         .collect();
-    let (messages, selected_owned, selected_status, active_turn_user_id) = load_chat_panel_data(
-        state,
-        session.user.username.as_str(),
-        query.agent.as_deref(),
-    )?;
+    let selected_requested = selected_chat_agent(query.agent.as_deref(), &chat_agents);
+    let (messages, selected_owned, selected_status, active_turn_user_id) =
+        load_chat_panel_data(state, session.user.username.as_str(), selected_requested)?;
     let selected = selected_owned.as_deref();
     let panel_html = render_chat_main_panel(
         &chat_agents,
@@ -12021,9 +12107,7 @@ async fn chat_send_message(
     let agents = state
         .auth
         .list_agent_tokens_for_user(&session.user.username)?;
-    if !agents.iter().any(|a| a.name == agent_name) {
-        return Err(LoreError::PermissionDenied.into());
-    }
+    find_owned_chat_agent(&agents, &agent_name)?;
 
     let client_message_id = form
         .client_message_id
@@ -12100,9 +12184,7 @@ async fn chat_update_message(
     let agents = state
         .auth
         .list_agent_tokens_for_user(&session.user.username)?;
-    if !agents.iter().any(|a| a.name == agent_name) {
-        return Err(LoreError::PermissionDenied.into());
-    }
+    find_owned_chat_agent(&agents, &agent_name)?;
 
     let updated = state.chat.set_message_context_excluded(
         owner,
@@ -12208,6 +12290,7 @@ async fn chat_agent_poll(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -12399,6 +12482,7 @@ async fn chat_agent_take_stop_request(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     Ok(Json(json!({
         "stop_requested": take_chat_agent_stop_request(&state, owner.as_str(), &agent.name)
@@ -12411,6 +12495,7 @@ async fn chat_agent_respond(
     Json(body): Json<ChatRespondBody>,
 ) -> Result<StatusCode, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -12570,6 +12655,7 @@ async fn chat_agent_update_status(
     Json(body): Json<ChatStatusBody>,
 ) -> Result<StatusCode, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -12830,6 +12916,7 @@ async fn chat_agent_errors_report(
     Json(mut body): Json<AgentErrorReport>,
 ) -> Result<StatusCode, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -12957,9 +13044,7 @@ async fn chat_errors_list(
     let session = require_ui_session(&state, &headers)?;
     let owner_name = &session.user.username;
     let agents = state.auth.list_agent_tokens_for_user(owner_name)?;
-    if !agents.iter().any(|a| a.name == agent_name) {
-        return Err(ApiError::from(LoreError::PermissionDenied));
-    }
+    find_owned_chat_agent(&agents, &agent_name)?;
 
     let root = errors_dir_for(&state);
     let records = read_recent_error_records(&root, owner_name.as_str(), Some(&agent_name), 200);
@@ -13240,6 +13325,7 @@ async fn chat_agent_history(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -13320,6 +13406,7 @@ async fn chat_agent_compact(
     Json(body): Json<ChatCompactBody>,
 ) -> Result<StatusCode, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -13357,6 +13444,7 @@ async fn chat_agent_config(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let mut resp = serde_json::json!({
         "backend": agent.backend.to_string(),
     });
@@ -13416,6 +13504,7 @@ async fn chat_agent_get_manage(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -13483,6 +13572,7 @@ async fn chat_agent_manager_report(
     Json(body): Json<ManagerReportBody>,
 ) -> Result<StatusCode, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -13568,6 +13658,7 @@ async fn chat_agent_manager_requested(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -13599,6 +13690,7 @@ async fn chat_manager_proxy_completions(
     Json(req): Json<crate::librarian::ProxyChatRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
@@ -14722,6 +14814,7 @@ async fn chat_proxy_completions(
     Json(req): Json<crate::librarian::ProxyChatRequest>,
 ) -> Result<Response, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
     let endpoint_id = agent
         .endpoint_id
         .as_deref()
@@ -14952,10 +15045,7 @@ async fn chat_get_config(
     let agents = state
         .auth
         .list_agent_tokens_for_user(&session.user.username)?;
-    let agent = agents
-        .iter()
-        .find(|a| a.name == agent_name)
-        .ok_or(LoreError::PermissionDenied)?;
+    let agent = find_owned_chat_agent(&agents, &agent_name)?;
     let backend_str = agent.backend.to_string();
 
     let mut all_prefs = serde_json::Map::new();
@@ -15004,10 +15094,7 @@ async fn chat_save_config(
     let agents = state
         .auth
         .list_agent_tokens_for_user(&session.user.username)?;
-    let agent = agents
-        .iter()
-        .find(|a| a.name == agent_name)
-        .ok_or(LoreError::PermissionDenied)?;
+    let agent = find_owned_chat_agent(&agents, &agent_name)?;
 
     let backend_str = if let Some(ref new_backend) = form.backend {
         let parsed: crate::auth::AgentBackend = new_backend.parse()?;
@@ -15065,10 +15152,7 @@ async fn chat_get_manage(
     let agents = state
         .auth
         .list_agent_tokens_for_user(&session.user.username)?;
-    let _agent = agents
-        .iter()
-        .find(|a| a.name == agent_name)
-        .ok_or(LoreError::PermissionDenied)?;
+    let _agent = find_owned_chat_agent(&agents, &agent_name)?;
 
     let mc = state
         .chat
@@ -15131,10 +15215,7 @@ async fn chat_save_manage(
     let agents = state
         .auth
         .list_agent_tokens_for_user(&session.user.username)?;
-    let agent = agents
-        .iter()
-        .find(|a| a.name == agent_name)
-        .ok_or(LoreError::PermissionDenied)?;
+    let agent = find_owned_chat_agent(&agents, &agent_name)?;
 
     let mut mc = state
         .chat
@@ -15245,9 +15326,7 @@ async fn chat_slash_command(
     let agents = state
         .auth
         .list_agent_tokens_for_user(&session.user.username)?;
-    if !agents.iter().any(|a| a.name == agent_name) {
-        return Err(LoreError::PermissionDenied.into());
-    }
+    find_owned_chat_agent(&agents, &agent_name)?;
 
     let trimmed = form.command.trim();
     let (cmd, args) = match trimmed.split_once(char::is_whitespace) {
@@ -15846,7 +15925,7 @@ async fn provision_agent_with_body(
                     })
                 })
                 .collect::<Result<Vec<_>, LoreError>>()?;
-            validate_user_grants(&state, &machine.user, &grants)?;
+            validate_user_grants(&machine.user, &grants)?;
             grants
         }
         None if req.inherit_owner_grants => build_user_all_grants(&state, &machine.user)?,
@@ -16513,7 +16592,7 @@ async fn machine_create_agent_json(
     };
     let machine_key = format!("{}_{}", session.user.username, machine_name);
     let grants = match parse_agent_grants(&req.grants).and_then(|grants| {
-        validate_user_grants(&state, &session.user, &grants)?;
+        validate_user_grants(&session.user, &grants)?;
         Ok(grants)
     }) {
         Ok(grants) => grants,
@@ -16800,8 +16879,8 @@ mod tests {
     use crate::store::FileBlockStore;
     use crate::updater::{AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream, hex_sha256};
     use crate::{
-        AgentBackend, AuthenticatedAgent, BlockType, LocalAuthStore, NewAgentToken, ProjectGrant,
-        ProjectName, ProjectPermission, UserName,
+        AgentBackend, AuthenticatedAgent, BlockType, LocalAuthStore, ProjectGrant, ProjectName,
+        ProjectPermission, UserName,
     };
 
     #[test]
@@ -16948,16 +17027,16 @@ mod tests {
         for display_name in ["alpha", "bravo"] {
             state
                 .auth
-                .create_agent_token(NewAgentToken {
-                    display_name: display_name.to_string(),
-                    owner: owner.clone(),
-                    grants: vec![ProjectGrant {
+                .provision_agent(
+                    &owner,
+                    display_name,
+                    vec![ProjectGrant {
                         project: ProjectName::new("alpha.docs").unwrap(),
                         permission: ProjectPermission::ReadWrite,
                     }],
-                    backend: AgentBackend::Claude,
-                    endpoint_id: None,
-                })
+                    Some(AgentBackend::Claude),
+                    Some("desk"),
+                )
                 .unwrap();
         }
 
@@ -17010,16 +17089,16 @@ mod tests {
         for display_name in ["alpha", "bravo"] {
             state
                 .auth
-                .create_agent_token(NewAgentToken {
-                    display_name: display_name.to_string(),
-                    owner: owner.clone(),
-                    grants: vec![ProjectGrant {
+                .provision_agent(
+                    &owner,
+                    display_name,
+                    vec![ProjectGrant {
                         project: ProjectName::new("alpha.docs").unwrap(),
                         permission: ProjectPermission::ReadWrite,
                     }],
-                    backend: AgentBackend::Claude,
-                    endpoint_id: None,
-                })
+                    Some(AgentBackend::Claude),
+                    Some("desk"),
+                )
                 .unwrap();
         }
 
@@ -17096,7 +17175,7 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let (session_cookie, _) = bootstrap_admin_session(&app, dir.path()).await;
         let _agent_token =
-            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
 
         let state = super::AppState::new(FileBlockStore::new(dir.path()));
         state
@@ -17140,7 +17219,7 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let _agent_token =
-            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
 
         let request = Request::builder()
             .method("POST")
@@ -17178,7 +17257,7 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let _agent_token =
-            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
 
         let state = super::AppState::new(FileBlockStore::new(dir.path()));
         let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
@@ -17273,7 +17352,7 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let _agent_token =
-            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
 
         let state = super::AppState::new(FileBlockStore::new(dir.path()));
         state
@@ -17312,7 +17391,7 @@ mod tests {
         let app = build_app(FileBlockStore::new(dir.path()));
         let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let _agent_token =
-            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
         let client_message_id = "retry_send_001";
         let body = format!(
             "csrf_token={}&message={}&client_message_id={}",
@@ -17367,7 +17446,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let agent_token =
-            issue_agent_token(&app, dir.path(), "agent-main", ProjectPermission::ReadWrite).await;
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
 
         let state = super::AppState::new(FileBlockStore::new(dir.path()));
         state
@@ -18695,6 +18774,74 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json[0]["name"], "worker-alpha");
         assert_eq!(json[0]["grants"][0]["project"], "alpha.docs");
+    }
+
+    #[tokio::test]
+    async fn user_can_create_external_agent_without_machine_agent() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        store.create_project("Alpha Docs", None).unwrap();
+        store.create_project("Beta Docs", None).unwrap();
+        let app = build_app(store);
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+
+        let create = Request::builder()
+            .method("POST")
+            .uri("/ui/agents/external-agent")
+            .header("cookie", &session_cookie)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "csrf_token={}&token_name={}&grants={}",
+                urlencoding::encode(&csrf_token),
+                urlencoding::encode("codex laptop"),
+                urlencoding::encode("alpha-docs:read")
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("/ui/agents?selected=codex-laptop&created_token=lore_at_"));
+        let token = location
+            .split("created_token=")
+            .nth(1)
+            .and_then(|tail| tail.split('&').next())
+            .unwrap()
+            .to_string();
+
+        let projects = Request::builder()
+            .method("GET")
+            .uri("/v1/projects")
+            .header(API_KEY_HEADER, token)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(projects).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["project"], "Alpha Docs");
+
+        let chat = Request::builder()
+            .method("GET")
+            .uri("/ui/chat?agent=codex-laptop")
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(chat).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("Codex Laptop"));
+        assert!(!html.contains("codex-laptop"));
     }
 
     #[tokio::test]
@@ -20233,6 +20380,30 @@ mod tests {
         issue_agent_token_multi_project(app, dir, name, &[("alpha.docs", permission)]).await
     }
 
+    fn issue_chat_agent_token(
+        dir: &std::path::Path,
+        name: &str,
+        permission: ProjectPermission,
+    ) -> String {
+        ensure_test_admin(dir);
+        let state = super::AppState::new(FileBlockStore::new(dir));
+        let owner = UserName::new("admin").unwrap();
+        state
+            .auth
+            .provision_agent(
+                &owner,
+                name,
+                vec![ProjectGrant {
+                    project: ProjectName::new("alpha.docs").unwrap(),
+                    permission,
+                }],
+                Some(AgentBackend::Claude),
+                Some("desk"),
+            )
+            .unwrap()
+            .token
+    }
+
     async fn issue_agent_token_multi_project<S>(
         app: &S,
         dir: &std::path::Path,
@@ -20786,7 +20957,7 @@ mod tests {
         let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
         let _machine_token = register_machine_token(&app, dir.path()).await;
         let agent_token =
-            issue_agent_token(&app, dir.path(), "agent-upd", ProjectPermission::ReadWrite).await;
+            issue_chat_agent_token(dir.path(), "agent-upd", ProjectPermission::ReadWrite);
 
         for (idx, expected_update) in [true, false, true, false].into_iter().enumerate() {
             let send = Request::builder()

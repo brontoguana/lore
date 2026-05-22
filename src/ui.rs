@@ -2640,15 +2640,15 @@ pub fn render_agents_page(
     endpoints: &[Endpoint],
     selected_agent: Option<&str>,
     flash: Option<&str>,
+    created_token: Option<&str>,
 ) -> String {
     let base_url = config.base_url();
     let mcp_url = config.mcp_url();
     let install_script_url = format!("{}/install-cli.sh", base_url.trim_end_matches('/'));
     let install_ps1_url = format!("{}/install-cli.ps1", base_url.trim_end_matches('/'));
 
-    // Agent list
     let agent_list_html = if agents.is_empty() {
-        r#"<p class="hint padded">No agents yet. Use the Create button on a machine, or run <code>lore agent</code> from the CLI.</p>"#.to_string()
+        r#"<p class="hint padded">No agents yet. Create an external agent here, or use the Create button on a machine for a Lore-managed worker.</p>"#.to_string()
     } else {
         agents
             .iter()
@@ -2684,6 +2684,13 @@ pub fn render_agents_page(
                 } else {
                     String::new()
                 };
+                let token_kind = if agent.machine_name.is_some() {
+                    "machine agent"
+                } else if agent.endpoint_id.is_some() {
+                    "API agent"
+                } else {
+                    "external agent"
+                };
                 format!(
                     r#"<a href="/ui/agents?selected={}" class="sel-item{}">
                       <div style="display:flex; align-items:center; gap:var(--s-2); min-width:0;">
@@ -2699,7 +2706,7 @@ pub fn render_agents_page(
                     cls,
                     escape_text(&agent.display_name),
                     escape_text(&grant_label),
-                    escape_text(&agent.backend),
+                    escape_text(token_kind),
                     status_class = status_class,
                     status_title = status_title,
                     status_icon = status_icon,
@@ -2708,6 +2715,38 @@ pub fn render_agents_page(
             })
             .collect::<Vec<_>>()
             .join("")
+    };
+
+    let external_grants_html = if user_projects.is_empty() {
+        "<p class=\"hint\" style=\"margin-top:var(--s-3);\">No projects available yet.</p>"
+            .to_string()
+    } else {
+        let rows = user_projects
+            .iter()
+            .map(|p| {
+                let rw_option = if p.max_permission.allows_write() {
+                    r#"<option value="read_write">Read/write</option>"#
+                } else {
+                    ""
+                };
+                format!(
+                    r#"<div class="grant-row" data-external-project-grant="{}">
+                      <span class="grant-project-name">{}</span>
+                      <select>
+                        <option value="" selected>No access</option>
+                        <option value="read">Read</option>
+                        {rw_option}
+                      </select>
+                    </div>"#,
+                    escape_attribute(&p.slug),
+                    escape_text(&p.display_name),
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            r#"<fieldset class="grant-fieldset"><legend>Project access</legend>{}</fieldset>"#,
+            rows.join("")
+        )
     };
 
     // Machines list
@@ -2850,18 +2889,33 @@ pub fn render_agents_page(
     // Selected agent detail
     let detail_html = if let Some(sel_name) = selected_agent {
         if let Some(agent) = agents.iter().find(|a| a.name == sel_name) {
+            let setup_token = created_token.unwrap_or("YOUR_TOKEN");
+            let is_external_agent = agent.machine_name.is_none() && agent.endpoint_id.is_none();
             let setup_instruction = build_agent_setup_instruction_text(
                 &base_url,
                 &mcp_url,
                 &install_script_url,
                 &install_ps1_url,
-                "YOUR_TOKEN",
+                setup_token,
                 server_version,
             );
             let mcp_config_text = format!(
-                r#"{{"transport": "streamable_http","url": "{}","headers": {{"Authorization": "Bearer YOUR_TOKEN","Accept": "application/json, text/event-stream","MCP-Protocol-Version": "2025-06-18"}}}}"#,
+                r#"{{"transport": "streamable_http","url": "{}","headers": {{"Authorization": "Bearer {}","Accept": "application/json, text/event-stream","MCP-Protocol-Version": "2025-06-18"}}}}"#,
                 escape_text(&mcp_url),
+                escape_text(setup_token),
             );
+            let created_token_html = created_token.map(|token| {
+                format!(
+                    r##"<div class="padded" style="border:1px solid var(--line); border-radius:var(--radius); margin-bottom:var(--s-4);">
+                  <div class="hint" style="margin-bottom:var(--s-2);">Copy this token now. Lore only shows it once.</div>
+                  <textarea readonly id="created-token" style="min-height:4rem; font-family:var(--font-mono); font-size:0.85rem;">{}</textarea>
+                  <div style="margin-top:var(--s-3); text-align:right;">
+                    <button type="button" class="btn-lg button-link" onclick="copyField('created-token')">Copy token</button>
+                  </div>
+                </div>"##,
+                    escape_text(token),
+                )
+            }).unwrap_or_default();
             // Grants editor
             let edit_grants_html = if user_projects.is_empty() {
                 "<p class=\"hint\">No projects available.</p>".to_string()
@@ -2912,7 +2966,9 @@ pub fn render_agents_page(
                 )
             };
 
-            let backend_options = {
+            let backend_section_html = if is_external_agent {
+                r#"<div class="panel-header"><h3>Runtime</h3><p>External agents use this token from their own machine and do not appear in chat.</p></div>"#.to_string()
+            } else {
                 let cli_backends = [
                     ("claude", "Claude"),
                     ("agy", "Antigravity"),
@@ -2947,19 +3003,30 @@ pub fn render_agents_page(
                 } else {
                     String::new()
                 };
-                format!(r#"<optgroup label="CLI">{cli_opts}</optgroup>{ep_group}"#)
+                let backend_options =
+                    format!(r#"<optgroup label="CLI">{cli_opts}</optgroup>{ep_group}"#);
+                format!(
+                    r#"<div class="panel-header"><h3>Backend</h3><p>Choose a CLI backend or a configured endpoint.</p></div>
+                <div class="padded">
+                  <select id="agent-backend-select" style="width:100%;" onchange="saveAgentBackend('{name_attr}')">{backend_options}</select>
+                </div>"#,
+                    name_attr = escape_attribute(&agent.name),
+                    backend_options = backend_options,
+                )
             };
 
             format!(
                 r##"<section class="panel" style="margin-top: var(--s-5);">
                 <div class="panel-header"><h2>{display_name}</h2><p>{owner}-{slug}</p></div>
 
-                <div class="panel-header"><h3>Configuration</h3></div>
+                {created_token_html}
+
+                <div class="panel-header"><h3>Permissions</h3></div>
                 <form method="post" action="/ui/agents/{name_attr}/grants" id="edit-grants-form">
                   <input type="hidden" name="csrf_token" value="{csrf_token}">
                   {edit_grants_html}
                   <textarea name="grants" style="display:none" id="edit-grants-field"></textarea>
-                  <button type="submit">Save</button>
+                  <button type="submit" class="btn-lg">Save</button>
                 </form>
                 <script>
                 (function() {{
@@ -2978,16 +3045,17 @@ pub fn render_agents_page(
                 }})();
                 </script>
 
-                <div class="panel-header"><h3>Backend</h3><p>Choose a CLI backend or a configured endpoint.</p></div>
-                <div class="padded">
-                  <select id="agent-backend-select" style="width:100%;" onchange="saveAgentBackend('{name_attr}')">{backend_options}</select>
-                </div>
+                {backend_section_html}
 
                 <div class="panel-header"><h3>Setup instructions</h3><p>Copy and give to your agent.</p></div>
                 <div class="padded">
                   <textarea readonly id="agent-instruction" style="min-height: 8rem; font-family: var(--font-mono); font-size: 0.85rem;">{setup_instruction}</textarea>
                   <div style="margin-top: var(--s-3); text-align: right;">
-                    <button type="button" class="button-link" onclick="copyField('agent-instruction')">Copy</button>
+                    <form method="post" action="/ui/agents/{name_attr}/rotate" class="inline-form" style="margin-right:var(--s-2);">
+                      <input type="hidden" name="csrf_token" value="{csrf_token}">
+                      <button type="submit" class="btn-lg">Regenerate token</button>
+                    </form>
+                    <button type="button" class="btn-lg button-link" onclick="copyField('agent-instruction')">Copy setup</button>
                   </div>
                 </div>
 
@@ -2995,7 +3063,7 @@ pub fn render_agents_page(
                 <div class="padded">
                   <textarea readonly id="mcp-config" style="min-height:8rem; font-family:var(--font-mono); font-size:0.85rem;">{mcp_config_text}</textarea>
                   <div style="margin-top: var(--s-2); text-align: right;">
-                    <button type="button" class="button-link" onclick="copyField('mcp-config')">Copy</button>
+                    <button type="button" class="btn-lg button-link" onclick="copyField('mcp-config')">Copy MCP config</button>
                   </div>
                 </div>
 
@@ -3012,9 +3080,10 @@ pub fn render_agents_page(
                 name_attr = escape_attribute(&agent.name),
                 csrf_token = escape_attribute(csrf_token),
                 edit_grants_html = edit_grants_html,
-                backend_options = backend_options,
+                backend_section_html = backend_section_html,
                 setup_instruction = escape_text(&setup_instruction),
                 mcp_config_text = escape_text(&mcp_config_text),
+                created_token_html = created_token_html,
             )
         } else {
             String::new()
@@ -3037,8 +3106,18 @@ pub fn render_agents_page(
     <section class="panel" style="margin-top: var(--s-5);">
       <div class="panel-header">
         <h2>Agents</h2>
-        <p>Each agent gets its own scoped token and project access.</p>
+        <p>Machine and API agents appear in chat. External agents use Lore from their own CLI and only receive scoped project access.</p>
       </div>
+      <form method="post" action="/ui/agents/external-agent" id="create-external-agent-form" style="margin-bottom:var(--s-4);">
+        <input type="hidden" name="csrf_token" value="{csrf_token}">
+        <label>
+          <span style="font-size:0.8rem; color:var(--fg-2);">External agent name</span>
+          <input type="text" name="token_name" placeholder="codex-laptop" style="width:100%; margin-top:var(--s-1);">
+        </label>
+        <div style="margin-top:var(--s-3);">{external_grants_html}</div>
+        <textarea name="grants" id="external-grants-field" style="display:none"></textarea>
+        <button type="submit" class="btn-lg" style="margin-top:var(--s-3);">Create External Agent</button>
+      </form>
       <div class="sel-list">{agent_list_html}</div>
     </section>
 
@@ -3051,6 +3130,21 @@ pub fn render_agents_page(
       navigator.clipboard.writeText(el.value).then(function() {{
         var btn = event && event.target && event.target.closest('button');
         if (btn) {{ var orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(function(){{ btn.textContent = orig; }}, 1500); }}
+      }});
+    }}
+
+    var externalAgentForm = document.getElementById('create-external-agent-form');
+    if (externalAgentForm) {{
+      externalAgentForm.addEventListener('submit', function() {{
+        var lines = [];
+        externalAgentForm.querySelectorAll('[data-external-project-grant]').forEach(function(row) {{
+          var sel = row.querySelector('select');
+          if (sel && sel.value) {{
+            lines.push(row.getAttribute('data-external-project-grant') + ':' + sel.value);
+          }}
+        }});
+        var field = document.getElementById('external-grants-field');
+        if (field) field.value = lines.join('\n');
       }});
     }}
 
@@ -3349,6 +3443,8 @@ pub fn render_agents_page(
         agent_list_html = agent_list_html,
         machines_html = machines_html,
         detail_html = detail_html,
+        csrf_token = escape_attribute(csrf_token),
+        external_grants_html = external_grants_html,
     );
 
     render_shell(
@@ -3374,9 +3470,9 @@ fn build_agent_setup_instruction_text(
     server_version: &str,
 ) -> String {
     format!(
-        r#"# Lore — shared project knowledge base
+        r#"# Lore - shared project knowledge base
 
-Lore is a structured knowledge base your team uses to store and retrieve project documentation, decisions, and context. You can read and write project documents made up of ordered blocks (markdown, SVG, or images).
+Lore is a structured knowledge base your team uses to store and retrieve project documentation, decisions, and context. You can read and write project documents made up of ordered blocks.
 
 ## Server
 
@@ -3390,7 +3486,7 @@ All requests require an agent token. Include it as:
 
 ## How to connect
 
-### Option 1 — Lore CLI (recommended for code agents)
+### Option 1 - Lore CLI (recommended for code agents)
 
 Install (Linux/macOS):
   LORE_VERSION=v{server_version} curl -fsSL {install_script_url} | sh
@@ -3398,21 +3494,24 @@ Install (Linux/macOS):
 Install (Windows PowerShell):
   $env:LORE_VERSION='v{server_version}'; irm {install_ps1_url} | iex
 
-Configure (registers this machine and saves credentials):
-  lore setup {base_url}
+Configure this machine for the external agent. This does not register a machine or start a Lore-managed agent service:
+  lore setup-external {base_url} --token {token}
+
+Set the project for the current repo:
+  lore project set-local <project-slug>
 
 Commands:
-  lore projects                     — list projects
-  lore blocks list <project>        — list blocks in a project
-  lore blocks read <project>        — read all block content
-  lore grep <project> -q "query"    — search blocks
-  lore add <project> --type markdown --content "..."  — add a block
-  lore update <block-id> --content "..."              — update a block
-  lore delete <block-id>            — delete a block
-  lore history list <project>       — view project history
-  lore librarian answer <project> -q "question"       — ask the librarian
+  lore projects                     - list projects
+  lore overview                     - read the current project overview
+  lore file-map read                - read the current project file map
+  lore context                      - read agent context
+  lore docs list                    - list documents
+  lore docs read <doc-id>           - read a document
+  lore blocks list --doc <doc-id>   - list document blocks
+  lore grep "query"                 - search blocks
+  lore librarian answer "question"  - ask the librarian
 
-### Option 2 — MCP (for MCP-native hosts)
+### Option 2 - MCP (for MCP-native hosts)
 
 Add this to your MCP client config (Claude Desktop, Cursor, etc.):
 
@@ -3911,8 +4010,8 @@ pub fn render_agent_guide_page(
       </div>
       <div class="padded">
         <div style="display:flex; align-items:stretch; gap:var(--s-2);">
-          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">lore setup {base_url}</code>
-          <button class="button-link" onclick="navigator.clipboard.writeText('lore setup {base_url}')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">lore setup-machine {base_url}</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('lore setup-machine {base_url}')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
         </div>
@@ -13329,6 +13428,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
 
         assert!(html.contains(r#"title="Working""#));
@@ -13375,6 +13475,7 @@ mod tests {
             &[],
             Some("worker"),
             None,
+            None,
         );
         let guide_html = render_agent_guide_page(
             &config,
@@ -13390,6 +13491,13 @@ mod tests {
             assert!(html.contains("https://lore.example.com/install-cli.ps1"));
             assert!(!html.contains("raw.githubusercontent.com/brontoguana/lore"));
         }
+        assert!(
+            agents_html.contains("lore setup-external https://lore.example.com --token YOUR_TOKEN")
+        );
+        assert!(
+            agents_html
+                .contains("This does not register a machine or start a Lore-managed agent service")
+        );
     }
 
     #[test]
@@ -13435,10 +13543,60 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
 
         assert!(html.contains("grants: grants.join('\\n')"));
+        assert!(html.contains("lines.join('\\n')"));
+        assert!(html.contains("data-external-project-grant"));
+        assert!(html.contains("row.getAttribute('data-external-project-grant')"));
         assert!(!html.contains("grants: grants.join('\\\\n')"));
+    }
+
+    #[test]
+    fn agents_page_created_token_is_shown_in_client_cli_instructions() {
+        let config = ServerConfig::new(
+            ExternalScheme::Https,
+            "lore.example.com".into(),
+            443,
+            UiTheme::Parchment,
+        )
+        .unwrap();
+        let agents = vec![AgentTokenSummary {
+            name: "codex-laptop".into(),
+            display_name: "Codex Laptop".into(),
+            owner: Some("admin".into()),
+            grants: Vec::new(),
+            backend: "claude".into(),
+            endpoint_id: None,
+            machine_name: None,
+            process_status: None,
+            status: "offline".into(),
+            created_at: time::OffsetDateTime::now_utc(),
+        }];
+
+        let html = render_agents_page(
+            &config,
+            "admin",
+            true,
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "csrf",
+            &agents,
+            &[],
+            &[],
+            &[],
+            Some("codex-laptop"),
+            None,
+            Some("lore_at_created_secret"),
+        );
+
+        assert!(html.contains("Copy this token now. Lore only shows it once."));
+        assert!(html.contains(
+            "lore setup-external https://lore.example.com --token lore_at_created_secret"
+        ));
+        assert!(html.contains("Bearer lore_at_created_secret"));
+        assert!(html.contains("external agent"));
     }
 
     #[test]

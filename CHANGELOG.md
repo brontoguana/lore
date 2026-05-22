@@ -1,7 +1,13 @@
 # Changelog
 
+## 2026-05-22
+
+- Reordered the Lore CLI top-level help so user setup commands (`setup-machine` and `setup-external`) appear first, ahead of content and agent/service daemon commands.
+
 ## 2026-05-20
 
+- Added first-class external agents. They are created and permissioned from the Agents page like normal agents, can be selected to copy/regenerate their setup token, do not appear in chat, and use `lore setup-external <url> --token <token>` for client-only CLI setup without registering a machine.
+- Added `lore setup-machine` as the explicit machine-agent setup command and updated external-agent setup instructions plus server-hosted CLI installers to show the external-agent and machine-agent paths separately.
 - Replaced Gemini CLI process-agent support with Antigravity CLI (`agy`). Lore now exposes `agy` as the CLI backend, maps legacy stored `gemini` backend values to `agy`, invokes `agy` print mode with permission bypass and a 15-minute print timeout, treats plain stdout as the assistant response, and detects Antigravity OAuth/auth prompts even when the CLI exits successfully.
 - Added headless Antigravity auth handling for machine-service agents. When the Antigravity OAuth token file exists and no SSH session variables are present, Lore sets SSH-style environment markers only for the `agy` child process so Antigravity uses file-token storage under systemd.
 

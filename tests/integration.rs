@@ -78,6 +78,43 @@ async fn api_create_agent_token(
     body["token"].as_str().unwrap().to_string()
 }
 
+async fn api_create_machine_agent_token(
+    client: &reqwest::Client,
+    addr: &SocketAddr,
+    name: &str,
+    grants: &[(&str, &str)],
+) -> String {
+    let machine_name = format!("{name}-machine");
+    let resp = client
+        .post(url(addr, "/v1/machines/register"))
+        .json(&json!({
+            "username": ADMIN_USER,
+            "password": ADMIN_PASS,
+            "machine_name": machine_name
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "register machine failed");
+    let body: Value = resp.json().await.unwrap();
+    let machine_token = body["token"].as_str().unwrap().to_string();
+
+    let grants_json: Vec<Value> = grants
+        .iter()
+        .map(|(project, perm)| json!({"project": project, "permission": perm}))
+        .collect();
+    let resp = client
+        .post(url(addr, "/v1/agents/provision"))
+        .header("x-lore-key", machine_token)
+        .json(&json!({"name": name, "grants": grants_json}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "provision machine agent failed");
+    let body: Value = resp.json().await.unwrap();
+    body["token"].as_str().unwrap().to_string()
+}
+
 async fn admin_login(client: &reqwest::Client, addr: &SocketAddr) -> (String, String) {
     let resp = client
         .post(url(addr, "/login"))
@@ -1963,7 +2000,8 @@ async fn agent_chat_send_poll_respond() {
 
     // Create agent token with a project grant
     let token =
-        api_create_agent_token(&client, &addr, "chat-bot", &[("chat.proj", "read_write")]).await;
+        api_create_machine_agent_token(&client, &addr, "chat-bot", &[("chat.proj", "read_write")])
+            .await;
 
     // Seed a project so it exists
     let resp = client
@@ -2115,7 +2153,8 @@ async fn agent_chat_keeps_follow_up_messages_sent_while_thinking() {
     .await;
 
     let token =
-        api_create_agent_token(&client, &addr, "chat-bot", &[("chat.proj", "read_write")]).await;
+        api_create_machine_agent_token(&client, &addr, "chat-bot", &[("chat.proj", "read_write")])
+            .await;
 
     let resp = client
         .post(url(&addr, "/v1/blocks"))
@@ -2239,7 +2278,7 @@ async fn simulated_api_agent_observes_stop_and_aborts_inflight_request() {
     )
     .await;
 
-    let token = api_create_agent_token(
+    let token = api_create_machine_agent_token(
         &client,
         &addr,
         "stop-api-agent",
@@ -2382,7 +2421,7 @@ async fn simulated_cli_agent_observes_stop_and_kills_fake_backend() {
     let dir = tempdir().unwrap();
     let (addr, client) = spawn_server(dir.path()).await;
 
-    let token = api_create_agent_token(
+    let token = api_create_machine_agent_token(
         &client,
         &addr,
         "stop-cli-agent",
