@@ -14910,7 +14910,7 @@ fn codex_model_options_from_cache_value(value: &Value) -> Option<Vec<String>> {
 fn chat_backend_model_options() -> Value {
     json!({
         "claude": ["default", "opus", "sonnet", "haiku"],
-        "gemini": ["default", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-pro-preview"],
+        "agy": ["default"],
         "codex": codex_model_options(),
         "openai": ["default"],
     })
@@ -14959,7 +14959,7 @@ async fn chat_get_config(
     let backend_str = agent.backend.to_string();
 
     let mut all_prefs = serde_json::Map::new();
-    for b in &["claude", "gemini", "codex", "openai"] {
+    for b in &["claude", "agy", "codex", "openai"] {
         let (model, effort) = state
             .chat
             .get_backend_prefs(owner, b)
@@ -15016,7 +15016,7 @@ async fn chat_save_config(
                 .auth
                 .set_agent_backend(&agent_name, &session.user.username, parsed)?;
         }
-        new_backend.clone()
+        parsed.to_string()
     } else {
         agent.backend.to_string()
     };
@@ -15074,13 +15074,21 @@ async fn chat_get_manage(
         .chat
         .get_manage_config(owner, &agent_name)?
         .unwrap_or_default();
+    let manage_backend = if mc.backend.is_empty() {
+        String::new()
+    } else {
+        mc.backend
+            .parse::<AgentBackend>()
+            .map(|backend| backend.to_string())
+            .unwrap_or_else(|_| mc.backend.clone())
+    };
 
     let endpoints: Vec<Value> = state.endpoint_store.list()?.iter().map(|ep| {
         json!({ "id": ep.id, "name": ep.name, "kind": ep.kind.to_string(), "model": ep.model })
     }).collect();
 
     Ok(Json(json!({
-        "backend": mc.backend,
+        "backend": manage_backend,
         "endpoint_id": mc.endpoint_id,
         "goals": mc.goals,
         "stopping_point": mc.stopping_point,
@@ -15135,7 +15143,11 @@ async fn chat_save_manage(
     let was_enabled = mc.enabled;
 
     if let Some(b) = &form.backend {
-        mc.backend = b.clone();
+        mc.backend = if b.is_empty() {
+            String::new()
+        } else {
+            b.parse::<AgentBackend>()?.to_string()
+        };
     }
     if let Some(eid) = &form.endpoint_id {
         mc.endpoint_id = eid.clone();
@@ -15487,8 +15499,8 @@ async fn chat_slash_command(
                 if args.is_empty() {
                     let current = current_model.as_deref().unwrap_or("default");
                     let options = match backend.as_str() {
-                        "gemini" => format!(
-                            "Current model: {current}\n\nOptions:\n  /model gemini-2.5-pro\n  /model gemini-2.5-flash\n  /model gemini-3-pro-preview\n  /model default"
+                        "agy" => format!(
+                            "Current model: {current}\n\nAntigravity CLI print mode does not expose a Lore-controlled model flag.\n\nUse /model default to clear any stored override."
                         ),
                         "claude" => format!(
                             "Current model: {current}\n\nOptions:\n  /model opus (claude-opus-4-6)\n  /model sonnet (claude-sonnet-4-6)\n  /model haiku (claude-haiku-4-5)\n  /model <full-model-id>\n  /model default"
@@ -15501,17 +15513,21 @@ async fn chat_slash_command(
                     options
                 } else {
                     let lower = args.to_lowercase();
-                    let new_model = if lower == "default" || lower == "off" || lower == "none" {
-                        None
+                    if backend == "agy" && lower != "default" && lower != "off" && lower != "none" {
+                        "Antigravity CLI print mode does not expose a Lore-controlled model flag.".to_string()
                     } else {
-                        Some(args.clone())
-                    };
-                    if current_model == new_model {
-                        format!("Already using {} model.", new_model.as_deref().unwrap_or("default"))
-                    } else {
-                        state.chat.set_backend_model(owner, &backend, new_model.clone())?;
-                        let label = new_model.as_deref().unwrap_or("default");
-                        format!("Model set to {label} for {backend}. Next message will use it.")
+                        let new_model = if lower == "default" || lower == "off" || lower == "none" {
+                            None
+                        } else {
+                            Some(args.clone())
+                        };
+                        if current_model == new_model {
+                            format!("Already using {} model.", new_model.as_deref().unwrap_or("default"))
+                        } else {
+                            state.chat.set_backend_model(owner, &backend, new_model.clone())?;
+                            let label = new_model.as_deref().unwrap_or("default");
+                            format!("Model set to {label} for {backend}. Next message will use it.")
+                        }
                     }
                 }
             }

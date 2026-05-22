@@ -30,6 +30,9 @@ const LORE_SERVICE_HANDOFF_PARENT_PID_ENV: &str = "LORE_SERVICE_HANDOFF_PARENT_P
 const LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV: &str = "LORE_SERVICE_HANDOFF_CANONICAL_EXE";
 const LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV: &str = "LORE_SERVICE_HANDOFF_TARGET_VERSION";
 const CLI_BACKEND_TURN_FAILURE_LIMIT: u32 = 3;
+const AGY_OAUTH_TOKEN_RELATIVE_PATH: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
+const AGY_FILE_TOKEN_SSH_CONNECTION: &str = "127.0.0.1 0 127.0.0.1 0";
+const AGY_FILE_TOKEN_SSH_CLIENT: &str = "127.0.0.1 0 0";
 
 fn resolve_executable_path(executable: &str, fallback_relative_paths: &[&str]) -> PathBuf {
     resolve_executable_path_from(
@@ -77,13 +80,47 @@ fn resolve_backend_executable(backend: AgentBackend) -> PathBuf {
         AgentBackend::Claude => {
             resolve_executable_path("claude", &[".local/bin/claude", ".npm-global/bin/claude"])
         }
-        AgentBackend::Gemini => {
-            resolve_executable_path("gemini", &[".local/bin/gemini", ".npm-global/bin/gemini"])
-        }
+        AgentBackend::Agy => resolve_executable_path("agy", &[".local/bin/agy"]),
         AgentBackend::Codex => {
             resolve_executable_path("codex", &[".local/bin/codex", ".npm-global/bin/codex"])
         }
         AgentBackend::OpenAi => PathBuf::from("openai"),
+    }
+}
+
+fn agy_file_token_path_from(home: Option<&OsStr>) -> Option<PathBuf> {
+    home.map(PathBuf::from)
+        .map(|home| home.join(AGY_OAUTH_TOKEN_RELATIVE_PATH))
+}
+
+fn should_force_agy_file_token_auth_from(
+    home: Option<&OsStr>,
+    ssh_connection: Option<&OsStr>,
+    ssh_client: Option<&OsStr>,
+) -> bool {
+    if ssh_connection.is_some() || ssh_client.is_some() {
+        return false;
+    }
+    agy_file_token_path_from(home)
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+}
+
+fn should_force_agy_file_token_auth() -> bool {
+    should_force_agy_file_token_auth_from(
+        env::var_os("HOME").as_deref(),
+        env::var_os("SSH_CONNECTION").as_deref(),
+        env::var_os("SSH_CLIENT").as_deref(),
+    )
+}
+
+fn configure_agy_auth_env(cmd: &mut tokio::process::Command) {
+    if should_force_agy_file_token_auth() {
+        // Antigravity CLI uses file-token storage in SSH sessions. Lore's
+        // systemd service is headless but has the same token file, so make the
+        // child select that auth path without changing the parent environment.
+        cmd.env("SSH_CONNECTION", AGY_FILE_TOKEN_SSH_CONNECTION)
+            .env("SSH_CLIENT", AGY_FILE_TOKEN_SSH_CLIENT);
     }
 }
 
@@ -729,7 +766,7 @@ struct AgentArgs {
     name: String,
     #[arg(long)]
     fg: bool,
-    /// Override the backend (claude, gemini, codex). If not set, uses server config.
+    /// Override the backend (claude, agy, codex). If not set, uses server config.
     #[arg(long)]
     backend: Option<String>,
 }
@@ -3618,7 +3655,12 @@ async fn agent_command(context: &CliContext, args: AgentArgs) -> CliResult<()> {
             .token
             .as_deref()
             .ok_or("no machine token configured. Run 'lore setup <url>' first.")?;
-        let backend_str = args.backend.as_deref().unwrap_or("claude");
+        let backend_str = args
+            .backend
+            .as_deref()
+            .map(|b| b.parse::<AgentBackend>().map(|backend| backend.to_string()))
+            .transpose()?
+            .unwrap_or_else(|| AgentBackend::Claude.to_string());
         eprintln!("Provisioning agent '{}'...", args.name);
         let resp = context
             .client
@@ -4339,6 +4381,23 @@ async fn agent_poll_and_process(
                     if line.is_empty() {
                         continue;
                     }
+                    if !backend_uses_json_lines(backend) {
+                        if let Some(record) = classify_cli_non_json_output(backend, "stdout", &line) {
+                            eprintln!("[agent] {}", record.detail);
+                            terminate_child_process_tree(&mut child).await;
+                            record_agent_error(context, agent_name, record).await;
+                            let _ = context
+                                .client
+                                .post(format!("{}/v1/chat/respond", context.url))
+                                .header("x-lore-key", token)
+                                .json(&serde_json::json!({ "complete": true }))
+                                .send()
+                                .await;
+                            return Ok(AgentPollAction::Continue);
+                        }
+                        append_plain_output_line(&mut response, &line);
+                        continue;
+                    }
                     let parsed: serde_json::Value = match serde_json::from_str(&line) {
                         Ok(v) => v,
                         Err(_) => {
@@ -4660,6 +4719,13 @@ async fn run_manager_cli(
                     };
                     let line = line.trim().to_string();
                     if line.is_empty() {
+                        continue;
+                    }
+                    if !backend_uses_json_lines(backend) {
+                        if let Some(record) = classify_cli_non_json_output(backend, "stdout", &line) {
+                            return Err(record.detail.into());
+                        }
+                        append_plain_output_line(&mut full_response, &line);
                         continue;
                     }
                     let parsed: serde_json::Value = match serde_json::from_str(&line) {
@@ -6633,57 +6699,6 @@ fn format_tool_use_claude(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-fn format_tool_use_gemini(name: &str, input: &serde_json::Value) -> String {
-    match name {
-        "read_file" => format!(
-            "Read {}",
-            input["file_path"]
-                .as_str()
-                .map(short_path)
-                .unwrap_or_default()
-        ),
-        "replace" => format!(
-            "Edit {}",
-            input["file_path"]
-                .as_str()
-                .map(short_path)
-                .unwrap_or_default()
-        ),
-        "write_file" => format!(
-            "Write {}",
-            input["file_path"]
-                .as_str()
-                .map(short_path)
-                .unwrap_or_default()
-        ),
-        "run_shell_command" => {
-            let cmd = input["command"].as_str().unwrap_or("");
-            let truncated: String = cmd.chars().take(120).collect();
-            format!("Bash: {truncated}")
-        }
-        "grep_search" => {
-            let pattern = input["pattern"].as_str().unwrap_or("");
-            let path = input["dir_path"]
-                .as_str()
-                .map(|p| short_path(p))
-                .unwrap_or_else(|| ".".to_string());
-            format!("Grep \"{pattern}\" in {path}")
-        }
-        "glob" => format!("Glob {}", input["pattern"].as_str().unwrap_or("")),
-        "google_web_search" => {
-            let query = input["query"].as_str().unwrap_or("");
-            let truncated: String = query.chars().take(100).collect();
-            format!("WebSearch: {truncated}")
-        }
-        "web_fetch" => {
-            let url = input["url"].as_str().unwrap_or("");
-            let truncated: String = url.chars().take(100).collect();
-            format!("WebFetch: {truncated}")
-        }
-        _ => name.to_string(),
-    }
-}
-
 fn format_tool_use_codex(item: &serde_json::Value) -> Option<String> {
     if item["type"].as_str() == Some("command_execution") {
         let cmd = item["command"]
@@ -6786,6 +6801,7 @@ async fn spawn_backend(
     use tokio::io::AsyncWriteExt;
 
     let cwd = agent_cwd();
+    let mut writes_prompt_to_stdin = true;
     let mut child = match backend {
         AgentBackend::Claude => {
             let mut args = vec![
@@ -6819,25 +6835,23 @@ async fn spawn_backend(
             }
             cmd.spawn()?
         }
-        AgentBackend::Gemini => {
+        AgentBackend::Agy => {
             let mut args = vec![
-                "-o".to_string(),
-                "stream-json".to_string(),
-                "--yolo".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--print-timeout".to_string(),
+                "15m".to_string(),
             ];
-            if let Some(m) = model {
-                args.push("-m".to_string());
-                args.push(m.to_string());
-            }
             args.push("-p".to_string());
-            args.push(String::new());
+            args.push(prompt.to_string());
+            writes_prompt_to_stdin = false;
             let mut cmd =
-                tokio::process::Command::new(resolve_backend_executable(AgentBackend::Gemini));
+                tokio::process::Command::new(resolve_backend_executable(AgentBackend::Agy));
             cmd.args(&args)
                 .current_dir(&cwd)
-                .stdin(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            configure_agy_auth_env(&mut cmd);
             configure_child_process_group(&mut cmd);
             if let Some(token) = agent_token {
                 cmd.env("LORE_AGENT_TOKEN", token);
@@ -6860,18 +6874,29 @@ async fn spawn_backend(
             cmd.spawn()?
         }
         AgentBackend::OpenAi => {
-            return Err(
-                "OpenAI backend is not yet implemented. Use claude, gemini, or codex.".into(),
-            );
+            return Err("OpenAI backend is not yet implemented. Use claude, agy, or codex.".into());
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes()).await?;
-        drop(stdin);
+    if writes_prompt_to_stdin {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(prompt.as_bytes()).await?;
+            drop(stdin);
+        }
     }
 
     Ok(child)
+}
+
+fn backend_uses_json_lines(backend: AgentBackend) -> bool {
+    matches!(backend, AgentBackend::Claude | AgentBackend::Codex)
+}
+
+fn append_plain_output_line(output: &mut String, line: &str) {
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(line);
 }
 
 fn codex_exec_args(model: Option<&str>, effort: Option<&str>) -> Vec<String> {
@@ -6896,7 +6921,7 @@ fn codex_exec_args(model: Option<&str>, effort: Option<&str>) -> Vec<String> {
 fn parse_backend_line(backend: AgentBackend, parsed: &serde_json::Value) -> Vec<BackendEvent> {
     match backend {
         AgentBackend::Claude => parse_claude_line(parsed),
-        AgentBackend::Gemini => parse_gemini_line(parsed),
+        AgentBackend::Agy => vec![BackendEvent::Skip],
         AgentBackend::Codex => parse_codex_line(parsed),
         AgentBackend::OpenAi => vec![BackendEvent::Skip],
     }
@@ -6934,28 +6959,6 @@ fn parse_claude_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
             let text = parsed["result"].as_str().unwrap_or("").to_string();
             vec![BackendEvent::Result(text)]
         }
-        _ => vec![BackendEvent::Skip],
-    }
-}
-
-fn parse_gemini_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
-    match parsed["type"].as_str() {
-        Some("message") => {
-            if parsed["role"].as_str() == Some("assistant") {
-                if let Some(content) = parsed["content"].as_str() {
-                    if !content.is_empty() {
-                        return vec![BackendEvent::Text(content.to_string())];
-                    }
-                }
-            }
-            vec![BackendEvent::Skip]
-        }
-        Some("tool_use") => {
-            let name = parsed["tool_name"].as_str().unwrap_or("");
-            let params = &parsed["parameters"];
-            vec![BackendEvent::ToolUse(format_tool_use_gemini(name, params))]
-        }
-        Some("result") => vec![BackendEvent::Result(String::new())],
         _ => vec![BackendEvent::Skip],
     }
 }
@@ -7018,8 +7021,8 @@ async fn run_compaction(
             let output = child.wait_with_output().await?;
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
-        AgentBackend::Gemini | AgentBackend::Codex => {
-            // Spawn in JSON mode, parse streaming output, accumulate text
+        AgentBackend::Agy | AgentBackend::Codex => {
+            // Codex streams JSON lines; Antigravity (`agy`) print mode returns plain text.
             let mut child =
                 spawn_backend(backend, prompt, None, None, context.token.as_deref()).await?;
             let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -7044,6 +7047,14 @@ async fn run_compaction(
                         };
                         let line = line.trim().to_string();
                         if line.is_empty() {
+                            continue;
+                        }
+                        if !backend_uses_json_lines(backend) {
+                            if let Some(record) = classify_cli_non_json_output(backend, "stdout", &line) {
+                                terminate_child_process_tree(&mut child).await;
+                                return Err(record.detail.into());
+                            }
+                            append_plain_output_line(&mut result, &line);
                             continue;
                         }
                         let parsed: serde_json::Value = match serde_json::from_str(&line) {
@@ -8068,7 +8079,12 @@ async fn service_handle_create_agent(
 ) -> CliResult<serde_json::Value> {
     let agent_name = params["agent_name"].as_str().ok_or("missing agent_name")?;
     let folder = params["folder"].as_str().ok_or("missing folder")?;
-    let backend = params["backend"].as_str().unwrap_or("claude");
+    let backend = params["backend"]
+        .as_str()
+        .unwrap_or("claude")
+        .parse::<AgentBackend>()
+        .unwrap_or(AgentBackend::Claude)
+        .to_string();
     let grants = params["grants"].clone();
     let (_, folder_path) = match resolve_existing_service_path(folder) {
         Ok(v) => v,
@@ -8114,7 +8130,7 @@ async fn service_handle_create_agent(
         pid: 0,
         folder: folder_path.to_string_lossy().into_owned(),
         token: agent_token.to_string(),
-        backend: Some(backend.to_string()),
+        backend: Some(backend),
     };
 
     // Start the agent as a task within this process
@@ -8137,20 +8153,22 @@ async fn service_handle_create_agent(
 #[cfg(test)]
 mod tests {
     use super::{
-        BlocksCommand, Cli, Command, DocWriteArgs, ProjectSource, ResolvedProject,
-        append_assistant_segment, append_block_content, append_new_stream_text,
-        build_compaction_prompt, codex_exec_args, count_history_exchanges, find_cwd_project_file,
+        AGY_OAUTH_TOKEN_RELATIVE_PATH, BlocksCommand, Cli, Command, DocWriteArgs, ProjectSource,
+        ResolvedProject, append_assistant_segment, append_block_content, append_new_stream_text,
+        append_plain_output_line, backend_uses_json_lines, build_compaction_prompt,
+        codex_exec_args, count_history_exchanges, find_cwd_project_file,
         history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
         load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
         markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
         parse_codex_line, recent_history_exchange_tail, remove_owned_service_pid_file,
         resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
-        sanitize_cli_output_preview, service_update_target,
+        sanitize_cli_output_preview, service_update_target, should_force_agy_file_token_auth_from,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
     use serde_json::json;
     use std::collections::HashSet;
+    use std::ffi::OsStr;
     use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -8225,6 +8243,17 @@ mod tests {
     }
 
     #[test]
+    fn agy_backend_collects_plain_output_lines() {
+        let mut output = String::new();
+
+        assert!(!backend_uses_json_lines(AgentBackend::Agy));
+        append_plain_output_line(&mut output, "first line");
+        append_plain_output_line(&mut output, "second line");
+
+        assert_eq!(output, "first line\nsecond line");
+    }
+
+    #[test]
     fn cli_compaction_prompt_includes_current_datetime_context() {
         let prompt =
             build_compaction_prompt("<messages_to_compact>\nUser: hello\n</messages_to_compact>");
@@ -8256,17 +8285,17 @@ mod tests {
     fn backend_executable_resolution_prefers_user_local_fallbacks() {
         let home = tempfile::tempdir().unwrap();
         let path_dir = tempfile::tempdir().unwrap();
-        let fallback = home.path().join(".npm-global/bin/gemini");
+        let fallback = home.path().join(".local/bin/agy");
         fs::create_dir_all(fallback.parent().unwrap()).unwrap();
         fs::write(&fallback, "").unwrap();
-        let system = path_dir.path().join("gemini");
+        let system = path_dir.path().join("agy");
         fs::write(&system, "").unwrap();
         let path = std::env::join_paths([path_dir.path()]).unwrap();
 
         assert_eq!(
             resolve_executable_path_from(
-                "gemini",
-                &[".local/bin/gemini", ".npm-global/bin/gemini"],
+                "agy",
+                &[".local/bin/agy"],
                 Some(home.path().as_os_str()),
                 Some(path.as_os_str())
             ),
@@ -8278,14 +8307,14 @@ mod tests {
     fn backend_executable_resolution_uses_path_when_no_user_local_fallback_exists() {
         let home = tempfile::tempdir().unwrap();
         let path_dir = tempfile::tempdir().unwrap();
-        let system = path_dir.path().join("gemini");
+        let system = path_dir.path().join("agy");
         fs::write(&system, "").unwrap();
         let path = std::env::join_paths([path_dir.path()]).unwrap();
 
         assert_eq!(
             resolve_executable_path_from(
-                "gemini",
-                &[".local/bin/gemini", ".npm-global/bin/gemini"],
+                "agy",
+                &[".local/bin/agy"],
                 Some(home.path().as_os_str()),
                 Some(path.as_os_str())
             ),
@@ -8294,21 +8323,46 @@ mod tests {
     }
 
     #[test]
+    fn agy_file_token_auth_is_forced_only_for_headless_token_env() {
+        let home = tempfile::tempdir().unwrap();
+        let token_path = home.path().join(AGY_OAUTH_TOKEN_RELATIVE_PATH);
+        fs::create_dir_all(token_path.parent().unwrap()).unwrap();
+
+        assert!(!should_force_agy_file_token_auth_from(
+            Some(home.path().as_os_str()),
+            None,
+            None
+        ));
+
+        fs::write(&token_path, "token").unwrap();
+        assert!(should_force_agy_file_token_auth_from(
+            Some(home.path().as_os_str()),
+            None,
+            None
+        ));
+        assert!(!should_force_agy_file_token_auth_from(
+            Some(home.path().as_os_str()),
+            Some(OsStr::new("real ssh")),
+            None
+        ));
+    }
+
+    #[test]
     fn agent_turn_failure_tracker_caps_identical_backend_turn_failures() {
         let mut tracker = super::AgentTurnFailureTracker::default();
         let message_ids = [269];
-        let detail = "spawn gemini failed: Broken pipe (os error 32)";
+        let detail = "spawn agy failed: Broken pipe (os error 32)";
 
         assert_eq!(
-            tracker.record_failure(AgentBackend::Gemini, &message_ids, detail),
+            tracker.record_failure(AgentBackend::Agy, &message_ids, detail),
             1
         );
         assert_eq!(
-            tracker.record_failure(AgentBackend::Gemini, &message_ids, detail),
+            tracker.record_failure(AgentBackend::Agy, &message_ids, detail),
             2
         );
         assert_eq!(
-            tracker.record_failure(AgentBackend::Gemini, &message_ids, detail),
+            tracker.record_failure(AgentBackend::Agy, &message_ids, detail),
             super::CLI_BACKEND_TURN_FAILURE_LIMIT
         );
     }
@@ -8318,43 +8372,35 @@ mod tests {
         let mut tracker = super::AgentTurnFailureTracker::default();
 
         assert_eq!(
+            tracker.record_failure(AgentBackend::Agy, &[269], "spawn agy failed: Broken pipe"),
+            1
+        );
+        assert_eq!(
+            tracker.record_failure(AgentBackend::Agy, &[270], "spawn agy failed: Broken pipe"),
+            1
+        );
+        assert_eq!(
             tracker.record_failure(
-                AgentBackend::Gemini,
-                &[269],
-                "spawn gemini failed: Broken pipe"
+                AgentBackend::Agy,
+                &[270],
+                "spawn agy failed: permission denied"
             ),
             1
         );
         assert_eq!(
             tracker.record_failure(
-                AgentBackend::Gemini,
+                AgentBackend::Agy,
                 &[270],
-                "spawn gemini failed: Broken pipe"
-            ),
-            1
-        );
-        assert_eq!(
-            tracker.record_failure(
-                AgentBackend::Gemini,
-                &[270],
-                "spawn gemini failed: permission denied"
-            ),
-            1
-        );
-        assert_eq!(
-            tracker.record_failure(
-                AgentBackend::Gemini,
-                &[270],
-                "spawn gemini failed: permission denied"
+                "spawn agy failed: permission denied"
             ),
             2
         );
         tracker.reset();
         assert_eq!(
             tracker.record_failure(
-                AgentBackend::Gemini,
+                AgentBackend::Agy,
                 &[270],
-                "spawn gemini failed: permission denied"
+                "spawn agy failed: permission denied"
             ),
             1
         );
@@ -8366,29 +8412,29 @@ mod tests {
             "OAuth login required. Open https://example.test/auth and enter the code."
         ));
         assert!(looks_like_cli_auth_prompt(
-            "Please login to continue using the Gemini CLI."
+            "Please login to continue using Antigravity CLI."
         ));
         assert!(super::classify_cli_non_json_output(
-            AgentBackend::Gemini,
+            AgentBackend::Agy,
             "stdout",
             "To continue, sign in with your Google Account by visiting https://example.test/login"
         )
         .unwrap()
         .detail
-        .contains("gemini emitted a non-JSON stdout authentication prompt"));
+        .contains("agy emitted a non-JSON stdout authentication prompt"));
     }
 
     #[test]
-    fn cli_non_json_detection_matches_gemini_startup_blockers() {
+    fn cli_non_json_detection_matches_agy_startup_blockers() {
         let record = super::classify_cli_non_json_output(
-            AgentBackend::Gemini,
+            AgentBackend::Agy,
             "stdout",
             "YOLO mode is disabled by your administrator.",
         )
         .unwrap();
 
         assert!(record.detail.contains("startup blocker"));
-        assert!(record.detail.contains("gemini emitted a non-JSON stdout"));
+        assert!(record.detail.contains("agy emitted a non-JSON stdout"));
     }
 
     #[test]

@@ -109,7 +109,8 @@ impl NewAgentToken {
 #[serde(rename_all = "lowercase")]
 pub enum AgentBackend {
     Claude,
-    Gemini,
+    #[serde(rename = "agy", alias = "gemini", alias = "antigravity")]
+    Agy,
     Codex,
     #[serde(rename = "openai")]
     OpenAi,
@@ -125,7 +126,7 @@ impl Display for AgentBackend {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Claude => write!(f, "claude"),
-            Self::Gemini => write!(f, "gemini"),
+            Self::Agy => write!(f, "agy"),
             Self::Codex => write!(f, "codex"),
             Self::OpenAi => write!(f, "openai"),
         }
@@ -137,7 +138,7 @@ impl std::str::FromStr for AgentBackend {
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
-            "gemini" => Ok(Self::Gemini),
+            "agy" | "antigravity" | "gemini" => Ok(Self::Agy),
             "codex" => Ok(Self::Codex),
             "openai" => Ok(Self::OpenAi),
             _ => Err(LoreError::Validation(format!("unknown backend: {s}"))),
@@ -3289,6 +3290,24 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
     use time::{Duration, OffsetDateTime};
+
+    #[test]
+    fn agent_backend_maps_legacy_gemini_to_agy() {
+        assert_eq!("agy".parse::<AgentBackend>().unwrap(), AgentBackend::Agy);
+        assert_eq!(
+            "antigravity".parse::<AgentBackend>().unwrap(),
+            AgentBackend::Agy
+        );
+        assert_eq!("gemini".parse::<AgentBackend>().unwrap(), AgentBackend::Agy);
+        assert_eq!(AgentBackend::Agy.to_string(), "agy");
+
+        let parsed: AgentBackend = serde_json::from_str("\"gemini\"").unwrap();
+        assert_eq!(parsed, AgentBackend::Agy);
+        assert_eq!(
+            serde_json::to_string(&AgentBackend::Agy).unwrap(),
+            "\"agy\""
+        );
+    }
 
     #[test]
     fn hashes_passwords_and_authenticates_users() {

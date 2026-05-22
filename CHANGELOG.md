@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-05-20
+
+- Replaced Gemini CLI process-agent support with Antigravity CLI (`agy`). Lore now exposes `agy` as the CLI backend, maps legacy stored `gemini` backend values to `agy`, invokes `agy` print mode with permission bypass and a 15-minute print timeout, treats plain stdout as the assistant response, and detects Antigravity OAuth/auth prompts even when the CLI exits successfully.
+- Added headless Antigravity auth handling for machine-service agents. When the Antigravity OAuth token file exists and no SSH session variables are present, Lore sets SSH-style environment markers only for the `agy` child process so Antigravity uses file-token storage under systemd.
+
 ## 2026-05-14
 
 - Expanded the README's agent control and orchestration positioning, including browser-managed agents, backend routing, machine execution, visible failures, retries, and live status.

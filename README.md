@@ -40,7 +40,7 @@ That means an agent can run on the machine where the project lives, use the same
 
 This matters when you have more than one agent, more than one project, or more than one model backend. Lore gives you a single place to:
 
-- Route work to Claude, Codex, Gemini, or another compatible CLI backend
+- Route work to Claude, Codex, Antigravity CLI (`agy`), or another compatible CLI backend
 - Keep agent conversations tied to project context and document history
 - See backend failures, auth problems, retries, and completion state in the UI
 - Avoid losing work when the browser sleeps, reconnects, or moves between devices
@@ -57,7 +57,7 @@ Developers can use Lore to give coding agents durable project context without pa
 Useful developer-facing features include:
 
 - Project-scoped agent context and setup instructions
-- Local machine agents backed by Claude, Codex, Gemini, or compatible CLI backends
+- Local machine agents backed by Claude, Codex, Antigravity CLI (`agy`), or compatible CLI backends
 - Browser-managed agent routing, status, retries, and visible failure reporting
 - Agent tokens with scoped project access
 - Audit trails for auth, librarian activity, and project actions

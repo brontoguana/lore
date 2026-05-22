@@ -2793,7 +2793,7 @@ pub fn render_agents_page(
                             <div class="create-agent-backend-row">
                               <select id="create-backend-{name_attr}">
                                 <option value="claude">Claude</option>
-                                <option value="gemini">Gemini</option>
+                                <option value="agy">Antigravity</option>
                                 <option value="codex">Codex</option>
                               </select>
                               <button type="button" class="btn-sm create-folder-toggle" onclick="toggleMkdir('{name_attr}')" title="Create folder" aria-label="Create folder">
@@ -2913,20 +2913,17 @@ pub fn render_agents_page(
             };
 
             let backend_options = {
-                let cli_backends = ["claude", "gemini", "codex"];
+                let cli_backends = [
+                    ("claude", "Claude"),
+                    ("agy", "Antigravity"),
+                    ("codex", "Codex"),
+                ];
                 let mut cli_opts = String::new();
-                for b in &cli_backends {
+                for (b, label) in &cli_backends {
                     let sel = if agent.endpoint_id.is_none() && agent.backend.to_string() == *b {
                         " selected"
                     } else {
                         ""
-                    };
-                    let label = {
-                        let mut c = b.chars();
-                        match c.next() {
-                            Some(first) => first.to_uppercase().to_string() + c.as_str(),
-                            None => String::new(),
-                        }
                     };
                     cli_opts.push_str(&format!(r#"<option value="cli:{b}"{sel}>{label}</option>"#));
                 }
@@ -3936,7 +3933,7 @@ pub fn render_agent_guide_page(
           </button>
         </div>
         <p class="hint" style="margin-top:var(--s-3);">The agent is automatically provisioned on the server and starts polling for messages. Use the Chat tab to talk to it.</p>
-        <p class="hint" style="margin-top:var(--s-2);">Options: <code>--backend gemini</code> or <code>--backend codex</code> to use a different backend (default is Claude).</p>
+        <p class="hint" style="margin-top:var(--s-2);">Options: <code>--backend agy</code> or <code>--backend codex</code> to use a different backend (default is Claude).</p>
       </div>
     </section>
 
@@ -6356,16 +6353,23 @@ var CHAT_MESSAGE_SWIPE_TOGGLE_THRESHOLD = 30;
 
 var backendModels = {{
   claude: ['default', 'opus', 'sonnet', 'haiku'],
-  gemini: ['default', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-3-pro-preview'],
+  agy: ['default'],
   codex: ['default', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2'],
   openai: ['default']
 }};
 
 var backendEfforts = {{
   claude: ['default', 'low', 'medium', 'high', 'max'],
-  gemini: [],
+  agy: [],
   codex: ['default', 'minimal', 'low', 'medium', 'high', 'xhigh'],
   openai: []
+}};
+
+var backendLabels = {{
+  claude: 'Claude',
+  agy: 'Antigravity',
+  codex: 'Codex',
+  openai: 'OpenAI'
 }};
 
 function closeAllPanels() {{
@@ -6537,7 +6541,7 @@ function loadManageConfig() {{
       var bSel = document.getElementById('mgr-backend');
       if (bSel) {{
         bSel.innerHTML = '';
-        var cliBackends = ['claude', 'gemini', 'codex'];
+        var cliBackends = ['claude', 'agy', 'codex'];
         var hasEndpoints = data.endpoints && data.endpoints.length > 0;
         var selectedBackend = data.backend || '';
         var selectedEndpoint = data.endpoint_id || '';
@@ -6546,7 +6550,7 @@ function loadManageConfig() {{
         for (var i = 0; i < cliBackends.length; i++) {{
           var opt = document.createElement('option');
           opt.value = 'cli:' + cliBackends[i];
-          opt.textContent = cliBackends[i].charAt(0).toUpperCase() + cliBackends[i].slice(1);
+          opt.textContent = backendLabels[cliBackends[i]] || (cliBackends[i].charAt(0).toUpperCase() + cliBackends[i].slice(1));
           if (!selectedEndpoint && selectedBackend === cliBackends[i]) opt.selected = true;
           cliGroup.appendChild(opt);
         }}
@@ -6660,7 +6664,7 @@ function toggleManageMode() {{
 function populateConfigDropdowns(backend, prefs) {{
   var bSel = document.getElementById('cfg-backend');
   bSel.innerHTML = '';
-  var cliBackends = ['claude', 'gemini', 'codex'];
+  var cliBackends = ['claude', 'agy', 'codex'];
   var hasEndpoints = chatConfigData && chatConfigData.endpoints && chatConfigData.endpoints.length > 0;
   var selectedEndpoint = chatConfigData && chatConfigData.endpoint_id;
 
@@ -6669,7 +6673,7 @@ function populateConfigDropdowns(backend, prefs) {{
   for (var i = 0; i < cliBackends.length; i++) {{
     var opt = document.createElement('option');
     opt.value = 'cli:' + cliBackends[i];
-    opt.textContent = cliBackends[i].charAt(0).toUpperCase() + cliBackends[i].slice(1);
+    opt.textContent = backendLabels[cliBackends[i]] || (cliBackends[i].charAt(0).toUpperCase() + cliBackends[i].slice(1));
     if (!selectedEndpoint && cliBackends[i] === backend) opt.selected = true;
     cliGroup.appendChild(opt);
   }}
