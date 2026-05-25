@@ -1,7 +1,17 @@
 # Changelog
 
+## 2026-05-25
+
+- Added enforced Admin Network IP allowlisting for browser logins, defaulting new entries to the current Caddy-forwarded client IP, requiring a non-loopback entry before enabling, and making `lore-server bypass` temporarily skip both IP and passkey restrictions for one correct-password login.
+- Added Admin Network trusted-login controls with passkey registration/login, pending approval for correct-password password logins, and SSH-granted temporary login bypass.
+- Added a document-view Markdown download action that exports the full document page as a `.md` attachment.
+- Fixed chat Markdown ordered lists so assistant responses that use repeated `1.` markers with body text between items render as one correctly numbered list instead of restarting each item at 1.
+
 ## 2026-05-22
 
+- Expanded Lore's theme catalog from 3 to 30 themes, with paired light/dark palettes and generated Settings swatches for each theme.
+- Right-aligned the collapsed Create external agent action at the bottom of the Machines section while keeping the expanded creation form below it.
+- Fixed the Agents setup guide install command so pinned Linux/macOS installs pass the version to `sh` correctly, and changed the machine setup step into an explicit choice between managed agent machines and external-agent CLI access.
 - Moved external-agent token creation behind a collapsed button at the bottom of the Machines section. The agent name, project permissions, and final create action now appear only after choosing to create an external agent, and selected external agents now show real token setup only immediately after create/regenerate instead of placeholder token text.
 - Split the Lore CLI top-level help into explicit User Commands (`setup-machine`, `setup-external`) and Agent Commands sections so setup commands are clearly separated from external-agent and daemon operations.
 

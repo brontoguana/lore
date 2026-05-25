@@ -57,6 +57,25 @@ enum ServerCommand {
     Clean,
     /// Create the initial admin account (required before first run)
     CreateAdmin,
+    /// Temporarily bypass browser login IP and passkey restrictions for one user
+    Bypass {
+        /// Lore username to allow; prompted if omitted
+        #[arg(long)]
+        user: Option<String>,
+        /// Bypass lifetime in minutes; prompted if omitted
+        #[arg(long)]
+        minutes: Option<u64>,
+    },
+    /// Allow one correct-password browser login for a user for a short TTL
+    #[command(hide = true)]
+    AllowLoginBypass {
+        /// Lore username to allow
+        #[arg(long)]
+        user: String,
+        /// Bypass lifetime, e.g. 15m, 1h, 300s
+        #[arg(long, default_value = "15m")]
+        ttl: String,
+    },
 }
 
 #[tokio::main]
@@ -94,6 +113,14 @@ async fn main() {
         ServerCommand::CreateAdmin => {
             ensure_data_dir(&data_root);
             create_admin_interactive(&data_root);
+        }
+        ServerCommand::Bypass { user, minutes } => {
+            ensure_data_dir(&data_root);
+            allow_login_bypass_interactive(&data_root, user, minutes);
+        }
+        ServerCommand::AllowLoginBypass { user, ttl } => {
+            ensure_data_dir(&data_root);
+            allow_login_bypass(&data_root, &user, &ttl);
         }
     }
 }
@@ -340,6 +367,112 @@ fn create_admin_interactive(data_root: &str) {
             std::process::exit(1);
         }
     }
+}
+
+fn allow_login_bypass(data_root: &str, username: &str, ttl: &str) {
+    let auth = LocalAuthStore::new(PathBuf::from(data_root));
+    let ttl = match parse_ttl(ttl) {
+        Ok(ttl) => ttl,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    };
+    let username = match UserName::new(username.to_string()) {
+        Ok(username) => username,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    };
+    match auth.grant_login_bypass(&username, ttl) {
+        Ok(expires_at) => {
+            eprintln!(
+                "allowed one correct-password browser login for '{}' until {}; IP and passkey restrictions will be bypassed for that login",
+                username.as_str(),
+                expires_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string())
+            );
+        }
+        Err(err) => {
+            eprintln!("error granting login bypass: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn allow_login_bypass_interactive(data_root: &str, user: Option<String>, minutes: Option<u64>) {
+    let username = match user {
+        Some(user) if !user.trim().is_empty() => user.trim().to_string(),
+        _ => prompt_required("What user: "),
+    };
+    let minutes = match minutes {
+        Some(minutes) if minutes > 0 => minutes,
+        _ => loop {
+            let value = prompt_required("How many minutes: ");
+            match value.trim().parse::<u64>() {
+                Ok(minutes) if minutes > 0 => break minutes,
+                _ => eprintln!("minutes must be a positive number"),
+            }
+        },
+    };
+    allow_login_bypass(data_root, &username, &format!("{minutes}m"));
+}
+
+fn prompt_required(prompt: &str) -> String {
+    if !atty::is(atty::Stream::Stdin) {
+        eprintln!("error: this command requires an interactive terminal or explicit arguments");
+        std::process::exit(1);
+    }
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    loop {
+        eprint!("{prompt}");
+        io::stderr().flush().ok();
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            eprintln!("aborted");
+            std::process::exit(1);
+        }
+        let trimmed = line.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+        eprintln!("value cannot be empty");
+    }
+}
+
+fn parse_ttl(value: &str) -> lore_core::Result<std::time::Duration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(lore_core::LoreError::Validation(
+            "ttl cannot be empty".into(),
+        ));
+    }
+    let (number, multiplier) = match trimmed.chars().last().unwrap() {
+        's' | 'S' => (&trimmed[..trimmed.len() - 1], 1),
+        'm' | 'M' => (&trimmed[..trimmed.len() - 1], 60),
+        'h' | 'H' => (&trimmed[..trimmed.len() - 1], 60 * 60),
+        ch if ch.is_ascii_digit() => (trimmed, 1),
+        _ => {
+            return Err(lore_core::LoreError::Validation(
+                "ttl must end with s, m, h, or be seconds".into(),
+            ));
+        }
+    };
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| lore_core::LoreError::Validation("ttl amount must be a number".into()))?;
+    if amount == 0 {
+        return Err(lore_core::LoreError::Validation(
+            "ttl must be positive".into(),
+        ));
+    }
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| lore_core::LoreError::Validation("ttl is too large".into()))?;
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 #[cfg(unix)]

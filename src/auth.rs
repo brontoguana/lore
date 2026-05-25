@@ -10,11 +10,13 @@ use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
+use webauthn_rs::prelude::Passkey;
 
 const MAX_USERNAME_LEN: usize = 32;
 const MAX_ROLE_NAME_LEN: usize = 32;
@@ -351,6 +353,55 @@ pub struct AuthenticatedUser {
     pub color_mode: Option<ColorMode>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredUserPasskey {
+    pub id: String,
+    pub username: UserName,
+    pub label: String,
+    pub credential: Passkey,
+    pub created_at: OffsetDateTime,
+    pub approved_at: OffsetDateTime,
+    pub last_used_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingLoginApproval {
+    pub id: String,
+    pub username: UserName,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+    pub approved_at: Option<OffsetDateTime>,
+    pub denied_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AllowedLoginIp {
+    pub id: String,
+    pub label: String,
+    pub cidr: String,
+    pub created_at: OffsetDateTime,
+    pub last_used_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoginSecuritySettings {
+    pub passkey_enforcement_enabled: bool,
+    pub ip_restrictions_enabled: bool,
+    pub updated_at: OffsetDateTime,
+}
+
+impl Default for LoginSecuritySettings {
+    fn default() -> Self {
+        Self {
+            passkey_enforcement_enabled: false,
+            ip_restrictions_enabled: false,
+            updated_at: OffsetDateTime::now_utc(),
+        }
+    }
+}
+
 impl AuthenticatedUser {
     pub fn can_read(&self, project: &ProjectName) -> bool {
         self.is_admin
@@ -425,6 +476,46 @@ CREATE TABLE IF NOT EXISTS machines (
     pending_update INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (name, username)
 );
+CREATE TABLE IF NOT EXISTS login_security_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    passkey_enforcement_enabled INTEGER NOT NULL DEFAULT 0,
+    ip_restrictions_enabled INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS allowed_login_ips (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    cidr TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
+);
+CREATE TABLE IF NOT EXISTS user_passkeys (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    label TEXT NOT NULL,
+    credential_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_user_passkeys_username ON user_passkeys(username);
+CREATE TABLE IF NOT EXISTS pending_login_approvals (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    approval_token_hash TEXT NOT NULL UNIQUE,
+    ip_address TEXT,
+    user_agent TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    approved_at TEXT,
+    denied_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_login_approvals_username ON pending_login_approvals(username);
+CREATE TABLE IF NOT EXISTS login_bypasses (
+    username TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
 ";
 
 fn fmt_dt(dt: &OffsetDateTime) -> String {
@@ -435,6 +526,90 @@ fn fmt_dt(dt: &OffsetDateTime) -> String {
 fn parse_dt(s: &str) -> OffsetDateTime {
     OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn normalize_login_ip_rule(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(LoreError::Validation(
+            "IP allowlist entry cannot be empty".into(),
+        ));
+    }
+    if let Some((ip, prefix)) = trimmed.split_once('/') {
+        let ip: IpAddr = ip.trim().parse().map_err(|_| {
+            LoreError::Validation("IP allowlist entry must be an IP or CIDR".into())
+        })?;
+        let prefix: u8 = prefix
+            .trim()
+            .parse()
+            .map_err(|_| LoreError::Validation("CIDR prefix must be a number".into()))?;
+        let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max_prefix {
+            return Err(LoreError::Validation(format!(
+                "CIDR prefix must be between 0 and {max_prefix}"
+            )));
+        }
+        Ok(format!("{ip}/{prefix}"))
+    } else {
+        let ip: IpAddr = trimmed.parse().map_err(|_| {
+            LoreError::Validation("IP allowlist entry must be an IP or CIDR".into())
+        })?;
+        Ok(ip.to_string())
+    }
+}
+
+fn login_ip_rule_contains(rule: &str, ip: IpAddr) -> Result<bool> {
+    if let Some((network, prefix)) = rule.split_once('/') {
+        let network: IpAddr = network
+            .parse()
+            .map_err(|_| LoreError::Validation("stored IP allowlist entry is invalid".into()))?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| LoreError::Validation("stored CIDR prefix is invalid".into()))?;
+        match (network, ip) {
+            (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                let mask = cidr_mask_u32(prefix)?;
+                Ok((u32::from(network) & mask) == (u32::from(ip) & mask))
+            }
+            (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                let mask = cidr_mask_u128(prefix)?;
+                Ok((u128::from(network) & mask) == (u128::from(ip) & mask))
+            }
+            _ => Ok(false),
+        }
+    } else {
+        let stored: IpAddr = rule
+            .parse()
+            .map_err(|_| LoreError::Validation("stored IP allowlist entry is invalid".into()))?;
+        Ok(stored == ip)
+    }
+}
+
+fn login_ip_rule_is_loopback_only(rule: &str) -> bool {
+    let sample = rule.split_once('/').map(|(ip, _)| ip).unwrap_or(rule);
+    sample.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn cidr_mask_u32(prefix: u8) -> Result<u32> {
+    if prefix > 32 {
+        return Err(LoreError::Validation("invalid IPv4 CIDR prefix".into()));
+    }
+    Ok(if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    })
+}
+
+fn cidr_mask_u128(prefix: u8) -> Result<u128> {
+    if prefix > 128 {
+        return Err(LoreError::Validation("invalid IPv6 CIDR prefix".into()));
+    }
+    Ok(if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    })
 }
 
 /// Parse a line into (base, repeat_count). A trailing " (xN)" is treated as a
@@ -538,6 +713,12 @@ fn run_migrations(conn: &Connection) {
             sql: "ALTER TABLE messages ADD COLUMN excluded_from_context INTEGER NOT NULL DEFAULT 0",
             table: "messages",
             column: "excluded_from_context",
+        },
+        Migration {
+            version: 9,
+            sql: "ALTER TABLE login_security_settings ADD COLUMN ip_restrictions_enabled INTEGER NOT NULL DEFAULT 0",
+            table: "login_security_settings",
+            column: "ip_restrictions_enabled",
         },
     ];
 
@@ -1513,7 +1694,412 @@ impl LocalAuthStore {
         Self::user_from_stored_conn(&conn, &stored)
     }
 
-    fn create_session_for_authenticated_user(&self, user: AuthenticatedUser) -> Result<NewSession> {
+    pub fn login_security_settings(&self) -> Result<LoginSecuritySettings> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let row = conn
+            .query_row(
+                "SELECT passkey_enforcement_enabled, ip_restrictions_enabled, updated_at FROM login_security_settings WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(row
+            .map(
+                |(passkey_enabled, ip_enabled, updated_at)| LoginSecuritySettings {
+                    passkey_enforcement_enabled: passkey_enabled != 0,
+                    ip_restrictions_enabled: ip_enabled != 0,
+                    updated_at: parse_dt(&updated_at),
+                },
+            )
+            .unwrap_or_default())
+    }
+
+    pub fn set_login_security_settings(
+        &self,
+        passkey_enabled: bool,
+        ip_enabled: bool,
+    ) -> Result<LoginSecuritySettings> {
+        let now = OffsetDateTime::now_utc();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO login_security_settings (id, passkey_enforcement_enabled, ip_restrictions_enabled, updated_at)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET passkey_enforcement_enabled = ?1, ip_restrictions_enabled = ?2, updated_at = ?3",
+            params![passkey_enabled as i32, ip_enabled as i32, fmt_dt(&now)],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(LoginSecuritySettings {
+            passkey_enforcement_enabled: passkey_enabled,
+            ip_restrictions_enabled: ip_enabled,
+            updated_at: now,
+        })
+    }
+
+    pub fn set_passkey_enforcement_enabled(&self, enabled: bool) -> Result<LoginSecuritySettings> {
+        let current = self.login_security_settings()?;
+        self.set_login_security_settings(enabled, current.ip_restrictions_enabled)
+    }
+
+    pub fn set_ip_restrictions_enabled(&self, enabled: bool) -> Result<LoginSecuritySettings> {
+        let current = self.login_security_settings()?;
+        self.set_login_security_settings(current.passkey_enforcement_enabled, enabled)
+    }
+
+    pub fn add_user_passkey(
+        &self,
+        username: &UserName,
+        label: &str,
+        credential: &Passkey,
+    ) -> Result<StoredUserPasskey> {
+        let label = label.trim();
+        if label.is_empty() || label.len() > 80 {
+            return Err(LoreError::Validation(
+                "passkey label must be 1-80 characters".into(),
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        let id = Uuid::new_v4().to_string();
+        let credential_json = serde_json::to_string(credential)
+            .map_err(|e| LoreError::Validation(format!("passkey serialisation failed: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::get_stored_user_from_conn(&conn, username)?;
+        conn.execute(
+            "INSERT INTO user_passkeys (id, username, label, credential_json, created_at, approved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, username.as_str(), label, credential_json, fmt_dt(&now), fmt_dt(&now)],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(StoredUserPasskey {
+            id,
+            username: username.clone(),
+            label: label.to_string(),
+            credential: credential.clone(),
+            created_at: now,
+            approved_at: now,
+            last_used_at: None,
+        })
+    }
+
+    pub fn list_user_passkeys(&self, username: &UserName) -> Result<Vec<StoredUserPasskey>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::list_user_passkeys_from_conn(&conn, username)
+    }
+
+    pub fn list_all_user_passkeys(&self) -> Result<Vec<StoredUserPasskey>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, username, label, credential_json, created_at, approved_at, last_used_at
+                 FROM user_passkeys ORDER BY username, created_at DESC",
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let rows = stmt
+            .query_map([], Self::passkey_from_row)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))
+    }
+
+    pub fn update_passkey_after_authentication(
+        &self,
+        passkey_id: &str,
+        credential: &Passkey,
+    ) -> Result<()> {
+        let credential_json = serde_json::to_string(credential)
+            .map_err(|e| LoreError::Validation(format!("passkey serialisation failed: {e}")))?;
+        let now = OffsetDateTime::now_utc();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute(
+            "UPDATE user_passkeys SET credential_json = ?1, last_used_at = ?2 WHERE id = ?3",
+            params![credential_json, fmt_dt(&now), passkey_id],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(())
+    }
+
+    pub fn delete_user_passkey(&self, id: &str) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute("DELETE FROM user_passkeys WHERE id = ?1", params![id])
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))
+    }
+
+    pub fn add_allowed_login_ip(&self, label: &str, cidr: &str) -> Result<AllowedLoginIp> {
+        let cidr = normalize_login_ip_rule(cidr)?;
+        let label = label.trim();
+        let label = if label.is_empty() { &cidr } else { label };
+        if label.len() > 80 {
+            return Err(LoreError::Validation(
+                "IP allowlist label must be 80 characters or fewer".into(),
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        let id = Uuid::new_v4().to_string();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO allowed_login_ips (id, label, cidr, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(cidr) DO UPDATE SET label = ?2",
+            params![id, label, cidr, fmt_dt(&now)],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(AllowedLoginIp {
+            id,
+            label: label.to_string(),
+            cidr,
+            created_at: now,
+            last_used_at: None,
+        })
+    }
+
+    pub fn list_allowed_login_ips(&self) -> Result<Vec<AllowedLoginIp>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, label, cidr, created_at, last_used_at
+                 FROM allowed_login_ips ORDER BY created_at DESC",
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let rows = stmt
+            .query_map([], Self::allowed_login_ip_from_row)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))
+    }
+
+    pub fn delete_allowed_login_ip(&self, id: &str) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute("DELETE FROM allowed_login_ips WHERE id = ?1", params![id])
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))
+    }
+
+    pub fn has_non_loopback_allowed_login_ip(&self) -> Result<bool> {
+        Ok(self
+            .list_allowed_login_ips()?
+            .iter()
+            .any(|entry| !login_ip_rule_is_loopback_only(&entry.cidr)))
+    }
+
+    pub fn login_ip_allowed(&self, ip: &str) -> Result<bool> {
+        let ip: IpAddr = ip
+            .trim()
+            .parse()
+            .map_err(|_| LoreError::Validation("invalid client IP address".into()))?;
+        if ip.is_loopback() {
+            return Ok(true);
+        }
+        let entries = self.list_allowed_login_ips()?;
+        for entry in entries {
+            if login_ip_rule_contains(&entry.cidr, ip)? {
+                let now = fmt_dt(&OffsetDateTime::now_utc());
+                let conn = self
+                    .conn
+                    .lock()
+                    .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+                conn.execute(
+                    "UPDATE allowed_login_ips SET last_used_at = ?1 WHERE id = ?2",
+                    params![now, entry.id],
+                )
+                .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn create_pending_login_approval(
+        &self,
+        username: &UserName,
+        approval_token: &str,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+        ttl: Duration,
+    ) -> Result<PendingLoginApproval> {
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now
+            + time::Duration::try_from(ttl)
+                .map_err(|_| LoreError::Validation("invalid approval ttl".into()))?;
+        let id = Uuid::new_v4().to_string();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO pending_login_approvals
+             (id, username, approval_token_hash, ip_address, user_agent, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                username.as_str(),
+                hash_login_approval_token(approval_token),
+                ip_address,
+                user_agent,
+                fmt_dt(&now),
+                fmt_dt(&expires_at)
+            ],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(PendingLoginApproval {
+            id,
+            username: username.clone(),
+            ip_address: ip_address.map(str::to_string),
+            user_agent: user_agent.map(str::to_string),
+            created_at: now,
+            expires_at,
+            approved_at: None,
+            denied_at: None,
+        })
+    }
+
+    pub fn list_pending_login_approvals(&self) -> Result<Vec<PendingLoginApproval>> {
+        self.cleanup_expired_login_approvals().ok();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, username, ip_address, user_agent, created_at, expires_at, approved_at, denied_at
+                 FROM pending_login_approvals
+                 WHERE approved_at IS NULL AND denied_at IS NULL AND expires_at > ?1
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let now = fmt_dt(&OffsetDateTime::now_utc());
+        let rows = stmt
+            .query_map(params![now], Self::pending_login_from_row)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))
+    }
+
+    pub fn approve_pending_login(&self, id: &str) -> Result<usize> {
+        let now = fmt_dt(&OffsetDateTime::now_utc());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute(
+            "UPDATE pending_login_approvals
+             SET approved_at = ?1
+             WHERE id = ?2 AND approved_at IS NULL AND denied_at IS NULL AND expires_at > ?1",
+            params![now, id],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))
+    }
+
+    pub fn deny_pending_login(&self, id: &str) -> Result<usize> {
+        let now = fmt_dt(&OffsetDateTime::now_utc());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute(
+            "UPDATE pending_login_approvals
+             SET denied_at = ?1
+             WHERE id = ?2 AND approved_at IS NULL AND denied_at IS NULL",
+            params![now, id],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))
+    }
+
+    pub fn consume_approved_login_approval(
+        &self,
+        username: &UserName,
+        approval_token: &str,
+    ) -> Result<bool> {
+        let token_hash = hash_login_approval_token(approval_token);
+        let now = fmt_dt(&OffsetDateTime::now_utc());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let removed = conn
+            .execute(
+                "DELETE FROM pending_login_approvals
+                 WHERE username = ?1 AND approval_token_hash = ?2 AND approved_at IS NOT NULL
+                 AND denied_at IS NULL AND expires_at > ?3",
+                params![username.as_str(), token_hash, now],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(removed > 0)
+    }
+
+    pub fn grant_login_bypass(&self, username: &UserName, ttl: Duration) -> Result<OffsetDateTime> {
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now
+            + time::Duration::try_from(ttl)
+                .map_err(|_| LoreError::Validation("invalid bypass ttl".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::get_stored_user_from_conn(&conn, username)?;
+        conn.execute(
+            "INSERT INTO login_bypasses (username, created_at, expires_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(username) DO UPDATE SET created_at = ?2, expires_at = ?3",
+            params![username.as_str(), fmt_dt(&now), fmt_dt(&expires_at)],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(expires_at)
+    }
+
+    pub fn consume_login_bypass(&self, username: &UserName) -> Result<bool> {
+        let now = fmt_dt(&OffsetDateTime::now_utc());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        let removed = conn
+            .execute(
+                "DELETE FROM login_bypasses WHERE username = ?1 AND expires_at > ?2",
+                params![username.as_str(), now],
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(removed > 0)
+    }
+
+    pub fn create_session_for_authenticated_user(
+        &self,
+        user: AuthenticatedUser,
+    ) -> Result<NewSession> {
         let token = Uuid::new_v4().to_string();
         let csrf_token = Uuid::new_v4().to_string();
         let now = OffsetDateTime::now_utc();
@@ -1540,6 +2126,87 @@ impl LocalAuthStore {
             csrf_token,
             user,
         })
+    }
+
+    fn passkey_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUserPasskey> {
+        let credential_json: String = row.get(3)?;
+        let credential: Passkey = serde_json::from_str(&credential_json).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
+        })?;
+        Ok(StoredUserPasskey {
+            id: row.get(0)?,
+            username: UserName::new(row.get::<_, String>(1)?).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?,
+            label: row.get(2)?,
+            credential,
+            created_at: parse_dt(&row.get::<_, String>(4)?),
+            approved_at: parse_dt(&row.get::<_, String>(5)?),
+            last_used_at: row.get::<_, Option<String>>(6)?.map(|s| parse_dt(&s)),
+        })
+    }
+
+    fn allowed_login_ip_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AllowedLoginIp> {
+        Ok(AllowedLoginIp {
+            id: row.get(0)?,
+            label: row.get(1)?,
+            cidr: row.get(2)?,
+            created_at: parse_dt(&row.get::<_, String>(3)?),
+            last_used_at: row.get::<_, Option<String>>(4)?.map(|s| parse_dt(&s)),
+        })
+    }
+
+    fn pending_login_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingLoginApproval> {
+        Ok(PendingLoginApproval {
+            id: row.get(0)?,
+            username: UserName::new(row.get::<_, String>(1)?).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?,
+            ip_address: row.get(2)?,
+            user_agent: row.get(3)?,
+            created_at: parse_dt(&row.get::<_, String>(4)?),
+            expires_at: parse_dt(&row.get::<_, String>(5)?),
+            approved_at: row.get::<_, Option<String>>(6)?.map(|s| parse_dt(&s)),
+            denied_at: row.get::<_, Option<String>>(7)?.map(|s| parse_dt(&s)),
+        })
+    }
+
+    fn list_user_passkeys_from_conn(
+        conn: &Connection,
+        username: &UserName,
+    ) -> Result<Vec<StoredUserPasskey>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, username, label, credential_json, created_at, approved_at, last_used_at
+                 FROM user_passkeys WHERE username = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let rows = stmt
+            .query_map(params![username.as_str()], Self::passkey_from_row)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))
+    }
+
+    fn cleanup_expired_login_approvals(&self) -> Result<usize> {
+        let now = fmt_dt(&OffsetDateTime::now_utc());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        conn.execute(
+            "DELETE FROM pending_login_approvals WHERE expires_at <= ?1",
+            params![now],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))
     }
 
     pub fn revoke_sessions_for_user(&self, username: &UserName) -> Result<usize> {
@@ -1967,6 +2634,13 @@ fn verify_password_hash(password_hash: &str, password: &str) -> Result<()> {
 fn hash_session_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"session:");
+    hasher.update(token.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_login_approval_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"login-approval:");
     hasher.update(token.as_bytes());
     format!("{:x}", hasher.finalize())
 }

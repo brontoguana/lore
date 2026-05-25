@@ -38,18 +38,50 @@ pub enum UiTheme {
     Parchment,
     Graphite,
     Signal,
+    Harbor,
+    Forest,
+    Plum,
+    Copper,
+    Slate,
+    Coral,
+    Indigo,
+    Moss,
+    Rosewood,
+    Glacier,
+    Ember,
+    Denim,
+    Olive,
+    Aubergine,
+    Cobalt,
+    Sepia,
+    Mint,
+    Crimson,
+    Midnight,
+    Sage,
+    Sunlit,
+    Lagoon,
+    Orchid,
+    Storm,
+    Fern,
+    Ruby,
+    Sky,
 }
 
 impl UiTheme {
     pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "parchment" => Ok(Self::Parchment),
-            "graphite" => Ok(Self::Graphite),
-            "signal" => Ok(Self::Signal),
-            _ => Err(LoreError::Validation(
-                "theme must be parchment, graphite, or signal".into(),
-            )),
-        }
+        Self::all()
+            .into_iter()
+            .find(|theme| theme.as_str() == value)
+            .ok_or_else(|| {
+                LoreError::Validation(format!(
+                    "theme must be one of: {}",
+                    Self::all()
+                        .into_iter()
+                        .map(Self::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
     }
 
     pub fn as_str(self) -> &'static str {
@@ -57,6 +89,33 @@ impl UiTheme {
             Self::Parchment => "parchment",
             Self::Graphite => "graphite",
             Self::Signal => "signal",
+            Self::Harbor => "harbor",
+            Self::Forest => "forest",
+            Self::Plum => "plum",
+            Self::Copper => "copper",
+            Self::Slate => "slate",
+            Self::Coral => "coral",
+            Self::Indigo => "indigo",
+            Self::Moss => "moss",
+            Self::Rosewood => "rosewood",
+            Self::Glacier => "glacier",
+            Self::Ember => "ember",
+            Self::Denim => "denim",
+            Self::Olive => "olive",
+            Self::Aubergine => "aubergine",
+            Self::Cobalt => "cobalt",
+            Self::Sepia => "sepia",
+            Self::Mint => "mint",
+            Self::Crimson => "crimson",
+            Self::Midnight => "midnight",
+            Self::Sage => "sage",
+            Self::Sunlit => "sunlit",
+            Self::Lagoon => "lagoon",
+            Self::Orchid => "orchid",
+            Self::Storm => "storm",
+            Self::Fern => "fern",
+            Self::Ruby => "ruby",
+            Self::Sky => "sky",
         }
     }
 
@@ -65,11 +124,69 @@ impl UiTheme {
             Self::Parchment => "Parchment",
             Self::Graphite => "Graphite",
             Self::Signal => "Signal",
+            Self::Harbor => "Harbor",
+            Self::Forest => "Forest",
+            Self::Plum => "Plum",
+            Self::Copper => "Copper",
+            Self::Slate => "Slate",
+            Self::Coral => "Coral",
+            Self::Indigo => "Indigo",
+            Self::Moss => "Moss",
+            Self::Rosewood => "Rosewood",
+            Self::Glacier => "Glacier",
+            Self::Ember => "Ember",
+            Self::Denim => "Denim",
+            Self::Olive => "Olive",
+            Self::Aubergine => "Aubergine",
+            Self::Cobalt => "Cobalt",
+            Self::Sepia => "Sepia",
+            Self::Mint => "Mint",
+            Self::Crimson => "Crimson",
+            Self::Midnight => "Midnight",
+            Self::Sage => "Sage",
+            Self::Sunlit => "Sunlit",
+            Self::Lagoon => "Lagoon",
+            Self::Orchid => "Orchid",
+            Self::Storm => "Storm",
+            Self::Fern => "Fern",
+            Self::Ruby => "Ruby",
+            Self::Sky => "Sky",
         }
     }
 
-    pub fn all() -> [Self; 3] {
-        [Self::Parchment, Self::Graphite, Self::Signal]
+    pub fn all() -> [Self; 30] {
+        [
+            Self::Parchment,
+            Self::Graphite,
+            Self::Signal,
+            Self::Harbor,
+            Self::Forest,
+            Self::Plum,
+            Self::Copper,
+            Self::Slate,
+            Self::Coral,
+            Self::Indigo,
+            Self::Moss,
+            Self::Rosewood,
+            Self::Glacier,
+            Self::Ember,
+            Self::Denim,
+            Self::Olive,
+            Self::Aubergine,
+            Self::Cobalt,
+            Self::Sepia,
+            Self::Mint,
+            Self::Crimson,
+            Self::Midnight,
+            Self::Sage,
+            Self::Sunlit,
+            Self::Lagoon,
+            Self::Orchid,
+            Self::Storm,
+            Self::Fern,
+            Self::Ruby,
+            Self::Sky,
+        ]
     }
 }
 
@@ -796,6 +913,20 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded.base_url(), "https://lore.example.com");
         assert_eq!(loaded.default_theme, UiTheme::Graphite);
+    }
+
+    #[test]
+    fn ui_theme_catalog_has_broad_parseable_theme_set() {
+        let themes = UiTheme::all();
+        assert_eq!(themes.len(), 30);
+        assert_eq!(UiTheme::parse("lagoon").unwrap(), UiTheme::Lagoon);
+        assert_eq!(UiTheme::parse("ruby").unwrap(), UiTheme::Ruby);
+        assert_eq!(UiTheme::Sky.as_str(), "sky");
+        assert_eq!(UiTheme::Aubergine.display_name(), "Aubergine");
+
+        for theme in themes {
+            assert_eq!(UiTheme::parse(theme.as_str()).unwrap(), theme);
+        }
     }
 
     #[test]

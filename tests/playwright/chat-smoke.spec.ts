@@ -70,4 +70,30 @@ test.describe('Chat smoke', () => {
       await loop.stop();
     }
   });
+
+  test('chat markdown keeps ordered list numbering across item body text', async ({ page, baseURL }) => {
+    const health = attachPageHealthChecks(page);
+    await login(page);
+    mock.clear();
+    mock.queue({
+      text: '1. First item\nDetail for first item.\n1. Second item\nDetail for second item.\n1. Third item',
+    });
+
+    const { agentName, loop } = await setupAgent(baseURL!);
+    try {
+      await openAgentChat(page, agentName);
+      await sendChatMessage(page, 'numbered list please');
+      await waitForAssistantReply(page);
+
+      const assistant = page.locator('#chat-messages .chat-msg-assistant').last();
+      await expect(assistant.locator('ol')).toHaveCount(1);
+      await expect(assistant.locator('ol > li')).toHaveCount(3);
+      await expect(assistant.locator('ol > li').nth(0)).toContainText('Detail for first item.');
+      await expect(assistant.locator('ol > li').nth(1)).toContainText('Second item');
+
+      expect(health.errors()).toEqual([]);
+    } finally {
+      await loop.stop();
+    }
+  });
 });

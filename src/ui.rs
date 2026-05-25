@@ -1,5 +1,8 @@
 use crate::audit::{AuditActor, AuditActorKind};
-use crate::auth::{ProjectGrant, ProjectPermission, StoredMachine, StoredRole};
+use crate::auth::{
+    AllowedLoginIp, LoginSecuritySettings, PendingLoginApproval, ProjectGrant, ProjectPermission,
+    StoredMachine, StoredRole, StoredUserPasskey,
+};
 use crate::config::{
     ColorMode, ExternalAuthConfig, ExternalScheme, OidcConfig, ServerConfig, UiTheme,
 };
@@ -727,6 +730,7 @@ pub fn render_login_page(
     has_users: bool,
     external_auth_enabled: bool,
     oidc_enabled: bool,
+    passkey_enabled: bool,
     flash: Option<&str>,
 ) -> String {
     let title = if has_users { "Sign in to Lore" } else { "Lore" };
@@ -757,6 +761,13 @@ pub fn render_login_page(
     } else {
         String::new()
     };
+    let passkey_html = if has_users && passkey_enabled {
+        r#"<button type="button" id="passkey-login-btn" style="margin-top:var(--s-2)">Sign in with passkey</button>
+      <p class="hint">Use a previously registered Lore passkey. Password-only logins require admin approval while this policy is enabled.</p>"#
+            .to_string()
+    } else {
+        String::new()
+    };
 
     let form_html = if has_users {
         format!(
@@ -769,12 +780,14 @@ pub fn render_login_page(
           Password
           <input type="password" name="password" autocomplete="current-password" required>
         </label>
-        <button type="submit">{button}</button>
-      </form>
-      {oidc_html}
-      {external_auth_html}"#,
+	        <button type="submit">{button}</button>
+        {passkey_html}
+	      </form>
+	      {oidc_html}
+	      {external_auth_html}"#,
             action = action,
             button = escape_text(button),
+            passkey_html = passkey_html,
             oidc_html = oidc_html,
             external_auth_html = external_auth_html,
         )
@@ -798,6 +811,78 @@ pub fn render_login_page(
         form_html = form_html,
     );
 
+    let passkey_script = if has_users && passkey_enabled {
+        r#"<script>
+(function() {
+  var btn = document.getElementById('passkey-login-btn');
+  if (!btn || !window.PublicKeyCredential || !navigator.credentials) return;
+  function b64ToBuf(value) {
+    var b64 = value.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
+    var raw = atob(b64);
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out.buffer;
+  }
+  function bufToB64(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var raw = '';
+    for (var i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+    return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+  btn.addEventListener('click', async function() {
+    var username = document.querySelector('input[name="username"]').value.trim();
+    if (!username) {
+      document.querySelector('input[name="username"]').focus();
+      return;
+    }
+    btn.disabled = true;
+    try {
+      var start = await fetch('/login/passkey/start', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({username: username})
+      });
+      if (!start.ok) throw new Error('No passkey is registered for this user.');
+      var data = await start.json();
+      var publicKey = data.public_key.publicKey || data.public_key;
+      publicKey.challenge = b64ToBuf(publicKey.challenge);
+      if (publicKey.allowCredentials) {
+        publicKey.allowCredentials.forEach(function(cred) { cred.id = b64ToBuf(cred.id); });
+      }
+      var credential = await navigator.credentials.get({publicKey: publicKey});
+      var finish = await fetch('/login/passkey/finish', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({
+          challenge_id: data.challenge_id,
+          credential: {
+            id: credential.id,
+            rawId: bufToB64(credential.rawId),
+            type: credential.type,
+            response: {
+              authenticatorData: bufToB64(credential.response.authenticatorData),
+              clientDataJSON: bufToB64(credential.response.clientDataJSON),
+              signature: bufToB64(credential.response.signature),
+              userHandle: credential.response.userHandle ? bufToB64(credential.response.userHandle) : null
+            },
+            clientExtensionResults: credential.getClientExtensionResults()
+          }
+        })
+      });
+      if (!finish.ok) throw new Error('Passkey sign-in failed.');
+      window.location = finish.url || '/ui';
+    } catch (err) {
+      alert(err && err.message ? err.message : 'Passkey sign-in failed.');
+      btn.disabled = false;
+    }
+  });
+})();
+</script>"#
+    } else {
+        ""
+    };
+
     render_shell(
         PageShell {
             title,
@@ -808,7 +893,7 @@ pub fn render_login_page(
             csrf_token: None,
             flash,
         },
-        content,
+        format!("{content}{passkey_script}"),
     )
 }
 
@@ -1262,6 +1347,11 @@ pub fn render_admin_page(
     user_agents: &std::collections::HashMap<String, Vec<AgentTokenSummary>>,
     user_machines: &std::collections::HashMap<String, Vec<StoredMachine>>,
     server_config: &ServerConfig,
+    login_security: &LoginSecuritySettings,
+    passkeys: &[StoredUserPasskey],
+    pending_login_approvals: &[PendingLoginApproval],
+    allowed_login_ips: &[AllowedLoginIp],
+    current_client_ip: &str,
     external_auth_config: &ExternalAuthConfig,
     oidc_config: &OidcConfig,
     auto_update_config: &AutoUpdateConfig,
@@ -1494,6 +1584,128 @@ pub fn render_admin_page(
             )
         })
         .unwrap_or_else(|| "<p><strong>Last sync</strong><br>Not run yet.</p>".to_string());
+    let login_security_checked = if login_security.passkey_enforcement_enabled {
+        " checked"
+    } else {
+        ""
+    };
+    let ip_restrictions_checked = if login_security.ip_restrictions_enabled {
+        " checked"
+    } else {
+        ""
+    };
+    let passkeys_html = if passkeys.is_empty() {
+        "<p class=\"hint padded\">No passkeys registered yet. Register this admin session before enabling enforcement.</p>".to_string()
+    } else {
+        let rows = passkeys
+            .iter()
+            .map(|passkey| {
+                let last_used = passkey
+                    .last_used_at
+                    .map(|dt| format_timestamp(dt))
+                    .unwrap_or_else(|| "never used".to_string());
+                format!(
+                    r#"<div class="sel-item">
+                      <div>
+                        <span class="sel-item-name">{label}</span>
+                        <span class="sel-item-meta"><span class="pill">{username}</span> &middot; last used {last_used}</span>
+                      </div>
+                      <span class="sel-item-actions">
+                        <form method="post" action="/ui/admin/passkeys/{id}/delete" style="margin:0" onsubmit="return confirm('Delete this passkey?')">
+                          <input type="hidden" name="csrf_token" value="{csrf_token}">
+                          <button class="btn-sm danger" title="Delete passkey" type="submit">{delete_icon}</button>
+                        </form>
+                      </span>
+                    </div>"#,
+                    id = escape_attribute(&passkey.id),
+                    label = escape_text(&passkey.label),
+                    username = escape_text(passkey.username.as_str()),
+                    last_used = escape_text(&last_used),
+                    csrf_token = escape_attribute(csrf_token),
+                    delete_icon = ICON_CLOSE,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        format!(r#"<div class="sel-list">{rows}</div>"#)
+    };
+    let pending_login_html = if pending_login_approvals.is_empty() {
+        "<p class=\"hint padded\">No password-only login attempts are waiting for approval.</p>"
+            .to_string()
+    } else {
+        let rows = pending_login_approvals
+            .iter()
+            .map(|pending| {
+                let ip = pending.ip_address.as_deref().unwrap_or("unknown IP");
+                let ua = pending.user_agent.as_deref().unwrap_or("unknown browser");
+                format!(
+                    r#"<div class="sel-item">
+                      <div>
+                        <span class="sel-item-name">{username}</span>
+                        <span class="sel-item-meta"><span class="pill">password accepted</span> &middot; {ip} &middot; expires {expires}</span>
+                        <span class="sel-item-meta">{ua}</span>
+                      </div>
+                      <span class="sel-item-actions">
+                        <form method="post" action="/ui/admin/login-approvals/{id}/approve" style="margin:0">
+                          <input type="hidden" name="csrf_token" value="{csrf_token}">
+                          <button class="btn-sm" title="Approve login" type="submit">{check_icon}</button>
+                        </form>
+                        <form method="post" action="/ui/admin/login-approvals/{id}/deny" style="margin:0">
+                          <input type="hidden" name="csrf_token" value="{csrf_token}">
+                          <button class="btn-sm danger" title="Deny login" type="submit">{close_icon}</button>
+                        </form>
+                      </span>
+                    </div>"#,
+                    id = escape_attribute(&pending.id),
+                    username = escape_text(pending.username.as_str()),
+                    ip = escape_text(ip),
+                    ua = escape_text(ua),
+                    expires = escape_text(&format_timestamp(pending.expires_at)),
+                    csrf_token = escape_attribute(csrf_token),
+                    check_icon = ICON_CHECK,
+                    close_icon = ICON_CLOSE,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        format!(r#"<div class="sel-list">{rows}</div>"#)
+    };
+    let allowed_login_ips_html = if allowed_login_ips.is_empty() {
+        "<p class=\"hint padded\">No allowed login IPs yet. Add your current public IP before enabling IP restrictions.</p>".to_string()
+    } else {
+        let rows = allowed_login_ips
+            .iter()
+            .map(|entry| {
+                let last_used = entry
+                    .last_used_at
+                    .map(format_timestamp)
+                    .unwrap_or_else(|| "never matched".to_string());
+                format!(
+                    r#"<div class="sel-item">
+                      <div>
+                        <span class="sel-item-name">{cidr}</span>
+                        <span class="sel-item-meta"><span class="pill">{label}</span> &middot; last matched {last_used}</span>
+                      </div>
+                      <span class="sel-item-actions">
+                        <form method="post" action="/ui/admin/login-ips/{id}/delete" style="margin:0" onsubmit="return confirm('Remove this allowed IP?')">
+                          <input type="hidden" name="csrf_token" value="{csrf_token}">
+                          <button class="btn-sm danger" title="Remove allowed IP" type="submit">{delete_icon}</button>
+                        </form>
+                      </span>
+                    </div>"#,
+                    id = escape_attribute(&entry.id),
+                    cidr = escape_text(&entry.cidr),
+                    label = escape_text(&entry.label),
+                    last_used = escape_text(&last_used),
+                    csrf_token = escape_attribute(csrf_token),
+                    delete_icon = ICON_CLOSE,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        format!(r#"<div class="sel-list">{rows}</div>"#)
+    };
+    let ssh_bypass_command = "lore-server bypass";
     let current_version = env!("CARGO_PKG_VERSION");
     let update_now_button = format!(
         r#"<button type="button" id="update-btn" data-csrf="{csrf_token}" data-state="check">Check for updates</button>"#,
@@ -1674,7 +1886,7 @@ pub fn render_admin_page(
       <section class="panel" data-panel="network"{network_display}>
         <div class="panel-header">
           <h2>Network</h2>
-          <p>Set the externally reachable Lore address.</p>
+          <p>Set the externally reachable Lore address and control where browser logins are allowed from.</p>
         </div>
         <form method="post" action="/ui/admin/setup">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -1699,6 +1911,52 @@ pub fn render_admin_page(
           <p><strong>Setup page</strong><br>{setup_url}</p>
           <p><strong>Plain text page</strong><br>{setup_text_url}</p>
         </div>
+        <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>Approved login methods</h2>
+          <p>When enabled, password-only logins do not create a session until an admin approves that exact login attempt. Passkey logins are allowed without per-login approval.</p>
+        </div>
+        <form method="post" action="/ui/admin/login-security">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label class="toggle">
+            <input type="checkbox" name="passkey_enforcement_enabled" value="true"{login_security_checked}>
+            <span>Require passkey or admin-approved password login</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" name="ip_restrictions_enabled" value="true"{ip_restrictions_checked}>
+            <span>Restrict browser logins to allowed IPs</span>
+          </label>
+          <button type="submit">Save login security</button>
+        </form>
+        <div class="meta-stack padded">
+          <p><strong>Bootstrap rule</strong><br>Register at least one admin passkey before enabling enforcement. The current admin session stays valid while you configure this.</p>
+          <p><strong>IP rule</strong><br>Add at least one non-loopback allowed IP before enabling IP restrictions. Loopback is always allowed for Lore's local Caddy path and does not count as an allowlist entry.</p>
+          <p><strong>SSH recovery</strong><br>If browser login is blocked, SSH to the server and run <code>{ssh_bypass_command}</code>. It asks for a user and minutes, then allows one correct-password login for that user while skipping both IP and passkey restrictions during the TTL.</p>
+        </div>
+        <div style="display:grid;gap:var(--s-3);margin-top:var(--s-4)">
+          <label>
+            Passkey label
+            <input type="text" id="passkey-label" value="Admin passkey" maxlength="80">
+          </label>
+          <button type="button" id="register-passkey-btn" data-csrf="{csrf_token}">Register passkey for this admin</button>
+          <p class="hint" id="passkey-register-status">Passkeys use Touch ID, Face ID, Windows Hello, Android screen lock, or a hardware security key. They require HTTPS except on localhost. Synced passkeys may follow the user's passkey account rather than one physical device.</p>
+        </div>
+        <div class="panel-header" style="margin-top:var(--s-5)"><h2>Registered passkeys</h2></div>
+        {passkeys_html}
+        <div class="panel-header" style="margin-top:var(--s-5)"><h2>Pending password logins</h2><p>Only correct-password attempts appear here. Approve only attempts you recognize.</p></div>
+        {pending_login_html}
+        <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>IP restrictions</h2>
+          <p>IP allowlists are useful for stable office or VPN addresses. Lore reads the client IP from Caddy's forwarded headers and always permits loopback for the local proxy path.</p>
+        </div>
+        <form method="post" action="/ui/admin/login-ips">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>Allowed IP or CIDR<input type="text" name="cidr" value="{current_client_ip}" placeholder="203.0.113.4 or 10.0.0.0/24" required></label>
+          <label>Label<input type="text" name="label" placeholder="Home, office VPN, server admin box"></label>
+          <button type="submit">Add IP rule</button>
+          <p class="hint">The field defaults to the IP Lore sees for your current browser request. CIDR ranges are accepted for VPN or office networks.</p>
+        </form>
+        <div class="panel-header" style="margin-top:var(--s-4)"><h2>Allowed login IPs</h2></div>
+        {allowed_login_ips_html}
       </section>
 
       <section class="panel" data-panel="endpoints"{endpoints_display}>
@@ -2297,14 +2555,76 @@ pub fn render_admin_page(
         }}
         return openExpandedTextEditor(targetId);
       }};
-      document.querySelectorAll('[data-manager-prompt-toggle]').forEach(function(toggle) {{
-        syncManagerPromptEditor(toggle);
-        toggle.addEventListener('change', function() {{
-          syncManagerPromptEditor(toggle);
-        }});
-      }});
+	      document.querySelectorAll('[data-manager-prompt-toggle]').forEach(function(toggle) {{
+	        syncManagerPromptEditor(toggle);
+	        toggle.addEventListener('change', function() {{
+	          syncManagerPromptEditor(toggle);
+	        }});
+	      }});
 
-      function initSelList(scope) {{
+	      var passkeyBtn = document.getElementById('register-passkey-btn');
+	      if (passkeyBtn && window.PublicKeyCredential && navigator.credentials) {{
+	        function b64ToBuf(value) {{
+	          var b64 = value.replace(/-/g, '+').replace(/_/g, '/');
+	          while (b64.length % 4) b64 += '=';
+	          var raw = atob(b64);
+	          var out = new Uint8Array(raw.length);
+	          for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+	          return out.buffer;
+	        }}
+	        function bufToB64(buffer) {{
+	          var bytes = new Uint8Array(buffer);
+	          var raw = '';
+	          for (var i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+	          return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+	        }}
+	        passkeyBtn.addEventListener('click', async function() {{
+	          var status = document.getElementById('passkey-register-status');
+	          var labelInput = document.getElementById('passkey-label');
+	          passkeyBtn.disabled = true;
+	          if (status) status.textContent = 'Waiting for passkey registration...';
+	          try {{
+	            var start = await fetch('/ui/admin/passkeys/register/start', {{
+	              method: 'POST',
+	              headers: {{'content-type': 'application/json', 'x-csrf-token': passkeyBtn.getAttribute('data-csrf') || ''}},
+	              body: JSON.stringify({{label: labelInput ? labelInput.value : 'Admin passkey'}})
+	            }});
+	            if (!start.ok) throw new Error('Could not start passkey registration.');
+	            var data = await start.json();
+	            var publicKey = data.public_key.publicKey || data.public_key;
+	            publicKey.challenge = b64ToBuf(publicKey.challenge);
+	            publicKey.user.id = b64ToBuf(publicKey.user.id);
+	            if (publicKey.excludeCredentials) {{
+	              publicKey.excludeCredentials.forEach(function(cred) {{ cred.id = b64ToBuf(cred.id); }});
+	            }}
+	            var credential = await navigator.credentials.create({{publicKey: publicKey}});
+	            var finish = await fetch('/ui/admin/passkeys/register/finish', {{
+	              method: 'POST',
+	              headers: {{'content-type': 'application/json', 'x-csrf-token': passkeyBtn.getAttribute('data-csrf') || ''}},
+	              body: JSON.stringify({{
+	                challenge_id: data.challenge_id,
+	                credential: {{
+	                  id: credential.id,
+	                  rawId: bufToB64(credential.rawId),
+	                  type: credential.type,
+	                  response: {{
+	                    attestationObject: bufToB64(credential.response.attestationObject),
+	                    clientDataJSON: bufToB64(credential.response.clientDataJSON)
+	                  }},
+	                  clientExtensionResults: credential.getClientExtensionResults()
+	                }}
+	              }})
+	            }});
+	            if (!finish.ok) throw new Error('Could not finish passkey registration.');
+	            location.href = '/ui/admin?section=network&flash=Passkey%20registered';
+	          }} catch (err) {{
+	            if (status) status.textContent = err && err.message ? err.message : 'Passkey registration failed.';
+	            passkeyBtn.disabled = false;
+	          }}
+	        }});
+	      }}
+
+	      function initSelList(scope) {{
         var items = scope.querySelectorAll('.sel-list .sel-item');
         var details = scope.querySelectorAll('.sel-detail');
         items.forEach(function(item) {{
@@ -2389,6 +2709,13 @@ pub fn render_admin_page(
         external_port = server_config.external_port,
         setup_url = escape_text(&server_config.setup_url()),
         setup_text_url = escape_text(&server_config.setup_text_url()),
+        login_security_checked = login_security_checked,
+        ip_restrictions_checked = ip_restrictions_checked,
+        passkeys_html = passkeys_html,
+        pending_login_html = pending_login_html,
+        current_client_ip = escape_attribute(current_client_ip),
+        allowed_login_ips_html = allowed_login_ips_html,
+        ssh_bypass_command = escape_text(ssh_bypass_command),
         endpoints_list_html = endpoints_list_html,
         endpoints_detail_html = endpoints_detail_html,
         librarian_endpoint_options = librarian_endpoint_options,
@@ -2751,7 +3078,9 @@ pub fn render_agents_page(
 
     let external_create_html = format!(
         r#"<div class="external-agent-create" style="margin-top:var(--s-4); border-top:1px solid var(--line); padding-top:var(--s-4);">
-        <button type="button" class="btn-lg" onclick="toggleExternalAgentCreate()">Create external agent</button>
+        <div style="display:flex; justify-content:flex-end;">
+          <button type="button" class="btn-lg" onclick="toggleExternalAgentCreate()" style="width:auto;">Create external agent</button>
+        </div>
         <form method="post" action="/ui/agents/external-agent" id="create-external-agent-form" style="display:none; margin-top:var(--s-4);">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
           <label>
@@ -3050,8 +3379,9 @@ pub fn render_agents_page(
                 format!(
                     r##"{created_token_html}
 
-                <div class="panel-header"><h3>Setup instructions</h3><p>Copy and give to your agent.</p></div>
+                <div class="panel-header"><h3>Setup instructions</h3><p>Use this token with setup-external on the machine where your external agent runs.</p></div>
                 <div class="padded">
+                  <p class="hint" style="margin-bottom:var(--s-3);">The token grants only the project permissions configured for this external agent.</p>
                   <textarea readonly id="agent-instruction" style="min-height: 8rem; font-family: var(--font-mono); font-size: 0.85rem;">{setup_instruction}</textarea>
                   <div style="margin-top: var(--s-3); text-align: right;">
                     <form method="post" action="/ui/agents/{name_attr}/rotate" class="inline-form" style="margin-right:var(--s-2);">
@@ -3530,12 +3860,12 @@ All requests require an agent token. Include it as:
 ### Option 1 - Lore CLI (recommended for code agents)
 
 Install (Linux/macOS):
-  LORE_VERSION=v{server_version} curl -fsSL {install_script_url} | sh
+  curl -fsSL {install_script_url} | sh -s -- v{server_version}
 
 Install (Windows PowerShell):
   $env:LORE_VERSION='v{server_version}'; irm {install_ps1_url} | iex
 
-Configure this machine for the external agent. This does not register a machine or start a Lore-managed agent service:
+Configure this machine for the external agent. This does not register a machine or start a Lore-managed agent service. The token grants only the project permissions configured for this external agent:
   lore setup-external {base_url} --token {token}
 
 Set the project for the current repo:
@@ -4024,16 +4354,17 @@ pub fn render_agent_guide_page(
     <section class="panel">
       <div class="panel-header">
         <h2>1. Install the Lore CLI</h2>
-        <p>Run this on the machine where you want agents to operate.</p>
+        <p>Run this on the machine where you want Lore-managed agents or external agents to access Lore.</p>
       </div>
       <div class="padded">
         <p class="hint" style="margin-bottom:var(--s-2);"><strong>Linux / macOS</strong></p>
         <div style="display:flex; align-items:stretch; gap:var(--s-2);">
-          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">LORE_VERSION=v{server_version} curl -fsSL {install_script_url} | sh</code>
-          <button class="button-link" onclick="navigator.clipboard.writeText('LORE_VERSION=v{server_version} curl -fsSL {install_script_url} | sh')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">curl -fsSL {install_script_url} | sh -s -- v{server_version}</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('curl -fsSL {install_script_url} | sh -s -- v{server_version}')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
         </div>
+        <p class="hint" style="margin-top:var(--s-2);">This server-hosted installer uses the CLI binaries currently staged on this Lore server. For macOS and Windows installs, use a full release build when the server has not staged your OS target.</p>
         <p class="hint" style="margin-top:var(--s-4); margin-bottom:var(--s-2);"><strong>Windows</strong> (PowerShell)</p>
         <div style="display:flex; align-items:stretch; gap:var(--s-2);">
           <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">$env:LORE_VERSION='v{server_version}'; irm {install_ps1_url} | iex</code>
@@ -4046,10 +4377,12 @@ pub fn render_agent_guide_page(
 
     <section class="panel" style="margin-top: var(--s-5);">
       <div class="panel-header">
-        <h2>2. Register this machine</h2>
-        <p>This links the machine to your Lore account so it can create agents.</p>
+        <h2>2. Choose how this machine will use Lore</h2>
+        <p>Set this machine up for either browser-managed agents or client-only external-agent access.</p>
       </div>
       <div class="padded">
+        <h3>Option A: Managed agent machine</h3>
+        <p class="hint" style="margin-bottom:var(--s-2);">Use this when you want Lore to create, run, stop, and monitor agents on this machine from the browser.</p>
         <div style="display:flex; align-items:stretch; gap:var(--s-2);">
           <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">lore setup-machine {base_url}</code>
           <button class="button-link" onclick="navigator.clipboard.writeText('lore setup-machine {base_url}')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
@@ -4057,13 +4390,22 @@ pub fn render_agent_guide_page(
           </button>
         </div>
         <p class="hint" style="margin-top:var(--s-3);">You will be prompted to log in with your Lore username and password, then asked to name this machine.</p>
+        <h3 style="margin-top:var(--s-5);">Option B: External agent CLI access</h3>
+        <p class="hint" style="margin-bottom:var(--s-2);">Use this when an existing agent or CLI tool should access Lore projects with a scoped external-agent token. Lore will not manage processes on this machine.</p>
+        <div style="display:flex; align-items:stretch; gap:var(--s-2);">
+          <code style="flex:1; min-width:0; padding:var(--s-2) var(--s-3); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); font-size:0.85rem; overflow-x:auto; white-space:nowrap; display:flex; align-items:center;">lore setup-external {base_url} --token &lt;external-agent-token&gt;</code>
+          <button class="button-link" onclick="navigator.clipboard.writeText('lore setup-external {base_url} --token &lt;external-agent-token&gt;')" title="Copy" style="aspect-ratio:1; width:auto; padding:0; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
+        <p class="hint" style="margin-top:var(--s-3);">Create or select an external agent on the Agents page to get a token. The token grants only the project permissions configured for that external agent.</p>
       </div>
     </section>
 
     <section class="panel" style="margin-top: var(--s-5);">
       <div class="panel-header">
-        <h2>3. Start an agent</h2>
-        <p>Create and run an agent on this machine.</p>
+        <h2>3. Start a Lore-managed agent</h2>
+        <p>Use this only after managed agent machine setup.</p>
       </div>
       <div class="padded">
         <div style="display:flex; align-items:stretch; gap:var(--s-2);">
@@ -5483,15 +5825,42 @@ function renderMarkdown(text) {{
   var lines = text.split('\n');
   var html = '';
   var inList = null;
+  var liOpen = false;
   var inBq = false;
   var inTable = false;
   var tableHead = true;
   var tableSep = false;
+  function nextNonEmptyLine(start) {{
+    for (var n = start; n < lines.length; n++) {{
+      if (lines[n].trim() !== '') return lines[n];
+    }}
+    return '';
+  }}
+  function isOrderedListLine(raw) {{
+    return /^\s{{0,3}}\d+\.\s+/.test(raw);
+  }}
+  function isUnorderedListLine(raw) {{
+    return /^\s{{0,3}}[-*]\s+/.test(raw);
+  }}
+  function closeListItem() {{
+    if (liOpen) {{
+      html += '</li>';
+      liOpen = false;
+    }}
+  }}
+  function closeList() {{
+    if (inList) {{
+      closeListItem();
+      html += '</' + inList + '>';
+      inList = null;
+    }}
+  }}
   for (var i = 0; i < lines.length; i++) {{
-    var line = lines[i];
+    var rawLine = lines[i];
+    var line = rawLine;
     var cm = line.match(/^__CODE_(\d+)__$/);
     if (cm) {{
-      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      closeList();
       if (inBq) {{ html += '</blockquote>'; inBq = false; }}
       if (inTable) {{ html += '</table></div>'; inTable = false; tableHead = false; tableSep = false; }}
       html += codeBlocks[parseInt(cm[1])];
@@ -5499,7 +5868,7 @@ function renderMarkdown(text) {{
     }}
     var sm = line.match(/^__SVG_(\d+)__$/);
     if (sm) {{
-      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      closeList();
       if (inBq) {{ html += '</blockquote>'; inBq = false; }}
       if (inTable) {{ html += '</table></div>'; inTable = false; tableHead = false; tableSep = false; }}
       html += '<div class="chat-svg-wrap" onclick="expandSvg(this)">' + svgs[parseInt(sm[1])] + '<div class="chat-svg-hint">Click to expand</div></div>';
@@ -5508,52 +5877,57 @@ function renderMarkdown(text) {{
     line = escapeHtmlRaw(line);
     var hm = line.match(/^(#{{1,6}})\s+(.+)$/);
     if (hm) {{
-      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      closeList();
       if (inBq) {{ html += '</blockquote>'; inBq = false; }}
       var lvl = hm[1].length;
       html += '<h' + lvl + '>' + inlineMd(hm[2]) + '</h' + lvl + '>';
       continue;
     }}
     if (/^-{{3,}}$/.test(line) || /^\*{{3,}}$/.test(line)) {{
-      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      closeList();
       if (inBq) {{ html += '</blockquote>'; inBq = false; }}
       html += '<hr>';
       continue;
     }}
     var bm = line.match(/^&gt;\s?(.*)$/);
     if (bm) {{
-      if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+      closeList();
       if (!inBq) {{ html += '<blockquote>'; inBq = true; }}
       html += inlineMd(bm[1]) + '<br>';
       continue;
     }} else if (inBq) {{
       html += '</blockquote>'; inBq = false;
     }}
-    var ul = line.match(/^[-*]\s+(.+)$/);
+    var ul = line.match(/^\s{{0,3}}[-*]\s+(.+)$/);
     if (ul) {{
       if (inBq) {{ html += '</blockquote>'; inBq = false; }}
       if (inList !== 'ul') {{
-        if (inList) html += '</' + inList + '>';
+        closeList();
         html += '<ul>'; inList = 'ul';
       }}
-      html += '<li>' + inlineMd(ul[1]) + '</li>';
+      closeListItem();
+      html += '<li>' + inlineMd(ul[1]);
+      liOpen = true;
       continue;
     }}
-    var ol = line.match(/^\d+\.\s+(.+)$/);
+    var ol = line.match(/^\s{{0,3}}(\d+)\.\s+(.+)$/);
     if (ol) {{
       if (inBq) {{ html += '</blockquote>'; inBq = false; }}
       if (inList !== 'ol') {{
-        if (inList) html += '</' + inList + '>';
-        html += '<ol>'; inList = 'ol';
+        closeList();
+        var start = parseInt(ol[1], 10);
+        html += start > 1 ? '<ol start="' + start + '">' : '<ol>';
+        inList = 'ol';
       }}
-      html += '<li>' + inlineMd(ol[1]) + '</li>';
+      closeListItem();
+      html += '<li>' + inlineMd(ol[2]);
+      liOpen = true;
       continue;
     }}
-    if (inList) {{ html += '</' + inList + '>'; inList = null; }}
     var tm = line.match(/^\|(.+)\|$/);
     if (tm) {{
       if (!inTable) {{
-        if (inList) {{ html += '</' + inList + '>'; inList = null; }}
+        closeList();
         if (inBq) {{ html += '</blockquote>'; inBq = false; }}
         html += '<div class="chat-table-wrap"><table>';
         inTable = true; tableHead = true; tableSep = false;
@@ -5574,9 +5948,19 @@ function renderMarkdown(text) {{
     }}
     if (inTable) {{ html += '</table></div>'; inTable = false; tableHead = false; tableSep = false; }}
     if (line.trim() === '') continue;
+    if (inList) {{
+      var nextLine = nextNonEmptyLine(i + 1);
+      var sameListContinues = inList === 'ol' ? isOrderedListLine(nextLine) : isUnorderedListLine(nextLine);
+      var indentedContinuation = /^\s{{2,}}\S/.test(rawLine);
+      if (sameListContinues || indentedContinuation) {{
+        html += '<p>' + inlineMd(line.replace(/^\s{{2,}}/, '')) + '</p>';
+        continue;
+      }}
+      closeList();
+    }}
     html += '<p>' + inlineMd(line) + '</p>';
   }}
-  if (inList) html += '</' + inList + '>';
+  closeList();
   if (inBq) html += '</blockquote>';
   if (inTable) html += '</table></div>';
   return html;
@@ -8024,6 +8408,12 @@ pub fn render_document_page(
         String::new()
     };
 
+    let download_doc_btn = format!(
+        r##"<a class="block-header-btn" href="/ui/{project_slug}/doc/{doc_id_attr}/download.md" title="Download Markdown" aria-label="Download Markdown" download>
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+</a>"##,
+    );
+
     let delete_doc_html = if can_write {
         format!(
             r#"<div class="delete-project-section">
@@ -8050,6 +8440,7 @@ pub fn render_document_page(
     </div>
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
       {rename_html}
+      <div class="block-header-actions document-page-actions">{download_doc_btn}</div>
     </div>
     <section class="panel" id="document" style="margin-top:var(--s-4);">
       <div class="timeline">{blocks_html}</div>
@@ -8062,6 +8453,7 @@ pub fn render_document_page(
         project_slug = project_slug,
         project_name = escape_text(project_display_name),
         rename_html = rename_html,
+        download_doc_btn = download_doc_btn,
         blocks_html = blocks_html,
         child_doc_items = child_doc_items,
         add_subdoc_html = add_subdoc_html,
@@ -9906,267 +10298,366 @@ fn escape_json_for_inline_script(value: &str) -> String {
 }
 
 struct ThemePalette {
-    color_scheme: &'static str,
-    bg: &'static str,
-    panel: &'static str,
-    panel_strong: &'static str,
-    ink: &'static str,
-    muted: &'static str,
-    line: &'static str,
-    accent: &'static str,
-    accent_soft: &'static str,
-    shadow: &'static str,
+    color_scheme: String,
+    bg: String,
+    panel: String,
+    panel_strong: String,
+    ink: String,
+    muted: String,
+    line: String,
+    accent: String,
+    accent_soft: String,
+    shadow: String,
+    radius: String,
+    font_sans: String,
+    font_mono: String,
+    body_background: String,
+    button_background: String,
+    button_text: String,
+    hero_button_background: String,
+    hero_button_text: String,
+    flash_background: String,
+    flash_text: String,
+    flash_border: String,
+    callout_background: String,
+    code_background: String,
+    code_text: String,
+    media_background: String,
+    media_image_background: String,
+    empty_background: String,
+    details_background: String,
+    input_background: String,
+    surface_hover: String,
+    diff_context_background: String,
+    diff_added_background: String,
+    diff_added_prefix: String,
+    diff_removed_background: String,
+    diff_removed_prefix: String,
+}
+
+struct ThemeSpec {
+    light_bg: &'static str,
+    light_panel: &'static str,
+    light_panel_strong: &'static str,
+    light_ink: &'static str,
+    light_muted: &'static str,
+    light_line: &'static str,
+    light_accent: &'static str,
+    light_companion: &'static str,
+    light_code_bg: &'static str,
+    light_code_text: &'static str,
+    dark_bg: &'static str,
+    dark_panel: &'static str,
+    dark_panel_strong: &'static str,
+    dark_ink: &'static str,
+    dark_muted: &'static str,
+    dark_line: &'static str,
+    dark_accent: &'static str,
+    dark_companion: &'static str,
+    dark_code_bg: &'static str,
+    dark_code_text: &'static str,
     radius: &'static str,
-    font_sans: &'static str,
-    font_mono: &'static str,
-    body_background: &'static str,
-    button_background: &'static str,
-    button_text: &'static str,
-    hero_button_background: &'static str,
-    hero_button_text: &'static str,
-    flash_background: &'static str,
-    flash_text: &'static str,
-    flash_border: &'static str,
-    callout_background: &'static str,
-    code_background: &'static str,
-    code_text: &'static str,
-    media_background: &'static str,
-    media_image_background: &'static str,
-    empty_background: &'static str,
-    details_background: &'static str,
-    input_background: &'static str,
-    surface_hover: &'static str,
-    diff_context_background: &'static str,
-    diff_added_background: &'static str,
-    diff_added_prefix: &'static str,
-    diff_removed_background: &'static str,
-    diff_removed_prefix: &'static str,
+}
+
+fn theme_spec(theme: UiTheme) -> ThemeSpec {
+    match theme {
+        UiTheme::Parchment => ThemeSpec {
+            light_bg: "#f4efe7",
+            light_panel: "rgba(255,255,255,0.88)",
+            light_panel_strong: "#fffaf3",
+            light_ink: "#1f1a17",
+            light_muted: "#6d6258",
+            light_line: "rgba(78, 55, 36, 0.14)",
+            light_accent: "#b55233",
+            light_companion: "#608aad",
+            light_code_bg: "#f6eee6",
+            light_code_text: "#4d3325",
+            dark_bg: "#1e1914",
+            dark_panel: "rgba(35,28,22,0.9)",
+            dark_panel_strong: "#2a221a",
+            dark_ink: "#ede5d8",
+            dark_muted: "#a3957f",
+            dark_line: "rgba(200, 170, 130, 0.18)",
+            dark_accent: "#e07050",
+            dark_companion: "#6aa5c8",
+            dark_code_bg: "#120e0a",
+            dark_code_text: "#f0e6d8",
+            radius: "22px",
+        },
+        UiTheme::Graphite => ThemeSpec {
+            light_bg: "#edf1f7",
+            light_panel: "rgba(255,255,255,0.9)",
+            light_panel_strong: "#ffffff",
+            light_ink: "#1a2233",
+            light_muted: "#637088",
+            light_line: "rgba(30, 50, 80, 0.14)",
+            light_accent: "#3b82f6",
+            light_companion: "#0f766e",
+            light_code_bg: "#e8eff8",
+            light_code_text: "#223248",
+            dark_bg: "#11161c",
+            dark_panel: "rgba(20,27,35,0.9)",
+            dark_panel_strong: "#1a222c",
+            dark_ink: "#edf2f7",
+            dark_muted: "#97a7b8",
+            dark_line: "rgba(166, 184, 204, 0.18)",
+            dark_accent: "#7dd3fc",
+            dark_companion: "#34d399",
+            dark_code_bg: "#091017",
+            dark_code_text: "#d9ecff",
+            radius: "20px",
+        },
+        UiTheme::Signal => ThemeSpec {
+            light_bg: "#e7f0ec",
+            light_panel: "rgba(248,252,250,0.9)",
+            light_panel_strong: "#ffffff",
+            light_ink: "#0f1f1b",
+            light_muted: "#536965",
+            light_line: "rgba(31, 73, 63, 0.16)",
+            light_accent: "#0f8f6f",
+            light_companion: "#1768ac",
+            light_code_bg: "#e7f4ef",
+            light_code_text: "#18483d",
+            dark_bg: "#0e1a16",
+            dark_panel: "rgba(18,32,27,0.9)",
+            dark_panel_strong: "#152520",
+            dark_ink: "#e2f0ea",
+            dark_muted: "#7fa99a",
+            dark_line: "rgba(120, 200, 170, 0.18)",
+            dark_accent: "#20c997",
+            dark_companion: "#60a5fa",
+            dark_code_bg: "#08120e",
+            dark_code_text: "#d0f8e8",
+            radius: "18px",
+        },
+        UiTheme::Harbor => theme_spec_values(
+            "#eaf3f5", "#0f2830", "#2f8ea3", "#8a5a2b", "#0c1820", "#d9eef2", "#5cc8dc", "#f4b860",
+        ),
+        UiTheme::Forest => theme_spec_values(
+            "#edf3ea", "#142016", "#2f7d4c", "#8b5e34", "#0d1810", "#dcebdd", "#65c18c", "#d7a84f",
+        ),
+        UiTheme::Plum => theme_spec_values(
+            "#f2edf4", "#241527", "#7c3a92", "#2c7a7b", "#180d1c", "#eadcf0", "#c084fc", "#67e8f9",
+        ),
+        UiTheme::Copper => theme_spec_values(
+            "#f4eee8", "#271913", "#b86533", "#2f7f86", "#1a100c", "#f0ded0", "#f08a4b", "#5cc8c5",
+        ),
+        UiTheme::Slate => theme_spec_values(
+            "#eef2f4", "#17202a", "#52677a", "#9b5d73", "#10161d", "#dce6ed", "#91a8bc", "#e49ab0",
+        ),
+        UiTheme::Coral => theme_spec_values(
+            "#fff0ec", "#2b1714", "#d75d4b", "#287c84", "#1c0e0d", "#f6ddd8", "#ff8a78", "#62d2d6",
+        ),
+        UiTheme::Indigo => theme_spec_values(
+            "#eef0fb", "#181a35", "#4f46e5", "#0f766e", "#101124", "#dde1ff", "#8b8cf6", "#5eead4",
+        ),
+        UiTheme::Moss => theme_spec_values(
+            "#eff4e8", "#1b2112", "#698c2e", "#7357a5", "#11160a", "#e4edcf", "#a3c957", "#b9a1ff",
+        ),
+        UiTheme::Rosewood => theme_spec_values(
+            "#f6ecef", "#29151a", "#a83f5d", "#357a67", "#1b0d11", "#efd8df", "#e86d8f", "#70d7ba",
+        ),
+        UiTheme::Glacier => theme_spec_values(
+            "#eaf5fb", "#102130", "#1686b3", "#6d67b1", "#0a1620", "#d8edf8", "#58c7ef", "#b1a7ff",
+        ),
+        UiTheme::Ember => theme_spec_values(
+            "#f8eee7", "#2c1711", "#c2412d", "#357a99", "#1d0d08", "#f1d9cc", "#fb7058", "#73cdf0",
+        ),
+        UiTheme::Denim => theme_spec_values(
+            "#edf2f8", "#111c2b", "#2f6fb0", "#9a6a21", "#0b1320", "#dce8f5", "#6ea8e8", "#e6b35c",
+        ),
+        UiTheme::Olive => theme_spec_values(
+            "#f2f2e7", "#202111", "#777a24", "#2d7d83", "#141508", "#e8e8cf", "#b1b64c", "#63d0d9",
+        ),
+        UiTheme::Aubergine => theme_spec_values(
+            "#f1ecf2", "#241728", "#6f3a80", "#a1682f", "#170d1a", "#e8d9ed", "#b979d0", "#e1a760",
+        ),
+        UiTheme::Cobalt => theme_spec_values(
+            "#ebf1fb", "#101b33", "#1d4ed8", "#0f8f6f", "#091225", "#d9e7ff", "#6692ff", "#58d7b7",
+        ),
+        UiTheme::Sepia => theme_spec_values(
+            "#f3eee2", "#211912", "#8a5a2b", "#376f7d", "#15100b", "#e8ddc9", "#c89155", "#6fc2d6",
+        ),
+        UiTheme::Mint => theme_spec_values(
+            "#eaf6f0", "#10231b", "#18966d", "#596bb3", "#0a1712", "#d7f1e6", "#53d8a7", "#94a3ff",
+        ),
+        UiTheme::Crimson => theme_spec_values(
+            "#f7ecee", "#2b1318", "#b91c3b", "#197a7a", "#1b0b0f", "#efd6dc", "#f0627c", "#5ee0dc",
+        ),
+        UiTheme::Midnight => theme_spec_values(
+            "#edf0f8", "#101827", "#4457a4", "#1b8a72", "#080d18", "#dce3f6", "#7c8ff0", "#52d0af",
+        ),
+        UiTheme::Sage => theme_spec_values(
+            "#edf3ed", "#172116", "#4f7f58", "#8f5f70", "#0d160d", "#dcebdd", "#84bf8d", "#e29aac",
+        ),
+        UiTheme::Sunlit => theme_spec_values(
+            "#f8f1df", "#251d10", "#b7791f", "#2e7c86", "#171106", "#efe1bd", "#e8b64f", "#64cbd7",
+        ),
+        UiTheme::Lagoon => theme_spec_values(
+            "#e9f5f5", "#0f2424", "#0e8d8d", "#7057a5", "#071818", "#d4eeee", "#4bd1d1", "#b79cff",
+        ),
+        UiTheme::Orchid => theme_spec_values(
+            "#f5ecf5", "#271427", "#a044a7", "#2e7c6f", "#1a0b1a", "#eed8ee", "#dc75df", "#70d9c1",
+        ),
+        UiTheme::Storm => theme_spec_values(
+            "#eef1f5", "#17202c", "#5b6472", "#b15f40", "#0f151d", "#dde4ec", "#98a4b5", "#ef9a74",
+        ),
+        UiTheme::Fern => theme_spec_values(
+            "#ecf4ea", "#142015", "#2e7d32", "#7b5ba7", "#0c150d", "#d9ebd8", "#69c56d", "#b69ce8",
+        ),
+        UiTheme::Ruby => theme_spec_values(
+            "#f8ecef", "#2b121a", "#a61945", "#176f88", "#1b0a10", "#efd4dc", "#e85a82", "#5cc8e4",
+        ),
+        UiTheme::Sky => theme_spec_values(
+            "#eaf4fb", "#0e2030", "#0284c7", "#8a6420", "#071521", "#d7edf9", "#48bff0", "#e5b75d",
+        ),
+    }
+}
+
+fn theme_spec_values(
+    light_bg: &'static str,
+    light_ink: &'static str,
+    light_accent: &'static str,
+    light_companion: &'static str,
+    dark_bg: &'static str,
+    dark_ink: &'static str,
+    dark_accent: &'static str,
+    dark_companion: &'static str,
+) -> ThemeSpec {
+    ThemeSpec {
+        light_bg,
+        light_panel: "rgba(255,255,255,0.9)",
+        light_panel_strong: "#ffffff",
+        light_ink,
+        light_muted: "#5f6b72",
+        light_line: "rgba(32, 48, 64, 0.14)",
+        light_accent,
+        light_companion,
+        light_code_bg: "#edf2f5",
+        light_code_text: light_ink,
+        dark_bg,
+        dark_panel: "rgba(20,27,35,0.9)",
+        dark_panel_strong: "#17212b",
+        dark_ink,
+        dark_muted: "#99a9b4",
+        dark_line: "rgba(166, 184, 204, 0.18)",
+        dark_accent,
+        dark_companion,
+        dark_code_bg: "#0a1118",
+        dark_code_text: dark_ink,
+        radius: "18px",
+    }
+}
+
+fn hex_rgb(hex: &str) -> (u8, u8, u8) {
+    let h = hex.trim_start_matches('#');
+    let parse = |range| u8::from_str_radix(&h[range], 16).unwrap_or(0);
+    (parse(0..2), parse(2..4), parse(4..6))
+}
+
+fn rgba(hex: &str, opacity: &str) -> String {
+    let (r, g, b) = hex_rgb(hex);
+    format!("rgba({r}, {g}, {b}, {opacity})")
+}
+
+fn gradient(a: &str, b: &str) -> String {
+    format!("linear-gradient(135deg, {a}, {b})")
 }
 
 fn theme_palette(theme: UiTheme, dark: bool) -> ThemePalette {
-    match (theme, dark) {
-        (UiTheme::Parchment, false) => ThemePalette {
-            color_scheme: "light",
-            bg: "#f4efe7",
-            panel: "rgba(255,255,255,0.88)",
-            panel_strong: "#fffaf3",
-            ink: "#1f1a17",
-            muted: "#6d6258",
-            line: "rgba(78, 55, 36, 0.14)",
-            accent: "#b55233",
-            accent_soft: "rgba(181, 82, 51, 0.12)",
-            shadow: "0 20px 60px rgba(71, 46, 31, 0.12)",
-            radius: "22px",
-            font_sans: "Inter, -apple-system, system-ui, sans-serif",
-            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
-            body_background: "radial-gradient(circle at top left, rgba(214, 139, 96, 0.24), transparent 28rem), radial-gradient(circle at top right, rgba(96, 138, 173, 0.14), transparent 22rem), linear-gradient(180deg, #f7f2ea 0%, var(--bg) 100%)",
-            button_background: "linear-gradient(135deg, #1f1a17, #7b3622)",
-            button_text: "#fff8f2",
-            hero_button_background: "linear-gradient(135deg, #1f1a17, #7b3622)",
-            hero_button_text: "#fff8f2",
-            flash_background: "rgba(62, 140, 93, 0.12)",
-            flash_text: "#234c31",
-            flash_border: "rgba(62, 140, 93, 0.2)",
-            callout_background: "rgba(181, 82, 51, 0.08)",
-            code_background: "#f6eee6",
-            code_text: "#4d3325",
-            media_background: "#fff",
-            media_image_background: "linear-gradient(180deg, #fffdf9, #f5eee3)",
-            empty_background: "rgba(255,255,255,0.62)",
-            details_background: "rgba(255,255,255,0.62)",
-            input_background: "rgba(255,255,255,0.92)",
-            surface_hover: "rgba(255,255,255,0.9)",
-            diff_context_background: "rgba(255,255,255,0.94)",
-            diff_added_background: "rgba(47, 122, 97, 0.12)",
-            diff_added_prefix: "#1d7257",
-            diff_removed_background: "rgba(181, 82, 51, 0.12)",
-            diff_removed_prefix: "#a33a1d",
-        },
-        (UiTheme::Parchment, true) => ThemePalette {
-            color_scheme: "dark",
-            bg: "#1e1914",
-            panel: "rgba(35,28,22,0.9)",
-            panel_strong: "#2a221a",
-            ink: "#ede5d8",
-            muted: "#a3957f",
-            line: "rgba(200, 170, 130, 0.18)",
-            accent: "#e07050",
-            accent_soft: "rgba(224, 112, 80, 0.16)",
-            shadow: "0 20px 60px rgba(10, 5, 0, 0.5)",
-            radius: "22px",
-            font_sans: "Inter, -apple-system, system-ui, sans-serif",
-            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
-            body_background: "radial-gradient(circle at top left, rgba(160, 90, 50, 0.2), transparent 28rem), radial-gradient(circle at top right, rgba(80, 110, 140, 0.12), transparent 22rem), linear-gradient(180deg, #1a1510 0%, var(--bg) 100%)",
-            button_background: "linear-gradient(135deg, #c45a30, #8b3a18)",
-            button_text: "#fff8f2",
-            hero_button_background: "linear-gradient(135deg, #c45a30, #8b3a18)",
-            hero_button_text: "#fff8f2",
-            flash_background: "rgba(62, 180, 110, 0.14)",
-            flash_text: "#b8f0d0",
-            flash_border: "rgba(62, 180, 110, 0.24)",
-            callout_background: "rgba(224, 112, 80, 0.1)",
-            code_background: "#120e0a",
-            code_text: "#f0e6d8",
-            media_background: "#1a1510",
-            media_image_background: "linear-gradient(180deg, #251e16, #1a1510)",
-            empty_background: "rgba(35,28,22,0.68)",
-            details_background: "rgba(35,28,22,0.72)",
-            input_background: "rgba(255,255,255,0.08)",
-            surface_hover: "rgba(255,255,255,0.1)",
-            diff_context_background: "rgba(255,255,255,0.04)",
-            diff_added_background: "rgba(62, 180, 110, 0.14)",
-            diff_added_prefix: "#6dd8a0",
-            diff_removed_background: "rgba(224, 112, 80, 0.14)",
-            diff_removed_prefix: "#f0a090",
-        },
-        (UiTheme::Graphite, true) => ThemePalette {
-            color_scheme: "dark",
-            bg: "#11161c",
-            panel: "rgba(20,27,35,0.9)",
-            panel_strong: "#1a222c",
-            ink: "#edf2f7",
-            muted: "#97a7b8",
-            line: "rgba(166, 184, 204, 0.18)",
-            accent: "#7dd3fc",
-            accent_soft: "rgba(125, 211, 252, 0.16)",
-            shadow: "0 20px 60px rgba(2, 8, 18, 0.45)",
-            radius: "20px",
-            font_sans: "Inter, -apple-system, system-ui, sans-serif",
-            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
-            body_background: "radial-gradient(circle at top left, rgba(46, 93, 131, 0.32), transparent 28rem), radial-gradient(circle at top right, rgba(125, 211, 252, 0.12), transparent 22rem), linear-gradient(180deg, #0c1117 0%, var(--bg) 100%)",
-            button_background: "linear-gradient(135deg, #2563eb, #0f766e)",
-            button_text: "#f8fbff",
-            hero_button_background: "linear-gradient(135deg, #2563eb, #0f766e)",
-            hero_button_text: "#f8fbff",
-            flash_background: "rgba(45, 212, 191, 0.14)",
-            flash_text: "#c7fff1",
-            flash_border: "rgba(45, 212, 191, 0.26)",
-            callout_background: "rgba(125, 211, 252, 0.1)",
-            code_background: "#091017",
-            code_text: "#d9ecff",
-            media_background: "#0e151d",
-            media_image_background: "linear-gradient(180deg, #18222d, #0f1820)",
-            empty_background: "rgba(20,27,35,0.68)",
-            details_background: "rgba(20,27,35,0.72)",
-            input_background: "rgba(255,255,255,0.08)",
-            surface_hover: "rgba(255,255,255,0.12)",
-            diff_context_background: "rgba(255,255,255,0.04)",
-            diff_added_background: "rgba(45, 212, 191, 0.12)",
-            diff_added_prefix: "#5eead4",
-            diff_removed_background: "rgba(248, 113, 113, 0.14)",
-            diff_removed_prefix: "#fca5a5",
-        },
-        (UiTheme::Graphite, false) => ThemePalette {
-            color_scheme: "light",
-            bg: "#edf1f7",
-            panel: "rgba(255,255,255,0.9)",
-            panel_strong: "#ffffff",
-            ink: "#1a2233",
-            muted: "#637088",
-            line: "rgba(30, 50, 80, 0.14)",
-            accent: "#3b82f6",
-            accent_soft: "rgba(59, 130, 246, 0.12)",
-            shadow: "0 20px 60px rgba(20, 40, 70, 0.1)",
-            radius: "20px",
-            font_sans: "Inter, -apple-system, system-ui, sans-serif",
-            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
-            body_background: "radial-gradient(circle at top left, rgba(59, 130, 246, 0.14), transparent 28rem), radial-gradient(circle at top right, rgba(99, 200, 220, 0.1), transparent 22rem), linear-gradient(180deg, #f3f6fb 0%, var(--bg) 100%)",
-            button_background: "linear-gradient(135deg, #2563eb, #0f766e)",
-            button_text: "#f8fbff",
-            hero_button_background: "linear-gradient(135deg, #2563eb, #0f766e)",
-            hero_button_text: "#f8fbff",
-            flash_background: "rgba(16, 185, 129, 0.12)",
-            flash_text: "#065f46",
-            flash_border: "rgba(16, 185, 129, 0.2)",
-            callout_background: "rgba(59, 130, 246, 0.08)",
-            code_background: "#e8eff8",
-            code_text: "#223248",
-            media_background: "#ffffff",
-            media_image_background: "linear-gradient(180deg, #fafbfe, #edf1f7)",
-            empty_background: "rgba(255,255,255,0.66)",
-            details_background: "rgba(255,255,255,0.66)",
-            input_background: "rgba(255,255,255,0.92)",
-            surface_hover: "rgba(255,255,255,0.9)",
-            diff_context_background: "rgba(255,255,255,0.94)",
-            diff_added_background: "rgba(16, 185, 129, 0.12)",
-            diff_added_prefix: "#047857",
-            diff_removed_background: "rgba(239, 68, 68, 0.1)",
-            diff_removed_prefix: "#dc2626",
-        },
-        (UiTheme::Signal, false) => ThemePalette {
-            color_scheme: "light",
-            bg: "#e7f0ec",
-            panel: "rgba(248,252,250,0.9)",
-            panel_strong: "#ffffff",
-            ink: "#0f1f1b",
-            muted: "#536965",
-            line: "rgba(31, 73, 63, 0.16)",
-            accent: "#0f8f6f",
-            accent_soft: "rgba(15, 143, 111, 0.14)",
-            shadow: "0 18px 54px rgba(18, 74, 63, 0.16)",
-            radius: "18px",
-            font_sans: "Inter, -apple-system, system-ui, sans-serif",
-            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
-            body_background: "radial-gradient(circle at top left, rgba(15, 143, 111, 0.18), transparent 28rem), radial-gradient(circle at top right, rgba(244, 114, 182, 0.12), transparent 22rem), linear-gradient(180deg, #f2f8f5 0%, var(--bg) 100%)",
-            button_background: "linear-gradient(135deg, #0f8f6f, #1768ac)",
-            button_text: "#f6fffc",
-            hero_button_background: "linear-gradient(135deg, #0f8f6f, #1768ac)",
-            hero_button_text: "#f6fffc",
-            flash_background: "rgba(22, 163, 74, 0.12)",
-            flash_text: "#14532d",
-            flash_border: "rgba(22, 163, 74, 0.22)",
-            callout_background: "rgba(15, 143, 111, 0.08)",
-            code_background: "#e7f4ef",
-            code_text: "#18483d",
-            media_background: "#ffffff",
-            media_image_background: "linear-gradient(180deg, #fbfffe, #edf7f4)",
-            empty_background: "rgba(255,255,255,0.66)",
-            details_background: "rgba(255,255,255,0.72)",
-            input_background: "rgba(255,255,255,0.92)",
-            surface_hover: "rgba(255,255,255,0.9)",
-            diff_context_background: "rgba(255,255,255,0.94)",
-            diff_added_background: "rgba(47, 122, 97, 0.12)",
-            diff_added_prefix: "#1d7257",
-            diff_removed_background: "rgba(181, 82, 51, 0.12)",
-            diff_removed_prefix: "#a33a1d",
-        },
-        (UiTheme::Signal, true) => ThemePalette {
-            color_scheme: "dark",
-            bg: "#0e1a16",
-            panel: "rgba(18,32,27,0.9)",
-            panel_strong: "#152520",
-            ink: "#e2f0ea",
-            muted: "#7fa99a",
-            line: "rgba(120, 200, 170, 0.18)",
-            accent: "#20c997",
-            accent_soft: "rgba(32, 201, 151, 0.16)",
-            shadow: "0 18px 54px rgba(5, 20, 15, 0.5)",
-            radius: "18px",
-            font_sans: "Inter, -apple-system, system-ui, sans-serif",
-            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace",
-            body_background: "radial-gradient(circle at top left, rgba(15, 143, 111, 0.2), transparent 28rem), radial-gradient(circle at top right, rgba(200, 100, 160, 0.1), transparent 22rem), linear-gradient(180deg, #0a1510 0%, var(--bg) 100%)",
-            button_background: "linear-gradient(135deg, #20c997, #1768ac)",
-            button_text: "#f0fff8",
-            hero_button_background: "linear-gradient(135deg, #20c997, #1768ac)",
-            hero_button_text: "#f0fff8",
-            flash_background: "rgba(32, 201, 151, 0.14)",
-            flash_text: "#b0f0d8",
-            flash_border: "rgba(32, 201, 151, 0.24)",
-            callout_background: "rgba(32, 201, 151, 0.1)",
-            code_background: "#08120e",
-            code_text: "#d0f8e8",
-            media_background: "#0e1a16",
-            media_image_background: "linear-gradient(180deg, #1a2e26, #0e1a16)",
-            empty_background: "rgba(18,32,27,0.68)",
-            details_background: "rgba(18,32,27,0.72)",
-            input_background: "rgba(255,255,255,0.08)",
-            surface_hover: "rgba(255,255,255,0.1)",
-            diff_context_background: "rgba(255,255,255,0.04)",
-            diff_added_background: "rgba(32, 201, 151, 0.14)",
-            diff_added_prefix: "#5ee8c0",
-            diff_removed_background: "rgba(248, 113, 113, 0.14)",
-            diff_removed_prefix: "#fca5a5",
-        },
+    let spec = theme_spec(theme);
+    if dark {
+        let button_background = gradient(spec.dark_accent, spec.dark_companion);
+        ThemePalette {
+            color_scheme: "dark".into(),
+            bg: spec.dark_bg.into(),
+            panel: spec.dark_panel.into(),
+            panel_strong: spec.dark_panel_strong.into(),
+            ink: spec.dark_ink.into(),
+            muted: spec.dark_muted.into(),
+            line: spec.dark_line.into(),
+            accent: spec.dark_accent.into(),
+            accent_soft: rgba(spec.dark_accent, "0.16"),
+            shadow: "0 20px 60px rgba(0, 0, 0, 0.46)".into(),
+            radius: spec.radius.into(),
+            font_sans: "Inter, -apple-system, system-ui, sans-serif".into(),
+            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace".into(),
+            body_background: format!(
+                "radial-gradient(circle at top left, {}, transparent 28rem), radial-gradient(circle at top right, {}, transparent 22rem), linear-gradient(180deg, #070b10 0%, var(--bg) 100%)",
+                rgba(spec.dark_accent, "0.22"),
+                rgba(spec.dark_companion, "0.12")
+            ),
+            button_background: button_background.clone(),
+            button_text: "#f8fbff".into(),
+            hero_button_background: button_background,
+            hero_button_text: "#f8fbff".into(),
+            flash_background: "rgba(32, 201, 151, 0.14)".into(),
+            flash_text: "#b8f0d8".into(),
+            flash_border: "rgba(32, 201, 151, 0.24)".into(),
+            callout_background: rgba(spec.dark_accent, "0.10"),
+            code_background: spec.dark_code_bg.into(),
+            code_text: spec.dark_code_text.into(),
+            media_background: spec.dark_bg.into(),
+            media_image_background: format!(
+                "linear-gradient(180deg, {}, {})",
+                spec.dark_panel_strong, spec.dark_bg
+            ),
+            empty_background: rgba(spec.dark_panel_strong, "0.68"),
+            details_background: rgba(spec.dark_panel_strong, "0.72"),
+            input_background: "rgba(255,255,255,0.08)".into(),
+            surface_hover: "rgba(255,255,255,0.10)".into(),
+            diff_context_background: "rgba(255,255,255,0.04)".into(),
+            diff_added_background: "rgba(32, 201, 151, 0.14)".into(),
+            diff_added_prefix: "#5ee8c0".into(),
+            diff_removed_background: "rgba(248, 113, 113, 0.14)".into(),
+            diff_removed_prefix: "#fca5a5".into(),
+        }
+    } else {
+        let button_background = gradient(spec.light_accent, spec.light_companion);
+        ThemePalette {
+            color_scheme: "light".into(),
+            bg: spec.light_bg.into(),
+            panel: spec.light_panel.into(),
+            panel_strong: spec.light_panel_strong.into(),
+            ink: spec.light_ink.into(),
+            muted: spec.light_muted.into(),
+            line: spec.light_line.into(),
+            accent: spec.light_accent.into(),
+            accent_soft: rgba(spec.light_accent, "0.12"),
+            shadow: "0 20px 60px rgba(20, 40, 70, 0.10)".into(),
+            radius: spec.radius.into(),
+            font_sans: "Inter, -apple-system, system-ui, sans-serif".into(),
+            font_mono: "\"IBM Plex Mono\", \"Cascadia Mono\", monospace".into(),
+            body_background: format!(
+                "radial-gradient(circle at top left, {}, transparent 28rem), radial-gradient(circle at top right, {}, transparent 22rem), linear-gradient(180deg, #ffffff 0%, var(--bg) 100%)",
+                rgba(spec.light_accent, "0.16"),
+                rgba(spec.light_companion, "0.12")
+            ),
+            button_background: button_background.clone(),
+            button_text: "#f8fbff".into(),
+            hero_button_background: button_background,
+            hero_button_text: "#f8fbff".into(),
+            flash_background: "rgba(16, 185, 129, 0.12)".into(),
+            flash_text: "#065f46".into(),
+            flash_border: "rgba(16, 185, 129, 0.20)".into(),
+            callout_background: rgba(spec.light_accent, "0.08"),
+            code_background: spec.light_code_bg.into(),
+            code_text: spec.light_code_text.into(),
+            media_background: "#ffffff".into(),
+            media_image_background: format!(
+                "linear-gradient(180deg, {}, {})",
+                spec.light_panel_strong, spec.light_bg
+            ),
+            empty_background: "rgba(255,255,255,0.66)".into(),
+            details_background: "rgba(255,255,255,0.66)".into(),
+            input_background: "rgba(255,255,255,0.92)".into(),
+            surface_hover: "rgba(255,255,255,0.90)".into(),
+            diff_context_background: "rgba(255,255,255,0.94)".into(),
+            diff_added_background: "rgba(16, 185, 129, 0.12)".into(),
+            diff_added_prefix: "#047857".into(),
+            diff_removed_background: "rgba(239, 68, 68, 0.10)".into(),
+            diff_removed_prefix: "#dc2626".into(),
+        }
     }
 }
 
@@ -10218,25 +10709,37 @@ fn render_theme_selector_cards(
             } else {
                 String::new()
             };
+            let preview = render_theme_preview(theme);
             format!(
                 r#"<div class="theme-card{}" data-theme="{}">
   <div class="theme-card-label">
     <strong>{}</strong>
     {}
   </div>
-  <div class="theme-preview theme-preview-{}">
-    <span></span><span></span><span></span>
-  </div>
+  {}
 </div>"#,
                 if is_selected { " selected" } else { "" },
                 escape_attribute(theme.as_str()),
                 escape_text(theme.display_name()),
                 pill,
-                escape_attribute(theme.as_str()),
+                preview,
             )
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn render_theme_preview(theme: UiTheme) -> String {
+    let light = theme_palette(theme, false);
+    let dark = theme_palette(theme, true);
+    format!(
+        r#"<div class="theme-preview" aria-hidden="true">
+    <span style="background:{};"></span><span style="background:{};"></span><span style="background:{};"></span>
+  </div>"#,
+        escape_attribute(&light.panel_strong),
+        escape_attribute(&light.accent),
+        escape_attribute(&dark.accent),
+    )
 }
 
 fn accent_foreground(hex: &str) -> &'static str {
@@ -10311,7 +10814,7 @@ fn palette_css_vars(p: &ThemePalette) -> String {
         muted = p.muted,
         line = p.line,
         accent = p.accent,
-        accent_fg = accent_foreground(p.accent),
+        accent_fg = accent_foreground(&p.accent),
         accent_soft = p.accent_soft,
         shadow = p.shadow,
         radius = p.radius,
@@ -12782,16 +13285,6 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border: 1px solid var(--line);
     }
 
-    .theme-preview-parchment span:nth-child(1) { background: #fff8ef; }
-    .theme-preview-parchment span:nth-child(2) { background: #d36a45; }
-    .theme-preview-parchment span:nth-child(3) { background: #c7d9e2; }
-    .theme-preview-graphite span:nth-child(1) { background: #1a222c; }
-    .theme-preview-graphite span:nth-child(2) { background: #2563eb; }
-    .theme-preview-graphite span:nth-child(3) { background: #7dd3fc; }
-    .theme-preview-signal span:nth-child(1) { background: #f6fffc; }
-    .theme-preview-signal span:nth-child(2) { background: #0f8f6f; }
-    .theme-preview-signal span:nth-child(3) { background: #1768ac; }
-
     .meta-stack {
       display: grid;
       gap: var(--s-3);
@@ -13310,6 +13803,8 @@ mod tests {
         );
 
         assert!(html.contains(r#"data-editor-save="block""#));
+        assert!(html.contains(r#"href="/ui/my-docs/doc/doc-1/download.md""#));
+        assert!(html.contains(r#"title="Download Markdown""#));
         assert!(html.contains(r#"data-editor-action="/ui/"#));
         assert!(html.contains(r#"data-editor-block-type="markdown""#));
         assert!(html.contains(r#"id="block-edit-content-"#));
@@ -13531,7 +14026,17 @@ mod tests {
             assert!(html.contains("https://lore.example.com/install-cli.sh"));
             assert!(html.contains("https://lore.example.com/install-cli.ps1"));
             assert!(!html.contains("raw.githubusercontent.com/brontoguana/lore"));
+            assert!(!html.contains("LORE_VERSION=v"));
         }
+        assert!(
+            guide_html.contains("curl -fsSL https://lore.example.com/install-cli.sh | sh -s -- v")
+        );
+        assert!(guide_html.contains("2. Choose how this machine will use Lore"));
+        assert!(guide_html.contains("Option A: Managed agent machine"));
+        assert!(guide_html.contains("Option B: External agent CLI access"));
+        assert!(guide_html.contains(
+            "lore setup-external https://lore.example.com --token &lt;external-agent-token&gt;"
+        ));
         assert!(
             agents_html.contains("lore setup-external https://lore.example.com --token YOUR_TOKEN")
         );
@@ -13592,6 +14097,8 @@ mod tests {
         assert!(html.contains("data-external-project-grant"));
         assert!(html.contains("row.getAttribute('data-external-project-grant')"));
         assert!(html.contains(r#"onclick="toggleExternalAgentCreate()""#));
+        assert!(html.contains(r#"display:flex; justify-content:flex-end;"#));
+        assert!(html.contains(r#"style="width:auto;">Create external agent</button>"#));
         assert!(html.contains(r#"id="create-external-agent-form" style="display:none;"#));
         assert!(html.contains("Create external agent token"));
         assert!(!html.contains("External agent name"));
@@ -13647,6 +14154,9 @@ mod tests {
         ));
         assert!(html.contains("Bearer lore_at_created_secret"));
         assert!(html.contains("external agent"));
+        assert!(html.contains(
+            "The token grants only the project permissions configured for this external agent."
+        ));
 
         let hidden_token_html = render_agents_page(
             &config,
@@ -14237,6 +14747,11 @@ mod tests {
                 UiTheme::Parchment,
             )
             .unwrap(),
+            &LoginSecuritySettings::default(),
+            &[],
+            &[],
+            &[],
+            "203.0.113.10",
             &crate::config::ExternalAuthConfig::default(),
             &crate::config::OidcConfig::default(),
             &AutoUpdateConfig::default(),
@@ -14290,6 +14805,28 @@ mod tests {
     }
 
     #[test]
+    fn settings_page_renders_full_theme_catalog() {
+        let html = render_settings_page(
+            UiTheme::Lagoon,
+            ColorMode::Light,
+            "antony",
+            "csrf-token",
+            Some(UiTheme::Lagoon),
+            None,
+            UiTheme::Parchment,
+            true,
+            None,
+        );
+
+        assert_eq!(html.matches(r#"data-theme=""#).count(), 30);
+        assert!(html.contains(r#"data-theme="lagoon""#));
+        assert!(html.contains(r#"data-theme="aubergine""#));
+        assert!(html.contains(r#"data-theme="sky""#));
+        assert!(html.contains(r#"<strong>Lagoon</strong>"#));
+        assert!(html.contains(r#"<div class="theme-preview" aria-hidden="true">"#));
+    }
+
+    #[test]
     fn admin_manager_special_case_fields_use_expanded_editor() {
         let html = render_admin_page(
             UiTheme::Parchment,
@@ -14307,6 +14844,11 @@ mod tests {
                 UiTheme::Parchment,
             )
             .unwrap(),
+            &LoginSecuritySettings::default(),
+            &[],
+            &[],
+            &[],
+            "203.0.113.10",
             &crate::config::ExternalAuthConfig::default(),
             &crate::config::OidcConfig::default(),
             &AutoUpdateConfig::default(),
@@ -14552,5 +15094,18 @@ mod tests {
         let dark = shared_styles(UiTheme::Parchment, ColorMode::Dark);
         assert!(dark.contains("--code-bg: #120e0a;"));
         assert!(dark.contains("--code-ink: #f0e6d8;"));
+    }
+
+    #[test]
+    fn expanded_themes_include_light_and_dark_palettes() {
+        let light = shared_styles(UiTheme::Ruby, ColorMode::Light);
+        assert!(light.contains("color-scheme: light;"));
+        assert!(light.contains("--bg: #f8ecef;"));
+        assert!(light.contains("--accent: #a61945;"));
+
+        let dark = shared_styles(UiTheme::Ruby, ColorMode::Dark);
+        assert!(dark.contains("color-scheme: dark;"));
+        assert!(dark.contains("--bg: #1b0a10;"));
+        assert!(dark.contains("--accent: #e85a82;"));
     }
 }

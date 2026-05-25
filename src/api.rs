@@ -3,7 +3,7 @@ use crate::auth::{
     AgentBackend, AgentChatStatus, AuthenticatedAgent, AuthenticatedUser, ChatAuditLog,
     ChatConversation, ChatMessage, ChatRole, ChatStore, LocalAuthStore, ManageConfig,
     NewAgentToken, NewRole, NewSession, NewUser, PinnedChatItem, ProjectGrant, ProjectPermission,
-    RoleName, StoredAgentToken, StoredMachine, UserName, hash_agent_token,
+    RoleName, StoredAgentToken, StoredMachine, StoredUserPasskey, UserName, hash_agent_token,
 };
 use crate::config::{
     ColorMode, ExternalAuthSecretUpdate, ExternalAuthStore, ExternalScheme, OidcConfig,
@@ -26,8 +26,7 @@ use crate::manager::{
 };
 use crate::model::{
     Block, BlockId, BlockType, DocumentId, ImageUpload, KeyFingerprint, NewBlock, OrderKey,
-    ProjectName, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW, UpdateBlock,
-    reserved_block_display_name,
+    ProjectName, RESERVED_AGENT_CONTEXT, RESERVED_MAP, RESERVED_OVERVIEW, UpdateBlock, slugify,
 };
 use crate::store::FileBlockStore;
 use crate::ui::{
@@ -73,12 +72,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use uuid::Uuid;
+use webauthn_rs::prelude::{
+    CreationChallengeResponse, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
+    RegisterPublicKeyCredential, RequestChallengeResponse, Url, Webauthn, WebauthnBuilder,
+};
 
 const API_KEY_HEADER: &str = "x-lore-key";
 const MCP_SESSION_HEADER: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const SESSION_COOKIE: &str = "lore_session";
+const LOGIN_APPROVAL_COOKIE: &str = "lore_login_approval";
+const PASSKEY_REGISTRATION_TTL_SECS: i64 = 600;
+const PASSKEY_AUTHENTICATION_TTL_SECS: i64 = 300;
+const LOGIN_APPROVAL_TTL_SECS: u64 = 15 * 60;
 const LOGIN_RATE_LIMIT_ATTEMPTS: usize = 8;
 const LOGIN_RATE_LIMIT_WINDOW_SECS: i64 = 300;
 const AGENT_AUTH_RATE_LIMIT_ATTEMPTS: usize = 20;
@@ -182,6 +189,25 @@ pub struct AppState {
     agent_recent_activity: Arc<Mutex<HashMap<String, AgentRecentActivity>>>,
     machine_update_timestamps: Arc<Mutex<HashMap<String, Instant>>>,
     machine_update_signal_state: Arc<Mutex<HashMap<String, bool>>>,
+    passkey_registrations: Arc<Mutex<HashMap<String, PendingPasskeyRegistration>>>,
+    passkey_authentications: Arc<Mutex<HashMap<String, PendingPasskeyAuthentication>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPasskeyRegistration {
+    username: UserName,
+    label: String,
+    state: PasskeyRegistration,
+    created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPasskeyAuthentication {
+    username: UserName,
+    passkey_ids: Vec<String>,
+    credentials: Vec<StoredUserPasskey>,
+    state: PasskeyAuthentication,
+    created_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone)]
@@ -514,6 +540,8 @@ impl AppState {
             agent_recent_activity: Arc::new(Mutex::new(HashMap::new())),
             machine_update_timestamps: Arc::new(Mutex::new(HashMap::new())),
             machine_update_signal_state: Arc::new(Mutex::new(HashMap::new())),
+            passkey_registrations: Arc::new(Mutex::new(HashMap::new())),
+            passkey_authentications: Arc::new(Mutex::new(HashMap::new())),
         };
         let _ = maybe_mark_machine_auto_update_rollout(&state);
         state
@@ -531,6 +559,8 @@ fn build_app_with_librarian(
     let router = Router::new()
         .route("/", get(root_redirect))
         .route("/login", get(login_page).post(login_submit))
+        .route("/login/passkey/start", post(passkey_login_start))
+        .route("/login/passkey/finish", post(passkey_login_finish))
         .route("/login/oidc", get(oidc_login_start))
         .route("/login/oidc/callback", get(oidc_login_callback))
         .route("/login/external", post(external_login_submit))
@@ -828,6 +858,35 @@ fn build_app_with_librarian(
             post(revoke_user_sessions_from_ui),
         )
         .route("/ui/admin/setup", post(update_setup_from_ui))
+        .route(
+            "/ui/admin/login-security",
+            post(update_login_security_from_ui),
+        )
+        .route(
+            "/ui/admin/passkeys/register/start",
+            post(passkey_register_start),
+        )
+        .route(
+            "/ui/admin/passkeys/register/finish",
+            post(passkey_register_finish),
+        )
+        .route(
+            "/ui/admin/passkeys/{id}/delete",
+            post(delete_passkey_from_ui),
+        )
+        .route(
+            "/ui/admin/login-approvals/{id}/approve",
+            post(approve_login_from_ui),
+        )
+        .route(
+            "/ui/admin/login-approvals/{id}/deny",
+            post(deny_login_from_ui),
+        )
+        .route("/ui/admin/login-ips", post(add_login_ip_from_ui))
+        .route(
+            "/ui/admin/login-ips/{id}/delete",
+            post(delete_login_ip_from_ui),
+        )
         .route("/ui/admin/endpoints", post(create_endpoint_from_ui))
         .route("/ui/admin/endpoints/list-models", post(list_models_from_ui))
         .route("/ui/admin/endpoints/{id}", post(update_endpoint_from_ui))
@@ -914,6 +973,10 @@ fn build_app_with_librarian(
         .route(
             "/ui/{project}/doc/{doc_id}",
             axum::routing::get(document_page),
+        )
+        .route(
+            "/ui/{project}/doc/{doc_id}/download.md",
+            axum::routing::get(download_document_markdown),
         )
         .route(
             "/ui/{project}/doc/{doc_id}/rename",
@@ -1312,6 +1375,40 @@ struct LoginForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct PasskeyStartLoginRequest {
+    username: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PasskeyFinishLoginRequest {
+    challenge_id: String,
+    credential: PublicKeyCredential,
+}
+
+#[derive(Debug, Deserialize)]
+struct PasskeyRegisterStartRequest {
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PasskeyRegisterFinishRequest {
+    challenge_id: String,
+    credential: RegisterPublicKeyCredential,
+}
+
+#[derive(Debug, Serialize)]
+struct PasskeyRegisterStartResponse {
+    challenge_id: String,
+    public_key: CreationChallengeResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct PasskeyAuthStartResponse {
+    challenge_id: String,
+    public_key: RequestChallengeResponse,
+}
+
+#[derive(Debug, Deserialize)]
 struct CsrfForm {
     csrf_token: String,
 }
@@ -1449,6 +1546,20 @@ struct UpdateSetupUiForm {
     external_scheme: String,
     external_host: String,
     external_port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateLoginSecurityUiForm {
+    csrf_token: String,
+    passkey_enforcement_enabled: Option<String>,
+    ip_restrictions_enabled: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddLoginIpUiForm {
+    csrf_token: String,
+    label: String,
+    cidr: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2007,12 +2118,17 @@ async fn login_page(
         state.auth.has_users()?,
         state.external_auth.load()?.is_configured(),
         state.oidc.load()?.is_configured(),
+        state
+            .auth
+            .login_security_settings()?
+            .passkey_enforcement_enabled,
         query.flash.as_deref(),
     )))
 }
 
 async fn login_submit(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> UiResult<Response> {
     if let Err(_) = enforce_login_rate_limit(&state, &form.username) {
@@ -2021,8 +2137,8 @@ async fn login_submit(
         )
         .into_response());
     }
-    let session = match state.auth.create_session(&form.username, &form.password) {
-        Ok(s) => s,
+    let user = match state.auth.authenticate(&form.username, &form.password) {
+        Ok(user) => user,
         Err(LoreError::PermissionDenied) => {
             return Ok(
                 Redirect::to("/login?flash=Incorrect%20username%20or%20password").into_response(),
@@ -2031,6 +2147,64 @@ async fn login_submit(
         Err(e) => return Err(e.into()),
     };
     clear_login_rate_limit(&state, &form.username);
+    let settings = state.auth.login_security_settings()?;
+    if settings.passkey_enforcement_enabled || settings.ip_restrictions_enabled {
+        let username = user.username.clone();
+        let client_ip = request_ip(&headers).unwrap_or_else(|| "127.0.0.1".to_string());
+        let ip_allowed = !settings.ip_restrictions_enabled
+            || state.auth.login_ip_allowed(&client_ip).unwrap_or(false);
+        let approved = if settings.passkey_enforcement_enabled {
+            let approved_cookie = extract_cookie(&headers, LOGIN_APPROVAL_COOKIE)
+                .filter(|token| !token.trim().is_empty())
+                .unwrap_or_default();
+            !approved_cookie.is_empty()
+                && state
+                    .auth
+                    .consume_approved_login_approval(&username, &approved_cookie)?
+        } else {
+            true
+        };
+        let needs_bypass = !ip_allowed || !approved;
+        let bypassed = needs_bypass && state.auth.consume_login_bypass(&username)?;
+        if !ip_allowed && !bypassed {
+            append_audit_event(
+                &state,
+                AuditActor {
+                    kind: AuditActorKind::User,
+                    name: username.as_str().to_string(),
+                },
+                "password login blocked by IP allowlist",
+                Some(username.as_str().to_string()),
+                Some(format!("ip={client_ip}")),
+            )?;
+            return Ok(Redirect::to(
+                "/login?flash=Password%20accepted,%20but%20this%20IP%20is%20not%20allowed.",
+            )
+            .into_response());
+        }
+        if !approved && !bypassed {
+            let approval_token = Uuid::new_v4().to_string();
+            let pending = state.auth.create_pending_login_approval(
+                &username,
+                &approval_token,
+                Some(client_ip.as_str()),
+                request_user_agent(&headers).as_deref(),
+                Duration::from_secs(LOGIN_APPROVAL_TTL_SECS),
+            )?;
+            append_audit_event(
+                &state,
+                AuditActor {
+                    kind: AuditActorKind::User,
+                    name: username.as_str().to_string(),
+                },
+                "password login awaiting approval",
+                Some(username.as_str().to_string()),
+                Some(format!("pending login {}", pending.id)),
+            )?;
+            return Ok(login_approval_redirect_response(&state, &approval_token));
+        }
+    }
+    let session = state.auth.create_session_for_authenticated_user(user)?;
     append_audit_event(
         &state,
         AuditActor {
@@ -2041,10 +2215,116 @@ async fn login_submit(
         Some(session.user.username.as_str().to_string()),
         None,
     )?;
-    Ok(session_redirect_response(
+    Ok(session_redirect_response_with_cleared_login_approval(
         &state,
         &session,
         Redirect::to("/ui?flash=Signed%20in"),
+    ))
+}
+
+async fn passkey_login_start(
+    State(state): State<AppState>,
+    Json(payload): Json<PasskeyStartLoginRequest>,
+) -> UiResult<Json<PasskeyAuthStartResponse>> {
+    cleanup_pending_passkey_maps(&state);
+    let username = UserName::new(payload.username)?;
+    let passkeys = state.auth.list_user_passkeys(&username)?;
+    if passkeys.is_empty() {
+        return Err(LoreError::PermissionDenied.into());
+    }
+    let credentials = passkeys
+        .iter()
+        .map(|passkey| passkey.credential.clone())
+        .collect::<Vec<_>>();
+    let webauthn = webauthn_for_server(&state.config.load()?)?;
+    let (public_key, auth_state) = webauthn
+        .start_passkey_authentication(&credentials)
+        .map_err(|err| LoreError::Validation(format!("passkey login failed: {err}")))?;
+    let challenge_id = Uuid::new_v4().to_string();
+    state
+        .passkey_authentications
+        .lock()
+        .map_err(|_| LoreError::Validation("passkey state lock poisoned".into()))?
+        .insert(
+            challenge_id.clone(),
+            PendingPasskeyAuthentication {
+                username,
+                passkey_ids: passkeys.iter().map(|passkey| passkey.id.clone()).collect(),
+                credentials: passkeys,
+                state: auth_state,
+                created_at: OffsetDateTime::now_utc(),
+            },
+        );
+    Ok(Json(PasskeyAuthStartResponse {
+        challenge_id,
+        public_key,
+    }))
+}
+
+async fn passkey_login_finish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<PasskeyFinishLoginRequest>,
+) -> UiResult<Response> {
+    cleanup_pending_passkey_maps(&state);
+    let pending = state
+        .passkey_authentications
+        .lock()
+        .map_err(|_| LoreError::Validation("passkey state lock poisoned".into()))?
+        .remove(&payload.challenge_id)
+        .ok_or(LoreError::PermissionDenied)?;
+    let webauthn = webauthn_for_server(&state.config.load()?)?;
+    let result = webauthn
+        .finish_passkey_authentication(&payload.credential, &pending.state)
+        .map_err(|_| LoreError::PermissionDenied)?;
+    let mut matched = false;
+    for (idx, stored) in pending.credentials.iter().enumerate() {
+        let mut credential = stored.credential.clone();
+        if credential.update_credential(&result).is_some() {
+            if let Some(passkey_id) = pending.passkey_ids.get(idx) {
+                state
+                    .auth
+                    .update_passkey_after_authentication(passkey_id, &credential)?;
+            }
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
+        return Err(LoreError::PermissionDenied.into());
+    }
+    let settings = state.auth.login_security_settings()?;
+    if settings.ip_restrictions_enabled {
+        let client_ip = request_ip(&headers).unwrap_or_else(|| "127.0.0.1".to_string());
+        if !state.auth.login_ip_allowed(&client_ip).unwrap_or(false) {
+            append_audit_event(
+                &state,
+                AuditActor {
+                    kind: AuditActorKind::User,
+                    name: pending.username.as_str().to_string(),
+                },
+                "passkey login blocked by IP allowlist",
+                Some(pending.username.as_str().to_string()),
+                Some(format!("ip={client_ip}")),
+            )?;
+            return Err(LoreError::PermissionDenied.into());
+        }
+    }
+    let session = state.auth.create_session_for_user(&pending.username)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: pending.username.as_str().to_string(),
+        },
+        "passkey sign-in",
+        Some(pending.username.as_str().to_string()),
+        None,
+    )?;
+    Ok(session_redirect_response_with_cleared_login_approval(
+        &state,
+        &session,
+        Redirect::to("/ui?flash=Signed%20in%20with%20passkey"),
     ))
 }
 
@@ -4217,6 +4497,11 @@ async fn admin_page(
     let pending_actions = state.pending_librarian_actions.list_all(12)?;
     let auth_audit = state.auth_audit.list_recent(12)?;
     let projects = state.store.list_project_infos()?;
+    let login_security = state.auth.login_security_settings()?;
+    let passkeys = state.auth.list_all_user_passkeys()?;
+    let pending_login_approvals = state.auth.list_pending_login_approvals()?;
+    let allowed_login_ips = state.auth.list_allowed_login_ips()?;
+    let current_client_ip = request_ip(&headers).unwrap_or_else(|| "127.0.0.1".to_string());
     let all_tokens = state.auth.list_agent_tokens()?;
     let mut user_agents: std::collections::HashMap<String, Vec<AgentTokenSummary>> =
         std::collections::HashMap::new();
@@ -4262,6 +4547,11 @@ async fn admin_page(
         &user_agents,
         &user_machines,
         &config,
+        &login_security,
+        &passkeys,
+        &pending_login_approvals,
+        &allowed_login_ips,
+        &current_client_ip,
         &external_auth_config,
         &oidc_config,
         &auto_update_config,
@@ -4679,6 +4969,132 @@ async fn document_page(
         &state.store,
     );
     Ok(Html(page))
+}
+
+async fn download_document_markdown(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, doc_id)): Path<(String, String)>,
+) -> UiResult<Response> {
+    let project = ProjectName::new(project)?;
+    let session = require_ui_session(&state, &headers)?;
+    state.auth.authorize_read(&session.user, &project)?;
+    let doc_id = DocumentId::from_string(doc_id)?;
+    let blocks = state.store.list_doc_blocks(&project, &doc_id)?;
+    let all_docs = state.store.list_documents(&project).unwrap_or_default();
+    let doc_name = find_doc_name(&all_docs, &doc_id).unwrap_or_else(|| "Document".to_string());
+    let markdown = document_markdown_export(&project, &doc_id, &doc_name, &blocks);
+    let filename_slug = {
+        let slug = slugify(&doc_name);
+        if slug.is_empty() {
+            "document".to_string()
+        } else {
+            slug
+        }
+    };
+    let disposition =
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename_slug}.md\""))
+            .map_err(|_| LoreError::Validation("document filename is invalid".into()))?;
+    let mut response = Body::from(markdown).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/markdown; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, disposition);
+    Ok(response)
+}
+
+fn document_markdown_export(
+    project: &ProjectName,
+    doc_id: &DocumentId,
+    doc_name: &str,
+    blocks: &[Block],
+) -> String {
+    let mut out = format!("# {}\n", markdown_single_line(doc_name));
+    for block in blocks {
+        let section = document_block_markdown_export(project, doc_id, block);
+        if section.trim().is_empty() {
+            continue;
+        }
+        if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(section.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn document_block_markdown_export(
+    project: &ProjectName,
+    doc_id: &DocumentId,
+    block: &Block,
+) -> String {
+    match block.block_type {
+        BlockType::Markdown => block.content.clone(),
+        BlockType::Html => fenced_markdown_block("html", &block.content),
+        BlockType::Svg => fenced_markdown_block("svg", &block.content),
+        BlockType::Image => {
+            let caption = markdown_single_line(block.content.trim());
+            let alt = if caption.is_empty() {
+                "Image".to_string()
+            } else {
+                caption
+            };
+            let src = if block.media_type.is_some() {
+                format!(
+                    "/ui/{}/doc/{}/blocks/{}/media",
+                    project.as_str(),
+                    doc_id.as_str(),
+                    block.id.as_str()
+                )
+            } else {
+                block.content.trim().to_string()
+            };
+            if src.is_empty() {
+                "<!-- Image block has no downloadable source. -->".to_string()
+            } else {
+                format!("![{}]({})", markdown_image_alt(&alt), src)
+            }
+        }
+    }
+}
+
+fn fenced_markdown_block(language: &str, content: &str) -> String {
+    let fence_len = longest_backtick_run(content).max(2) + 1;
+    format!(
+        "{ticks}{language}\n{content}\n{ticks}",
+        ticks = "`".repeat(fence_len),
+        language = language,
+        content = content.trim_end()
+    )
+}
+
+fn longest_backtick_run(content: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for ch in content.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+fn markdown_single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn markdown_image_alt(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
 }
 
 fn find_doc_name(docs: &[crate::store::DocumentInfo], target: &DocumentId) -> Option<String> {
@@ -5237,6 +5653,255 @@ async fn update_setup_from_ui(
         None,
     )?;
     Ok(Redirect::to("/ui/admin?flash=Setup%20address%20saved"))
+}
+
+async fn update_login_security_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UpdateLoginSecurityUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let passkey_enabled = form.passkey_enforcement_enabled.as_deref() == Some("true");
+    let ip_enabled = form.ip_restrictions_enabled.as_deref() == Some("true");
+    if passkey_enabled
+        && state
+            .auth
+            .list_user_passkeys(&session.user.username)?
+            .is_empty()
+    {
+        return Ok(Redirect::to(
+            "/ui/admin?section=network&flash=Register%20an%20admin%20passkey%20before%20enabling%20enforcement",
+        ));
+    }
+    if ip_enabled && !state.auth.has_non_loopback_allowed_login_ip()? {
+        return Ok(Redirect::to(
+            "/ui/admin?section=network&flash=Add%20at%20least%20one%20non-loopback%20allowed%20IP%20before%20enabling%20IP%20restrictions",
+        ));
+    }
+    state
+        .auth
+        .set_login_security_settings(passkey_enabled, ip_enabled)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "update login security",
+        None,
+        Some(format!(
+            "passkey_enforcement_enabled={passkey_enabled}; ip_restrictions_enabled={ip_enabled}"
+        )),
+    )?;
+    Ok(Redirect::to(
+        "/ui/admin?section=network&flash=Login%20security%20saved",
+    ))
+}
+
+async fn passkey_register_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<PasskeyRegisterStartRequest>,
+) -> UiResult<Json<PasskeyRegisterStartResponse>> {
+    cleanup_pending_passkey_maps(&state);
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf_header(&session, &headers)?;
+    let existing = state.auth.list_user_passkeys(&session.user.username)?;
+    let exclude_credentials = existing
+        .iter()
+        .map(|passkey| passkey.credential.cred_id().clone())
+        .collect::<Vec<_>>();
+    let label = payload
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Admin passkey")
+        .to_string();
+    let webauthn = webauthn_for_server(&state.config.load()?)?;
+    let (public_key, reg_state) = webauthn
+        .start_passkey_registration(
+            Uuid::new_v4(),
+            session.user.username.as_str(),
+            session.user.username.as_str(),
+            Some(exclude_credentials),
+        )
+        .map_err(|err| LoreError::Validation(format!("passkey registration failed: {err}")))?;
+    let challenge_id = Uuid::new_v4().to_string();
+    state
+        .passkey_registrations
+        .lock()
+        .map_err(|_| LoreError::Validation("passkey state lock poisoned".into()))?
+        .insert(
+            challenge_id.clone(),
+            PendingPasskeyRegistration {
+                username: session.user.username,
+                label,
+                state: reg_state,
+                created_at: OffsetDateTime::now_utc(),
+            },
+        );
+    Ok(Json(PasskeyRegisterStartResponse {
+        challenge_id,
+        public_key,
+    }))
+}
+
+async fn passkey_register_finish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<PasskeyRegisterFinishRequest>,
+) -> UiResult<Json<Value>> {
+    cleanup_pending_passkey_maps(&state);
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf_header(&session, &headers)?;
+    let pending = state
+        .passkey_registrations
+        .lock()
+        .map_err(|_| LoreError::Validation("passkey state lock poisoned".into()))?
+        .remove(&payload.challenge_id)
+        .ok_or(LoreError::PermissionDenied)?;
+    if pending.username != session.user.username {
+        return Err(LoreError::PermissionDenied.into());
+    }
+    let webauthn = webauthn_for_server(&state.config.load()?)?;
+    let passkey = webauthn
+        .finish_passkey_registration(&payload.credential, &pending.state)
+        .map_err(|err| LoreError::Validation(format!("passkey registration failed: {err}")))?;
+    let stored = state
+        .auth
+        .add_user_passkey(&session.user.username, &pending.label, &passkey)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "register passkey",
+        Some(stored.id.clone()),
+        Some(stored.label),
+    )?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn delete_passkey_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    state.auth.delete_user_passkey(&id)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "delete passkey",
+        Some(id),
+        None,
+    )?;
+    Ok(Redirect::to(
+        "/ui/admin?section=network&flash=Passkey%20deleted",
+    ))
+}
+
+async fn add_login_ip_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AddLoginIpUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let entry = state.auth.add_allowed_login_ip(&form.label, &form.cidr)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "add login IP allowlist entry",
+        Some(entry.id),
+        Some(format!("{} ({})", entry.cidr, entry.label)),
+    )?;
+    Ok(Redirect::to(
+        "/ui/admin?section=network&flash=Allowed%20IP%20added",
+    ))
+}
+
+async fn delete_login_ip_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    state.auth.delete_allowed_login_ip(&id)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "delete login IP allowlist entry",
+        Some(id),
+        None,
+    )?;
+    Ok(Redirect::to(
+        "/ui/admin?section=network&flash=Allowed%20IP%20removed",
+    ))
+}
+
+async fn approve_login_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    state.auth.approve_pending_login(&id)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "approve password login",
+        Some(id),
+        None,
+    )?;
+    Ok(Redirect::to(
+        "/ui/admin?section=network&flash=Login%20approved",
+    ))
+}
+
+async fn deny_login_from_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<UserActionUiForm>,
+) -> UiResult<Redirect> {
+    let session = require_ui_admin(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    state.auth.deny_pending_login(&id)?;
+    append_audit_event(
+        &state,
+        AuditActor {
+            kind: AuditActorKind::User,
+            name: session.user.username.as_str().to_string(),
+        },
+        "deny password login",
+        Some(id),
+        None,
+    )?;
+    Ok(Redirect::to(
+        "/ui/admin?section=network&flash=Login%20denied",
+    ))
 }
 
 async fn update_theme_from_ui(
@@ -6777,6 +7442,14 @@ fn verify_csrf(session: &UiSession, submitted: &str) -> Result<(), LoreError> {
     Ok(())
 }
 
+fn verify_csrf_header(session: &UiSession, headers: &HeaderMap) -> Result<(), LoreError> {
+    let submitted = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    verify_csrf(session, submitted)
+}
+
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -6893,6 +7566,18 @@ fn session_cookie_value(token: &str, secure: bool) -> String {
     )
 }
 
+fn login_approval_cookie_value(token: &str, secure: bool) -> String {
+    let secure_flag = if secure { "; Secure" } else { "" };
+    format!(
+        "{LOGIN_APPROVAL_COOKIE}={token}; Path=/login; HttpOnly; SameSite=Lax; Max-Age={LOGIN_APPROVAL_TTL_SECS}{secure_flag}"
+    )
+}
+
+fn clear_login_approval_cookie_value(secure: bool) -> String {
+    let secure_flag = if secure { "; Secure" } else { "" };
+    format!("{LOGIN_APPROVAL_COOKIE}=; Path=/login; HttpOnly; SameSite=Lax; Max-Age=0{secure_flag}")
+}
+
 fn clear_session_cookie_value(secure: bool) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
     format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_flag}")
@@ -6917,6 +7602,46 @@ fn session_redirect_response(
         .into_response()
 }
 
+fn session_redirect_response_with_cleared_login_approval(
+    state: &AppState,
+    session: &NewSession,
+    redirect: Redirect,
+) -> Response {
+    let secure = state
+        .config
+        .load()
+        .map_or(false, |c| c.external_scheme == ExternalScheme::Https);
+    let mut response = redirect.into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&session_cookie_value(&session.token, secure))
+            .expect("session cookie value should be a valid header"),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_login_approval_cookie_value(secure))
+            .expect("login approval cookie value should be a valid header"),
+    );
+    response
+}
+
+fn login_approval_redirect_response(state: &AppState, token: &str) -> Response {
+    let secure = state
+        .config
+        .load()
+        .map_or(false, |c| c.external_scheme == ExternalScheme::Https);
+    let mut response = Redirect::to(
+        "/login?flash=Password%20accepted.%20Waiting%20for%20admin%20login%20approval.",
+    )
+    .into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&login_approval_cookie_value(token, secure))
+            .expect("login approval cookie value should be a valid header"),
+    );
+    response
+}
+
 fn clear_session_redirect_response(state: &AppState, redirect: Redirect) -> Response {
     let secure = state
         .config
@@ -6927,6 +7652,64 @@ fn clear_session_redirect_response(state: &AppState, redirect: Redirect) -> Resp
         redirect,
     )
         .into_response()
+}
+
+fn webauthn_for_server(config: &ServerConfig) -> Result<Webauthn, LoreError> {
+    let origin = Url::parse(&config.base_url())
+        .map_err(|err| LoreError::Validation(format!("invalid passkey origin: {err}")))?;
+    let rp_id = origin
+        .host_str()
+        .ok_or_else(|| LoreError::Validation("passkeys require an external host".into()))?;
+    WebauthnBuilder::new(rp_id, &origin)
+        .map_err(|err| LoreError::Validation(format!("invalid passkey configuration: {err}")))?
+        .rp_name("Lore")
+        .allow_any_port(config.external_host == "localhost" || config.external_host == "127.0.0.1")
+        .build()
+        .map_err(|err| LoreError::Validation(format!("invalid passkey configuration: {err}")))
+}
+
+fn cleanup_pending_passkey_maps(state: &AppState) {
+    let now = OffsetDateTime::now_utc();
+    if let Ok(mut regs) = state.passkey_registrations.lock() {
+        regs.retain(|_, pending| {
+            now - pending.created_at < time::Duration::seconds(PASSKEY_REGISTRATION_TTL_SECS)
+        });
+    }
+    if let Ok(mut auths) = state.passkey_authentications.lock() {
+        auths.retain(|_, pending| {
+            now - pending.created_at < time::Duration::seconds(PASSKEY_AUTHENTICATION_TTL_SECS)
+        });
+    }
+}
+
+fn request_ip(headers: &HeaderMap) -> Option<String> {
+    let forwarded = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let real_ip = || {
+        headers
+            .get("x-real-ip")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    forwarded
+        .or_else(real_ip)
+        .or_else(|| Some("127.0.0.1".to_string()))
+}
+
+fn request_user_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(240).collect())
 }
 
 fn external_auth_secret_update_from_request<'a>(
@@ -16858,7 +17641,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Request, StatusCode, header};
     use base64::Engine;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -17869,6 +18652,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_markdown_download_returns_plain_markdown_attachment() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, _) = bootstrap_admin_session(&app, dir.path()).await;
+        let agent_token = issue_agent_token(
+            &app,
+            dir.path(),
+            "agent-doc-download",
+            ProjectPermission::ReadWrite,
+        )
+        .await;
+
+        let create_doc = Request::builder()
+            .method("POST")
+            .uri("/v1/projects/alpha.docs/documents")
+            .header("content-type", "application/json")
+            .header("x-lore-key", &agent_token)
+            .body(Body::from("{\"name\":\"Export Doc\"}"))
+            .unwrap();
+        let response = app.clone().oneshot(create_doc).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc_json: Value = serde_json::from_slice(&body).unwrap();
+        let doc_id = doc_json["id"].as_str().unwrap().to_string();
+
+        let markdown_block = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/projects/alpha.docs/documents/{doc_id}/blocks"))
+            .header("content-type", "application/json")
+            .header("x-lore-key", &agent_token)
+            .body(Body::from(
+                r###"{"block_type":"markdown","content":"## First\n\nBody text"}"###,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(markdown_block).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let html_block = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/projects/alpha.docs/documents/{doc_id}/blocks"))
+            .header("content-type", "application/json")
+            .header("x-lore-key", &agent_token)
+            .body(Body::from(
+                r#"{"block_type":"html","content":"<aside>Raw html</aside>"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(html_block).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/ui/alpha.docs/doc/{doc_id}/download.md"))
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/markdown; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok()),
+            Some("attachment; filename=\"export-doc.md\"")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let markdown = String::from_utf8(body.to_vec()).unwrap();
+        assert!(markdown.starts_with("# Export Doc\n\n"));
+        assert!(markdown.contains("## First\n\nBody text"));
+        assert!(markdown.contains("```html\n<aside>Raw html</aside>\n```"));
+        assert!(!markdown.contains("@@block"));
+    }
+
+    #[tokio::test]
     async fn creates_block_from_form_and_redirects() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
@@ -18543,6 +19414,7 @@ mod tests {
             .method("GET")
             .uri("/ui/admin")
             .header("cookie", &session_cookie)
+            .header("x-forwarded-for", "203.0.113.77")
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
@@ -18553,13 +19425,222 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("Network"));
         assert!(html.contains("Users"));
+        assert!(html.contains("Require passkey or admin-approved password login"));
+        assert!(html.contains("Restrict browser logins to allowed IPs"));
+        assert!(html.contains("lore-server bypass"));
+        assert!(html.contains("Allowed login IPs"));
+        assert!(html.contains(r#"name="cidr" value="203.0.113.77""#));
+    }
+
+    #[tokio::test]
+    async fn passkey_enforcement_holds_password_login_for_admin_approval() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        ensure_test_admin(dir.path());
+        let auth = LocalAuthStore::new(dir.path());
+        auth.set_passkey_enforcement_enabled(true).unwrap();
+
+        let login = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("user-agent", "Lore test browser")
+            .header("x-forwarded-for", "203.0.113.10")
+            .body(Body::from("username=admin&password=correct-horse-battery"))
+            .unwrap();
+        let response = app.clone().oneshot(login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/login?flash=Password%20accepted.%20Waiting%20for%20admin%20login%20approval."
+        );
+        let cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(cookie.contains("lore_login_approval="));
+        assert!(!cookie.contains("lore_session="));
+
+        let pending = auth.list_pending_login_approvals().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].username.as_str(), "admin");
+        assert_eq!(pending[0].ip_address.as_deref(), Some("203.0.113.10"));
+    }
+
+    #[tokio::test]
+    async fn ssh_login_bypass_allows_one_correct_password_login() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        ensure_test_admin(dir.path());
+        let auth = LocalAuthStore::new(dir.path());
+        auth.set_passkey_enforcement_enabled(true).unwrap();
+        auth.grant_login_bypass(
+            &UserName::new("admin".to_string()).unwrap(),
+            std::time::Duration::from_secs(15 * 60),
+        )
+        .unwrap();
+
+        let login = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("username=admin&password=correct-horse-battery"))
+            .unwrap();
+        let response = app.clone().oneshot(login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(cookies.contains("lore_session="));
+
+        let second = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("username=admin&password=correct-horse-battery"))
+            .unwrap();
+        let response = app.oneshot(second).await.unwrap();
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(cookies.contains("lore_login_approval="));
+        assert!(!cookies.contains("lore_session="));
+    }
+
+    #[tokio::test]
+    async fn ip_restrictions_require_non_loopback_allowlist_entry() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+
+        let enable_without_entry = Request::builder()
+            .method("POST")
+            .uri("/ui/admin/login-security")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={csrf_token}&ip_restrictions_enabled=true"
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(enable_without_entry).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/ui/admin?section=network&flash=Add%20at%20least%20one%20non-loopback%20allowed%20IP%20before%20enabling%20IP%20restrictions"
+        );
+
+        let auth = LocalAuthStore::new(dir.path());
+        auth.add_allowed_login_ip("loopback", "127.0.0.1").unwrap();
+        let enable_loopback_only = Request::builder()
+            .method("POST")
+            .uri("/ui/admin/login-security")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={csrf_token}&ip_restrictions_enabled=true"
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(enable_loopback_only).await.unwrap();
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/ui/admin?section=network&flash=Add%20at%20least%20one%20non-loopback%20allowed%20IP%20before%20enabling%20IP%20restrictions"
+        );
+
+        auth.add_allowed_login_ip("office", "203.0.113.0/24")
+            .unwrap();
+        let enable_allowed = Request::builder()
+            .method("POST")
+            .uri("/ui/admin/login-security")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={csrf_token}&ip_restrictions_enabled=true"
+            )))
+            .unwrap();
+        let response = app.oneshot(enable_allowed).await.unwrap();
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/ui/admin?section=network&flash=Login%20security%20saved"
+        );
+        assert!(
+            auth.login_security_settings()
+                .unwrap()
+                .ip_restrictions_enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn ip_restrictions_block_password_login_until_ssh_bypass() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        ensure_test_admin(dir.path());
+        let auth = LocalAuthStore::new(dir.path());
+        auth.add_allowed_login_ip("office", "203.0.113.0/24")
+            .unwrap();
+        auth.set_ip_restrictions_enabled(true).unwrap();
+
+        let blocked = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-forwarded-for", "198.51.100.44")
+            .body(Body::from("username=admin&password=correct-horse-battery"))
+            .unwrap();
+        let response = app.clone().oneshot(blocked).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/login?flash=Password%20accepted,%20but%20this%20IP%20is%20not%20allowed."
+        );
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!cookies.contains("lore_session="));
+        assert!(auth.list_pending_login_approvals().unwrap().is_empty());
+
+        auth.grant_login_bypass(
+            &UserName::new("admin".to_string()).unwrap(),
+            std::time::Duration::from_secs(15 * 60),
+        )
+        .unwrap();
+        let bypassed = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-forwarded-for", "198.51.100.44")
+            .body(Body::from("username=admin&password=correct-horse-battery"))
+            .unwrap();
+        let response = app.oneshot(bypassed).await.unwrap();
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(cookies.contains("lore_session="));
     }
 
     #[tokio::test]
     async fn anonymous_pages_use_saved_default_theme() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
-        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let _ = bootstrap_admin_session(&app, dir.path()).await;
 
         let update = Request::builder()
             .method("POST")
