@@ -5707,11 +5707,6 @@ async fn passkey_register_start(
     cleanup_pending_passkey_maps(&state);
     let session = require_ui_admin(&state, &headers)?;
     verify_csrf_header(&session, &headers)?;
-    let existing = state.auth.list_user_passkeys(&session.user.username)?;
-    let exclude_credentials = existing
-        .iter()
-        .map(|passkey| passkey.credential.cred_id().clone())
-        .collect::<Vec<_>>();
     let label = payload
         .label
         .as_deref()
@@ -5725,7 +5720,7 @@ async fn passkey_register_start(
             Uuid::new_v4(),
             session.user.username.as_str(),
             session.user.username.as_str(),
-            Some(exclude_credentials),
+            None,
         )
         .map_err(|err| LoreError::Validation(format!("passkey registration failed: {err}")))?;
     let challenge_id = Uuid::new_v4().to_string();
@@ -19429,9 +19424,37 @@ mod tests {
         assert!(html.contains("Restrict browser logins to allowed IPs"));
         assert!(html.contains("lore-server bypass"));
         assert!(html.contains(r#"class="padded passkey-registration""#));
-        assert!(html.contains("This device or passkey account already has a Lore passkey"));
+        assert!(html.contains("You can register separate passkeys"));
+        assert!(!html.contains("This device or passkey account already has a Lore passkey"));
         assert!(html.contains("Allowed login IPs"));
         assert!(html.contains(r#"name="cidr" value="203.0.113.77""#));
+    }
+
+    #[tokio::test]
+    async fn passkey_registration_start_does_not_exclude_existing_credentials() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ui/admin/passkeys/register/start")
+            .header("content-type", "application/json")
+            .header("cookie", &session_cookie)
+            .header("x-csrf-token", csrf_token)
+            .body(Body::from(r#"{"label":"iPhone"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let public_key = json
+            .get("public_key")
+            .and_then(|value| value.get("publicKey").or(Some(value)))
+            .unwrap();
+        assert!(public_key.get("excludeCredentials").is_none());
     }
 
     #[tokio::test]

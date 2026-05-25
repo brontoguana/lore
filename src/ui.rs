@@ -1938,7 +1938,7 @@ pub fn render_admin_page(
             <input type="text" id="passkey-label" value="Admin passkey" maxlength="80">
           </label>
           <button type="button" id="register-passkey-btn" data-csrf="{csrf_token}">Register passkey for this admin</button>
-          <p class="hint" id="passkey-register-status">Passkeys use Touch ID, Face ID, Windows Hello, Android screen lock, or a hardware security key. They require HTTPS except on localhost. Synced passkeys may follow the user's passkey account rather than one physical device.</p>
+          <p class="hint" id="passkey-register-status">You can register separate passkeys for laptops, phones, tablets, and hardware security keys. Passkeys use Touch ID, Face ID, Windows Hello, Android screen lock, or a hardware security key. They require HTTPS except on localhost. Synced passkeys may follow the user's passkey account rather than one physical device.</p>
         </div>
         <div class="panel-header" style="margin-top:var(--s-5)"><h2>Registered passkeys</h2></div>
         {passkeys_html}
@@ -2555,90 +2555,90 @@ pub fn render_admin_page(
         }}
         return openExpandedTextEditor(targetId);
       }};
-	      document.querySelectorAll('[data-manager-prompt-toggle]').forEach(function(toggle) {{
-	        syncManagerPromptEditor(toggle);
-	        toggle.addEventListener('change', function() {{
-	          syncManagerPromptEditor(toggle);
-	        }});
-	      }});
+      document.querySelectorAll('[data-manager-prompt-toggle]').forEach(function(toggle) {{
+        syncManagerPromptEditor(toggle);
+        toggle.addEventListener('change', function() {{
+          syncManagerPromptEditor(toggle);
+        }});
+      }});
 
-	      var passkeyBtn = document.getElementById('register-passkey-btn');
-	      if (passkeyBtn && window.PublicKeyCredential && navigator.credentials) {{
-	        function b64ToBuf(value) {{
-	          var b64 = value.replace(/-/g, '+').replace(/_/g, '/');
-	          while (b64.length % 4) b64 += '=';
-	          var raw = atob(b64);
-	          var out = new Uint8Array(raw.length);
-	          for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
-	          return out.buffer;
-	        }}
-		        function bufToB64(buffer) {{
-		          var bytes = new Uint8Array(buffer);
-		          var raw = '';
-		          for (var i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
-		          return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-		        }}
-		        function passkeyRegistrationErrorMessage(err) {{
-		          var name = err && err.name ? err.name : '';
-		          var message = err && err.message ? err.message : '';
-		          if (name === 'InvalidStateError' || /invalid state/i.test(message)) {{
-		            return 'This device or passkey account already has a Lore passkey for this admin. Try signing in with passkey, or delete the existing Lore passkey before registering a replacement.';
-		          }}
-		          if (name === 'NotAllowedError') {{
-		            return 'Passkey registration was cancelled or blocked by the browser.';
-		          }}
-		          if (name === 'SecurityError') {{
-		            return 'Passkeys require HTTPS except on localhost.';
-		          }}
-		          return message || 'Passkey registration failed.';
-		        }}
-		        passkeyBtn.addEventListener('click', async function() {{
-	          var status = document.getElementById('passkey-register-status');
-	          var labelInput = document.getElementById('passkey-label');
-	          passkeyBtn.disabled = true;
-	          if (status) status.textContent = 'Waiting for passkey registration...';
-	          try {{
-	            var start = await fetch('/ui/admin/passkeys/register/start', {{
-	              method: 'POST',
-	              headers: {{'content-type': 'application/json', 'x-csrf-token': passkeyBtn.getAttribute('data-csrf') || ''}},
-	              body: JSON.stringify({{label: labelInput ? labelInput.value : 'Admin passkey'}})
-	            }});
-	            if (!start.ok) throw new Error('Could not start passkey registration.');
-	            var data = await start.json();
-	            var publicKey = data.public_key.publicKey || data.public_key;
-	            publicKey.challenge = b64ToBuf(publicKey.challenge);
-	            publicKey.user.id = b64ToBuf(publicKey.user.id);
-	            if (publicKey.excludeCredentials) {{
-	              publicKey.excludeCredentials.forEach(function(cred) {{ cred.id = b64ToBuf(cred.id); }});
-	            }}
-	            var credential = await navigator.credentials.create({{publicKey: publicKey}});
-	            var finish = await fetch('/ui/admin/passkeys/register/finish', {{
-	              method: 'POST',
-	              headers: {{'content-type': 'application/json', 'x-csrf-token': passkeyBtn.getAttribute('data-csrf') || ''}},
-	              body: JSON.stringify({{
-	                challenge_id: data.challenge_id,
-	                credential: {{
-	                  id: credential.id,
-	                  rawId: bufToB64(credential.rawId),
-	                  type: credential.type,
-	                  response: {{
-	                    attestationObject: bufToB64(credential.response.attestationObject),
-	                    clientDataJSON: bufToB64(credential.response.clientDataJSON)
-	                  }},
-	                  clientExtensionResults: credential.getClientExtensionResults()
-	                }}
-	              }})
-	            }});
-		            if (!finish.ok) throw new Error('Could not finish passkey registration.');
-		            location.href = '/ui/admin?section=network&flash=Passkey%20registered';
-		          }} catch (err) {{
-		            if (status) status.textContent = passkeyRegistrationErrorMessage(err);
-		            passkeyBtn.disabled = false;
-		          }}
-	        }});
-	      }}
+      var passkeyBtn = document.getElementById('register-passkey-btn');
+      if (passkeyBtn && window.PublicKeyCredential && navigator.credentials) {{
+        function b64ToBuf(value) {{
+          var b64 = value.replace(/-/g, '+').replace(/_/g, '/');
+          while (b64.length % 4) b64 += '=';
+          var raw = atob(b64);
+          var out = new Uint8Array(raw.length);
+          for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+          return out.buffer;
+        }}
+        function bufToB64(buffer) {{
+          var bytes = new Uint8Array(buffer);
+          var raw = '';
+          for (var i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+          return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        }}
+        function passkeyRegistrationErrorMessage(err) {{
+          var name = err && err.name ? err.name : '';
+          var message = err && err.message ? err.message : '';
+          if (name === 'InvalidStateError' || /invalid state/i.test(message)) {{
+            return 'The passkey provider could not create another passkey for this admin on this device. Lore supports multiple registered passkeys, so try a different passkey provider, hardware security key, or browser.';
+          }}
+          if (name === 'NotAllowedError') {{
+            return 'Passkey registration was cancelled or blocked by the browser.';
+          }}
+          if (name === 'SecurityError') {{
+            return 'Passkeys require HTTPS except on localhost.';
+          }}
+          return message || 'Passkey registration failed.';
+        }}
+        passkeyBtn.addEventListener('click', async function() {{
+          var status = document.getElementById('passkey-register-status');
+          var labelInput = document.getElementById('passkey-label');
+          passkeyBtn.disabled = true;
+          if (status) status.textContent = 'Waiting for passkey registration...';
+          try {{
+            var start = await fetch('/ui/admin/passkeys/register/start', {{
+              method: 'POST',
+              headers: {{'content-type': 'application/json', 'x-csrf-token': passkeyBtn.getAttribute('data-csrf') || ''}},
+              body: JSON.stringify({{label: labelInput ? labelInput.value : 'Admin passkey'}})
+            }});
+            if (!start.ok) throw new Error('Could not start passkey registration.');
+            var data = await start.json();
+            var publicKey = data.public_key.publicKey || data.public_key;
+            publicKey.challenge = b64ToBuf(publicKey.challenge);
+            publicKey.user.id = b64ToBuf(publicKey.user.id);
+            if (publicKey.excludeCredentials) {{
+              publicKey.excludeCredentials.forEach(function(cred) {{ cred.id = b64ToBuf(cred.id); }});
+            }}
+            var credential = await navigator.credentials.create({{publicKey: publicKey}});
+            var finish = await fetch('/ui/admin/passkeys/register/finish', {{
+              method: 'POST',
+              headers: {{'content-type': 'application/json', 'x-csrf-token': passkeyBtn.getAttribute('data-csrf') || ''}},
+              body: JSON.stringify({{
+                challenge_id: data.challenge_id,
+                credential: {{
+                  id: credential.id,
+                  rawId: bufToB64(credential.rawId),
+                  type: credential.type,
+                  response: {{
+                    attestationObject: bufToB64(credential.response.attestationObject),
+                    clientDataJSON: bufToB64(credential.response.clientDataJSON)
+                  }},
+                  clientExtensionResults: credential.getClientExtensionResults()
+                }}
+              }})
+            }});
+            if (!finish.ok) throw new Error('Could not finish passkey registration.');
+            location.href = '/ui/admin?section=network&flash=Passkey%20registered';
+          }} catch (err) {{
+            if (status) status.textContent = passkeyRegistrationErrorMessage(err);
+            passkeyBtn.disabled = false;
+          }}
+        }});
+      }}
 
-	      function initSelList(scope) {{
+      function initSelList(scope) {{
         var items = scope.querySelectorAll('.sel-list .sel-item');
         var details = scope.querySelectorAll('.sel-detail');
         items.forEach(function(item) {{

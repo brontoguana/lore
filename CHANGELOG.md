@@ -2,7 +2,8 @@
 
 ## 2026-05-25
 
-- Translated Safari/iOS passkey registration `InvalidStateError` failures into a clear duplicate-passkey message instead of showing the raw browser error.
+- Allowed admins to register additional passkeys from another device or passkey provider instead of blocking registration when an existing credential is visible to the browser.
+- Translated Safari/iOS passkey registration `InvalidStateError` failures into a clearer provider/browser failure message instead of showing the raw browser error.
 - Aligned the Admin Network passkey registration controls with the SSH recovery guidance indentation.
 - Moved the document Markdown download action from the page-title controls to the first block action strip immediately after the pin button.
 - Moved the Settings account/password controls above the theme selector.
