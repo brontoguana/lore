@@ -2,6 +2,10 @@
 
 ## 2026-05-25
 
+- Translated Safari/iOS passkey registration `InvalidStateError` failures into a clear duplicate-passkey message instead of showing the raw browser error.
+- Aligned the Admin Network passkey registration controls with the SSH recovery guidance indentation.
+- Moved the document Markdown download action from the page-title controls to the first block action strip immediately after the pin button.
+- Moved the Settings account/password controls above the theme selector.
 - Fixed full-release builds for the WebAuthn dependency path by vendoring OpenSSL for release targets that do not provide system OpenSSL.
 - Added enforced Admin Network IP allowlisting for browser logins, defaulting new entries to the current Caddy-forwarded client IP, requiring a non-loopback entry before enabling, and making `lore-server bypass` temporarily skip both IP and passkey restrictions for one correct-password login.
 - Added Admin Network trusted-login controls with passkey registration/login, pending approval for correct-password password logins, and SSH-granted temporary login bypass.

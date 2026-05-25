@@ -19428,6 +19428,8 @@ mod tests {
         assert!(html.contains("Require passkey or admin-approved password login"));
         assert!(html.contains("Restrict browser logins to allowed IPs"));
         assert!(html.contains("lore-server bypass"));
+        assert!(html.contains(r#"class="padded passkey-registration""#));
+        assert!(html.contains("This device or passkey account already has a Lore passkey"));
         assert!(html.contains("Allowed login IPs"));
         assert!(html.contains(r#"name="cidr" value="203.0.113.77""#));
     }

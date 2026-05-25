@@ -1932,7 +1932,7 @@ pub fn render_admin_page(
           <p><strong>IP rule</strong><br>Add at least one non-loopback allowed IP before enabling IP restrictions. Loopback is always allowed for Lore's local Caddy path and does not count as an allowlist entry.</p>
           <p><strong>SSH recovery</strong><br>If browser login is blocked, SSH to the server and run <code>{ssh_bypass_command}</code>. It asks for a user and minutes, then allows one correct-password login for that user while skipping both IP and passkey restrictions during the TTL.</p>
         </div>
-        <div style="display:grid;gap:var(--s-3);margin-top:var(--s-4)">
+        <div class="padded passkey-registration" style="display:grid;gap:var(--s-3);padding-top:0;">
           <label>
             Passkey label
             <input type="text" id="passkey-label" value="Admin passkey" maxlength="80">
@@ -2572,13 +2572,27 @@ pub fn render_admin_page(
 	          for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
 	          return out.buffer;
 	        }}
-	        function bufToB64(buffer) {{
-	          var bytes = new Uint8Array(buffer);
-	          var raw = '';
-	          for (var i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
-	          return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-	        }}
-	        passkeyBtn.addEventListener('click', async function() {{
+		        function bufToB64(buffer) {{
+		          var bytes = new Uint8Array(buffer);
+		          var raw = '';
+		          for (var i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+		          return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+		        }}
+		        function passkeyRegistrationErrorMessage(err) {{
+		          var name = err && err.name ? err.name : '';
+		          var message = err && err.message ? err.message : '';
+		          if (name === 'InvalidStateError' || /invalid state/i.test(message)) {{
+		            return 'This device or passkey account already has a Lore passkey for this admin. Try signing in with passkey, or delete the existing Lore passkey before registering a replacement.';
+		          }}
+		          if (name === 'NotAllowedError') {{
+		            return 'Passkey registration was cancelled or blocked by the browser.';
+		          }}
+		          if (name === 'SecurityError') {{
+		            return 'Passkeys require HTTPS except on localhost.';
+		          }}
+		          return message || 'Passkey registration failed.';
+		        }}
+		        passkeyBtn.addEventListener('click', async function() {{
 	          var status = document.getElementById('passkey-register-status');
 	          var labelInput = document.getElementById('passkey-label');
 	          passkeyBtn.disabled = true;
@@ -2615,12 +2629,12 @@ pub fn render_admin_page(
 	                }}
 	              }})
 	            }});
-	            if (!finish.ok) throw new Error('Could not finish passkey registration.');
-	            location.href = '/ui/admin?section=network&flash=Passkey%20registered';
-	          }} catch (err) {{
-	            if (status) status.textContent = err && err.message ? err.message : 'Passkey registration failed.';
-	            passkeyBtn.disabled = false;
-	          }}
+		            if (!finish.ok) throw new Error('Could not finish passkey registration.');
+		            location.href = '/ui/admin?section=network&flash=Passkey%20registered';
+		          }} catch (err) {{
+		            if (status) status.textContent = passkeyRegistrationErrorMessage(err);
+		            passkeyBtn.disabled = false;
+		          }}
 	        }});
 	      }}
 
@@ -3954,6 +3968,35 @@ pub fn render_settings_page(
     let content = format!(
         r#"<h1 class="page-title">Settings</h1>
 
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Account</h2>
+      </div>
+      <div class="padded meta-stack">
+        <p><strong>Signed in as</strong><br>{signed_in_username}</p>
+        <form method="post" action="/ui/settings/password">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>
+            Current password
+            <input type="password" name="current_password" autocomplete="current-password" required>
+          </label>
+          <label>
+            New password
+            <input type="password" name="password" autocomplete="new-password" required>
+          </label>
+          <label>
+            Confirm new password
+            <input type="password" name="confirm_password" autocomplete="new-password" required>
+          </label>
+          <button type="submit" class="btn-lg">Change password</button>
+        </form>
+        <form method="post" action="/logout" style="margin-top:var(--s-5);">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <button type="submit" class="btn-lg" style="background:var(--danger, #c53030); color:#fff;">Sign out</button>
+        </form>
+      </div>
+    </section>
+
     <div class="layout">
       <section class="panel">
         <div class="panel-header">
@@ -3988,34 +4031,6 @@ pub fn render_settings_page(
         </div>
       </section>
     </div>
-    <section class="panel" style="margin-top:var(--s-6);">
-      <div class="panel-header">
-        <h2>Account</h2>
-      </div>
-      <div class="padded meta-stack">
-        <p><strong>Signed in as</strong><br>{signed_in_username}</p>
-        <form method="post" action="/ui/settings/password">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label>
-            Current password
-            <input type="password" name="current_password" autocomplete="current-password" required>
-          </label>
-          <label>
-            New password
-            <input type="password" name="password" autocomplete="new-password" required>
-          </label>
-          <label>
-            Confirm new password
-            <input type="password" name="confirm_password" autocomplete="new-password" required>
-          </label>
-          <button type="submit" class="btn-lg">Change password</button>
-        </form>
-        <form method="post" action="/logout" style="margin-top:var(--s-5);">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <button type="submit" class="btn-lg" style="background:var(--danger, #c53030); color:#fff;">Sign out</button>
-        </form>
-      </div>
-    </section>
     <script>
     (function() {{
       var cards = document.querySelectorAll('.theme-card[data-theme]');
@@ -8339,6 +8354,7 @@ pub fn render_document_page(
                 &project_infos,
                 csrf_token,
                 i,
+                i == 0,
             ));
             if can_write {
                 html.push_str(&render_doc_block_inserter(
@@ -8408,11 +8424,14 @@ pub fn render_document_page(
         String::new()
     };
 
-    let download_doc_btn = format!(
-        r##"<a class="block-header-btn" href="/ui/{project_slug}/doc/{doc_id_attr}/download.md" title="Download Markdown" aria-label="Download Markdown" download>
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-</a>"##,
-    );
+    let empty_doc_download_btn = if blocks.is_empty() {
+        format!(
+            r#"<div class="block-header-actions document-page-actions">{}</div>"#,
+            render_doc_download_button(project, doc_id),
+        )
+    } else {
+        String::new()
+    };
 
     let delete_doc_html = if can_write {
         format!(
@@ -8440,7 +8459,7 @@ pub fn render_document_page(
     </div>
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--s-3);">
       {rename_html}
-      <div class="block-header-actions document-page-actions">{download_doc_btn}</div>
+      {empty_doc_download_btn}
     </div>
     <section class="panel" id="document" style="margin-top:var(--s-4);">
       <div class="timeline">{blocks_html}</div>
@@ -8453,7 +8472,7 @@ pub fn render_document_page(
         project_slug = project_slug,
         project_name = escape_text(project_display_name),
         rename_html = rename_html,
-        download_doc_btn = download_doc_btn,
+        empty_doc_download_btn = empty_doc_download_btn,
         blocks_html = blocks_html,
         child_doc_items = child_doc_items,
         add_subdoc_html = add_subdoc_html,
@@ -8547,6 +8566,7 @@ fn render_doc_block(
     _project_infos: &[ProjectInfo],
     csrf_token: &str,
     block_index: usize,
+    show_document_download: bool,
 ) -> String {
     let block_id = escape_attribute(block.id.as_str());
     let project_slug = escape_attribute(project.as_str());
@@ -8558,6 +8578,12 @@ fn render_doc_block(
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
   </button>"##,
     );
+
+    let download_doc_btn = if show_document_download {
+        render_doc_download_button(project, doc_id)
+    } else {
+        String::new()
+    };
 
     let pin_title = if block.pinned {
         "Unpin (allow agent edits)"
@@ -8595,6 +8621,7 @@ fn render_doc_block(
   <button type="button" class="{pin_class}" title="{pin_title}" onclick="document.getElementById('pin-{block_id}').submit();">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
   </button>
+  {download_doc_btn}
   {inline_edit_actions}
   <form id="del-{block_id}" method="post" action="/ui/{project_slug}/doc/{doc_id_attr}/blocks/{block_id}/delete" style="display:none;">
     <input type="hidden" name="csrf_token" value="{csrf}">
@@ -8604,9 +8631,10 @@ fn render_doc_block(
   </form>
 </div>"##,
             inline_edit_actions = inline_edit_actions,
+            download_doc_btn = download_doc_btn,
         )
     } else {
-        format!(r##"<div class="block-header-actions">{copy_link_btn}</div>"##,)
+        format!(r##"<div class="block-header-actions">{copy_link_btn}{download_doc_btn}</div>"##,)
     };
 
     let block_type_label = format!("{:?}", block.block_type).to_lowercase();
@@ -8683,6 +8711,16 @@ fn render_doc_block(
     {edit_panel}
   </article>{band_html}
 </div>"#,
+    )
+}
+
+fn render_doc_download_button(project: &ProjectName, doc_id: &str) -> String {
+    let project_slug = escape_attribute(project.as_str());
+    let doc_id_attr = escape_attribute(doc_id);
+    format!(
+        r##"<a class="block-header-btn" href="/ui/{project_slug}/doc/{doc_id_attr}/download.md" title="Download Markdown" aria-label="Download Markdown" download>
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+</a>"##,
     )
 }
 
@@ -13805,6 +13843,12 @@ mod tests {
         assert!(html.contains(r#"data-editor-save="block""#));
         assert!(html.contains(r#"href="/ui/my-docs/doc/doc-1/download.md""#));
         assert!(html.contains(r#"title="Download Markdown""#));
+        assert!(!html.contains("document-page-actions"));
+        let pin_index = html.find(r#"title="Pin (block agent edits)""#).unwrap();
+        let download_index = html
+            .find(r#"href="/ui/my-docs/doc/doc-1/download.md""#)
+            .unwrap();
+        assert!(pin_index < download_index);
         assert!(html.contains(r#"data-editor-action="/ui/"#));
         assert!(html.contains(r#"data-editor-block-type="markdown""#));
         assert!(html.contains(r#"id="block-edit-content-"#));
@@ -14797,6 +14841,9 @@ mod tests {
         assert!(html.contains(r#"<h2>Account</h2>"#));
         assert!(html.contains("Signed in as"));
         assert!(html.contains("antony"));
+        let account_heading = html.find(r#"<h2>Account</h2>"#).expect("account heading");
+        let theme_heading = html.find(r#"<h2>Theme</h2>"#).expect("theme heading");
+        assert!(account_heading < theme_heading);
         assert!(html.contains(r#"action="/ui/settings/password""#));
         assert!(html.contains(r#"name="current_password" autocomplete="current-password""#));
         assert!(html.contains(r#"name="password" autocomplete="new-password""#));
