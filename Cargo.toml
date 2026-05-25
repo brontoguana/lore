@@ -23,6 +23,7 @@ clap = { version = "4.5", features = ["derive"] }
 flate2 = "1.1"
 futures-util = "0.3"
 openidconnect = "4.0.1"
+openssl = { version = "0.10", features = ["vendored"] }
 pulldown-cmark = "0.13"
 quick-xml = "0.37"
 regex = "1"

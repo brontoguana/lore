@@ -2,6 +2,7 @@
 
 ## 2026-05-25
 
+- Fixed full-release builds for the WebAuthn dependency path by vendoring OpenSSL for release targets that do not provide system OpenSSL.
 - Added enforced Admin Network IP allowlisting for browser logins, defaulting new entries to the current Caddy-forwarded client IP, requiring a non-loopback entry before enabling, and making `lore-server bypass` temporarily skip both IP and passkey restrictions for one correct-password login.
 - Added Admin Network trusted-login controls with passkey registration/login, pending approval for correct-password password logins, and SSH-granted temporary login bypass.
 - Added a document-view Markdown download action that exports the full document page as a `.md` attachment.
