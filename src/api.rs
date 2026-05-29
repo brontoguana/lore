@@ -12057,8 +12057,15 @@ fn chat_message_json(msg: &ChatMessage) -> Value {
 
 fn chat_preview_text(content: &str) -> String {
     let content = strip_think_blocks(content);
+    chat_content_without_data_images(&content)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn chat_content_without_data_images(content: &str) -> String {
     let mut out = String::new();
-    let mut rest = content.as_str();
+    let mut rest = content;
     loop {
         let Some(start) = rest.find("![") else {
             out.push_str(rest);
@@ -12080,10 +12087,17 @@ fn chat_preview_text(content: &str) -> String {
             out.push_str(candidate);
             break;
         };
-        out.push_str("[image]");
+        out.push_str(&chat_data_image_placeholder(
+            &candidate[2..close_alt],
+            &candidate[url_start..url_start + close_url],
+        ));
         rest = &candidate[url_start + close_url + 1..];
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    out
+}
+
+fn chat_data_image_placeholder(_alt: &str, _data_url: &str) -> String {
+    "[image]".to_string()
 }
 
 fn strip_think_blocks(content: &str) -> String {
@@ -14873,8 +14887,10 @@ async fn do_exchange_compact(
             ChatRole::Tool => "Tool",
             ChatRole::Error => "Error",
         };
-        let content: String = msg.content.chars().take(2000).collect();
-        let content = if content.len() < msg.content.len() {
+        let content = chat_content_without_data_images(&msg.content);
+        let was_truncated = content.chars().count() > 2000;
+        let content: String = content.chars().take(2000).collect();
+        let content = if was_truncated {
             format!("{content}...")
         } else {
             content
@@ -18371,6 +18387,17 @@ mod tests {
             super::chat_preview_text("before <think>unfinished private text"),
             "before"
         );
+    }
+
+    #[test]
+    fn chat_content_without_data_images_removes_inline_payloads() {
+        let content = super::chat_content_without_data_images(
+            "before ![shot](data:image/png;base64,aGVsbG8=) after",
+        );
+
+        assert_eq!(content, "before [image] after");
+        assert!(!content.contains("data:image"));
+        assert!(!content.contains("aGVsbG8"));
     }
 
     #[tokio::test]

@@ -3520,6 +3520,69 @@ fn recent_history_exchange_tail<'a>(
     &messages[boundaries[boundaries.len() - exchange_limit]..]
 }
 
+fn chat_content_for_prompt(content: &str, preserve_data_images: bool) -> String {
+    if preserve_data_images {
+        content.to_string()
+    } else {
+        replace_markdown_data_images_with_placeholders(content)
+    }
+}
+
+fn replace_markdown_data_images_with_placeholders(text: &str) -> String {
+    let mut rest = text;
+    let mut out = String::with_capacity(text.len().min(4096));
+    loop {
+        let Some(start) = rest.find("![") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let candidate = &rest[start..];
+        let Some(close_alt) = candidate.find("](") else {
+            out.push_str(candidate);
+            break;
+        };
+        let url_start = close_alt + 2;
+        if !candidate[url_start..].starts_with("data:image/") {
+            out.push_str(&candidate[..url_start]);
+            rest = &candidate[url_start..];
+            continue;
+        }
+        let Some(close_url) = candidate[url_start..].find(')') else {
+            out.push_str(candidate);
+            break;
+        };
+        let alt = candidate[2..close_alt]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let alt: String = alt.chars().take(80).collect();
+        let data_url = &candidate[url_start..url_start + close_url];
+        out.push_str(&data_image_prompt_placeholder(&alt, data_url));
+        rest = &candidate[url_start + close_url + 1..];
+    }
+    out
+}
+
+fn data_image_prompt_placeholder(alt: &str, data_url: &str) -> String {
+    let mime = data_url
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(';').map(|(mime, _)| mime))
+        .filter(|value| !value.is_empty())
+        .unwrap_or("image");
+    let encoded_len = data_url
+        .split_once(',')
+        .map(|(_, encoded)| encoded.trim_end_matches('=').len())
+        .unwrap_or(0);
+    let approx_bytes = encoded_len.saturating_mul(3) / 4;
+    let approx_kb = approx_bytes.div_ceil(1024);
+    if alt.trim().is_empty() {
+        format!("[image attachment omitted from text prompt: {mime}, ~{approx_kb} KB]")
+    } else {
+        format!("[image attachment omitted from text prompt: {alt}, {mime}, ~{approx_kb} KB]")
+    }
+}
+
 fn history_compaction_split_index(
     messages: &[&serde_json::Value],
     window_size: usize,
@@ -4403,7 +4466,10 @@ async fn agent_poll_and_process(
 
     // Conversation summary
     if !summary.is_empty() {
-        prompt_parts.push(format!("## Conversation Summary\n\n{summary}"));
+        prompt_parts.push(format!(
+            "## Conversation Summary\n\n{}",
+            chat_content_for_prompt(summary, false)
+        ));
     }
 
     // Previous conversation with relative timestamps
@@ -4419,6 +4485,7 @@ async fn agent_poll_and_process(
                 let timestamp = msg["timestamp"].as_str().unwrap_or("");
                 let time_label = format_relative_time(timestamp, now);
                 let role_label = if role == "user" { "User" } else { "You" };
+                let content = chat_content_for_prompt(content, false);
                 if role == "user" {
                     prompt_parts.push(format!("\u{2500}\u{2500}\u{2500} {role_label} ({time_label}) \u{2500}\u{2500}\u{2500}\n{content}"));
                 } else {
@@ -4429,7 +4496,10 @@ async fn agent_poll_and_process(
         }
     }
 
-    prompt_parts.push(format!("\n## New Message\n\n{combined}"));
+    prompt_parts.push(format!(
+        "\n## New Message\n\n{}",
+        chat_content_for_prompt(&combined, has_endpoint)
+    ));
 
     let user_context = prompt_parts.join("\n\n");
 
@@ -4832,6 +4902,7 @@ async fn run_manager_cli(
             let role = msg["role"].as_str().unwrap_or("user");
             let content = msg["content"].as_str().unwrap_or("");
             let label = if role == "user" { "User" } else { "Agent" };
+            let content = chat_content_for_prompt(content, false);
             let truncated: String = content.chars().take(4000).collect();
             prompt_parts.push(format!("--- {label} ---\n{truncated}"));
         }
@@ -4966,9 +5037,10 @@ async fn run_manager_endpoint(
     let mut api_messages = vec![serde_json::json!({ "role": "system", "content": system_prompt })];
     if let Some(msgs) = messages {
         for msg in msgs {
+            let content = chat_content_for_prompt(msg["content"].as_str().unwrap_or(""), false);
             api_messages.push(serde_json::json!({
                 "role": msg["role"].as_str().unwrap_or("user"),
-                "content": msg["content"].as_str().unwrap_or(""),
+                "content": content,
             }));
         }
     }
@@ -6772,6 +6844,7 @@ async fn do_compact(
     for msg in to_compact {
         let role = msg["role"].as_str().unwrap_or("user");
         let content = msg["content"].as_str().unwrap_or("");
+        let content = chat_content_for_prompt(content, false);
         if role == "user" {
             input.push_str(&format!("User: {content}\n"));
         } else {
@@ -8420,7 +8493,7 @@ mod tests {
         ResolvedProject, api_endpoint_runtime_context, api_user_content_from_markdown_images,
         append_assistant_segment, append_block_content, append_new_stream_text,
         append_plain_output_line, backend_uses_json_lines, build_compaction_prompt,
-        codex_exec_args, count_history_exchanges, find_cwd_project_file,
+        chat_content_for_prompt, codex_exec_args, count_history_exchanges, find_cwd_project_file,
         history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
         load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
         markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
@@ -9047,6 +9120,21 @@ mod tests {
             api_user_content_from_markdown_images("plain text"),
             json!("plain text")
         );
+    }
+
+    #[test]
+    fn chat_prompt_content_omits_data_images_unless_preserved() {
+        let content = "before\n\n![phone screenshot.png](data:image/png;base64,aGVsbG8=)\n\nafter";
+        let sanitized = chat_content_for_prompt(content, false);
+
+        assert!(sanitized.contains("before"));
+        assert!(sanitized.contains("after"));
+        assert!(sanitized.contains("phone screenshot.png"));
+        assert!(sanitized.contains("image/png"));
+        assert!(sanitized.contains("~1 KB"));
+        assert!(!sanitized.contains("data:image"));
+        assert!(!sanitized.contains("aGVsbG8="));
+        assert_eq!(chat_content_for_prompt(content, true), content);
     }
 
     #[test]

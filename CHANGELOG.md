@@ -3,6 +3,7 @@
 ## 2026-05-25
 
 - Fixed API-endpoint agent runtime status so agents configured for endpoints such as Krasis via SSH no longer overwrite the chat header with the stale legacy Claude backend while thinking.
+- Stopped pasted chat screenshots from poisoning later agent turns by replacing prior data-image attachments with compact placeholders in CLI, manager, and compaction prompts while preserving only the current API-endpoint image for multimodal calls.
 - Added API-endpoint runtime identity context so agents switched from a legacy Claude process backend do not repeat stale Claude/Anthropic identity claims from old summaries or chat history, and endpoint agents no longer inherit legacy process-model overrides such as `opus`.
 - Made service-managed CLI agents use the current backend returned by each server poll instead of a cached local backend, and added CLI runtime identity context so backend switches take effect on the next claimed turn without stale Claude/Codex identity bleed-through.
 - Made CLI-backed chat agent failures visible when a backend is missing, blocked, exits nonzero, or exits without producing a response instead of silently completing the turn.
