@@ -34,6 +34,7 @@ const ICON_CHECK: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill
 const ICON_CLOSE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 const ICON_MANAGER: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
+const ICON_IMAGE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>"#;
 const ICON_STATUS_DONE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/></svg>"#;
 const ICON_STATUS_WORKING: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.3-3.3a6 6 0 0 1-7.9 7.9l-6.8 6.8a2 2 0 1 1-2.8-2.8l6.8-6.8a6 6 0 0 1 7.9-7.9z"/></svg>"#;
 const ICON_STATUS_STOPPED: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6"/><path d="M15 9l-6 6"/></svg>"#;
@@ -4245,6 +4246,8 @@ pub fn render_chat_main_panel(
   <div class="chat-header-actions">
     <span class="chat-header-status" id="chat-agent-status"></span>
     <button type="button" class="btn-sm button-link" id="chat-manage-btn" onclick="toggleManagePanel()" title="Manage">{ICON_MANAGER}</button>
+    <button type="button" class="btn-sm button-link" id="chat-image-btn" onclick="return chooseChatImages()" title="Add images">{image_icon}</button>
+    <input type="file" id="chat-image-input" accept="image/*" multiple style="display:none" onchange="return handleChatImageFileInput(event)">
     <button type="button" class="btn-sm button-link" id="chat-config-btn" onclick="toggleChatConfig()" title="Configure">{settings_icon}</button>
   </div>
 </div>
@@ -4310,6 +4313,7 @@ pub fn render_chat_main_panel(
 </div>
 <form class="chat-input-form" id="chat-input-form" onsubmit="return sendMessage(event)">
   <input type="hidden" name="csrf_token" value="{csrf_token}">
+  <div class="chat-attachment-strip" id="chat-attachment-strip" style="display:none;"></div>
   <textarea class="chat-input" id="chat-input" placeholder="Type a message..." rows="1" onkeydown="return handleChatKey(event)"></textarea>
   <button type="submit" class="chat-send-btn">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
@@ -4338,6 +4342,7 @@ pub fn render_chat_main_panel(
             header_avatar = header_avatar,
             display_name = escape_text(display),
             metadata_html = metadata_html,
+            image_icon = ICON_IMAGE,
             settings_icon = ICON_SETTINGS,
             close_icon = ICON_CLOSE,
             check_icon = ICON_CHECK,
@@ -4665,6 +4670,13 @@ var chatLastFullPanelRefreshAt = Date.now();
 var chatWasBackgrounded = false;
 var chatSendInFlight = false;
 var chatSendMaxAttempts = 3;
+var chatImageAttachments = [];
+var chatImageAttachmentSeq = 0;
+var chatImageProcessingCount = 0;
+var chatAttachmentAgent = currentAgent;
+var CHAT_IMAGE_MAX_COUNT = 8;
+var CHAT_IMAGE_MAX_DIMENSION = 1600;
+var CHAT_IMAGE_MAX_DATA_URL_LENGTH = 3000000;
 var chatRestoreInFlight = false;
 var chatPanelRequestSeq = 0;
 var chatPanelRefreshScrollSnapshot = null;
@@ -4880,6 +4892,12 @@ function sidebarTimeNow() {{
   return new Date().toLocaleTimeString([], {{ hour: 'numeric', minute: '2-digit' }});
 }}
 
+function chatPreviewText(content) {{
+  var normalized = (content || '').replace(/!\[[^\]]*\]\(data:image\/[^)]+\)/g, '[image]');
+  normalized = normalized.replace(/\s+/g, ' ').trim();
+  return normalized;
+}}
+
 function updateAgentListPreview(agent, content, timeText) {{
   if (!agent || agent === 'librarian') return;
   var item = document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(agent) + '"]');
@@ -4887,7 +4905,7 @@ function updateAgentListPreview(agent, content, timeText) {{
   var snippetEl = item.querySelector('.chat-agent-snippet');
   var timeEl = item.querySelector('.chat-agent-time');
   if (snippetEl && typeof content === 'string') {{
-    var normalized = content.replace(/\s+/g, ' ').trim();
+    var normalized = chatPreviewText(content);
     snippetEl.textContent = normalized ? normalized.slice(0, 60) : 'No messages yet';
   }}
   if (timeEl && typeof timeText === 'string') {{
@@ -5425,6 +5443,7 @@ function resizeChatInput() {{
 function initChatComposer() {{
   var input = document.getElementById('chat-input');
   if (!input) return;
+  syncChatAttachmentAgent();
   input.value = getChatDraft(currentAgent);
   syncChatSendToken(currentAgent, input.value || '');
   if (input.dataset.chatComposerBound !== '1') {{
@@ -5436,8 +5455,163 @@ function initChatComposer() {{
         scheduleChatViewportFix();
       }}
     }});
+    input.addEventListener('paste', handleChatInputPaste);
   }}
+  renderChatAttachmentStrip();
   resizeChatInput();
+}}
+
+function syncChatAttachmentAgent() {{
+  if (chatAttachmentAgent !== currentAgent) {{
+    chatImageAttachments = [];
+    chatImageProcessingCount = 0;
+    chatAttachmentAgent = currentAgent;
+  }}
+}}
+
+function chooseChatImages() {{
+  var input = document.getElementById('chat-image-input');
+  if (!input || chatSendInFlight) return false;
+  input.click();
+  return false;
+}}
+
+function handleChatImageFileInput(event) {{
+  var files = event && event.target && event.target.files ? Array.prototype.slice.call(event.target.files) : [];
+  addChatImageFiles(files);
+  if (event && event.target) event.target.value = '';
+  return false;
+}}
+
+function handleChatInputPaste(event) {{
+  if (!event || !event.clipboardData || chatSendInFlight) return;
+  var items = Array.prototype.slice.call(event.clipboardData.items || []);
+  var files = [];
+  items.forEach(function(item) {{
+    if (item && item.kind === 'file' && item.type && item.type.indexOf('image/') === 0) {{
+      var file = item.getAsFile();
+      if (file) files.push(file);
+    }}
+  }});
+  if (!files.length) return;
+  event.preventDefault();
+  addChatImageFiles(files);
+}}
+
+function addChatImageFiles(files) {{
+  syncChatAttachmentAgent();
+  if (!files || !files.length || !currentAgent || isLibrarian) return;
+  var available = CHAT_IMAGE_MAX_COUNT - chatImageAttachments.length - chatImageProcessingCount;
+  files.slice(0, Math.max(0, available)).forEach(function(file) {{
+    if (!file || !file.type || file.type.indexOf('image/') !== 0) return;
+    chatImageProcessingCount += 1;
+    renderChatAttachmentStrip();
+    normalizeChatImageFile(file)
+      .then(function(att) {{
+        chatImageProcessingCount = Math.max(0, chatImageProcessingCount - 1);
+        if (!att) {{
+          renderChatAttachmentStrip();
+          return;
+        }}
+        chatImageAttachments.push(att);
+        renderChatAttachmentStrip();
+      }})
+      .catch(function() {{
+        chatImageProcessingCount = Math.max(0, chatImageProcessingCount - 1);
+        renderChatAttachmentStrip();
+      }});
+  }});
+}}
+
+function readFileAsDataUrl(file) {{
+  return new Promise(function(resolve, reject) {{
+    var reader = new FileReader();
+    reader.onload = function(e) {{ resolve(e.target.result || ''); }};
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  }});
+}}
+
+function loadImageElement(dataUrl) {{
+  return new Promise(function(resolve, reject) {{
+    var img = new Image();
+    img.onload = function() {{ resolve(img); }};
+    img.onerror = reject;
+    img.src = dataUrl;
+  }});
+}}
+
+function normalizeChatImageFile(file) {{
+  return readFileAsDataUrl(file).then(function(dataUrl) {{
+    if (!dataUrl || dataUrl.indexOf('data:image/') !== 0) return null;
+    var mime = (file.type || '').toLowerCase();
+    if (mime === 'image/svg+xml') return null;
+    if (mime === 'image/gif') {{
+      if (dataUrl.length > CHAT_IMAGE_MAX_DATA_URL_LENGTH) return null;
+      return {{
+        id: 'img_' + (++chatImageAttachmentSeq),
+        name: file.name || 'image',
+        mime: mime,
+        data_url: dataUrl
+      }};
+    }}
+    return loadImageElement(dataUrl).then(function(img) {{
+      var scale = Math.min(1, CHAT_IMAGE_MAX_DIMENSION / Math.max(img.width || 1, img.height || 1));
+      var width = Math.max(1, Math.round((img.width || 1) * scale));
+      var height = Math.max(1, Math.round((img.height || 1) * scale));
+      var canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      var ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      var outType = mime === 'image/png' ? 'image/png' : 'image/jpeg';
+      var output = canvas.toDataURL(outType, outType === 'image/png' ? undefined : 0.84);
+      if (output.length > CHAT_IMAGE_MAX_DATA_URL_LENGTH && outType !== 'image/png') {{
+        output = canvas.toDataURL('image/jpeg', 0.68);
+      }}
+      if (output.length > CHAT_IMAGE_MAX_DATA_URL_LENGTH) return null;
+      return {{
+        id: 'img_' + (++chatImageAttachmentSeq),
+        name: file.name || 'image',
+        mime: outType,
+        data_url: output
+      }};
+    }});
+  }});
+}}
+
+function removeChatImageAttachment(id) {{
+  chatImageAttachments = chatImageAttachments.filter(function(att) {{ return att.id !== id; }});
+  renderChatAttachmentStrip();
+  return false;
+}}
+
+function clearChatImageAttachments() {{
+  chatImageAttachments = [];
+  chatImageProcessingCount = 0;
+  renderChatAttachmentStrip();
+}}
+
+function renderChatAttachmentStrip() {{
+  var strip = document.getElementById('chat-attachment-strip');
+  if (!strip) return;
+  var hasItems = chatImageAttachments.length > 0 || chatImageProcessingCount > 0;
+  strip.style.display = hasItems ? '' : 'none';
+  if (!hasItems) {{
+    strip.innerHTML = '';
+    return;
+  }}
+  var html = '';
+  chatImageAttachments.forEach(function(att) {{
+    html += '<div class="chat-attachment-thumb">';
+    html += '<img src="' + escapeHtmlRaw(att.data_url || '') + '" alt="' + escapeHtmlRaw(att.name || 'image') + '">';
+    html += '<button type="button" class="btn-sm chat-attachment-remove" title="Remove image" onclick="return removeChatImageAttachment(\\'' + escapeHtmlRaw(att.id) + '\\')">{close_icon}</button>';
+    html += '</div>';
+  }});
+  for (var i = 0; i < chatImageProcessingCount; i++) {{
+    html += '<div class="chat-attachment-thumb chat-attachment-processing"></div>';
+  }}
+  strip.innerHTML = html;
 }}
 
 if (window.visualViewport) {{
@@ -5987,6 +6161,9 @@ function inlineMd(t) {{
     codes.push('<code>' + c + '</code>');
     return '__IC_' + (codes.length - 1) + '__';
   }});
+  t = t.replace(/!\[([^\]]*)\]\((data:image\/[^)]+)\)/g, function(m, alt, src) {{
+    return '<img class="chat-inline-image" src="' + src + '" alt="' + alt + '">';
+  }});
   t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   t = t.replace(/\*(.+?)\*/g, '<em>$1</em>');
   t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
@@ -6223,8 +6400,10 @@ function setChatSendPending(pending) {{
   chatSendInFlight = !!pending;
   var input = document.getElementById('chat-input');
   var sendBtn = document.querySelector('#chat-input-form .chat-send-btn');
+  var imageBtn = document.getElementById('chat-image-btn');
   if (input) input.disabled = chatSendInFlight;
   if (sendBtn) sendBtn.disabled = chatSendInFlight;
+  if (imageBtn) imageBtn.disabled = chatSendInFlight;
 }}
 
 function shouldRetryChatSendStatus(status) {{
@@ -6261,8 +6440,9 @@ function handleChatSendSuccess(agentName, text, message) {{
   setChatDraft(agentName, '');
   clearChatSendToken(agentName);
   moveAgentItemToTop(agentName);
-  updateAgentListPreview(agentName, text);
+  updateAgentListPreview(agentName, message && message.content ? message.content : text);
   if (currentAgent === agentName) {{
+    clearChatImageAttachments();
     var input = document.getElementById('chat-input');
     if (input) {{
       input.value = '';
@@ -6273,10 +6453,13 @@ function handleChatSendSuccess(agentName, text, message) {{
   }}
 }}
 
-function handleChatSendFailure(agentName, text, errorMessage) {{
+function handleChatSendFailure(agentName, text, attachments, errorMessage) {{
   setChatSendPending(false);
   setChatDraft(agentName, text);
   if (currentAgent === agentName) {{
+    chatImageAttachments = Array.isArray(attachments) ? attachments.slice() : [];
+    chatAttachmentAgent = agentName;
+    renderChatAttachmentStrip();
     var input = document.getElementById('chat-input');
     if (input && input.value !== text) {{
       input.value = text;
@@ -6287,7 +6470,7 @@ function handleChatSendFailure(agentName, text, errorMessage) {{
   }}
 }}
 
-function sendMessageRequest(agentName, text, clientMessageId, attempt) {{
+function sendMessageRequest(agentName, text, clientMessageId, attachments, attempt) {{
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/ui/chat/' + encodeURIComponent(agentName) + '/send');
   xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
@@ -6295,30 +6478,30 @@ function sendMessageRequest(agentName, text, clientMessageId, attempt) {{
   xhr.onerror = function() {{
     if (attempt < chatSendMaxAttempts) {{
       window.setTimeout(function() {{
-        sendMessageRequest(agentName, text, clientMessageId, attempt + 1);
+        sendMessageRequest(agentName, text, clientMessageId, attachments, attempt + 1);
       }}, attempt * 800);
       return;
     }}
-    handleChatSendFailure(agentName, text, 'Failed to send message after retrying (network error)');
+    handleChatSendFailure(agentName, text, attachments, 'Failed to send message after retrying (network error)');
   }};
   xhr.ontimeout = function() {{
     if (attempt < chatSendMaxAttempts) {{
       window.setTimeout(function() {{
-        sendMessageRequest(agentName, text, clientMessageId, attempt + 1);
+        sendMessageRequest(agentName, text, clientMessageId, attachments, attempt + 1);
       }}, attempt * 800);
       return;
     }}
-    handleChatSendFailure(agentName, text, 'Failed to send message after retrying (request timed out)');
+    handleChatSendFailure(agentName, text, attachments, 'Failed to send message after retrying (request timed out)');
   }};
   xhr.onload = function() {{
     if (xhr.status !== 200) {{
       if (attempt < chatSendMaxAttempts && shouldRetryChatSendStatus(xhr.status)) {{
         window.setTimeout(function() {{
-          sendMessageRequest(agentName, text, clientMessageId, attempt + 1);
+          sendMessageRequest(agentName, text, clientMessageId, attachments, attempt + 1);
         }}, attempt * 800);
         return;
       }}
-      handleChatSendFailure(agentName, text, 'Failed to send message (HTTP ' + xhr.status + ')');
+      handleChatSendFailure(agentName, text, attachments, 'Failed to send message (HTTP ' + xhr.status + ')');
       return;
     }}
     var message = null;
@@ -6329,10 +6512,11 @@ function sendMessageRequest(agentName, text, clientMessageId, attempt) {{
     handleChatSendSuccess(agentName, text, message);
   }};
   xhr.send(
-    'csrf_token=' + encodeURIComponent(csrfToken) +
-    '&message=' + encodeURIComponent(text) +
-    '&client_message_id=' + encodeURIComponent(clientMessageId)
-  );
+	    'csrf_token=' + encodeURIComponent(csrfToken) +
+	    '&message=' + encodeURIComponent(text) +
+	    '&client_message_id=' + encodeURIComponent(clientMessageId) +
+	    '&attachments=' + encodeURIComponent(JSON.stringify(attachments || []))
+	  );
 }}
 
 function sendMessage(e) {{
@@ -6342,10 +6526,17 @@ function sendMessage(e) {{
   var input = document.getElementById('chat-input');
   if (!input) return false;
   var text = input.value.trim();
-  if (!text) return false;
+  syncChatAttachmentAgent();
+  if (chatImageProcessingCount > 0) {{
+    insertChatMessage({{ role: 'system', content: 'Images are still processing.' }});
+    renderMessages();
+    return false;
+  }}
+  var attachments = chatImageAttachments.slice();
+  if (!text && attachments.length === 0) return false;
 
   // Slash commands go to the command endpoint
-  if (text.startsWith('/')) {{
+  if (text.startsWith('/') && attachments.length === 0) {{
     setChatDraft(currentAgent, '');
     input.value = '';
     resizeChatInput();
@@ -6373,7 +6564,7 @@ function sendMessage(e) {{
 
   chatFollowScroll = true;
   setChatSendPending(true);
-  sendMessageRequest(agentName, text, resolveChatSendToken(agentName, text), 1);
+  sendMessageRequest(agentName, text, resolveChatSendToken(agentName, text + JSON.stringify(attachments)), attachments, 1);
   return false;
 }}
 
@@ -7610,6 +7801,7 @@ window.addEventListener('popstate', function() {{
         username_js = username_js,
         messages_json = messages_json,
         profile_url_js = profile_url_js,
+        close_icon = ICON_CLOSE,
     );
 
     render_shell(
@@ -12297,10 +12489,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       border-radius: 50%;
     }
     .svg-overlay-close:hover { background: var(--line); }
-    .chat-input-form {
-      display: flex;
-      gap: var(--s-2);
-      padding: var(--s-3) var(--s-4) calc(var(--s-3) + env(safe-area-inset-bottom));
+	    .chat-input-form {
+	      display: flex;
+	      flex-wrap: wrap;
+	      gap: var(--s-2);
+	      padding: var(--s-3) var(--s-4) calc(var(--s-3) + env(safe-area-inset-bottom));
       border-top: 1px solid var(--line);
       align-items: flex-end;
       flex-shrink: 0;
@@ -12340,8 +12533,50 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       flex-shrink: 0;
       align-self: flex-end;
     }
-    .chat-send-btn:hover { opacity: 0.85; }
-    .chat-empty {
+	    .chat-send-btn:hover { opacity: 0.85; }
+	    .chat-attachment-strip {
+	      width: 100%;
+	      display: flex;
+	      flex-wrap: wrap;
+	      gap: var(--s-2);
+	      align-items: center;
+	    }
+	    .chat-attachment-thumb {
+	      position: relative;
+	      width: 72px;
+	      height: 72px;
+	      border: 1px solid var(--line);
+	      border-radius: 6px;
+	      overflow: hidden;
+	      background: var(--bg);
+	      flex: 0 0 auto;
+	    }
+	    .chat-attachment-thumb img {
+	      width: 100%;
+	      height: 100%;
+	      object-fit: cover;
+	      display: block;
+	    }
+	    .chat-attachment-processing {
+	      background: linear-gradient(135deg, var(--surface-hover), var(--panel-strong));
+	    }
+	    .chat-attachment-remove {
+	      position: absolute;
+	      top: 3px;
+	      right: 3px;
+	      background: var(--panel);
+	      color: var(--ink);
+	      border: 1px solid var(--line);
+	    }
+	    .chat-inline-image {
+	      display: block;
+	      max-width: min(100%, 420px);
+	      max-height: 360px;
+	      border-radius: 6px;
+	      margin: var(--s-2) 0;
+	      object-fit: contain;
+	    }
+	    .chat-empty {
       flex: 1;
       display: flex;
       align-items: center;
@@ -14267,6 +14502,47 @@ mod tests {
             panel.contains(r#"<span class="chat-header-status" id="chat-agent-status"></span>"#)
         );
         assert!(panel.contains(r#"id="chat-manage-btn""#));
+    }
+
+    #[test]
+    fn chat_page_supports_multiple_image_attachments() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[ChatAgentSummary {
+                name: "worker".into(),
+                display_name: "Worker".into(),
+                owner: "admin".into(),
+                status: "idle".into(),
+                manage_enabled: false,
+                last_message: None,
+                last_message_time: None,
+                profile_url: None,
+                cwd: None,
+                git_branch: None,
+            }],
+            Some("worker"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        let manage_idx = html.find(r#"id="chat-manage-btn""#).unwrap();
+        let image_idx = html.find(r#"id="chat-image-btn""#).unwrap();
+        let config_idx = html.find(r#"id="chat-config-btn""#).unwrap();
+        assert!(manage_idx < image_idx && image_idx < config_idx);
+        assert!(html.contains(r#"id="chat-image-input" accept="image/*" multiple"#));
+        assert!(html.contains("input.addEventListener('paste', handleChatInputPaste);"));
+        assert!(html.contains("function addChatImageFiles(files) {"));
+        assert!(
+            html.contains("&attachments=' + encodeURIComponent(JSON.stringify(attachments || []))")
+        );
+        assert!(html.contains(".chat-attachment-strip {"));
+        assert!(html.contains(".chat-inline-image {"));
     }
 
     #[test]

@@ -1731,7 +1731,10 @@ fn translate_messages_to_anthropic(
             continue;
         }
         // user
-        out.push(json!({"role": "user", "content": content_to_text(&msg.content.clone().unwrap_or(json!("")))}));
+        out.push(json!({
+            "role": "user",
+            "content": user_content_to_anthropic_blocks(msg.content.as_ref())
+        }));
     }
 
     let translated_tools = tools.as_ref().map(|tl| {
@@ -1843,6 +1846,59 @@ fn content_to_text(value: &serde_json::Value) -> String {
         return out;
     }
     value.to_string()
+}
+
+fn user_content_to_anthropic_blocks(content: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
+    let Some(content) = content else {
+        return vec![json!({"type": "text", "text": ""})];
+    };
+    if let Some(parts) = content.as_array() {
+        let mut out = Vec::new();
+        for part in parts {
+            match part.get("type").and_then(|value| value.as_str()) {
+                Some("text") => {
+                    if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                        out.push(json!({"type": "text", "text": text}));
+                    }
+                }
+                Some("image_url") => {
+                    let url = part
+                        .get("image_url")
+                        .and_then(|image| image.get("url"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    if let Some((media_type, data)) = data_image_url_parts(url) {
+                        out.push(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data,
+                            }
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    vec![json!({"type": "text", "text": content_to_text(content)})]
+}
+
+fn data_image_url_parts(url: &str) -> Option<(&str, &str)> {
+    let (header, data) = url.split_once(',')?;
+    let media_type = header.strip_prefix("data:")?.strip_suffix(";base64")?;
+    if matches!(
+        media_type,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    ) {
+        Some((media_type, data))
+    } else {
+        None
+    }
 }
 
 pub fn build_proxy_request(
@@ -2629,6 +2685,50 @@ mod tests {
 
         assert_eq!(url, "https://api.deepinfra.com/v1/openai/chat/completions");
         assert_eq!(body["model"], "zai-org/GLM-5.1");
+    }
+
+    #[test]
+    fn anthropic_proxy_request_translates_image_url_parts() {
+        let endpoint = Endpoint {
+            id: "ep".into(),
+            name: "Anthropic".into(),
+            kind: EndpointKind::Anthropic,
+            url: "https://api.anthropic.com/v1/messages".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: Some("secret".into()),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let req = ProxyChatRequest {
+            messages: vec![ProxyChatMessage {
+                role: "user".into(),
+                content: Some(json!([
+                    {"type": "text", "text": "see this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                ])),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            model: None,
+            stream: Some(false),
+            tools: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+        };
+
+        let (_, body) = build_proxy_request(&endpoint, &req, false);
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("anthropic content should be block array");
+
+        assert_eq!(content[0], json!({"type": "text", "text": "see this"}));
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "aGVsbG8=");
     }
 
     #[test]

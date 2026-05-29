@@ -50,7 +50,7 @@ use crate::versioning::{
     StoredProjectVersionOperation, run_git_export,
 };
 use axum::body::Body;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post, put};
@@ -815,7 +815,10 @@ fn build_app_with_librarian(
             post(librarian_chat_reject_action),
         )
         .route("/ui/chat/librarian/clear", post(librarian_chat_clear))
-        .route("/ui/chat/{agent}/send", post(chat_send_message))
+        .route(
+            "/ui/chat/{agent}/send",
+            post(chat_send_message).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .route("/ui/chat/{agent}/message", post(chat_update_message))
         .route("/ui/chat/{agent}/command", post(chat_slash_command))
         .route(
@@ -12051,6 +12054,36 @@ fn chat_message_json(msg: &ChatMessage) -> Value {
     })
 }
 
+fn chat_preview_text(content: &str) -> String {
+    let mut out = String::new();
+    let mut rest = content;
+    loop {
+        let Some(start) = rest.find("![") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let candidate = &rest[start..];
+        let Some(close_alt) = candidate.find("](") else {
+            out.push_str(candidate);
+            break;
+        };
+        let url_start = close_alt + 2;
+        if !candidate[url_start..].starts_with("data:image/") {
+            out.push_str(&candidate[..url_start]);
+            rest = &candidate[url_start..];
+            continue;
+        }
+        let Some(close_url) = candidate[url_start..].find(')') else {
+            out.push_str(candidate);
+            break;
+        };
+        out.push_str("[image]");
+        rest = &candidate[url_start + close_url + 1..];
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn agent_context_messages(messages: &[ChatMessage]) -> Vec<&ChatMessage> {
     messages
         .iter()
@@ -12149,7 +12182,12 @@ fn build_chat_agents(
             .rev()
             .find(|m| m.role == ChatRole::User && !m.excluded_from_context);
         let last_user_at = last_user.map(|m| m.timestamp);
-        let snippet = last_msg.map(|m| m.content.chars().take(60).collect::<String>());
+        let snippet = last_msg.map(|m| {
+            chat_preview_text(&m.content)
+                .chars()
+                .take(60)
+                .collect::<String>()
+        });
         let time_str = last_user_at.map(format_chat_time);
         chat_agents.push((
             last_user_at,
@@ -12862,6 +12900,117 @@ struct ChatSendForm {
     csrf_token: String,
     message: String,
     client_message_id: Option<String>,
+    attachments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatImageAttachmentInput {
+    name: Option<String>,
+    mime: Option<String>,
+    data_url: String,
+}
+
+const CHAT_IMAGE_MAX_ATTACHMENTS: usize = 8;
+const CHAT_IMAGE_MAX_BYTES: usize = 2_250_000;
+const CHAT_IMAGE_MAX_TOTAL_BYTES: usize = 9_000_000;
+
+fn parse_chat_image_attachments(
+    raw: Option<&str>,
+) -> Result<Vec<ChatImageAttachmentInput>, LoreError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let attachments: Vec<ChatImageAttachmentInput> = serde_json::from_str(raw)
+        .map_err(|_| LoreError::Validation("invalid chat image attachments".into()))?;
+    if attachments.len() > CHAT_IMAGE_MAX_ATTACHMENTS {
+        return Err(LoreError::Validation(format!(
+            "too many chat images; maximum is {CHAT_IMAGE_MAX_ATTACHMENTS}"
+        )));
+    }
+    Ok(attachments)
+}
+
+fn validate_chat_image_data_url(
+    attachment: &ChatImageAttachmentInput,
+) -> Result<(String, String, usize), LoreError> {
+    let data_url = attachment.data_url.trim();
+    let (header, encoded) = data_url
+        .split_once(',')
+        .ok_or_else(|| LoreError::Validation("invalid chat image data URL".into()))?;
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|value| value.strip_suffix(";base64"))
+        .ok_or_else(|| LoreError::Validation("invalid chat image data URL".into()))?
+        .to_ascii_lowercase();
+    if !matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    ) {
+        return Err(LoreError::Validation(
+            "chat images must be PNG, JPEG, WebP, or GIF".into(),
+        ));
+    }
+    if let Some(declared) = attachment.mime.as_deref().filter(|value| !value.is_empty()) {
+        let declared = declared.to_ascii_lowercase();
+        if declared != mime {
+            return Err(LoreError::Validation(
+                "chat image MIME type does not match data URL".into(),
+            ));
+        }
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| LoreError::Validation("invalid chat image base64".into()))?;
+    if decoded.is_empty() || decoded.len() > CHAT_IMAGE_MAX_BYTES {
+        return Err(LoreError::Validation(format!(
+            "chat image is too large; maximum is {CHAT_IMAGE_MAX_BYTES} bytes"
+        )));
+    }
+    Ok((mime, data_url.to_string(), decoded.len()))
+}
+
+fn chat_image_alt_text(name: Option<&str>, index: usize) -> String {
+    let raw = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("image");
+    let mut alt = raw
+        .chars()
+        .filter(|ch| *ch != '[' && *ch != ']' && *ch != '(' && *ch != ')')
+        .take(80)
+        .collect::<String>();
+    if alt.trim().is_empty() {
+        alt = format!("image {index}");
+    }
+    alt
+}
+
+fn append_chat_image_markdown(
+    message: &str,
+    attachments: Vec<ChatImageAttachmentInput>,
+) -> Result<String, LoreError> {
+    if attachments.is_empty() {
+        return Ok(message.trim().to_string());
+    }
+    let mut total_bytes = 0usize;
+    let mut lines = Vec::new();
+    for (idx, attachment) in attachments.iter().enumerate() {
+        let (_mime, data_url, bytes) = validate_chat_image_data_url(attachment)?;
+        total_bytes += bytes;
+        if total_bytes > CHAT_IMAGE_MAX_TOTAL_BYTES {
+            return Err(LoreError::Validation(format!(
+                "chat images are too large; maximum total is {CHAT_IMAGE_MAX_TOTAL_BYTES} bytes"
+            )));
+        }
+        let alt = chat_image_alt_text(attachment.name.as_deref(), idx + 1);
+        lines.push(format!("![{alt}]({data_url})"));
+    }
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        Ok(lines.join("\n\n"))
+    } else {
+        Ok(format!("{trimmed}\n\n{}", lines.join("\n\n")))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -12905,16 +13054,22 @@ async fn chat_send_message(
         })
         .transpose()?;
 
+    let attachments = parse_chat_image_attachments(form.attachments.as_deref())?;
+    let message_content = append_chat_image_markdown(&form.message, attachments)?;
+    if message_content.trim().is_empty() {
+        return Err(LoreError::Validation("message cannot be empty".into()).into());
+    }
+
     let (msg, inserted) = state.chat.append_user_message_idempotent(
         owner,
         &agent_name,
-        form.message.clone(),
+        message_content.clone(),
         client_message_id.as_deref(),
     )?;
     if inserted {
         state
             .chat_audit
-            .log(&agent_name, owner, "user", &form.message);
+            .log(&agent_name, owner, "user", &message_content);
 
         // Push SSE event to the user
         push_chat_event(
@@ -12976,7 +13131,12 @@ async fn chat_update_message(
         .iter()
         .rev()
         .find(|msg| !msg.excluded_from_context)
-        .map(|msg| msg.content.chars().take(60).collect::<String>())
+        .map(|msg| {
+            chat_preview_text(&msg.content)
+                .chars()
+                .take(60)
+                .collect::<String>()
+        })
         .unwrap_or_default();
     let last_message_time = conv
         .messages
@@ -13466,11 +13626,6 @@ async fn chat_agent_update_status(
     );
 
     if matches!(status, AgentChatStatus::Thinking) {
-        let backend_str = agent.backend.to_string();
-        let (model, effort) = state
-            .chat
-            .get_backend_prefs(owner_str, &backend_str)
-            .unwrap_or((None, None));
         push_chat_event(
             &state,
             owner_str,
@@ -13478,16 +13633,38 @@ async fn chat_agent_update_status(
                 event_type: "config_info".into(),
                 agent: agent.name.clone(),
                 owner: owner_str.to_string(),
-                data: json!({
-                    "backend": backend_str,
-                    "model": model,
-                    "effort": effort,
-                }),
+                data: chat_runtime_config_info(&state, owner_str, &agent),
             },
         );
     }
 
     Ok(StatusCode::OK)
+}
+
+fn chat_runtime_config_info(state: &AppState, owner: &str, agent: &AuthenticatedAgent) -> Value {
+    if let Some(endpoint_id) = agent.endpoint_id.as_deref() {
+        if let Ok(Some(endpoint)) = state.endpoint_store.get(endpoint_id) {
+            return json!({
+                "mode": "api",
+                "backend": endpoint.name,
+                "model": endpoint.model,
+                "effort": null,
+                "endpoint_id": endpoint.id,
+            });
+        }
+    }
+
+    let backend_str = agent.backend.to_string();
+    let (model, effort) = state
+        .chat
+        .get_backend_prefs(owner, &backend_str)
+        .unwrap_or((None, None));
+    json!({
+        "mode": "process",
+        "backend": backend_str,
+        "model": model,
+        "effort": effort,
+    })
 }
 
 // --- Agent error reporting ---
@@ -17649,7 +17826,7 @@ mod tests {
     use super::{finalize_pending_stream_tool_call, merge_pending_stream_tool_call};
     use crate::auth::{AgentChatStatus, ChatConversation, ChatMessage, ChatRole, ManageConfig};
     use crate::librarian::{
-        AnswerLibrarianClient, Endpoint, LibrarianAnswer, LibrarianConfig, LibrarianRequest,
+        AnswerLibrarianClient, Endpoint, EndpointKind, LibrarianAnswer, LibrarianRequest,
         ProjectLibrarianOperation, ProjectLibrarianPlan, ProjectLibrarianRequest,
         ProviderCheckResult, RATE_LIMIT_REQUESTS,
     };
@@ -17681,6 +17858,40 @@ mod tests {
                 "gpt-5.4".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn chat_runtime_config_info_reports_endpoint_display_for_api_agents() {
+        let dir = tempdir().unwrap();
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let endpoint = state
+            .endpoint_store
+            .create(
+                "Krasis via SSH".into(),
+                EndpointKind::OpenAi,
+                "http://127.0.0.1:8012/v1/chat/completions".into(),
+                "Qwen3.6-35B-A3B-vision".into(),
+                Some("test-key".into()),
+            )
+            .unwrap();
+        let agent = AuthenticatedAgent {
+            token: "token".into(),
+            name: "temp-agent".into(),
+            owner: Some(UserName::new("antony").unwrap()),
+            owner_is_admin: true,
+            grants: Vec::new(),
+            backend: AgentBackend::Claude,
+            endpoint_id: Some(endpoint.id.clone()),
+            machine_name: Some("Loom".into()),
+        };
+
+        let info = super::chat_runtime_config_info(&state, "antony", &agent);
+
+        assert_eq!(info["mode"], json!("api"));
+        assert_eq!(info["backend"], json!("Krasis via SSH"));
+        assert_eq!(info["model"], json!("Qwen3.6-35B-A3B-vision"));
+        assert_eq!(info["endpoint_id"], json!(endpoint.id));
+        assert!(info["effort"].is_null());
     }
 
     #[test]
@@ -18027,6 +18238,66 @@ mod tests {
         assert_eq!(conv.messages.len(), 1);
         assert_eq!(conv.messages[0].role, ChatRole::User);
         assert_eq!(conv.messages[0].content, "hello from user");
+    }
+
+    #[tokio::test]
+    async fn chat_send_accepts_image_attachments_in_user_message() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let agent_token =
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode("tiny image bytes")
+        );
+        let attachments = serde_json::to_string(&json!([
+            {
+                "name": "phone screenshot.png",
+                "mime": "image/png",
+                "data_url": data_url,
+            }
+        ]))
+        .unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/agent-main/send")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}&message={}&attachments={}",
+                urlencoding::encode(&csrf_token),
+                urlencoding::encode("look at this"),
+                urlencoding::encode(&attachments),
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let content = json["message"]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("look at this\n\n![phone screenshot.png](data:image/png;base64,")
+        );
+        assert_eq!(super::chat_preview_text(content), "look at this [image]");
+
+        let poll = Request::builder()
+            .method("GET")
+            .uri("/v1/chat/poll")
+            .header(API_KEY_HEADER, &agent_token)
+            .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+            .body(Body::empty())
+            .unwrap();
+        let poll_response = app.oneshot(poll).await.unwrap();
+        assert_eq!(poll_response.status(), StatusCode::OK);
+        let poll_body = axum::body::to_bytes(poll_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let poll_json: Value = serde_json::from_slice(&poll_body).unwrap();
+        assert_eq!(poll_json["messages"][0]["content"], content);
     }
 
     #[tokio::test]

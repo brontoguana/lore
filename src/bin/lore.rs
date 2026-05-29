@@ -5578,6 +5578,50 @@ const API_AGENT_RATE_LIMIT_WAIT_SECS: u64 = 30;
 const API_AGENT_MAX_RETRIES: usize = 2;
 const API_AGENT_TRIMMED_STUB: &str = "[Content trimmed \u{2014} re-read if needed]";
 
+fn api_user_content_from_markdown_images(text: &str) -> serde_json::Value {
+    let mut rest = text;
+    let mut parts = Vec::new();
+    let mut saw_image = false;
+    loop {
+        let Some(start) = rest.find("![") else {
+            if !rest.is_empty() {
+                parts.push(serde_json::json!({ "type": "text", "text": rest }));
+            }
+            break;
+        };
+        if start > 0 {
+            parts.push(serde_json::json!({ "type": "text", "text": &rest[..start] }));
+        }
+        let candidate = &rest[start..];
+        let Some(close_alt) = candidate.find("](") else {
+            parts.push(serde_json::json!({ "type": "text", "text": candidate }));
+            break;
+        };
+        let url_start = close_alt + 2;
+        if !candidate[url_start..].starts_with("data:image/") {
+            parts.push(serde_json::json!({ "type": "text", "text": &candidate[..url_start] }));
+            rest = &candidate[url_start..];
+            continue;
+        }
+        let Some(close_url) = candidate[url_start..].find(')') else {
+            parts.push(serde_json::json!({ "type": "text", "text": candidate }));
+            break;
+        };
+        let url = &candidate[url_start..url_start + close_url];
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": url }
+        }));
+        saw_image = true;
+        rest = &candidate[url_start + close_url + 1..];
+    }
+    if saw_image {
+        serde_json::Value::Array(parts)
+    } else {
+        serde_json::json!(text)
+    }
+}
+
 async fn run_api_agent_turn(
     context: &CliContext,
     agent_name: &str,
@@ -5625,7 +5669,7 @@ async fn run_api_agent_turn(
         }),
         serde_json::json!({
             "role": "user",
-            "content": user_context
+            "content": api_user_content_from_markdown_images(user_context)
         }),
     ];
 
@@ -8279,15 +8323,16 @@ async fn service_handle_create_agent(
 mod tests {
     use super::{
         AGY_OAUTH_TOKEN_RELATIVE_PATH, BlocksCommand, Cli, Command, DocWriteArgs, ProjectSource,
-        ResolvedProject, append_assistant_segment, append_block_content, append_new_stream_text,
-        append_plain_output_line, backend_uses_json_lines, build_compaction_prompt,
-        codex_exec_args, count_history_exchanges, find_cwd_project_file,
-        history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
-        load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
-        markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
-        parse_codex_line, recent_history_exchange_tail, remove_owned_service_pid_file,
-        resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
-        sanitize_cli_output_preview, service_update_target, should_force_agy_file_token_auth_from,
+        ResolvedProject, api_user_content_from_markdown_images, append_assistant_segment,
+        append_block_content, append_new_stream_text, append_plain_output_line,
+        backend_uses_json_lines, build_compaction_prompt, codex_exec_args, count_history_exchanges,
+        find_cwd_project_file, history_compaction_split_index, history_messages_excluding_pending,
+        load_cli_text_input, load_doc_write_content, load_required_text_arg,
+        looks_like_cli_auth_prompt, markdown_heading_matches, next_service_update_retry_delay_secs,
+        parse_cli_version_output, parse_codex_line, recent_history_exchange_tail,
+        remove_owned_service_pid_file, resolve_context_project, resolve_executable_path_from,
+        reuse_or_clear_staged_binary, sanitize_cli_output_preview, service_update_target,
+        should_force_agy_file_token_auth_from,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
@@ -8849,6 +8894,27 @@ mod tests {
         let ids: Vec<u64> = recent.iter().filter_map(|msg| msg["id"].as_u64()).collect();
 
         assert_eq!(ids, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn api_user_content_converts_markdown_data_images_to_multimodal_parts() {
+        let content = api_user_content_from_markdown_images(
+            "before\n\n![phone](data:image/png;base64,aGVsbG8=)\n\nafter",
+        );
+        let parts = content.as_array().expect("content should be parts");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "before\n\n");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert_eq!(parts[2]["text"], "\n\nafter");
+
+        assert_eq!(
+            api_user_content_from_markdown_images("plain text"),
+            json!("plain text")
+        );
     }
 
     #[test]

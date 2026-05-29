@@ -2,6 +2,8 @@
 
 ## 2026-05-25
 
+- Fixed API-endpoint agent runtime status so agents configured for endpoints such as Krasis via SSH no longer overwrite the chat header with the stale legacy Claude backend while thinking.
+- Added multi-image chat attachments for agents, including pasted images, a header image-picker button beside Manager, thumbnail previews, server-side image validation, and Markdown image rendering in chat history.
 - Allowed admins to register additional passkeys from another device or passkey provider instead of blocking registration when an existing credential is visible to the browser.
 - Translated Safari/iOS passkey registration `InvalidStateError` failures into a clearer provider/browser failure message instead of showing the raw browser error.
 - Aligned the Admin Network passkey registration controls with the SSH recovery guidance indentation.
