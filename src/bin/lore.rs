@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use lore_core::updater::{download_update_to_path, hex_sha256};
 use lore_core::{
@@ -3532,6 +3533,10 @@ fn chat_content_for_current_message_prompt(content: &str) -> String {
     chat_content_for_prompt(content, true)
 }
 
+fn chat_content_for_current_message_cli_prompt(content: &str) -> String {
+    chat_content_for_prompt(content, false)
+}
+
 fn replace_markdown_data_images_with_placeholders(text: &str) -> String {
     let mut rest = text;
     let mut out = String::with_capacity(text.len().min(4096));
@@ -3585,6 +3590,122 @@ fn data_image_prompt_placeholder(alt: &str, data_url: &str) -> String {
     } else {
         format!("[image attachment omitted from text prompt: {alt}, {mime}, ~{approx_kb} KB]")
     }
+}
+
+#[derive(Debug)]
+struct MarkdownDataImageAttachment {
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct CodexImageAttachmentFiles {
+    dir: PathBuf,
+    paths: Vec<PathBuf>,
+}
+
+impl CodexImageAttachmentFiles {
+    fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+impl Drop for CodexImageAttachmentFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn markdown_data_image_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "img",
+    }
+}
+
+fn markdown_data_image_attachments(text: &str) -> Vec<MarkdownDataImageAttachment> {
+    let mut rest = text;
+    let mut attachments = Vec::new();
+    loop {
+        let Some(start) = rest.find("![") else {
+            break;
+        };
+        let candidate = &rest[start..];
+        let Some(close_alt) = candidate.find("](") else {
+            break;
+        };
+        let url_start = close_alt + 2;
+        if !candidate[url_start..].starts_with("data:image/") {
+            rest = &candidate[url_start..];
+            continue;
+        }
+        let Some(close_url) = candidate[url_start..].find(')') else {
+            break;
+        };
+        let data_url = &candidate[url_start..url_start + close_url];
+        if let Some((metadata, encoded)) = data_url
+            .strip_prefix("data:")
+            .and_then(|value| value.split_once(','))
+        {
+            let mut parts = metadata.split(';');
+            let mime = parts.next().unwrap_or("").to_string();
+            let is_base64 = parts.any(|part| part.eq_ignore_ascii_case("base64"));
+            if mime.starts_with("image/")
+                && is_base64
+                && let Ok(bytes) = BASE64_STANDARD.decode(encoded)
+            {
+                attachments.push(MarkdownDataImageAttachment { mime, bytes });
+            }
+        }
+        rest = &candidate[url_start + close_url + 1..];
+    }
+    attachments
+}
+
+fn create_codex_image_temp_dir() -> io::Result<PathBuf> {
+    let base = env::temp_dir();
+    let stamp = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    for attempt in 0..100u32 {
+        let dir = base.join(format!(
+            "lore-codex-images-{}-{stamp}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate temporary Codex image directory",
+    ))
+}
+
+fn write_codex_image_attachments(content: &str) -> io::Result<Option<CodexImageAttachmentFiles>> {
+    let attachments = markdown_data_image_attachments(content);
+    if attachments.is_empty() {
+        return Ok(None);
+    }
+
+    let dir = create_codex_image_temp_dir()?;
+    let mut files = CodexImageAttachmentFiles {
+        dir,
+        paths: Vec::with_capacity(attachments.len()),
+    };
+    for (idx, attachment) in attachments.iter().enumerate() {
+        let path = files.dir.join(format!(
+            "lore-chat-image-{}.{}",
+            idx + 1,
+            markdown_data_image_extension(&attachment.mime)
+        ));
+        fs::write(&path, &attachment.bytes)?;
+        files.paths.push(path);
+    }
+    Ok(Some(files))
 }
 
 fn history_compaction_split_index(
@@ -4500,10 +4621,12 @@ async fn agent_poll_and_process(
         }
     }
 
-    prompt_parts.push(format!(
-        "\n## New Message\n\n{}",
+    let current_message_prompt = if has_endpoint {
         chat_content_for_current_message_prompt(&combined)
-    ));
+    } else {
+        chat_content_for_current_message_cli_prompt(&combined)
+    };
+    prompt_parts.push(format!("\n## New Message\n\n{current_message_prompt}"));
 
     let user_context = prompt_parts.join("\n\n");
 
@@ -4541,6 +4664,15 @@ async fn agent_poll_and_process(
             effort_override.as_deref(),
         ));
         let full_prompt = format!("{system_instructions}\n\n---\n\n{user_context}");
+        let codex_image_attachments = if matches!(backend, AgentBackend::Codex) {
+            write_codex_image_attachments(&combined)?
+        } else {
+            None
+        };
+        let codex_image_paths: &[PathBuf] = codex_image_attachments
+            .as_ref()
+            .map(|files| files.paths())
+            .unwrap_or(&[]);
 
         {
             let lore_dir = agent_lore_dir(agent_name);
@@ -4554,6 +4686,7 @@ async fn agent_poll_and_process(
             model_override.as_deref(),
             effort_override.as_deref(),
             context.token.as_deref(),
+            codex_image_paths,
         )
         .await
         {
@@ -4718,6 +4851,7 @@ async fn agent_poll_and_process(
             record_agent_error(context, agent_name, rec).await;
             response = visible_agent_error_content(&detail);
         }
+        drop(codex_image_attachments);
         (response, emitted_assistant_messages)
     };
 
@@ -4923,8 +5057,15 @@ async fn run_manager_cli(
         let _ = fs::write(lore_dir.join("manager_context.txt"), &full_prompt);
     }
 
-    let mut child = match spawn_backend(backend, &full_prompt, None, None, context.token.as_deref())
-        .await
+    let mut child = match spawn_backend(
+        backend,
+        &full_prompt,
+        None,
+        None,
+        context.token.as_deref(),
+        &[],
+    )
+    .await
     {
         Ok(c) => c,
         Err(e) => {
@@ -7129,6 +7270,7 @@ async fn spawn_backend(
     model: Option<&str>,
     effort: Option<&str>,
     agent_token: Option<&str>,
+    image_paths: &[PathBuf],
 ) -> CliResult<tokio::process::Child> {
     use tokio::io::AsyncWriteExt;
 
@@ -7191,7 +7333,7 @@ async fn spawn_backend(
             cmd.spawn()?
         }
         AgentBackend::Codex => {
-            let args = codex_exec_args(model, effort);
+            let args = codex_exec_args(model, effort, image_paths);
             let mut cmd =
                 tokio::process::Command::new(resolve_backend_executable(AgentBackend::Codex));
             cmd.args(&args)
@@ -7231,7 +7373,11 @@ fn append_plain_output_line(output: &mut String, line: &str) {
     output.push_str(line);
 }
 
-fn codex_exec_args(model: Option<&str>, effort: Option<&str>) -> Vec<String> {
+fn codex_exec_args(
+    model: Option<&str>,
+    effort: Option<&str>,
+    image_paths: &[PathBuf],
+) -> Vec<String> {
     let mut args = vec![
         "exec".to_string(),
         "--json".to_string(),
@@ -7245,6 +7391,10 @@ fn codex_exec_args(model: Option<&str>, effort: Option<&str>) -> Vec<String> {
     if let Some(e) = effort {
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort=\"{e}\""));
+    }
+    for path in image_paths {
+        args.push("--image".to_string());
+        args.push(path.to_string_lossy().into_owned());
     }
     args.push("-".to_string());
     args
@@ -7356,7 +7506,7 @@ async fn run_compaction(
         AgentBackend::Agy | AgentBackend::Codex => {
             // Codex streams JSON lines; Antigravity (`agy`) print mode returns plain text.
             let mut child =
-                spawn_backend(backend, prompt, None, None, context.token.as_deref()).await?;
+                spawn_backend(backend, prompt, None, None, context.token.as_deref(), &[]).await?;
             let stdout = child.stdout.take().ok_or("no stdout")?;
             let stderr = child.stderr.take().ok_or("no stderr")?;
             let reader = tokio::io::BufReader::new(stdout);
@@ -8497,10 +8647,11 @@ mod tests {
         ResolvedProject, api_endpoint_runtime_context, api_user_content_from_markdown_images,
         append_assistant_segment, append_block_content, append_new_stream_text,
         append_plain_output_line, backend_uses_json_lines, build_compaction_prompt,
-        chat_content_for_current_message_prompt, chat_content_for_prompt, codex_exec_args,
-        count_history_exchanges, find_cwd_project_file, history_compaction_split_index,
-        history_messages_excluding_pending, load_cli_text_input, load_doc_write_content,
-        load_required_text_arg, looks_like_cli_auth_prompt, markdown_heading_matches,
+        chat_content_for_current_message_cli_prompt, chat_content_for_current_message_prompt,
+        chat_content_for_prompt, codex_exec_args, count_history_exchanges, find_cwd_project_file,
+        history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
+        load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
+        markdown_data_image_attachments, markdown_heading_matches,
         next_service_update_retry_delay_secs, parse_cli_version_output, parse_codex_line,
         recent_history_exchange_tail, remove_owned_service_pid_file, resolve_context_project,
         resolve_executable_path_from, reuse_or_clear_staged_binary, sanitize_cli_output_preview,
@@ -8513,6 +8664,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::io::Write;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -9141,6 +9293,29 @@ mod tests {
         assert!(!sanitized.contains("aGVsbG8="));
         assert_eq!(chat_content_for_prompt(content, true), content);
         assert_eq!(chat_content_for_current_message_prompt(content), content);
+
+        let cli_current = chat_content_for_current_message_cli_prompt(content);
+        assert!(cli_current.contains("[image attachment omitted from text prompt"));
+        assert!(!cli_current.contains("data:image"));
+        assert!(!cli_current.contains("aGVsbG8="));
+    }
+
+    #[test]
+    fn current_chat_images_can_be_attached_to_codex_exec() {
+        let content = "look\n\n![shot](data:image/png;base64,aGVsbG8=)\n\nagain";
+        let attachments = markdown_data_image_attachments(content);
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].mime, "image/png");
+        assert_eq!(attachments[0].bytes, b"hello");
+
+        let image = PathBuf::from("/tmp/lore-current-image.png");
+        let args = codex_exec_args(Some("gpt-5.5"), Some("high"), &[image.clone()]);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--image", image.to_string_lossy().as_ref()])
+        );
+        assert_eq!(args.last().map(String::as_str), Some("-"));
     }
 
     #[test]
@@ -9384,7 +9559,7 @@ mod tests {
 
     #[test]
     fn codex_exec_args_include_reasoning_effort_override() {
-        let args = codex_exec_args(Some("gpt-5.4"), Some("xhigh"));
+        let args = codex_exec_args(Some("gpt-5.4"), Some("xhigh"), &[]);
 
         assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-5.4"]));
         assert!(
