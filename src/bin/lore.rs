@@ -4673,6 +4673,12 @@ async fn agent_poll_and_process(
             .as_ref()
             .map(|files| files.paths())
             .unwrap_or(&[]);
+        if !codex_image_paths.is_empty() {
+            eprintln!(
+                "[agent] Attaching {} current chat image(s) to Codex via --image",
+                codex_image_paths.len()
+            );
+        }
 
         {
             let lore_dir = agent_lore_dir(agent_name);
@@ -8656,6 +8662,7 @@ mod tests {
         recent_history_exchange_tail, remove_owned_service_pid_file, resolve_context_project,
         resolve_executable_path_from, reuse_or_clear_staged_binary, sanitize_cli_output_preview,
         service_update_target, should_force_agy_file_token_auth_from,
+        write_codex_image_attachments,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
@@ -9308,6 +9315,13 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].mime, "image/png");
         assert_eq!(attachments[0].bytes, b"hello");
+
+        let files = write_codex_image_attachments(content)
+            .unwrap()
+            .expect("image attachment files");
+        assert_eq!(files.paths().len(), 1);
+        assert!(files.paths()[0].ends_with("lore-chat-image-1.png"));
+        assert_eq!(fs::read(&files.paths()[0]).unwrap(), b"hello");
 
         let image = PathBuf::from("/tmp/lore-current-image.png");
         let args = codex_exec_args(Some("gpt-5.5"), Some("high"), &[image.clone()]);

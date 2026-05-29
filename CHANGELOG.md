@@ -3,6 +3,7 @@
 ## 2026-05-25
 
 - Fixed API-endpoint agent runtime status so agents configured for endpoints such as Krasis via SSH no longer overwrite the chat header with the stale legacy Claude backend while thinking.
+- Logged when Codex-backed chat agents receive current chat images as `codex exec --image` attachments, and tightened the regression around temporary attachment file creation.
 - Passed current chat images to Codex as real `codex exec --image` file attachments instead of relying on Markdown data URLs inside the text prompt.
 - Preserved images from the active chat message for CLI-backed agents such as Codex while still replacing older image data URLs with compact placeholders.
 - Stopped pasted chat screenshots from poisoning later agent turns by replacing prior data-image attachments with compact placeholders in CLI, manager, and compaction prompts while preserving only the current API-endpoint image for multimodal calls.
