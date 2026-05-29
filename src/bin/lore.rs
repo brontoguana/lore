@@ -3528,6 +3528,10 @@ fn chat_content_for_prompt(content: &str, preserve_data_images: bool) -> String 
     }
 }
 
+fn chat_content_for_current_message_prompt(content: &str) -> String {
+    chat_content_for_prompt(content, true)
+}
+
 fn replace_markdown_data_images_with_placeholders(text: &str) -> String {
     let mut rest = text;
     let mut out = String::with_capacity(text.len().min(4096));
@@ -4498,7 +4502,7 @@ async fn agent_poll_and_process(
 
     prompt_parts.push(format!(
         "\n## New Message\n\n{}",
-        chat_content_for_prompt(&combined, has_endpoint)
+        chat_content_for_current_message_prompt(&combined)
     ));
 
     let user_context = prompt_parts.join("\n\n");
@@ -8493,13 +8497,14 @@ mod tests {
         ResolvedProject, api_endpoint_runtime_context, api_user_content_from_markdown_images,
         append_assistant_segment, append_block_content, append_new_stream_text,
         append_plain_output_line, backend_uses_json_lines, build_compaction_prompt,
-        chat_content_for_prompt, codex_exec_args, count_history_exchanges, find_cwd_project_file,
-        history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
-        load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
-        markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
-        parse_codex_line, recent_history_exchange_tail, remove_owned_service_pid_file,
-        resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
-        sanitize_cli_output_preview, service_update_target, should_force_agy_file_token_auth_from,
+        chat_content_for_current_message_prompt, chat_content_for_prompt, codex_exec_args,
+        count_history_exchanges, find_cwd_project_file, history_compaction_split_index,
+        history_messages_excluding_pending, load_cli_text_input, load_doc_write_content,
+        load_required_text_arg, looks_like_cli_auth_prompt, markdown_heading_matches,
+        next_service_update_retry_delay_secs, parse_cli_version_output, parse_codex_line,
+        recent_history_exchange_tail, remove_owned_service_pid_file, resolve_context_project,
+        resolve_executable_path_from, reuse_or_clear_staged_binary, sanitize_cli_output_preview,
+        service_update_target, should_force_agy_file_token_auth_from,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
@@ -9135,6 +9140,7 @@ mod tests {
         assert!(!sanitized.contains("data:image"));
         assert!(!sanitized.contains("aGVsbG8="));
         assert_eq!(chat_content_for_prompt(content, true), content);
+        assert_eq!(chat_content_for_current_message_prompt(content), content);
     }
 
     #[test]
