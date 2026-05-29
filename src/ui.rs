@@ -5605,7 +5605,7 @@ function renderChatAttachmentStrip() {{
   chatImageAttachments.forEach(function(att) {{
     html += '<div class="chat-attachment-thumb">';
     html += '<img src="' + escapeHtmlRaw(att.data_url || '') + '" alt="' + escapeHtmlRaw(att.name || 'image') + '">';
-    html += '<button type="button" class="btn-sm chat-attachment-remove" title="Remove image" onclick="return removeChatImageAttachment(\\'' + escapeHtmlRaw(att.id) + '\\')">{close_icon}</button>';
+    html += '<button type="button" class="btn-sm chat-attachment-remove" title="Remove image" onclick="return removeChatImageAttachment(\'' + escapeHtmlRaw(att.id) + '\')">{close_icon}</button>';
     html += '</div>';
   }});
   for (var i = 0; i < chatImageProcessingCount; i++) {{
@@ -14541,6 +14541,8 @@ mod tests {
         assert!(
             html.contains("&attachments=' + encodeURIComponent(JSON.stringify(attachments || []))")
         );
+        assert!(html.contains(r#"removeChatImageAttachment(\'' + escapeHtmlRaw(att.id) + '\')"#));
+        assert!(!html.contains(r#"removeChatImageAttachment(\\''"#));
         assert!(html.contains(".chat-attachment-strip {"));
         assert!(html.contains(".chat-inline-image {"));
     }
