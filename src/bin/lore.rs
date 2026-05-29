@@ -4035,6 +4035,26 @@ async fn report_stop_acknowledged(context: &CliContext, token: &str) {
         .await;
 }
 
+fn visible_agent_error_content(detail: &str) -> String {
+    format!(
+        "[Agent error: {}]",
+        truncate_head_tail(detail.trim(), 900, 300)
+    )
+}
+
+async fn complete_agent_turn_with_error(context: &CliContext, token: &str, detail: &str) {
+    let _ = context
+        .client
+        .post(format!("{}/v1/chat/respond", context.url))
+        .header("x-lore-key", token)
+        .json(&serde_json::json!({
+            "content": visible_agent_error_content(detail),
+            "complete": true
+        }))
+        .send()
+        .await;
+}
+
 async fn agent_poll_and_process(
     context: &CliContext,
     agent_name: &str,
@@ -4267,6 +4287,11 @@ async fn agent_poll_and_process(
     let project_context = history["project_context"].as_str().unwrap_or("");
     let accessible_projects = history["accessible_projects"].as_str().unwrap_or("");
     let recent_activity = history["recent_activity"].as_str().unwrap_or("");
+    let endpoint_runtime_context = if has_endpoint {
+        api_endpoint_runtime_context(history.get("endpoint"))
+    } else {
+        None
+    };
 
     let mut prompt_parts: Vec<String> = Vec::new();
 
@@ -4411,7 +4436,7 @@ async fn agent_poll_and_process(
     let (full_response, emitted_assistant_messages) = if has_endpoint {
         // API mode: run local agentic loop, proxy LLM calls through the server
         eprintln!("[agent] Using API endpoint mode");
-        let model_override = history["model"].as_str().map(|s| s.to_string());
+        let model_override = model_override_from_history(&history, true);
         let endpoint_id = body["endpoint_id"].as_str().map(|s| s.to_string());
         run_api_agent_turn(
             context,
@@ -4422,16 +4447,25 @@ async fn agent_poll_and_process(
             recent_activity,
             model_override.as_deref(),
             endpoint_id.as_deref(),
+            endpoint_runtime_context.as_deref(),
         )
         .await?
     } else {
         // CLI mode: spawn backend process — prepend system instructions to user context
-        let system_instructions = build_lore_system_instructions(
+        let mut system_instructions = build_lore_system_instructions(
             project_context,
             accessible_projects,
             recent_activity,
             &build_cli_tool_section(),
         );
+        let model_override = model_override_from_history(&history, false);
+        let effort_override = history["effort"].as_str().map(|s| s.to_string());
+        system_instructions.push_str("\n\n");
+        system_instructions.push_str(&cli_runtime_context(
+            backend,
+            model_override.as_deref(),
+            effort_override.as_deref(),
+        ));
         let full_prompt = format!("{system_instructions}\n\n---\n\n{user_context}");
 
         {
@@ -4440,8 +4474,6 @@ async fn agent_poll_and_process(
             let _ = fs::write(lore_dir.join("prompt.txt"), &full_prompt);
         }
 
-        let model_override = history["model"].as_str().map(|s| s.to_string());
-        let effort_override = history["effort"].as_str().map(|s| s.to_string());
         let mut child = match spawn_backend(
             backend,
             &full_prompt,
@@ -4463,20 +4495,17 @@ async fn agent_poll_and_process(
                             "{detail}; stopping retries after {failure_count} failed attempts for this user turn. Fix the {backend} CLI or backend configuration, then send a new message to retry."
                         ),
                     );
+                    let detail = rec.detail.clone();
                     record_agent_error(context, agent_name, rec).await;
-                    let _ = context
-                        .client
-                        .post(format!("{}/v1/chat/respond", context.url))
-                        .header("x-lore-key", token)
-                        .json(&serde_json::json!({ "complete": true }))
-                        .send()
-                        .await;
+                    complete_agent_turn_with_error(context, token, &detail).await;
                     turn_failure_tracker.reset();
                     return Ok(AgentPollAction::Continue);
                 }
                 let rec = AgentErrorRecord::new("cli", detail);
+                let detail = rec.detail.clone();
                 record_agent_error(context, agent_name, rec).await;
-                return Err(e);
+                complete_agent_turn_with_error(context, token, &detail).await;
+                return Ok(AgentPollAction::Continue);
             }
         };
         turn_failure_tracker.reset();
@@ -4510,14 +4539,9 @@ async fn agent_poll_and_process(
                         if let Some(record) = classify_cli_non_json_output(backend, "stdout", &line) {
                             eprintln!("[agent] {}", record.detail);
                             terminate_child_process_tree(&mut child).await;
+                            let detail = record.detail.clone();
                             record_agent_error(context, agent_name, record).await;
-                            let _ = context
-                                .client
-                                .post(format!("{}/v1/chat/respond", context.url))
-                                .header("x-lore-key", token)
-                                .json(&serde_json::json!({ "complete": true }))
-                                .send()
-                                .await;
+                            complete_agent_turn_with_error(context, token, &detail).await;
                             return Ok(AgentPollAction::Continue);
                         }
                         append_plain_output_line(&mut response, &line);
@@ -4529,14 +4553,9 @@ async fn agent_poll_and_process(
                             if let Some(record) = classify_cli_non_json_output(backend, "stdout", &line) {
                                 eprintln!("[agent] {}", record.detail);
                                 terminate_child_process_tree(&mut child).await;
+                                let detail = record.detail.clone();
                                 record_agent_error(context, agent_name, record).await;
-                                let _ = context
-                                    .client
-                                    .post(format!("{}/v1/chat/respond", context.url))
-                                    .header("x-lore-key", token)
-                                    .json(&serde_json::json!({ "complete": true }))
-                                    .send()
-                                    .await;
+                                complete_agent_turn_with_error(context, token, &detail).await;
                                 return Ok(AgentPollAction::Continue);
                             }
                             continue;
@@ -4586,14 +4605,9 @@ async fn agent_poll_and_process(
                     if let Some(record) = classify_cli_non_json_output(backend, "stderr", &line) {
                         eprintln!("[agent] {}", record.detail);
                         terminate_child_process_tree(&mut child).await;
+                        let detail = record.detail.clone();
                         record_agent_error(context, agent_name, record).await;
-                        let _ = context
-                            .client
-                            .post(format!("{}/v1/chat/respond", context.url))
-                            .header("x-lore-key", token)
-                            .json(&serde_json::json!({ "complete": true }))
-                            .send()
-                            .await;
+                        complete_agent_turn_with_error(context, token, &detail).await;
                         return Ok(AgentPollAction::Continue);
                     }
                 }
@@ -4605,7 +4619,31 @@ async fn agent_poll_and_process(
                 }
             }
         }
-        let _ = child.wait().await;
+        match child.wait().await {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                let detail = format!("{backend} exited with status {status}");
+                let rec = AgentErrorRecord::new("cli", &detail);
+                record_agent_error(context, agent_name, rec).await;
+                if !emitted_assistant_messages && response.trim().is_empty() {
+                    response = visible_agent_error_content(&detail);
+                }
+            }
+            Err(e) => {
+                let detail = format!("failed to wait for {backend}: {e}");
+                let rec = AgentErrorRecord::new("cli", &detail);
+                record_agent_error(context, agent_name, rec).await;
+                if !emitted_assistant_messages && response.trim().is_empty() {
+                    response = visible_agent_error_content(&detail);
+                }
+            }
+        }
+        if !emitted_assistant_messages && response.trim().is_empty() {
+            let detail = format!("{backend} exited without producing a response");
+            let rec = AgentErrorRecord::new("cli", &detail);
+            record_agent_error(context, agent_name, rec).await;
+            response = visible_agent_error_content(&detail);
+        }
         (response, emitted_assistant_messages)
     };
 
@@ -5622,6 +5660,49 @@ fn api_user_content_from_markdown_images(text: &str) -> serde_json::Value {
     }
 }
 
+fn api_endpoint_runtime_context(endpoint: Option<&serde_json::Value>) -> Option<String> {
+    let endpoint = endpoint?;
+    let name = endpoint
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("configured endpoint");
+    let kind = endpoint
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("api");
+    let model = endpoint
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("configured model");
+
+    Some(format!(
+        "## Current Runtime\n\nYou are currently running through the Lore API endpoint `{name}` ({kind}) using model `{model}`. Do not infer your current identity, provider, training origin, or capabilities from older assistant messages, conversation summaries, local backend names, or previous CLI-agent configuration. If asked who trained you or what model you are, answer from this current endpoint/model information. If the training origin is not known from the current model metadata, say that you do not know rather than repeating stale history."
+    ))
+}
+
+fn cli_runtime_context(
+    backend: AgentBackend,
+    model_override: Option<&str>,
+    effort_override: Option<&str>,
+) -> String {
+    let model = model_override
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or("default");
+    let effort = effort_override
+        .filter(|effort| !effort.trim().is_empty())
+        .unwrap_or("default");
+    format!(
+        "## Current Runtime\n\nYou are currently running through the Lore `{backend}` CLI backend with model `{model}` and effort `{effort}`. Do not infer your current identity, provider, training origin, model, or capabilities from older assistant messages, conversation summaries, local backend names, or previous agent configuration. If asked who trained you or what model you are, answer from this current runtime information rather than repeating stale history."
+    )
+}
+
+fn model_override_from_history(history: &serde_json::Value, endpoint_mode: bool) -> Option<String> {
+    if endpoint_mode {
+        return None;
+    }
+    history["model"].as_str().map(|s| s.to_string())
+}
+
 async fn run_api_agent_turn(
     context: &CliContext,
     agent_name: &str,
@@ -5631,6 +5712,7 @@ async fn run_api_agent_turn(
     recent_activity: &str,
     model_override: Option<&str>,
     endpoint_id: Option<&str>,
+    runtime_context: Option<&str>,
 ) -> CliResult<(String, bool)> {
     let endpoint_id_owned = endpoint_id.map(|s| s.to_string());
     let token = context.token.as_deref().ok_or("no token configured")?;
@@ -5646,12 +5728,16 @@ async fn run_api_agent_turn(
         .collect();
     let lore_name_list: Vec<String> = lore_names.iter().cloned().collect();
 
-    let system_content = build_lore_system_instructions(
+    let mut system_content = build_lore_system_instructions(
         project_context,
         accessible_projects,
         recent_activity,
         &build_api_tool_section(&lore_name_list),
     );
+    if let Some(runtime_context) = runtime_context {
+        system_content.push_str("\n\n");
+        system_content.push_str(runtime_context);
+    }
 
     {
         let lore_dir = agent_lore_dir(agent_name);
@@ -7557,7 +7643,7 @@ impl ServiceState {
 fn spawn_agent_task(context: &CliContext, agent: &ManagedAgent) -> tokio::task::JoinHandle<()> {
     let folder = PathBuf::from(&agent.folder);
     let name = agent.name.clone();
-    let backend_override = agent.backend.as_ref().and_then(|b| b.parse().ok());
+    let backend_override = service_managed_backend_override(agent);
     let ctx = CliContext {
         client: context.client.clone(),
         url: context.url.clone(),
@@ -7612,6 +7698,14 @@ fn spawn_agent_task(context: &CliContext, agent: &ManagedAgent) -> tokio::task::
             }
         }
     }))
+}
+
+fn service_managed_backend_override(_agent: &ManagedAgent) -> Option<AgentBackend> {
+    // Service-managed agents receive the current backend in every server poll.
+    // Do not capture the cached agents.json backend here; otherwise a backend
+    // switch can race with an already-running long-polling task and consume the
+    // next turn using the old backend.
+    None
 }
 
 /// Rotate log file if it exceeds 2MB. Keeps one `.1` backup.
@@ -8323,16 +8417,16 @@ async fn service_handle_create_agent(
 mod tests {
     use super::{
         AGY_OAUTH_TOKEN_RELATIVE_PATH, BlocksCommand, Cli, Command, DocWriteArgs, ProjectSource,
-        ResolvedProject, api_user_content_from_markdown_images, append_assistant_segment,
-        append_block_content, append_new_stream_text, append_plain_output_line,
-        backend_uses_json_lines, build_compaction_prompt, codex_exec_args, count_history_exchanges,
-        find_cwd_project_file, history_compaction_split_index, history_messages_excluding_pending,
-        load_cli_text_input, load_doc_write_content, load_required_text_arg,
-        looks_like_cli_auth_prompt, markdown_heading_matches, next_service_update_retry_delay_secs,
-        parse_cli_version_output, parse_codex_line, recent_history_exchange_tail,
-        remove_owned_service_pid_file, resolve_context_project, resolve_executable_path_from,
-        reuse_or_clear_staged_binary, sanitize_cli_output_preview, service_update_target,
-        should_force_agy_file_token_auth_from,
+        ResolvedProject, api_endpoint_runtime_context, api_user_content_from_markdown_images,
+        append_assistant_segment, append_block_content, append_new_stream_text,
+        append_plain_output_line, backend_uses_json_lines, build_compaction_prompt,
+        codex_exec_args, count_history_exchanges, find_cwd_project_file,
+        history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
+        load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
+        markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
+        parse_codex_line, recent_history_exchange_tail, remove_owned_service_pid_file,
+        resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
+        sanitize_cli_output_preview, service_update_target, should_force_agy_file_token_auth_from,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
@@ -8592,6 +8686,44 @@ mod tests {
         .unwrap()
         .detail
         .contains("agy emitted a non-JSON stdout authentication prompt"));
+    }
+
+    #[test]
+    fn visible_agent_error_content_is_bounded_and_marked() {
+        let detail = format!(
+            "codex exited without producing a response {}",
+            "x".repeat(2_000)
+        );
+        let content = super::visible_agent_error_content(&detail);
+
+        assert!(content.starts_with("[Agent error: codex exited without producing a response"));
+        assert!(content.ends_with(']'));
+        assert!(content.len() < 1_300);
+    }
+
+    #[test]
+    fn cli_runtime_context_pins_current_backend_identity() {
+        let context = super::cli_runtime_context(AgentBackend::Codex, None, Some("high"));
+
+        assert!(context.contains("Lore `codex` CLI backend"));
+        assert!(context.contains("model `default`"));
+        assert!(context.contains("effort `high`"));
+        assert!(context.contains("Do not infer your current identity"));
+        assert!(context.contains("older assistant messages"));
+        assert!(context.contains("stale history"));
+    }
+
+    #[test]
+    fn service_managed_agent_uses_server_poll_backend_not_cached_backend() {
+        let agent = super::ManagedAgent {
+            name: "general".into(),
+            pid: 0,
+            folder: "/tmp".into(),
+            token: "lore_at_test".into(),
+            backend: Some("claude".into()),
+        };
+
+        assert_eq!(super::service_managed_backend_override(&agent), None);
     }
 
     #[test]
@@ -8914,6 +9046,40 @@ mod tests {
         assert_eq!(
             api_user_content_from_markdown_images("plain text"),
             json!("plain text")
+        );
+    }
+
+    #[test]
+    fn api_endpoint_runtime_context_overrides_stale_identity_history() {
+        let context = api_endpoint_runtime_context(Some(&json!({
+            "name": "Krasis via SSH",
+            "kind": "openai",
+            "model": "Qwen3.6-35B-A3B-vision",
+        })))
+        .expect("endpoint context should render");
+
+        assert!(context.contains("Krasis via SSH"));
+        assert!(context.contains("Qwen3.6-35B-A3B-vision"));
+        assert!(context.contains("Do not infer your current identity"));
+        assert!(context.contains("older assistant messages"));
+        assert!(context.contains("conversation summaries"));
+        assert!(context.contains("stale history"));
+    }
+
+    #[test]
+    fn endpoint_mode_ignores_legacy_backend_model_override() {
+        let history = json!({
+            "model": "opus",
+            "endpoint": {
+                "name": "Krasis via SSH",
+                "model": "Qwen3.6-35B-A3B-vision"
+            }
+        });
+
+        assert_eq!(super::model_override_from_history(&history, true), None);
+        assert_eq!(
+            super::model_override_from_history(&history, false).as_deref(),
+            Some("opus")
         );
     }
 

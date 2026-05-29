@@ -3475,7 +3475,7 @@ impl ChatStore {
         )
         .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
-            "UPDATE conversations SET next_id = 1, summary_until_id = 0, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND agent = ?2",
+            "UPDATE conversations SET next_id = 1, summary = '', summary_until_id = 0, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND agent = ?2",
             params![owner, agent],
         )
         .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
@@ -3492,7 +3492,7 @@ impl ChatStore {
             params![owner],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
-            "UPDATE conversations SET next_id = 1, summary_until_id = 0, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND (agent = 'librarian' OR agent LIKE 'librarian:%')",
+            "UPDATE conversations SET next_id = 1, summary = '', summary_until_id = 0, last_delivered_user_id = 0, active_turn_user_id = 0 WHERE owner = ?1 AND (agent = 'librarian' OR agent LIKE 'librarian:%')",
             params![owner],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())

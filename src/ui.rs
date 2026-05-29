@@ -4281,6 +4281,9 @@ pub fn render_chat_main_panel(
       <label class="chat-config-label">Error Log <span id="cfg-errors-count" style="color:var(--fg-muted);font-weight:normal;"></span></label>
       <div id="cfg-errors-list" class="chat-errors-list"></div>
     </div>
+    <div class="chat-config-field chat-config-field-wide" id="cfg-clear-history-field">
+      <button type="button" class="btn-lg button-danger" id="cfg-clear-history-btn" onclick="return clearCurrentChatHistory()">Clear chat history</button>
+    </div>
   </div>
 </div>
 <div class="chat-config-panel" id="chat-manage-panel" style="display:none;">
@@ -5756,7 +5759,9 @@ function renderMessages() {{
     if (msg.excluded_from_context) {{
       html += '<div class="chat-msg-excluded-prefix" title="Excluded from agent context">&#128465;</div>';
     }}
-    if (msg.role === 'assistant' || msg.role === 'user') {{
+    if (msg.role === 'assistant') {{
+      html += '<div class="chat-msg-content">' + renderAssistantMarkdown(msg.content) + '</div>';
+    }} else if (msg.role === 'user') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
     }} else if (msg.role === 'error') {{
       html += '<div class="chat-msg-content chat-msg-error-content"><svg class="chat-msg-error-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><span>' + escapeHtml(msg.content) + '</span></div>';
@@ -6153,6 +6158,37 @@ function renderMarkdown(text) {{
   if (inBq) html += '</blockquote>';
   if (inTable) html += '</table></div>';
   return html;
+}}
+
+function renderAssistantMarkdown(text) {{
+  if (!text) return '';
+  var source = String(text);
+  var cursor = 0;
+  var html = '';
+  while (cursor < source.length) {{
+    var start = findThinkTag(source, '<think>', cursor);
+    if (start < 0) {{
+      html += renderMarkdown(source.slice(cursor));
+      break;
+    }}
+    if (start > cursor) {{
+      html += renderMarkdown(source.slice(cursor, start));
+    }}
+    var bodyStart = start + '<think>'.length;
+    var end = findThinkTag(source, '</think>', bodyStart);
+    var thinking = end < 0 ? source.slice(bodyStart) : source.slice(bodyStart, end);
+    var renderedThinking = renderMarkdown(thinking.trim());
+    html += '<details class="chat-think"><summary>Thinking</summary><div class="chat-think-body">' + renderedThinking + '</div></details>';
+    cursor = end < 0 ? source.length : end + '</think>'.length;
+  }}
+  return html;
+}}
+
+function findThinkTag(source, tag, from) {{
+  for (var i = from; i <= source.length - tag.length; i++) {{
+    if (source.slice(i, i + tag.length).toLowerCase() === tag) return i;
+  }}
+  return -1;
 }}
 
 function inlineMd(t) {{
@@ -6877,6 +6913,10 @@ function updateCachedChatPanelFromEvent(evt) {{
         insertChatMessage({{ role: 'assistant', content: evt.data.content, _id: evt.data.id }});
       }}
       streamingContent = '';
+    }} else if (evt.event_type === 'clear') {{
+      chatMessages = [];
+      activeTurnUserId = 0;
+      streamingContent = '';
     }} else if (evt.event_type === 'auto_message') {{
       insertChatMessage({{ role: 'user', content: evt.data.content }});
     }} else if (evt.event_type === 'command_response') {{
@@ -7016,6 +7056,11 @@ function connectSSE() {{
             _id: evt.data.id
           }});
         }}
+        streamingContent = '';
+        renderMessages();
+      }} else if (evt.event_type === 'clear') {{
+        chatMessages = [];
+        activeTurnUserId = 0;
         streamingContent = '';
         renderMessages();
       }} else if (evt.event_type === 'auto_message') {{
@@ -7243,6 +7288,42 @@ function refreshErrorsPanel() {{
       if (countEl) countEl.textContent = '';
       list.innerHTML = '<div class="chat-errors-empty">Failed to load errors.</div>';
     }});
+}}
+
+function clearCurrentChatHistory() {{
+  if (!currentAgent || isLibrarian) return false;
+  var label = currentAgent;
+  var currentItem = document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(currentAgent) + '"] .chat-agent-name');
+  if (currentItem && currentItem.textContent) label = currentItem.textContent.trim() || label;
+  if (!confirm('Clear all chat history for ' + label + '? This cannot be undone.')) return false;
+  var btn = document.getElementById('cfg-clear-history-btn');
+  if (btn) {{
+    btn.disabled = true;
+    btn.textContent = 'Clearing...';
+  }}
+  fetch('/ui/chat/' + encodeURIComponent(currentAgent) + '/clear', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+    body: 'csrf_token=' + encodeURIComponent(csrfToken)
+  }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      if (!data || !data.ok) throw new Error((data && data.error) || 'Failed to clear chat history');
+      chatMessages = [];
+      activeTurnUserId = 0;
+      renderMessages();
+      updateAgentListPreview(currentAgent, '', '');
+    }})
+    .catch(function(err) {{
+      alert(err && err.message ? err.message : 'Failed to clear chat history');
+    }})
+    .finally(function() {{
+      if (btn) {{
+        btn.disabled = false;
+        btn.textContent = 'Clear chat history';
+      }}
+    }});
+  return false;
 }}
 
 var pinnedSaveTimer = null;
@@ -12235,6 +12316,24 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       max-height: 200px;
       overflow: auto;
     }
+    .chat-think {
+      margin: 0.35em 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--details-bg);
+      color: var(--fg-muted);
+    }
+    .chat-think summary {
+      cursor: pointer;
+      padding: var(--s-2) var(--s-3);
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .chat-think-body {
+      border-top: 1px solid var(--line);
+      padding: var(--s-2) var(--s-3);
+      color: var(--fg);
+    }
     .errors-toolbar {
       display: flex;
       gap: var(--s-2);
@@ -14545,6 +14644,46 @@ mod tests {
         assert!(!html.contains(r#"removeChatImageAttachment(\\''"#));
         assert!(html.contains(".chat-attachment-strip {"));
         assert!(html.contains(".chat-inline-image {"));
+    }
+
+    #[test]
+    fn chat_page_collapses_think_tags_and_exposes_clear_history() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[ChatAgentSummary {
+                name: "worker".into(),
+                display_name: "Worker".into(),
+                owner: "admin".into(),
+                status: "idle".into(),
+                manage_enabled: false,
+                last_message: None,
+                last_message_time: None,
+                profile_url: None,
+                cwd: None,
+                git_branch: None,
+            }],
+            Some("worker"),
+            r#"[{"role":"assistant","content":"<think>private reasoning</think>Visible answer"}]"#,
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("function renderAssistantMarkdown(text) {"));
+        assert!(html.contains("function findThinkTag(source, tag, from) {"));
+        assert!(html.contains("findThinkTag(source, '<think>', cursor)"));
+        assert!(html.contains(r#"<details class="chat-think"><summary>Thinking</summary>"#));
+        assert!(html.contains(".chat-think {"));
+        assert!(html.contains("renderAssistantMarkdown(msg.content)"));
+        assert!(html.contains(r#"id="cfg-errors-list""#));
+        assert!(html.contains(r#"id="cfg-clear-history-btn""#));
+        assert!(html.contains("Clear chat history"));
+        assert!(html.contains("confirm('Clear all chat history for ' + label"));
+        assert!(html.contains("'/ui/chat/' + encodeURIComponent(currentAgent) + '/clear'"));
     }
 
     #[test]

@@ -820,6 +820,7 @@ fn build_app_with_librarian(
             post(chat_send_message).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/ui/chat/{agent}/message", post(chat_update_message))
+        .route("/ui/chat/{agent}/clear", post(chat_clear_history))
         .route("/ui/chat/{agent}/command", post(chat_slash_command))
         .route(
             "/ui/chat/{agent}/config",
@@ -12055,8 +12056,9 @@ fn chat_message_json(msg: &ChatMessage) -> Value {
 }
 
 fn chat_preview_text(content: &str) -> String {
+    let content = strip_think_blocks(content);
     let mut out = String::new();
-    let mut rest = content;
+    let mut rest = content.as_str();
     loop {
         let Some(start) = rest.find("![") else {
             out.push_str(rest);
@@ -12082,6 +12084,27 @@ fn chat_preview_text(content: &str) -> String {
         rest = &candidate[url_start + close_url + 1..];
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn strip_think_blocks(content: &str) -> String {
+    let lower = content.to_ascii_lowercase();
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    loop {
+        let lower_offset = content.len() - rest.len();
+        let Some(start_rel) = lower[lower_offset..].find("<think>") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start_rel]);
+        let body_start = start_rel + "<think>".len();
+        let next_offset = lower_offset + body_start;
+        let Some(end_rel) = lower[next_offset..].find("</think>") else {
+            break;
+        };
+        rest = &rest[body_start + end_rel + "</think>".len()..];
+    }
+    out
 }
 
 fn agent_context_messages(messages: &[ChatMessage]) -> Vec<&ChatMessage> {
@@ -13020,6 +13043,11 @@ struct ChatExcludeMessageForm {
     excluded: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatClearHistoryForm {
+    csrf_token: String,
+}
+
 async fn chat_send_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -13154,6 +13182,38 @@ async fn chat_update_message(
         "last_message_time": last_message_time,
     }))
     .into_response())
+}
+
+async fn chat_clear_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(agent_name): Path<String>,
+    Form(form): Form<ChatClearHistoryForm>,
+) -> UiResult<Response> {
+    let session = require_ui_session(&state, &headers)?;
+    verify_csrf(&session, &form.csrf_token)?;
+    let owner = session.user.username.as_str();
+
+    let agents = state
+        .auth
+        .list_agent_tokens_for_user(&session.user.username)?;
+    find_owned_chat_agent(&agents, &agent_name)?;
+
+    state.chat.clear_messages(owner, &agent_name)?;
+    clear_chat_agent_stop_request(&state, owner, &agent_name);
+
+    push_chat_event(
+        &state,
+        owner,
+        ChatEvent {
+            event_type: "clear".into(),
+            agent: agent_name.clone(),
+            owner: owner.to_string(),
+            data: json!({}),
+        },
+    );
+
+    Ok(Json(json!({ "ok": true })).into_response())
 }
 
 async fn chat_sse_stream(State(state): State<AppState>, headers: HeaderMap) -> UiResult<Response> {
@@ -18300,6 +18360,19 @@ mod tests {
         assert_eq!(poll_json["messages"][0]["content"], content);
     }
 
+    #[test]
+    fn chat_preview_text_strips_thinking_blocks() {
+        let preview = super::chat_preview_text(
+            "<think>private chain\nof thought</think>Final answer ![shot](data:image/png;base64,abc)",
+        );
+        assert_eq!(preview, "Final answer [image]");
+
+        assert_eq!(
+            super::chat_preview_text("before <think>unfinished private text"),
+            "before"
+        );
+    }
+
     #[tokio::test]
     async fn chat_update_message_toggles_message_context_exclusion() {
         let dir = tempdir().unwrap();
@@ -18393,6 +18466,73 @@ mod tests {
 
         let saved = state.chat.load_conversation("admin", "agent-main").unwrap();
         assert!(!saved.messages[0].excluded_from_context);
+    }
+
+    #[tokio::test]
+    async fn chat_clear_history_removes_messages_and_summary_after_confirmation() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let _agent_token =
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
+
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let conv = ChatConversation {
+            messages: vec![
+                ChatMessage {
+                    id: 1,
+                    role: ChatRole::User,
+                    content: "hello".into(),
+                    timestamp: OffsetDateTime::UNIX_EPOCH,
+                    client_message_id: None,
+                    excluded_from_context: false,
+                },
+                ChatMessage {
+                    id: 2,
+                    role: ChatRole::Assistant,
+                    content: "<think>hidden</think>answer".into(),
+                    timestamp: OffsetDateTime::UNIX_EPOCH,
+                    client_message_id: None,
+                    excluded_from_context: false,
+                },
+            ],
+            summary: "old summary".into(),
+            summary_until_id: 2,
+            next_id: 3,
+            last_delivered_user_id: 1,
+            active_turn_user_id: 1,
+            ..ChatConversation::default()
+        };
+        state
+            .chat
+            .save_conversation("admin", "agent-main", &conv)
+            .unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/agent-main/clear")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}",
+                urlencoding::encode(&csrf_token),
+            )))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+
+        let saved = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert!(saved.messages.is_empty());
+        assert_eq!(saved.summary, "");
+        assert_eq!(saved.summary_until_id, 0);
+        assert_eq!(saved.next_id, 1);
+        assert_eq!(saved.last_delivered_user_id, 0);
+        assert_eq!(saved.active_turn_user_id, 0);
     }
 
     #[tokio::test]
