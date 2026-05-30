@@ -6716,19 +6716,10 @@ function chatMessageStableKey(msg) {{
   return id > 0 ? ('id:' + id) : '';
 }}
 
-function chatToolTurnId(msg) {{
-  if (!msg || msg.role !== 'tool') return 0;
-  var id = msg.tool_turn_id || msg.toolTurnId || 0;
-  if (typeof id === 'string') id = parseInt(id, 10);
-  return Number.isFinite(id) ? id : 0;
-}}
-
 function chatToolStableKey(msg) {{
   if (!msg || msg.role !== 'tool') return '';
   var id = chatMessageId(msg);
   if (id > 0) return 'tool-id:' + id;
-  var turnId = chatToolTurnId(msg);
-  if (turnId > 0) return 'tool-turn:' + turnId;
   return '';
 }}
 
@@ -6770,8 +6761,6 @@ function coalesceToolMessages(messages) {{
       byKey[key].content = combineToolContent(byKey[key].content, msg.content);
       var id = chatMessageId(msg);
       if (id > 0) byKey[key]._id = id;
-      var turnId = chatToolTurnId(msg);
-      if (turnId > 0) byKey[key].tool_turn_id = turnId;
       continue;
     }}
     out.push(msg);
@@ -6870,33 +6859,17 @@ function upsertToolUseMessage(data) {{
   var id = data.id || data._id || 0;
   if (typeof id === 'string') id = parseInt(id, 10);
   id = Number.isFinite(id) ? id : 0;
-  var turnId = data.tool_turn_id || data.toolTurnId || 0;
-  if (typeof turnId === 'string') turnId = parseInt(turnId, 10);
-  turnId = Number.isFinite(turnId) ? turnId : 0;
   if (id > 0) {{
     var byId = findChatMessageById(id);
     if (byId) {{
       byId.role = 'tool';
       byId.content = content;
       byId._id = id;
-      if (turnId > 0) byId.tool_turn_id = turnId;
       return byId;
-    }}
-  }}
-  if (turnId > 0) {{
-    for (var i = 0; i < chatMessages.length; i++) {{
-      var msg = chatMessages[i];
-      if (msg && msg.role === 'tool' && chatToolTurnId(msg) === turnId) {{
-        msg.content = content;
-        if (id > 0) msg._id = id;
-        msg.tool_turn_id = turnId;
-        return msg;
-      }}
     }}
   }}
   var toolMsg = {{ role: 'tool', content: content }};
   if (id > 0) toolMsg._id = id;
-  if (turnId > 0) toolMsg.tool_turn_id = turnId;
   return insertChatMessage(toolMsg);
 }}
 
@@ -14930,6 +14903,8 @@ mod tests {
         assert!(html.contains("function coalesceToolMessages(messages) {"));
         assert!(html.contains("chatMessages = coalesceToolMessages(chatMessages);"));
         assert!(html.contains("upsertToolUseMessage(evt.data);"));
+        assert!(!html.contains("tool-turn:"));
+        assert!(!html.contains("chatToolTurnId"));
         assert!(
             html.contains("Object.assign({}, existingMessages[j], incomingByKey[existingKey])")
         );
