@@ -2,6 +2,7 @@
 
 ## 2026-05-25
 
+- Grouped agent action rows by active agent turn and reconciled live `tool_use` events with their persisted message ids, so hidden streaming placeholders or panel refreshes no longer split one run into multiple collapsed action lists.
 - Fixed API-endpoint agent runtime status so agents configured for endpoints such as Krasis via SSH no longer overwrite the chat header with the stale legacy Claude backend while thinking.
 - Logged when Codex-backed chat agents receive current chat images as `codex exec --image` attachments, and tightened the regression around temporary attachment file creation.
 - Passed current chat images to Codex as real `codex exec --image` file attachments instead of relying on Markdown data URLs inside the text prompt.

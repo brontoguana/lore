@@ -632,6 +632,27 @@ fn parse_tool_repeat(line: &str) -> (&str, Option<u32>) {
     parse_repeat_marker(line)
 }
 
+fn extend_tool_content(existing: &str, detail: &str) -> String {
+    if existing.is_empty() {
+        return detail.to_string();
+    }
+    let mut lines: Vec<String> = existing.split('\n').map(|s| s.to_string()).collect();
+    let prev = lines.last().cloned().unwrap_or_default();
+    let (prev_base, prev_count) = parse_tool_repeat(&prev);
+    if prev_base == detail {
+        let new_count = prev_count.unwrap_or(1) + 1;
+        let new_line = format!("{detail} (x{new_count})");
+        if let Some(last) = lines.last_mut() {
+            *last = new_line;
+        } else {
+            lines.push(new_line);
+        }
+    } else {
+        lines.push(detail.to_string());
+    }
+    lines.join("\n")
+}
+
 /// Check whether a column exists on a table.
 fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
     let mut stmt = match conn.prepare(&format!("PRAGMA table_info({})", table)) {
@@ -2675,6 +2696,19 @@ pub struct ChatMessage {
     pub excluded_from_context: bool,
 }
 
+pub const TOOL_TURN_CLIENT_MESSAGE_PREFIX: &str = "__lore_internal_tool_turn:";
+
+pub fn tool_turn_client_message_id(turn_user_message_id: u64) -> String {
+    format!("{TOOL_TURN_CLIENT_MESSAGE_PREFIX}{turn_user_message_id}")
+}
+
+pub fn tool_turn_id_from_client_message_id(client_message_id: Option<&str>) -> Option<u64> {
+    client_message_id?
+        .strip_prefix(TOOL_TURN_CLIENT_MESSAGE_PREFIX)?
+        .parse()
+        .ok()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinnedChatItem {
     pub id: u64,
@@ -3213,10 +3247,9 @@ impl ChatStore {
         ))
     }
 
-    /// Append a tool-use detail. If the most recent message for this (owner,agent)
-    /// is already a Tool message, extend it with a new line (with x-count dedup on
-    /// consecutive duplicates, mirroring the live UI aggregation). Otherwise insert
-    /// a new Tool message. Returns the resulting stored message.
+    /// Append a tool-use detail. During an active user turn, all tool details are
+    /// coalesced into one Tool message keyed to that turn. Older/no-turn callers
+    /// keep the legacy adjacent-tool behavior.
     pub fn append_or_extend_tool(
         &self,
         owner: &str,
@@ -3230,27 +3263,53 @@ impl ChatStore {
         Self::ensure_conversation(&conn, owner, agent)
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
 
-        let last: Option<(i64, String, String, String)> = conn.query_row(
-            "SELECT id, role, content, timestamp FROM messages WHERE owner = ?1 AND agent = ?2 ORDER BY id DESC LIMIT 1",
+        let (last_delivered_user_id, active_turn_user_id): (i64, i64) = conn
+            .query_row(
+                "SELECT last_delivered_user_id, active_turn_user_id FROM conversations WHERE owner = ?1 AND agent = ?2",
+                params![owner, agent],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let turn_client_message_id = (active_turn_user_id > last_delivered_user_id)
+            .then(|| tool_turn_client_message_id(active_turn_user_id as u64));
+
+        if let Some(ref tool_key) = turn_client_message_id {
+            let existing: Option<(i64, String, String)> = conn
+                .query_row(
+                    "SELECT id, content, timestamp FROM messages WHERE owner = ?1 AND agent = ?2 AND role = 'tool' AND client_message_id = ?3 LIMIT 1",
+                    params![owner, agent, tool_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+
+            if let Some((tool_id, content, ts)) = existing {
+                let new_content = extend_tool_content(&content, detail);
+                conn.execute(
+                    "UPDATE messages SET content = ?1 WHERE owner = ?2 AND agent = ?3 AND id = ?4",
+                    params![new_content, owner, agent, tool_id],
+                )
+                .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+                return Ok(ChatMessage {
+                    id: tool_id as u64,
+                    role: ChatRole::Tool,
+                    content: new_content,
+                    timestamp: parse_dt(&ts),
+                    client_message_id: Some(tool_key.clone()),
+                    excluded_from_context: false,
+                });
+            }
+        }
+
+        let last: Option<(i64, String, String, String, Option<String>)> = conn.query_row(
+            "SELECT id, role, content, timestamp, client_message_id FROM messages WHERE owner = ?1 AND agent = ?2 ORDER BY id DESC LIMIT 1",
             params![owner, agent],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         ).optional().map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
 
-        if let Some((last_id, last_role, last_content, last_ts)) = last {
+        if let Some((last_id, last_role, last_content, last_ts, last_client_message_id)) = last {
             if last_role == "tool" {
-                let mut lines: Vec<String> =
-                    last_content.split('\n').map(|s| s.to_string()).collect();
-                let prev = lines.last().cloned().unwrap_or_default();
-                let (prev_base, prev_count) = parse_tool_repeat(&prev);
-                if prev_base == detail {
-                    let new_count = prev_count.unwrap_or(1) + 1;
-                    let new_line = format!("{detail} (x{new_count})");
-                    let last_idx = lines.len() - 1;
-                    lines[last_idx] = new_line;
-                } else {
-                    lines.push(detail.to_string());
-                }
-                let new_content = lines.join("\n");
+                let new_content = extend_tool_content(&last_content, detail);
                 conn.execute(
                     "UPDATE messages SET content = ?1 WHERE owner = ?2 AND agent = ?3 AND id = ?4",
                     params![new_content, owner, agent, last_id],
@@ -3261,7 +3320,7 @@ impl ChatStore {
                     role: ChatRole::Tool,
                     content: new_content,
                     timestamp: parse_dt(&last_ts),
-                    client_message_id: None,
+                    client_message_id: last_client_message_id,
                     excluded_from_context: false,
                 });
             }
@@ -3276,8 +3335,8 @@ impl ChatStore {
             .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         let now = OffsetDateTime::now_utc();
         conn.execute(
-            "INSERT INTO messages (owner, agent, id, role, content, timestamp, excluded_from_context) VALUES (?1, ?2, ?3, 'tool', ?4, ?5, 0)",
-            params![owner, agent, next_id, detail, fmt_dt(&now)],
+            "INSERT INTO messages (owner, agent, id, role, content, client_message_id, timestamp, excluded_from_context) VALUES (?1, ?2, ?3, 'tool', ?4, ?5, ?6, 0)",
+            params![owner, agent, next_id, detail, turn_client_message_id, fmt_dt(&now)],
         ).map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         conn.execute(
             "UPDATE conversations SET next_id = ?1 WHERE owner = ?2 AND agent = ?3",
@@ -3289,7 +3348,7 @@ impl ChatStore {
             role: ChatRole::Tool,
             content: detail.to_string(),
             timestamp: now,
-            client_message_id: None,
+            client_message_id: turn_client_message_id,
             excluded_from_context: false,
         })
     }
@@ -3957,7 +4016,7 @@ mod tests {
     use super::{
         AUTH_SCHEMA, AgentBackend, ChatConversation, ChatMessage, ChatRole, ChatStore,
         LocalAuthStore, NewAgentToken, NewRole, NewUser, ProjectGrant, ProjectPermission, RoleName,
-        UserName,
+        UserName, tool_turn_client_message_id,
     };
     use crate::config::{ColorMode, UiTheme};
     use crate::model::ProjectName;
@@ -4330,6 +4389,63 @@ mod tests {
         let conv = chat.load_conversation("alice", "krasis").unwrap();
         assert_eq!(conv.messages.len(), 1);
         assert_eq!(conv.messages[0].content, third.content);
+    }
+
+    #[test]
+    fn chat_store_coalesces_tool_messages_by_active_turn() {
+        let dir = tempdir().unwrap();
+        let chat = ChatStore::new(dir.path());
+
+        let (user_msg, inserted) = chat
+            .append_user_message_idempotent("alice", "worker", "please work".into(), None)
+            .unwrap();
+        assert!(inserted);
+        let claimed = chat.claim_pending_user_messages("alice", "worker").unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, user_msg.id);
+
+        let first = chat
+            .append_or_extend_tool("alice", "worker", "Bash: cargo test")
+            .unwrap();
+        let assistant = chat
+            .append_message(
+                "alice",
+                "worker",
+                ChatRole::Assistant,
+                "still working".into(),
+            )
+            .unwrap();
+        let second = chat
+            .append_or_extend_tool("alice", "worker", "Read src/api.rs")
+            .unwrap();
+        let third = chat
+            .append_or_extend_tool("alice", "worker", "Read src/api.rs")
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.id, third.id);
+        let expected_tool_key = tool_turn_client_message_id(user_msg.id);
+        assert_eq!(
+            third.client_message_id.as_deref(),
+            Some(expected_tool_key.as_str())
+        );
+        assert_eq!(third.content, "Bash: cargo test\nRead src/api.rs (x2)");
+
+        let conv = chat.load_conversation("alice", "worker").unwrap();
+        let tool_rows: Vec<_> = conv
+            .messages
+            .iter()
+            .filter(|msg| msg.role == ChatRole::Tool)
+            .collect();
+        assert_eq!(tool_rows.len(), 1);
+        assert_eq!(tool_rows[0].id, first.id);
+        assert_eq!(
+            conv.messages
+                .iter()
+                .filter(|msg| msg.id == assistant.id)
+                .count(),
+            1
+        );
     }
 
     #[test]

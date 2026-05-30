@@ -6716,6 +6716,70 @@ function chatMessageStableKey(msg) {{
   return id > 0 ? ('id:' + id) : '';
 }}
 
+function chatToolTurnId(msg) {{
+  if (!msg || msg.role !== 'tool') return 0;
+  var id = msg.tool_turn_id || msg.toolTurnId || 0;
+  if (typeof id === 'string') id = parseInt(id, 10);
+  return Number.isFinite(id) ? id : 0;
+}}
+
+function chatToolStableKey(msg) {{
+  if (!msg || msg.role !== 'tool') return '';
+  var id = chatMessageId(msg);
+  if (id > 0) return 'tool-id:' + id;
+  var turnId = chatToolTurnId(msg);
+  if (turnId > 0) return 'tool-turn:' + turnId;
+  return '';
+}}
+
+function combineToolContent(existing, incoming) {{
+  existing = typeof existing === 'string' ? existing : '';
+  incoming = typeof incoming === 'string' ? incoming : '';
+  if (!existing) return incoming;
+  if (!incoming || existing === incoming) return existing;
+  var existingLines = existing.split('\n');
+  var incomingLines = incoming.split('\n');
+  if (incomingLines.length >= existingLines.length) {{
+    var incomingPrefix = incomingLines.slice(0, existingLines.length).join('\n');
+    if (incomingPrefix === existing) return incoming;
+  }}
+  var lines = existingLines.slice();
+  for (var i = 0; i < incomingLines.length; i++) {{
+    var line = incomingLines[i];
+    if (!line) continue;
+    var prevLine = lines.length ? lines[lines.length - 1] : '';
+    var prevMatch = prevLine.match(/^(.+?)( \(x(\d+)\))?$/);
+    if (prevMatch && prevMatch[1] === line) {{
+      var count = prevMatch[3] ? parseInt(prevMatch[3], 10) + 1 : 2;
+      lines[lines.length - 1] = line + ' (x' + count + ')';
+    }} else {{
+      lines.push(line);
+    }}
+  }}
+  return lines.join('\n');
+}}
+
+function coalesceToolMessages(messages) {{
+  if (!Array.isArray(messages) || !messages.length) return messages || [];
+  var out = [];
+  var byKey = {{}};
+  for (var i = 0; i < messages.length; i++) {{
+    var msg = messages[i];
+    var key = chatToolStableKey(msg);
+    if (key && byKey[key]) {{
+      byKey[key].content = combineToolContent(byKey[key].content, msg.content);
+      var id = chatMessageId(msg);
+      if (id > 0) byKey[key]._id = id;
+      var turnId = chatToolTurnId(msg);
+      if (turnId > 0) byKey[key].tool_turn_id = turnId;
+      continue;
+    }}
+    out.push(msg);
+    if (key) byKey[key] = msg;
+  }}
+  return out;
+}}
+
 function mergeChatMessagesPreservingVisibleOrder(existingMessages, incomingMessages) {{
   if (!Array.isArray(incomingMessages) || !incomingMessages.length) return incomingMessages || [];
   if (!Array.isArray(existingMessages) || !existingMessages.length) return incomingMessages;
@@ -6797,6 +6861,45 @@ function insertChatMessage(msg) {{
   return msg;
 }}
 
+function upsertToolUseMessage(data) {{
+  data = data || {{}};
+  var content = typeof data.content === 'string' && data.content
+    ? data.content
+    : (data.detail ? '\u{{1F527}} ' + data.detail : '');
+  if (!content) return null;
+  var id = data.id || data._id || 0;
+  if (typeof id === 'string') id = parseInt(id, 10);
+  id = Number.isFinite(id) ? id : 0;
+  var turnId = data.tool_turn_id || data.toolTurnId || 0;
+  if (typeof turnId === 'string') turnId = parseInt(turnId, 10);
+  turnId = Number.isFinite(turnId) ? turnId : 0;
+  if (id > 0) {{
+    var byId = findChatMessageById(id);
+    if (byId) {{
+      byId.role = 'tool';
+      byId.content = content;
+      byId._id = id;
+      if (turnId > 0) byId.tool_turn_id = turnId;
+      return byId;
+    }}
+  }}
+  if (turnId > 0) {{
+    for (var i = 0; i < chatMessages.length; i++) {{
+      var msg = chatMessages[i];
+      if (msg && msg.role === 'tool' && chatToolTurnId(msg) === turnId) {{
+        msg.content = content;
+        if (id > 0) msg._id = id;
+        msg.tool_turn_id = turnId;
+        return msg;
+      }}
+    }}
+  }}
+  var toolMsg = {{ role: 'tool', content: content }};
+  if (id > 0) toolMsg._id = id;
+  if (turnId > 0) toolMsg.tool_turn_id = turnId;
+  return insertChatMessage(toolMsg);
+}}
+
 function findLastNonQueuedMessageIndex() {{
   for (var i = chatMessages.length - 1; i >= 0; i--) {{
     if (!isQueuedFollowUpUserMessage(chatMessages[i])) return i;
@@ -6830,6 +6933,7 @@ function normalizeChatMessageOrder() {{
     return 0;
   }});
   chatMessages = main;
+  chatMessages = coalesceToolMessages(chatMessages);
   if (finished) chatMessages.push(finished);
   Array.prototype.push.apply(chatMessages, pending);
 }}
@@ -6875,23 +6979,7 @@ function updateCachedChatPanelFromEvent(evt) {{
     }} else if (evt.event_type === 'tool_use') {{
       agentStatus = 'thinking';
       maybeRemoveFinishedMessage();
-      var detail = '\u{{1F527}} ' + evt.data.detail;
-      var toolIdx = findLastNonQueuedMessageIndex();
-      var toolMsg = toolIdx >= 0 ? chatMessages[toolIdx] : null;
-      if (toolMsg && toolMsg.role === 'tool') {{
-        var lines = toolMsg.content.split('\n');
-        var prevLine = lines[lines.length - 1];
-        var prevMatch = prevLine.match(/^(.+?)( \(x(\d+)\))?$/);
-        if (prevMatch && prevMatch[1] === detail) {{
-          var count = prevMatch[3] ? parseInt(prevMatch[3]) + 1 : 2;
-          lines[lines.length - 1] = detail + ' (x' + count + ')';
-          toolMsg.content = lines.join('\n');
-        }} else {{
-          toolMsg.content += '\n' + detail;
-        }}
-      }} else {{
-        insertChatMessage({{ role: 'tool', content: detail }});
-      }}
+      upsertToolUseMessage(evt.data);
     }} else if (evt.event_type === 'chunk') {{
       agentStatus = 'thinking';
       maybeRemoveFinishedMessage();
@@ -7014,23 +7102,7 @@ function connectSSE() {{
         renderMessages();
       }} else if (evt.event_type === 'tool_use') {{
         markAgentActivity(evt.agent);
-        var detail = '\u{{1F527}} ' + evt.data.detail;
-        var lastIdx = findLastNonQueuedMessageIndex();
-        var lastMsg = lastIdx >= 0 ? chatMessages[lastIdx] : null;
-        if (lastMsg && lastMsg.role === 'tool') {{
-          var lines = lastMsg.content.split('\n');
-          var prevLine = lines[lines.length - 1];
-          var prevMatch = prevLine.match(/^(.+?)( \(x(\d+)\))?$/);
-          if (prevMatch && prevMatch[1] === detail) {{
-            var count = prevMatch[3] ? parseInt(prevMatch[3]) + 1 : 2;
-            lines[lines.length - 1] = detail + ' (x' + count + ')';
-            lastMsg.content = lines.join('\n');
-          }} else {{
-            lastMsg.content += '\n' + detail;
-          }}
-        }} else {{
-          insertChatMessage({{ role: 'tool', content: detail }});
-        }}
+        upsertToolUseMessage(evt.data);
         renderMessages();
       }} else if (evt.event_type === 'chunk') {{
         markAgentActivity(evt.agent);
@@ -14854,6 +14926,10 @@ mod tests {
         assert!(html.contains(
             "function mergeChatMessagesPreservingVisibleOrder(existingMessages, incomingMessages) {"
         ));
+        assert!(html.contains("function upsertToolUseMessage(data) {"));
+        assert!(html.contains("function coalesceToolMessages(messages) {"));
+        assert!(html.contains("chatMessages = coalesceToolMessages(chatMessages);"));
+        assert!(html.contains("upsertToolUseMessage(evt.data);"));
         assert!(
             html.contains("Object.assign({}, existingMessages[j], incomingByKey[existingKey])")
         );

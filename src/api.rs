@@ -4,6 +4,7 @@ use crate::auth::{
     ChatConversation, ChatMessage, ChatRole, ChatStore, LocalAuthStore, ManageConfig,
     NewAgentToken, NewRole, NewSession, NewUser, PinnedChatItem, ProjectGrant, ProjectPermission,
     RoleName, StoredAgentToken, StoredMachine, StoredUserPasskey, UserName, hash_agent_token,
+    tool_turn_id_from_client_message_id,
 };
 use crate::config::{
     ColorMode, ExternalAuthSecretUpdate, ExternalAuthStore, ExternalScheme, OidcConfig,
@@ -12052,6 +12053,7 @@ fn chat_message_json(msg: &ChatMessage) -> Value {
         "content": msg.content,
         "timestamp": msg.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
         "excluded_from_context": msg.excluded_from_context,
+        "tool_turn_id": tool_turn_id_from_client_message_id(msg.client_message_id.as_deref()),
     })
 }
 
@@ -13512,9 +13514,9 @@ async fn chat_agent_respond(
     let owner_str = owner.as_str();
 
     if let Some(detail) = &body.tool_use {
-        let _ = state
+        let msg = state
             .chat
-            .append_or_extend_tool(owner_str, &agent.name, detail);
+            .append_or_extend_tool(owner_str, &agent.name, detail)?;
         state.chat_audit.log(&agent.name, owner_str, "tool", detail);
         push_chat_event(
             &state,
@@ -13523,7 +13525,12 @@ async fn chat_agent_respond(
                 event_type: "tool_use".into(),
                 agent: agent.name.clone(),
                 owner: owner_str.to_string(),
-                data: json!({ "detail": detail }),
+                data: json!({
+                    "id": msg.id,
+                    "detail": detail,
+                    "content": msg.content,
+                    "tool_turn_id": tool_turn_id_from_client_message_id(msg.client_message_id.as_deref()),
+                }),
             },
         );
         record_tool_activity(&state, owner_str, &agent.name, detail);
@@ -15573,7 +15580,7 @@ fn flush_pending_stream_tool_calls(
         }
         let (detail, args) =
             finalize_pending_stream_tool_call(&tool_call.name, &tool_call.arguments);
-        let _ = state.chat.append_or_extend_tool(owner, agent, &detail);
+        let msg = state.chat.append_or_extend_tool(owner, agent, &detail).ok();
         state.chat_audit.log(agent, owner, "tool", &detail);
         push_chat_event(
             state,
@@ -15582,7 +15589,12 @@ fn flush_pending_stream_tool_calls(
                 event_type: "tool_use".into(),
                 agent: agent.to_string(),
                 owner: owner.to_string(),
-                data: json!({ "detail": detail }),
+                data: json!({
+                    "id": msg.as_ref().map(|m| m.id),
+                    "detail": detail.clone(),
+                    "content": msg.as_ref().map(|m| m.content.as_str()).unwrap_or(detail.as_str()),
+                    "tool_turn_id": msg.as_ref().and_then(|m| tool_turn_id_from_client_message_id(m.client_message_id.as_deref())),
+                }),
             },
         );
         if let Some(args) = args.as_ref() {
@@ -15741,9 +15753,10 @@ async fn run_api_btw(
 
                     let detail = format_api_tool_display(tool_name, &tool_args);
                     let labeled_detail = format!("[btw] {detail}");
-                    let _ = state
+                    let msg = state
                         .chat
-                        .append_or_extend_tool(&owner, &agent_name, &labeled_detail);
+                        .append_or_extend_tool(&owner, &agent_name, &labeled_detail)
+                        .ok();
                     state
                         .chat_audit
                         .log(&agent_name, &owner, "tool", &labeled_detail);
@@ -15754,7 +15767,12 @@ async fn run_api_btw(
                             event_type: "tool_use".into(),
                             agent: agent_name.clone(),
                             owner: owner.clone(),
-                            data: json!({"detail": labeled_detail}),
+                            data: json!({
+                                "id": msg.as_ref().map(|m| m.id),
+                                "detail": labeled_detail.clone(),
+                                "content": msg.as_ref().map(|m| m.content.as_str()).unwrap_or(labeled_detail.as_str()),
+                                "tool_turn_id": msg.as_ref().and_then(|m| tool_turn_id_from_client_message_id(m.client_message_id.as_deref())),
+                            }),
                         },
                     );
                     record_api_tool_activity(&state, &owner, &agent_name, tool_name, &tool_args);
