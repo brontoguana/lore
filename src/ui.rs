@@ -5788,46 +5788,97 @@ function renderMessages() {{
   cacheCurrentChatPanelState(false);
 }}
 
+function chatToolStats(msg) {{
+  if (!msg || typeof msg.content !== 'string' || !msg.content) return {{ count: 0, latest: '' }};
+  if (msg._tool_stats_content === msg.content && msg._tool_stats) return msg._tool_stats;
+  var content = msg.content;
+  var count = 0;
+  var latest = '';
+  var start = 0;
+  for (var i = 0; i <= content.length; i++) {{
+    if (i !== content.length && content.charCodeAt(i) !== 10) continue;
+    var line = content.slice(start, i);
+    if (line) {{
+      count += 1;
+      latest = line;
+    }}
+    start = i + 1;
+  }}
+  msg._tool_stats_content = content;
+  msg._tool_stats = {{ count: count, latest: latest }};
+  return msg._tool_stats;
+}}
+
 function chatToolLines(msg) {{
   if (!msg || typeof msg.content !== 'string' || !msg.content) return [];
   return msg.content.split('\n').filter(function(line) {{ return !!line; }});
 }}
 
-function renderToolMessage(msg, index) {{
+function renderToolDetailHtml(msg) {{
   var lines = chatToolLines(msg);
-  if (!lines.length) {{
+  return lines.length > 1 ? escapeHtml(lines.join('\n')) : '';
+}}
+
+function renderToolMessage(msg, index) {{
+  var stats = chatToolStats(msg);
+  if (!stats.count) {{
     return '<div class="chat-msg-content"></div>';
   }}
-  var latest = lines[lines.length - 1];
   var expanded = !!msg.tool_expanded;
   var html = '<div class="chat-msg-content">';
   html += '<div class="chat-tool-summary">';
-  if (lines.length > 1) {{
+  if (stats.count > 1) {{
     var title = expanded ? 'Collapse tool runs' : 'Expand tool runs';
     var ariaLabel = expanded ? 'Collapse tool runs' : 'Expand tool runs';
     var icon = expanded
       ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
       : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>';
-    html += '<button type="button" class="btn-sm chat-tool-toggle" onclick="toggleToolMessage(' + index + '); return false;" title="' + title + '" aria-label="' + ariaLabel + '">' + icon + '</button>';
+    html += '<button type="button" class="btn-sm chat-tool-toggle" onclick="toggleToolMessage(' + index + ', this); return false;" title="' + title + '" aria-label="' + ariaLabel + '">' + icon + '</button>';
   }}
-  html += '<span class="chat-tool-line">' + escapeHtml(latest) + '</span>';
-  if (lines.length > 1) {{
-    html += '<span class="chat-tool-count">' + lines.length + ' runs</span>';
+  html += '<span class="chat-tool-line">' + escapeHtml(stats.latest) + '</span>';
+  if (stats.count > 1) {{
+    html += '<span class="chat-tool-count">' + stats.count + ' runs</span>';
   }}
   html += '</div>';
-  if (expanded && lines.length > 1) {{
-    html += '<div class="chat-tool-lines">' + escapeHtml(lines.join('\n')) + '</div>';
+  if (stats.count > 1) {{
+    html += '<div class="chat-tool-lines" data-tool-lines-index="' + index + '"' + (expanded ? '' : ' hidden') + '>';
+    if (expanded) html += renderToolDetailHtml(msg);
+    html += '</div>';
   }}
   html += '</div>';
   return html;
 }}
 
-function toggleToolMessage(index) {{
+function setToolToggleIcon(button, expanded) {{
+  if (!button) return;
+  var title = expanded ? 'Collapse tool runs' : 'Expand tool runs';
+  button.title = title;
+  button.setAttribute('aria-label', title);
+  button.innerHTML = expanded
+    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
+    : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>';
+}}
+
+function toggleToolMessage(index, button) {{
   var msg = chatMessages[index];
   if (!msg || msg.role !== 'tool') return false;
-  if (chatToolLines(msg).length < 2) return false;
+  if (chatToolStats(msg).count < 2) return false;
   msg.tool_expanded = !msg.tool_expanded;
-  renderMessages();
+  var expanded = !!msg.tool_expanded;
+  var row = button ? button.closest('.chat-msg-row') : null;
+  var detail = row ? row.querySelector('.chat-tool-lines') : null;
+  if (!detail) {{
+    renderMessages();
+    return false;
+  }}
+  if (expanded) {{
+    detail.innerHTML = renderToolDetailHtml(msg);
+    detail.hidden = false;
+  }} else {{
+    detail.hidden = true;
+    detail.textContent = '';
+  }}
+  setToolToggleIcon(button, expanded);
   return false;
 }}
 
@@ -14910,6 +14961,36 @@ mod tests {
         );
         assert!(html.contains("incomingMessages = mergeChatMessagesPreservingVisibleOrder(chatMessages, incomingMessages);"));
         assert!(html.contains("incomingMessages = mergeChatMessagesPreservingVisibleOrder(cached.messages, incomingMessages);"));
+    }
+
+    #[test]
+    fn chat_page_lazily_renders_tool_details_on_expand() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("dokima"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("function chatToolStats(msg) {"));
+        assert!(html.contains("msg._tool_stats_content === msg.content"));
+        assert!(html.contains("function renderToolDetailHtml(msg) {"));
+        assert!(html.contains("data-tool-lines-index=\"' + index + '\""));
+        assert!(html.contains("toggleToolMessage(' + index + ', this);"));
+        assert!(html.contains("detail.innerHTML = renderToolDetailHtml(msg);"));
+        assert!(html.contains("detail.textContent = '';"));
+        assert!(html.contains("function setToolToggleIcon(button, expanded) {"));
+        assert!(!html.contains(
+            "function renderToolMessage(msg, index) {\n  var lines = chatToolLines(msg);"
+        ));
+        assert!(!html.contains("msg.tool_expanded = !msg.tool_expanded;\n  renderMessages();"));
     }
 
     #[test]
