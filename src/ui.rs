@@ -4664,6 +4664,9 @@ var libProject = '';
 var chatFollowScroll = true;
 var chatViewportResizeRestorePending = false;
 var chatViewportResizeRestoreSeq = 0;
+var CHAT_INITIAL_RENDER_LIMIT = 900;
+var CHAT_RENDER_BATCH_SIZE = 900;
+var chatRenderedMessageLimit = CHAT_INITIAL_RENDER_LIMIT;
 var chatResumeRefreshInFlight = false;
 var chatResumeRefreshTimer = null;
 var chatResumeRefreshSeq = 0;
@@ -5077,6 +5080,7 @@ function applyChatPanelResponse(data, pushHistory, fromCache) {{
   var main = document.getElementById('chat-main');
   if (!main) return;
   var selectedAgent = data.selected_agent || null;
+  var agentChanged = selectedAgent !== currentAgent;
   var incomingMessages = Array.isArray(data.messages) ? data.messages : [];
   if (selectedAgent && selectedAgent === currentAgent && Array.isArray(chatMessages) && chatMessages.length) {{
     incomingMessages = mergeChatMessagesPreservingVisibleOrder(chatMessages, incomingMessages);
@@ -5088,6 +5092,7 @@ function applyChatPanelResponse(data, pushHistory, fromCache) {{
   if (!fromCache && shouldApplyChatRefreshWithoutPanelReplace(selectedAgent)) {{
     currentAgent = selectedAgent;
     chatMessages = incomingMessages;
+    if (agentChanged) chatRenderedMessageLimit = CHAT_INITIAL_RENDER_LIMIT;
     agentStatus = data.agent_status || '';
     activeTurnUserId = data.active_turn_user_id || 0;
     agentProfileUrl = data.profile_url || null;
@@ -5107,6 +5112,7 @@ function applyChatPanelResponse(data, pushHistory, fromCache) {{
   main.innerHTML = data.panel_html || '';
   currentAgent = selectedAgent;
   chatMessages = incomingMessages;
+  if (agentChanged) chatRenderedMessageLimit = CHAT_INITIAL_RENDER_LIMIT;
   agentStatus = data.agent_status || '';
   activeTurnUserId = data.active_turn_user_id || 0;
   agentProfileUrl = data.profile_url || null;
@@ -5735,7 +5741,17 @@ function renderMessages() {{
     anchor = captureChatViewportAnchor(container);
   }}
   var html = '';
-  for (var i = 0; i < chatMessages.length; i++) {{
+  var renderStart = chatRenderStartIndex();
+  if (renderStart > 0) {{
+    html += renderChatLoadOlderControl(renderStart);
+  }}
+  for (var i = renderStart; i < chatMessages.length; i++) {{
+    var progressRun = collectAssistantProgressRun(i);
+    if (progressRun) {{
+      html += renderAssistantProgressGroup(progressRun);
+      i = progressRun.end;
+      continue;
+    }}
     var msg = chatMessages[i];
     var kind = msg.role === 'user' ? 'user' : msg.role === 'system' ? 'system' : msg.role === 'config' ? 'config' : msg.role === 'tool' ? 'tool' : msg.role === 'error' ? 'error' : 'assistant';
     var cls = kind === 'user' ? 'chat-msg-user' : kind === 'system' ? 'chat-msg-system' : kind === 'config' ? 'chat-msg-config' : kind === 'tool' ? 'chat-msg-tool' : kind === 'error' ? 'chat-msg-error' : 'chat-msg-assistant';
@@ -5786,6 +5802,130 @@ function renderMessages() {{
   }}
   updateChatJumpButton();
   cacheCurrentChatPanelState(false);
+}}
+
+function chatRenderStartIndex() {{
+  if (!Array.isArray(chatMessages)) return 0;
+  var limit = Math.max(CHAT_INITIAL_RENDER_LIMIT, chatRenderedMessageLimit || CHAT_INITIAL_RENDER_LIMIT);
+  if (chatMessages.length <= limit) return 0;
+  return Math.max(0, chatMessages.length - limit);
+}}
+
+function renderChatLoadOlderControl(hiddenCount) {{
+  return '<div class="chat-msg-row chat-msg-row-system chat-load-older-row" data-chat-idx="older">'
+    + '<button type="button" class="btn-lg chat-load-older-btn" onclick="loadOlderChatMessages(); return false;">Load older messages (' + hiddenCount + ')</button>'
+    + '</div>';
+}}
+
+function loadOlderChatMessages() {{
+  chatRenderedMessageLimit += CHAT_RENDER_BATCH_SIZE;
+  if (chatRenderedMessageLimit > chatMessages.length) chatRenderedMessageLimit = chatMessages.length;
+  renderMessages();
+  return false;
+}}
+
+function isCollapsibleAssistantProgress(msg) {{
+  if (!msg || msg.role !== 'assistant') return false;
+  if (msg.streaming || msg._thinking || msg.excluded_from_context) return false;
+  if (typeof msg.content !== 'string') return false;
+  var text = msg.content.trim();
+  if (!text || text.length > 360) return false;
+  if (text.indexOf('\n\n') >= 0 || text.indexOf('```') >= 0) return false;
+  if (text.indexOf('![') >= 0 || text.indexOf('<img') >= 0 || text.indexOf('<think') >= 0) return false;
+  var lines = text.split('\n');
+  if (lines.length > 3) return false;
+  if (/^\s*(#{{1,6}}\s|\d+\.\s|[-*]\s|\|)/m.test(text)) return false;
+  return true;
+}}
+
+function collectAssistantProgressRun(start) {{
+  if (!isCollapsibleAssistantProgress(chatMessages[start])) return null;
+  var end = start;
+  while (end + 1 < chatMessages.length && isCollapsibleAssistantProgress(chatMessages[end + 1])) {{
+    end += 1;
+  }}
+  if (end - start + 1 < 3) return null;
+  return {{
+    start: start,
+    end: end,
+    count: end - start + 1,
+    latest: (chatMessages[end].content || '').trim(),
+    expanded: !!chatMessages[start].assistant_progress_expanded
+  }};
+}}
+
+function renderAssistantProgressGroup(run) {{
+  var last = chatMessages[run.end] || {{}};
+  var timestamp = formatChatTimestamp(last.timestamp);
+  var title = run.expanded ? 'Collapse assistant updates' : 'Expand assistant updates';
+  var icon = assistantProgressToggleIcon(run.expanded);
+  var html = '<div class="chat-msg-row chat-msg-row-assistant chat-msg-row-assistant-progress" data-chat-idx="' + run.start + '">';
+  if (timestamp) {{
+    html += '<div class="chat-msg-timestamp">' + escapeHtmlRaw(timestamp) + '</div>';
+  }}
+  html += '<div class="chat-msg chat-msg-assistant chat-msg-assistant-progress">';
+  html += '<div class="chat-msg-content">';
+  html += '<div class="chat-assistant-progress-summary">';
+  html += '<button type="button" class="btn-sm chat-assistant-progress-toggle" onclick="toggleAssistantProgressGroup(' + run.start + ', this); return false;" title="' + title + '" aria-label="' + title + '">' + icon + '</button>';
+  html += '<span class="chat-assistant-progress-latest">' + escapeHtml(run.latest) + '</span>';
+  html += '<span class="chat-assistant-progress-count">' + run.count + ' updates</span>';
+  html += '</div>';
+  html += '<div class="chat-assistant-progress-lines" data-assistant-progress-start="' + run.start + '"' + (run.expanded ? '' : ' hidden') + '>';
+  if (run.expanded) html += renderAssistantProgressDetailHtml(run.start);
+  html += '</div>';
+  html += '</div></div></div>';
+  return html;
+}}
+
+function renderAssistantProgressDetailHtml(start) {{
+  var run = collectAssistantProgressRun(start);
+  if (!run) return '';
+  var html = '';
+  for (var i = run.start; i <= run.end; i++) {{
+    var msg = chatMessages[i];
+    var timestamp = formatChatTimestamp(msg.timestamp);
+    html += '<div class="chat-assistant-progress-line">';
+    if (timestamp) html += '<span class="chat-assistant-progress-time">' + escapeHtmlRaw(timestamp) + '</span>';
+    html += '<span class="chat-assistant-progress-text">' + escapeHtml((msg.content || '').trim()) + '</span>';
+    html += '</div>';
+  }}
+  return html;
+}}
+
+function assistantProgressToggleIcon(expanded) {{
+  return expanded
+    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
+    : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>';
+}}
+
+function setAssistantProgressToggleIcon(button, expanded) {{
+  if (!button) return;
+  var title = expanded ? 'Collapse assistant updates' : 'Expand assistant updates';
+  button.title = title;
+  button.setAttribute('aria-label', title);
+  button.innerHTML = assistantProgressToggleIcon(expanded);
+}}
+
+function toggleAssistantProgressGroup(start, button) {{
+  var run = collectAssistantProgressRun(start);
+  if (!run) return false;
+  chatMessages[start].assistant_progress_expanded = !run.expanded;
+  var expanded = !!chatMessages[start].assistant_progress_expanded;
+  var row = button ? button.closest('.chat-msg-row') : null;
+  var detail = row ? row.querySelector('.chat-assistant-progress-lines') : null;
+  if (!detail) {{
+    renderMessages();
+    return false;
+  }}
+  if (expanded) {{
+    detail.innerHTML = renderAssistantProgressDetailHtml(start);
+    detail.hidden = false;
+  }} else {{
+    detail.hidden = true;
+    detail.textContent = '';
+  }}
+  setAssistantProgressToggleIcon(button, expanded);
+  return false;
 }}
 
 function chatToolStats(msg) {{
@@ -12198,6 +12338,22 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-msg-row-config {
       align-items: center;
     }
+    .chat-load-older-row {
+      padding: var(--s-2) 0;
+    }
+    .chat-load-older-btn {
+      width: auto;
+      min-height: 40px;
+      padding: var(--s-2) var(--s-4);
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--fg-muted);
+      box-shadow: none;
+    }
+    .chat-load-older-btn:hover {
+      background: var(--surface-hover);
+      color: var(--fg);
+    }
     .chat-msg-timestamp {
       font-size: 0.74rem;
       line-height: 1.25;
@@ -12258,6 +12414,11 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       min-width: 0;
       max-width: 100%;
     }
+    .chat-msg-assistant-progress {
+      background: color-mix(in srgb, var(--bg-hover) 72%, var(--panel));
+      color: var(--fg-muted);
+      font-size: 0.84rem;
+    }
     .chat-msg-system {
       align-self: center;
       background: var(--bg);
@@ -12307,6 +12468,55 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
     .chat-tool-toggle:hover {
       background: var(--surface-hover);
       color: var(--fg);
+    }
+    .chat-assistant-progress-summary {
+      display: flex;
+      align-items: center;
+      gap: var(--s-2);
+      min-width: 0;
+    }
+    .chat-assistant-progress-toggle {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--fg-muted);
+      flex-shrink: 0;
+    }
+    .chat-assistant-progress-toggle:hover {
+      background: var(--surface-hover);
+      color: var(--fg);
+    }
+    .chat-assistant-progress-latest {
+      min-width: 0;
+      flex: 1 1 auto;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .chat-assistant-progress-count {
+      flex-shrink: 0;
+      color: var(--fg-dim, var(--fg-muted));
+      font-size: 0.75rem;
+    }
+    .chat-assistant-progress-lines {
+      margin-top: var(--s-2);
+      padding-left: calc(28px + var(--s-2));
+      display: grid;
+      gap: var(--s-2);
+    }
+    .chat-assistant-progress-line {
+      display: grid;
+      gap: var(--s-1);
+      min-width: 0;
+    }
+    .chat-assistant-progress-time {
+      font-size: 0.72rem;
+      color: var(--fg-dim, var(--fg-muted));
+      line-height: 1.2;
+    }
+    .chat-assistant-progress-text {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .chat-tool-line {
       min-width: 0;
@@ -14991,6 +15201,68 @@ mod tests {
             "function renderToolMessage(msg, index) {\n  var lines = chatToolLines(msg);"
         ));
         assert!(!html.contains("msg.tool_expanded = !msg.tool_expanded;\n  renderMessages();"));
+    }
+
+    #[test]
+    fn chat_page_collapses_short_assistant_progress_runs() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("dokima"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("function isCollapsibleAssistantProgress(msg) {"));
+        assert!(html.contains("function collectAssistantProgressRun(start) {"));
+        assert!(html.contains("if (end - start + 1 < 3) return null;"));
+        assert!(html.contains("renderAssistantProgressGroup(progressRun);"));
+        assert!(html.contains("i = progressRun.end;"));
+        assert!(html.contains("function renderAssistantProgressDetailHtml(start) {"));
+        assert!(html.contains("toggleAssistantProgressGroup(' + run.start + ', this);"));
+        assert!(html.contains("detail.innerHTML = renderAssistantProgressDetailHtml(start);"));
+        assert!(html.contains("detail.textContent = '';"));
+        assert!(html.contains(".chat-assistant-progress-summary {"));
+        assert!(html.contains(".chat-assistant-progress-lines {"));
+    }
+
+    #[test]
+    fn chat_page_renders_recent_message_tail_first() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[],
+            Some("dokima"),
+            "[]",
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("var CHAT_INITIAL_RENDER_LIMIT = 900;"));
+        assert!(html.contains("var CHAT_RENDER_BATCH_SIZE = 900;"));
+        assert!(html.contains("var chatRenderedMessageLimit = CHAT_INITIAL_RENDER_LIMIT;"));
+        assert!(html.contains("function chatRenderStartIndex() {"));
+        assert!(html.contains("renderChatLoadOlderControl(renderStart);"));
+        assert!(html.contains("for (var i = renderStart; i < chatMessages.length; i++) {"));
+        assert!(html.contains("function loadOlderChatMessages() {"));
+        assert!(html.contains("chatRenderedMessageLimit += CHAT_RENDER_BATCH_SIZE;"));
+        assert!(html.contains("Load older messages ("));
+        assert!(html.contains(".chat-load-older-btn {"));
+        assert!(
+            html.contains(
+                "if (agentChanged) chatRenderedMessageLimit = CHAT_INITIAL_RENDER_LIMIT;"
+            )
+        );
     }
 
     #[test]

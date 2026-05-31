@@ -2,6 +2,7 @@
 
 ## 2026-05-25
 
+- Rendered long agent chats from the recent message tail first, with load-older paging, and collapsed contiguous runs of short assistant progress/status messages into lazy expandable update rows to reduce heavy mobile chat DOMs such as Dokima.
 - Lazy-render expanded chat tool/action details so heavy agent transcripts do not build every collapsed tool body during the initial chat render.
 - Reconciled live agent action events with their persisted message ids while preserving assistant-output boundaries, so duplicate refresh/SSE action rows collapse without pulling every action in a turn into one block.
 - Fixed API-endpoint agent runtime status so agents configured for endpoints such as Krasis via SSH no longer overwrite the chat header with the stale legacy Claude backend while thinking.
