@@ -6,10 +6,13 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tar::Archive;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub const SERVER_SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/lore-server.service";
+pub const SERVER_SYSTEMD_SERVICE_NAME: &str = "lore-server";
 pub const DEFAULT_UPDATE_REPO: &str = "brontoguana/lore";
 pub const SERVER_RELEASE_CLI_TARGETS: &[&str] = &[
     "x86_64-unknown-linux-gnu",
@@ -222,6 +225,74 @@ pub struct UpdateCheck {
 pub enum SelfUpdateOutcome {
     UpToDate(AutoUpdateStatus),
     Updated(AutoUpdateStatus),
+}
+
+pub fn server_systemd_unit_exists() -> bool {
+    Path::new(SERVER_SYSTEMD_UNIT_PATH).exists()
+}
+
+pub fn restart_server_via_systemd() -> Result<()> {
+    if !server_systemd_unit_exists() {
+        return Err(LoreError::ExternalService(format!(
+            "systemd unit file not found: {SERVER_SYSTEMD_UNIT_PATH}"
+        )));
+    }
+
+    run_sudo_systemctl(&["daemon-reload"])?;
+    match run_sudo_systemctl(&["restart", SERVER_SYSTEMD_SERVICE_NAME]) {
+        Ok(()) => Ok(()),
+        Err(restart_err) => {
+            if service_is_active(SERVER_SYSTEMD_SERVICE_NAME) {
+                return Err(LoreError::ExternalService(format!(
+                    "systemd restart failed while {SERVER_SYSTEMD_SERVICE_NAME} remained active: {restart_err}"
+                )));
+            }
+
+            match run_sudo_systemctl(&["start", SERVER_SYSTEMD_SERVICE_NAME]) {
+                Ok(()) if service_is_active(SERVER_SYSTEMD_SERVICE_NAME) => Ok(()),
+                Ok(()) => Err(LoreError::ExternalService(format!(
+                    "systemd restart failed and recovery start did not leave {SERVER_SYSTEMD_SERVICE_NAME} active: {restart_err}"
+                ))),
+                Err(start_err) => Err(LoreError::ExternalService(format!(
+                    "systemd restart failed: {restart_err}; recovery start failed: {start_err}"
+                ))),
+            }
+        }
+    }
+}
+
+fn run_sudo_systemctl(args: &[&str]) -> Result<()> {
+    let output = Command::new("sudo")
+        .arg("-n")
+        .arg("systemctl")
+        .args(args)
+        .output()
+        .map_err(LoreError::Io)?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit status {}", output.status.code().unwrap_or(-1))
+    };
+    Err(LoreError::ExternalService(format!(
+        "sudo -n systemctl {} failed: {detail}",
+        args.join(" ")
+    )))
+}
+
+fn service_is_active(service_name: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", service_name])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 pub async fn check_for_update(

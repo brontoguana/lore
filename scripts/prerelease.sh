@@ -7,8 +7,19 @@ cd "$(git rev-parse --show-toplevel)"
 CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
 echo "Current Cargo.toml version: ${CURRENT}"
 
-# Parse base version (strip any -rcN suffix)
-BASE=$(echo "$CURRENT" | sed 's/-rc[0-9]*//')
+# Parse base version. If the current version is an already-tagged stable
+# release, prereleases should target the next patch version.
+if [[ "$CURRENT" == *-rc* ]]; then
+    BASE=$(echo "$CURRENT" | sed 's/-rc[0-9]*//')
+else
+    BASE="$CURRENT"
+    if git rev-parse -q --verify "refs/tags/v${BASE}" >/dev/null; then
+        MAJOR=$(echo "$BASE" | cut -d. -f1)
+        MINOR=$(echo "$BASE" | cut -d. -f2)
+        PATCH=$(echo "$BASE" | cut -d. -f3)
+        BASE="${MAJOR}.${MINOR}.$((PATCH + 1))"
+    fi
+fi
 
 # Find the highest rc tag for this base version
 LAST_RC=$(git tag -l "v${BASE}-rc*" | sed "s/v${BASE}-rc//" | sort -n | tail -1)

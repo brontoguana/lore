@@ -42,7 +42,8 @@ use crate::ui::{
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
     ReleaseStream, SERVER_RELEASE_CLI_TARGETS, check_for_update, hex_sha256,
-    maybe_apply_self_update, sync_release_binaries_to_directory,
+    maybe_apply_self_update, restart_server_via_systemd, server_systemd_unit_exists,
+    sync_release_binaries_to_directory,
 };
 use crate::versioning::{
     GitExportConfig, GitExportConfigStore, GitExportStatus, GitExportStatusStore,
@@ -4210,7 +4211,7 @@ async fn apply_auto_update(
     )?;
     let summary = auto_update_status_summary(&status);
     if applied {
-        schedule_server_restart(executable_path);
+        schedule_server_restart(executable_path, Arc::clone(&state.auto_update_status));
     }
     Ok(Json(summary))
 }
@@ -6501,7 +6502,7 @@ async fn apply_auto_update_from_ui(
         Some(status.detail.clone()),
     )?;
     let flash = if applied {
-        schedule_server_restart(executable_path);
+        schedule_server_restart(executable_path, Arc::clone(&state.auto_update_status));
         "Update%20applied%20—%20server%20restarting"
     } else {
         "Already%20up%20to%20date"
@@ -6559,7 +6560,7 @@ async fn apply_auto_update_json(
     )?;
     let summary = auto_update_status_summary(&status);
     if applied {
-        schedule_server_restart(executable_path);
+        schedule_server_restart(executable_path, Arc::clone(&state.auto_update_status));
     }
     Ok(Json(summary))
 }
@@ -8541,28 +8542,24 @@ async fn run_auto_update_apply(state: &AppState) -> Result<AutoUpdateStatus, Lor
     }
 }
 
-fn schedule_server_restart(executable_path: std::path::PathBuf) {
+fn schedule_server_restart(
+    executable_path: std::path::PathBuf,
+    status_store: Arc<AutoUpdateStatusStore>,
+) {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     tokio::spawn(async move {
         eprintln!("updater: restarting server in 3 seconds");
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        // If running as a systemd service, restart through systemd so the
-        // service manager tracks the new process and dependent services
-        // (like Caddy) are not disrupted.
-        if std::path::Path::new("/etc/systemd/system/lore-server.service").exists() {
-            let status = std::process::Command::new("sudo")
-                .args(["systemctl", "restart", "lore-server"])
-                .status();
-            match status {
-                Ok(s) if s.success() => std::process::exit(0),
-                Ok(s) => {
-                    eprintln!(
-                        "warning: systemctl restart failed (exit {}), falling back to exec",
-                        s.code().unwrap_or(-1)
-                    );
-                }
+        if server_systemd_unit_exists() {
+            match restart_server_via_systemd() {
+                Ok(()) => std::process::exit(0),
                 Err(err) => {
-                    eprintln!("warning: systemctl restart failed ({err}), falling back to exec");
+                    let detail = format!(
+                        "update applied, but systemd restart failed: {err}; not falling back to unmanaged exec"
+                    );
+                    eprintln!("warning: {detail}");
+                    record_auto_update_restart_failure(&status_store, detail);
+                    return;
                 }
             }
         }
@@ -8572,17 +8569,52 @@ fn schedule_server_restart(executable_path: std::path::PathBuf) {
         {
             use std::os::unix::process::CommandExt;
             let err = command.exec();
-            eprintln!("warning: failed to relaunch updated server: {err}");
-            std::process::exit(1);
+            let detail = format!("update applied, but unmanaged relaunch failed: {err}");
+            eprintln!("warning: {detail}");
+            record_auto_update_restart_failure(&status_store, detail);
         }
         #[cfg(not(unix))]
         {
             if let Err(err) = command.spawn() {
-                eprintln!("warning: failed to relaunch updated server: {err}");
+                let detail = format!("update applied, but unmanaged relaunch failed: {err}");
+                eprintln!("warning: {detail}");
+                record_auto_update_restart_failure(&status_store, detail);
+                return;
             }
             std::process::exit(0);
         }
     });
+}
+
+fn record_auto_update_restart_failure(
+    status_store: &AutoUpdateStatusStore,
+    restart_detail: String,
+) {
+    let previous = match status_store.load() {
+        Ok(status) => status,
+        Err(err) => {
+            eprintln!("warning: failed to read auto-update status after restart failure: {err}");
+            None
+        }
+    };
+    let detail = previous
+        .as_ref()
+        .map(|status| format!("{}; {restart_detail}", status.detail))
+        .unwrap_or(restart_detail);
+    let status = AutoUpdateStatus {
+        checked_at: OffsetDateTime::now_utc(),
+        current_version: previous
+            .as_ref()
+            .map(|status| status.current_version.clone())
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+        latest_version: previous.and_then(|status| status.latest_version),
+        detail,
+        applied: true,
+        ok: false,
+    };
+    if let Err(err) = status_store.save(&status) {
+        eprintln!("warning: failed to save auto-update restart failure: {err}");
+    }
 }
 
 fn api_key_update_from_request(api_key: Option<&str>, clear: Option<bool>) -> ApiKeyUpdate<'_> {

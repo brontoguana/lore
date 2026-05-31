@@ -93,7 +93,7 @@ WantedBy=multi-user.target
 EOF
 
 cat > "$SUDOERS_FILE" <<EOF
-${SERVICE_USER} ALL=(root) NOPASSWD: ${systemctl_path} restart lore-server, ${systemctl_path} daemon-reload
+${SERVICE_USER} ALL=(root) NOPASSWD: ${systemctl_path} restart lore-server, ${systemctl_path} start lore-server, ${systemctl_path} daemon-reload
 EOF
 chmod 0440 "$SUDOERS_FILE"
 
@@ -136,7 +136,7 @@ except Exception:
 sys.exit(0 if has_users else 1)
 PY
     then
-        "$systemctl_path" restart lore-server
+        "$systemctl_path" restart lore-server || "$systemctl_path" start lore-server
         echo "lore-server restarted"
     else
         echo "Lore binary exists, but no app admin was detected; not starting the service yet."

@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use lore_core::{
     AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore, DEFAULT_UPDATE_REPO,
     ExternalScheme, FileBlockStore, LocalAuthStore, ServerConfigStore, UiTheme, UserName,
-    build_app, maybe_apply_self_update,
+    build_app, maybe_apply_self_update, restart_server_via_systemd, server_systemd_unit_exists,
 };
 use std::env;
 use std::fs;
@@ -10,7 +10,7 @@ use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const SELF_UPDATE_SKIP_ENV: &str = "LORE_SKIP_SELF_UPDATE";
 const SERVICE_NAME: &str = "lore-server";
@@ -632,9 +632,13 @@ fn find_command_path(command: &str) -> Option<String> {
 }
 
 fn restart_sudoers_content(user: &str, systemctl: &str, include_caddy: bool) -> String {
-    let mut commands = vec![format!("{systemctl} restart {SERVICE_NAME}")];
+    let mut commands = vec![
+        format!("{systemctl} restart {SERVICE_NAME}"),
+        format!("{systemctl} start {SERVICE_NAME}"),
+    ];
     if include_caddy {
         commands.push(format!("{systemctl} restart {CADDY_SERVICE_NAME}"));
+        commands.push(format!("{systemctl} start {CADDY_SERVICE_NAME}"));
     }
     commands.push(format!("{systemctl} daemon-reload"));
     format!("{user} ALL=(root) NOPASSWD: {}\n", commands.join(", "))
@@ -711,6 +715,56 @@ fn migrate_user_services() {
     eprintln!("old user services removed");
 }
 
+fn lore_systemd_unit(user: &str, exe: &Path, data_dir: &Path, bind: &str) -> String {
+    format!(
+        "\
+[Unit]
+Description=Lore knowledge server
+After=network.target
+
+[Service]
+Type=simple
+User={user}
+ExecStart={exe} --data-dir {data_dir} --bind {bind} start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+",
+        exe = exe.display(),
+        data_dir = data_dir.display(),
+    )
+}
+
+fn caddy_systemd_unit(user: &str, caddy: &Path, data_dir: &Path) -> String {
+    format!(
+        "\
+[Unit]
+Description=Caddy reverse proxy for Lore
+After=network.target {SERVICE_NAME}.service
+Wants={SERVICE_NAME}.service
+
+[Service]
+Type=simple
+User={user}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart={caddy} run --config {caddyfile}
+Environment=XDG_DATA_HOME={caddy_data}
+Environment=XDG_CONFIG_HOME={caddy_config}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+",
+        caddy = caddy.display(),
+        caddyfile = data_dir.join("Caddyfile").display(),
+        caddy_data = data_dir.join("caddy-data").display(),
+        caddy_config = data_dir.join("caddy-config").display(),
+    )
+}
+
 fn daemon_install(data_root: &str, bind: &str, domain: &str, manage_caddy: bool) {
     let exe = env::current_exe().unwrap_or_else(|err| {
         eprintln!("error: cannot determine executable path: {err}");
@@ -778,53 +832,11 @@ fn daemon_install(data_root: &str, bind: &str, domain: &str, manage_caddy: bool)
     eprintln!();
     eprintln!("installing system services (requires sudo)...");
 
-    let lore_unit = format!(
-        "\
-[Unit]
-Description=Lore knowledge server
-After=network.target
+    let lore_unit = lore_systemd_unit(&user, &exe, &data_root_abs, bind);
 
-[Service]
-Type=simple
-User={user}
-ExecStart={exe} --data-dir {data_dir} --bind {bind} start
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-",
-        exe = exe.display(),
-        data_dir = data_root_abs.display(),
-    );
-
-    let caddy_unit = caddy_path.as_ref().map(|caddy_path| {
-        format!(
-            "\
-[Unit]
-Description=Caddy reverse proxy for Lore
-After=network.target {SERVICE_NAME}.service
-Wants={SERVICE_NAME}.service
-
-[Service]
-Type=simple
-User={user}
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-ExecStart={caddy} run --config {caddyfile}
-Environment=XDG_DATA_HOME={caddy_data}
-Environment=XDG_CONFIG_HOME={caddy_config}
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-",
-            caddy = caddy_path.display(),
-            caddyfile = data_root_abs.join("Caddyfile").display(),
-            caddy_data = data_root_abs.join("caddy-data").display(),
-            caddy_config = data_root_abs.join("caddy-config").display(),
-        )
-    });
+    let caddy_unit = caddy_path
+        .as_ref()
+        .map(|caddy_path| caddy_systemd_unit(&user, caddy_path, &data_root_abs));
 
     let lore_unit_path = system_unit_path(SERVICE_NAME);
     let caddy_unit_path = system_unit_path(CADDY_SERVICE_NAME);
@@ -1149,7 +1161,22 @@ async fn maybe_update_server(data_root: &PathBuf) -> lore_core::Result<()> {
                 lore_core::SelfUpdateOutcome::UpToDate(status) => status,
                 lore_core::SelfUpdateOutcome::Updated(status) => {
                     status_store.save(&status)?;
-                    relaunch_current_process(&executable_path);
+                    if let Err(err) = relaunch_current_process(&executable_path) {
+                        let detail = format!(
+                            "{}; restart failed: {err}; leaving current process running",
+                            status.detail
+                        );
+                        let failed_status = AutoUpdateStatus {
+                            checked_at: time::OffsetDateTime::now_utc(),
+                            current_version: status.current_version.clone(),
+                            latest_version: status.latest_version.clone(),
+                            detail,
+                            applied: true,
+                            ok: false,
+                        };
+                        status_store.save(&failed_status)?;
+                        return Err(lore_core::LoreError::ExternalService(failed_status.detail));
+                    }
                     return Ok(());
                 }
             };
@@ -1177,16 +1204,15 @@ async fn maybe_update_server(data_root: &PathBuf) -> lore_core::Result<()> {
     Ok(())
 }
 
-fn relaunch_current_process(executable_path: &std::path::Path) {
-    // If running as a systemd service, restart through systemd
-    if std::path::Path::new("/etc/systemd/system/lore-server.service").exists() {
-        let status = std::process::Command::new("sudo")
-            .args(["systemctl", "restart", SERVICE_NAME])
-            .status();
-        match status {
-            Ok(s) if s.success() => std::process::exit(0),
-            Ok(_) | Err(_) => {
-                eprintln!("warning: systemctl restart failed, falling back to exec");
+fn relaunch_current_process(executable_path: &Path) -> std::result::Result<(), String> {
+    if server_systemd_unit_exists() {
+        match restart_server_via_systemd() {
+            Ok(()) => std::process::exit(0),
+            Err(err) => {
+                eprintln!(
+                    "warning: systemd restart failed after self-update: {err}; not falling back to unmanaged exec"
+                );
+                return Err(err.to_string());
             }
         }
     }
@@ -1198,13 +1224,12 @@ fn relaunch_current_process(executable_path: &std::path::Path) {
     {
         use std::os::unix::process::CommandExt;
         let err = command.exec();
-        eprintln!("warning: failed to relaunch updated server: {err}");
-        std::process::exit(0);
+        Err(format!("failed to relaunch updated server: {err}"))
     }
     #[cfg(not(unix))]
     {
         if let Err(err) = command.spawn() {
-            eprintln!("warning: failed to relaunch updated server: {err}");
+            return Err(format!("failed to relaunch updated server: {err}"));
         }
         std::process::exit(0);
     }
@@ -1243,6 +1268,18 @@ mod tests {
     }
 
     #[test]
+    fn managed_caddy_unit_does_not_bind_proxy_lifetime_to_lore_server() {
+        let unit = caddy_systemd_unit(
+            "lore",
+            Path::new("/home/lore/.local/bin/caddy"),
+            Path::new("/home/lore/lore"),
+        );
+        assert!(unit.contains("After=network.target lore-server.service"));
+        assert!(unit.contains("Wants=lore-server.service"));
+        assert!(!unit.contains("BindsTo="));
+    }
+
+    #[test]
     fn bind_port_reads_trailing_port() {
         assert_eq!(bind_port("127.0.0.1:7043"), 7043);
         assert_eq!(bind_port("[::1]:8123"), 8123);
@@ -1253,6 +1290,7 @@ mod tests {
     fn no_caddy_sudoers_rule_excludes_lore_caddy_restart() {
         let sudoers = restart_sudoers_content("lore", "/usr/bin/systemctl", false);
         assert!(sudoers.contains("/usr/bin/systemctl restart lore-server"));
+        assert!(sudoers.contains("/usr/bin/systemctl start lore-server"));
         assert!(sudoers.contains("/usr/bin/systemctl daemon-reload"));
         assert!(!sudoers.contains("lore-caddy"));
     }
@@ -1261,7 +1299,9 @@ mod tests {
     fn managed_caddy_sudoers_rule_includes_lore_caddy_restart() {
         let sudoers = restart_sudoers_content("lore", "/usr/bin/systemctl", true);
         assert!(sudoers.contains("/usr/bin/systemctl restart lore-server"));
+        assert!(sudoers.contains("/usr/bin/systemctl start lore-server"));
         assert!(sudoers.contains("/usr/bin/systemctl restart lore-caddy"));
+        assert!(sudoers.contains("/usr/bin/systemctl start lore-caddy"));
         assert!(sudoers.contains("/usr/bin/systemctl daemon-reload"));
     }
 }

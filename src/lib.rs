@@ -38,8 +38,9 @@ pub use store::{
 };
 pub use updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
-    DEFAULT_UPDATE_REPO, ReleaseStream, SelfUpdateOutcome, apply_update_to_version,
-    check_for_update, maybe_apply_self_update,
+    DEFAULT_UPDATE_REPO, ReleaseStream, SERVER_SYSTEMD_SERVICE_NAME, SERVER_SYSTEMD_UNIT_PATH,
+    SelfUpdateOutcome, apply_update_to_version, check_for_update, maybe_apply_self_update,
+    restart_server_via_systemd, server_systemd_unit_exists,
 };
 pub use versioning::{
     GitExportConfig, GitExportConfigStore, GitExportStatus, GitExportStatusStore,

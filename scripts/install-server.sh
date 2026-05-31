@@ -62,21 +62,21 @@ setup_restart_sudoers() {
   current_user="$(id -un)"
   tmp_sudoers="$TMP_DIR/lore-server-restart"
   cat >"$tmp_sudoers" <<EOF
-$current_user ALL=(root) NOPASSWD: $systemctl_path restart lore-server, $systemctl_path restart lore-caddy, $systemctl_path daemon-reload
+$current_user ALL=(root) NOPASSWD: $systemctl_path restart lore-server, $systemctl_path start lore-server, $systemctl_path restart lore-caddy, $systemctl_path start lore-caddy, $systemctl_path daemon-reload
 EOF
   sudo install -m 0440 "$tmp_sudoers" "$SUDOERS_FILE"
 }
 
 restart_service() {
   service_name="$1"
-  if sudo -n systemctl restart "$service_name" >/dev/null 2>&1; then
+  if sudo -n systemctl restart "$service_name" >/dev/null 2>&1 || sudo -n systemctl start "$service_name" >/dev/null 2>&1; then
     return 0
   fi
 
   echo "configuring passwordless restart permission for $service_name..."
   setup_restart_sudoers
   sudo -n systemctl daemon-reload >/dev/null 2>&1 || sudo systemctl daemon-reload
-  sudo -n systemctl restart "$service_name"
+  sudo -n systemctl restart "$service_name" || sudo -n systemctl start "$service_name"
 }
 
 verify_checksum() {

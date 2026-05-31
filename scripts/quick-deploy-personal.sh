@@ -177,7 +177,7 @@ EOF
     ssh "$SERVER" "set -eu
 systemctl_path=\$(command -v systemctl || echo /bin/systemctl)
 cat > /etc/sudoers.d/lore-server-restart <<EOF
-${q_user} ALL=(root) NOPASSWD: \${systemctl_path} restart lore-server, \${systemctl_path} daemon-reload
+${q_user} ALL=(root) NOPASSWD: \${systemctl_path} restart lore-server, \${systemctl_path} start lore-server, \${systemctl_path} daemon-reload
 EOF
 chmod 0440 /etc/sudoers.d/lore-server-restart
 systemctl daemon-reload
@@ -275,7 +275,7 @@ create_initial_admin_if_needed() {
 }
 
 restart_remote_service() {
-    ssh "$SERVER" "systemctl restart lore-server"
+    ssh "$SERVER" "systemctl daemon-reload && (systemctl restart lore-server || systemctl start lore-server)"
 }
 
 check_remote_health() {
@@ -310,7 +310,17 @@ check_public_health() {
 
 # --- Version bump ---
 CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-BASE=$(echo "$CURRENT" | sed 's/-rc[0-9]*//')
+if [[ "$CURRENT" == *-rc* ]]; then
+    BASE=$(echo "$CURRENT" | sed 's/-rc[0-9]*//')
+else
+    BASE="$CURRENT"
+    if git rev-parse -q --verify "refs/tags/v${BASE}" >/dev/null; then
+        MAJOR=$(echo "$BASE" | cut -d. -f1)
+        MINOR=$(echo "$BASE" | cut -d. -f2)
+        PATCH=$(echo "$BASE" | cut -d. -f3)
+        BASE="${MAJOR}.${MINOR}.$((PATCH + 1))"
+    fi
+fi
 LAST_RC=$(git tag -l "v${BASE}-rc*" | sed "s/v${BASE}-rc//" | sort -n | tail -1)
 NEXT_RC=$(( ${LAST_RC:-0} + 1 ))
 VERSION="${BASE}-rc${NEXT_RC}"

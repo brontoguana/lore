@@ -105,11 +105,18 @@ journalctl -u lore-caddy -n 20 --no-pager 2>/dev/null || true
 }
 
 restart_remote_service() {
-    if ssh "$SERVER" "sudo -n systemctl restart lore-server" 2>/dev/null; then
+    if ssh "$SERVER" '
+if [ -f /etc/systemd/system/lore-server.service ]; then
+    sudo -n systemctl daemon-reload &&
+    (sudo -n systemctl restart lore-server || sudo -n systemctl start lore-server)
+else
+    exit 42
+fi
+' 2>/dev/null; then
         echo "Restarted via systemd"
     else
-        echo "Systemd restart unavailable, using fallback start command..."
-        ssh "$SERVER" "pkill -f 'lore-server.*start' || true; sleep 1; nohup ${REMOTE_BIN} --data-dir /home/lore/lore --bind 127.0.0.1:7043 start </dev/null >/dev/null 2>&1 &"
+        echo "Systemd restart unavailable; refusing unmanaged fallback because lore-caddy depends on systemd state"
+        return 1
     fi
 }
 
@@ -172,7 +179,17 @@ check_public_health() {
 
 # --- Version bump ---
 CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-BASE=$(echo "$CURRENT" | sed 's/-rc[0-9]*//')
+if [[ "$CURRENT" == *-rc* ]]; then
+    BASE=$(echo "$CURRENT" | sed 's/-rc[0-9]*//')
+else
+    BASE="$CURRENT"
+    if git rev-parse -q --verify "refs/tags/v${BASE}" >/dev/null; then
+        MAJOR=$(echo "$BASE" | cut -d. -f1)
+        MINOR=$(echo "$BASE" | cut -d. -f2)
+        PATCH=$(echo "$BASE" | cut -d. -f3)
+        BASE="${MAJOR}.${MINOR}.$((PATCH + 1))"
+    fi
+fi
 LAST_RC=$(git tag -l "v${BASE}-rc*" | sed "s/v${BASE}-rc//" | sort -n | tail -1)
 NEXT_RC=$(( ${LAST_RC:-0} + 1 ))
 VERSION="${BASE}-rc${NEXT_RC}"
