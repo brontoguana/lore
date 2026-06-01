@@ -2,6 +2,8 @@
 
 ## 2026-05-25
 
+- Added a desktop chat message action toggle so user messages can reveal delete/undelete controls from the message margin without using mobile swipe gestures.
+- Made deleting a queued follow-up message while an agent is mid-run cancel that undelivered message instead of carrying it forward as pending after the current turn.
 - Hardened server update restarts so systemd-managed installs use noninteractive `systemctl daemon-reload`/`restart` with `start` recovery, avoid unmanaged fallback processes when systemd restart fails, and generate Caddy units that want rather than bind to the Lore service.
 - Rendered long agent chats from the recent message tail first, with load-older paging, and collapsed contiguous runs of short assistant progress/status messages into lazy expandable update rows to reduce heavy mobile chat DOMs such as Dokima.
 - Lazy-render expanded chat tool/action details so heavy agent transcripts do not build every collapsed tool body during the initial chat render.

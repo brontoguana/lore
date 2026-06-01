@@ -5768,7 +5768,12 @@ function renderMessages() {{
       var toggleExcluded = msg.excluded_from_context ? 'false' : 'true';
       var toggleTitle = msg.excluded_from_context ? 'Include in agent context' : 'Exclude from agent context';
       var actionClass = 'btn-sm chat-msg-swipe-action' + (msg.excluded_from_context ? ' chat-msg-swipe-action-active' : '');
+      var railActionClass = 'btn-sm chat-msg-action-button' + (msg.excluded_from_context ? ' chat-msg-action-button-active' : '');
       html += '<div class="chat-msg-swipe-shell">';
+      html += '<button type="button" class="btn-sm chat-msg-action-toggle" title="Message actions" aria-label="Message actions" aria-expanded="false" onclick="event.stopPropagation(); return toggleChatMessageActionRail(this);"><svg class="chat-msg-action-toggle-open" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg><svg class="chat-msg-action-toggle-close" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></button>';
+      html += '<div class="chat-msg-action-rail" aria-hidden="true">';
+      html += '<button type="button" class="' + railActionClass + '" title="' + toggleTitle + '" aria-label="' + toggleTitle + '" onclick="event.stopPropagation(); return toggleChatMessageContextExclusion(' + messageId + ', ' + toggleExcluded + ');"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button>';
+      html += '</div>';
       html += '<button type="button" class="' + actionClass + '" title="' + toggleTitle + '" aria-label="' + toggleTitle + '" onclick="event.stopPropagation(); return toggleChatMessageContextExclusion(' + messageId + ', ' + toggleExcluded + ');"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button>';
     }}
     html += '<div class="chat-msg ' + cls + '">';
@@ -6449,8 +6454,13 @@ function handleChatKey(e) {{
 function applyExcludedChatMessage(data, messageId) {{
   if (!data) return;
   if (data.message) {{
+    var removed = !!data.removed;
     for (var i = 0; i < chatMessages.length; i++) {{
       if (chatMessageId(chatMessages[i]) === data.message.id) {{
+        if (removed) {{
+          chatMessages.splice(i, 1);
+          break;
+        }}
         chatMessages[i].excluded_from_context = !!data.message.excluded_from_context;
         break;
       }}
@@ -6509,9 +6519,42 @@ function closeAllChatSwipeRows(exceptRow) {{
   }});
 }}
 
+function setChatMessageActionRailOpen(row, open) {{
+  if (!row) return;
+  row.classList.toggle('chat-msg-row-actions-open', !!open);
+  var toggle = row.querySelector('.chat-msg-action-toggle');
+  if (toggle) toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  var rail = row.querySelector('.chat-msg-action-rail');
+  if (rail) rail.setAttribute('aria-hidden', open ? 'false' : 'true');
+}}
+
+function closeAllChatActionRails(exceptRow) {{
+  var container = document.getElementById('chat-messages');
+  if (!container) return;
+  var rows = container.querySelectorAll('.chat-msg-row-actions-open[data-chat-msg-id]');
+  rows.forEach(function(row) {{
+    if (exceptRow && row === exceptRow) return;
+    setChatMessageActionRailOpen(row, false);
+  }});
+}}
+
+function toggleChatMessageActionRail(button) {{
+  var row = button && button.closest ? button.closest('.chat-msg-row[data-chat-msg-id]') : null;
+  if (!row) return false;
+  var messageId = parseInt(row.getAttribute('data-chat-msg-id'), 10) || 0;
+  var msg = findChatMessageById(messageId);
+  if (!chatMessageCanMutate(msg)) return false;
+  var nextOpen = !row.classList.contains('chat-msg-row-actions-open');
+  closeAllChatActionRails(row);
+  closeAllChatSwipeRows(row);
+  setChatMessageActionRailOpen(row, nextOpen);
+  return false;
+}}
+
 function openChatSwipeRow(row) {{
   if (!row) return;
   closeAllChatSwipeRows(row);
+  closeAllChatActionRails(row);
   setChatMessageSwipeOffset(row, CHAT_MESSAGE_SWIPE_REVEAL);
 }}
 
@@ -6524,27 +6567,20 @@ function bindChatMessageMutationGestures() {{
   if (!container || container.dataset.messageMutationBound === '1') return;
   container.dataset.messageMutationBound = '1';
 
-  container.addEventListener('contextmenu', function(e) {{
-    var row = e.target && e.target.closest ? e.target.closest('.chat-msg-row[data-chat-msg-id]') : null;
-    if (!row) return;
-    e.preventDefault();
-    var messageId = parseInt(row.getAttribute('data-chat-msg-id'), 10) || 0;
-    var msg = findChatMessageById(messageId);
-    if (!chatMessageCanMutate(msg)) return;
-    toggleChatMessageContextExclusion(messageId, !msg.excluded_from_context);
-  }});
-
   container.addEventListener('click', function(e) {{
-    if (e.target && e.target.closest && e.target.closest('.chat-msg-swipe-action')) return;
+    if (e.target && e.target.closest && e.target.closest('.chat-msg-swipe-action, .chat-msg-action-toggle, .chat-msg-action-rail')) return;
     var row = e.target && e.target.closest ? e.target.closest('.chat-msg-row[data-chat-msg-id]') : null;
     if (!row || !row.classList.contains('chat-msg-row-swipe-open')) {{
       closeAllChatSwipeRows(null);
+    }}
+    if (!row || !row.classList.contains('chat-msg-row-actions-open')) {{
+      closeAllChatActionRails(null);
     }}
   }});
 
   container.addEventListener('pointerdown', function(e) {{
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (e.target && e.target.closest && e.target.closest('.chat-msg-swipe-action')) return;
+    if (e.target && e.target.closest && e.target.closest('.chat-msg-swipe-action, .chat-msg-action-toggle, .chat-msg-action-rail')) return;
     var row = e.target && e.target.closest ? e.target.closest('.chat-msg-row[data-chat-msg-id]') : null;
     if (!row) return;
     var messageId = parseInt(row.getAttribute('data-chat-msg-id'), 10) || 0;
@@ -6619,6 +6655,7 @@ function bindChatMessageMutationGestures() {{
   }});
   container.addEventListener('scroll', function() {{
     closeAllChatSwipeRows(null);
+    closeAllChatActionRails(null);
     clearChatMessageSwipeGesture();
   }}, {{ passive: true }});
 }}
@@ -7002,9 +7039,16 @@ function findChatMessageById(messageId) {{
 
 function isQueuedFollowUpUserMessage(msg) {{
   if (!msg || msg.role !== 'user') return false;
+  if (msg.excluded_from_context) return false;
   var id = chatMessageId(msg);
   if (id > 0) return id > activeTurnUserId;
   return !!msg.queued_follow_up;
+}}
+
+function isCancelledQueuedFollowUpUserMessage(msg) {{
+  if (!msg || msg.role !== 'user' || !msg.excluded_from_context) return false;
+  var id = chatMessageId(msg);
+  return id > 0 && id > activeTurnUserId;
 }}
 
 function hasQueuedFollowUpUserMessages() {{
@@ -7082,6 +7126,7 @@ function normalizeChatMessageOrder() {{
       finished = msg;
       continue;
     }}
+    if (isCancelledQueuedFollowUpUserMessage(msg)) continue;
     if (isQueuedFollowUpUserMessage(msg)) {{
       pending.push(msg);
     }} else {{
@@ -12282,7 +12327,65 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       justify-content: flex-end;
       align-items: center;
+      gap: var(--s-1);
       position: relative;
+    }
+    .chat-msg-action-toggle {
+      flex: 0 0 auto;
+      color: var(--fg-muted);
+      background: transparent;
+      border-color: transparent;
+      opacity: 0.72;
+      transition: opacity 140ms ease, color 140ms ease, background 140ms ease, transform 140ms ease;
+    }
+    .chat-msg-action-toggle:hover,
+    .chat-msg-row-actions-open .chat-msg-action-toggle {
+      opacity: 1;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    }
+    .chat-msg-action-toggle-close {
+      display: none;
+    }
+    .chat-msg-row-actions-open .chat-msg-action-toggle-open {
+      display: none;
+    }
+    .chat-msg-row-actions-open .chat-msg-action-toggle-close {
+      display: block;
+    }
+    .chat-msg-action-rail {
+      display: flex;
+      align-items: center;
+      gap: var(--s-1);
+      max-width: 0;
+      opacity: 0;
+      overflow: hidden;
+      pointer-events: none;
+      transform: translateX(4px);
+      transition: max-width 140ms ease, opacity 140ms ease, transform 140ms ease;
+    }
+    .chat-msg-row-actions-open .chat-msg-action-rail {
+      max-width: 96px;
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
+    }
+    .chat-msg-action-button {
+      color: var(--danger);
+      background: color-mix(in srgb, var(--danger) 16%, transparent);
+      border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+    }
+    .chat-msg-action-button:hover {
+      background: color-mix(in srgb, var(--danger) 24%, transparent);
+    }
+    .chat-msg-action-button-active {
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 16%, transparent);
+      border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    }
+    .chat-msg-action-button-active:hover {
+      background: color-mix(in srgb, var(--accent) 24%, transparent);
     }
     .chat-msg-row-mutable .chat-msg {
       cursor: grab;
@@ -14331,6 +14434,10 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
         overflow-y: scroll;
         overflow-x: hidden;
       }
+      .chat-msg-action-toggle,
+      .chat-msg-action-rail {
+        display: none;
+      }
       .chat-msg { max-width: 90%; }
       .chat-msg-assistant,
       .chat-msg-content,
@@ -15779,10 +15886,18 @@ mod tests {
 
         assert!(html.contains("function bindChatMessageMutationGestures() {"));
         assert!(html.contains("function toggleChatMessageContextExclusion(messageId, excluded) {"));
+        assert!(html.contains("function toggleChatMessageActionRail(button) {"));
+        assert!(html.contains("function isCancelledQueuedFollowUpUserMessage(msg) {"));
+        assert!(html.contains("if (removed) {\n          chatMessages.splice(i, 1);"));
+        assert!(html.contains("if (msg.excluded_from_context) return false;"));
         assert!(html.contains("CHAT_MESSAGE_SWIPE_TOGGLE_THRESHOLD = 30;"));
+        assert!(html.contains("class=\"btn-sm chat-msg-action-toggle\""));
+        assert!(html.contains(".chat-msg-action-rail {"));
+        assert!(html.contains(".chat-msg-row-actions-open .chat-msg-action-rail {"));
         assert!(html.contains(".chat-msg-swipe-action {"));
         assert!(html.contains(".chat-msg-excluded {"));
         assert!(html.contains("data-chat-msg-id="));
+        assert!(!html.contains("container.addEventListener('contextmenu'"));
     }
 
     #[test]

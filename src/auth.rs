@@ -3536,6 +3536,22 @@ impl ChatStore {
                 "only user messages can be excluded from context".into(),
             ));
         }
+        if excluded_from_context
+            && conv.active_turn_user_id > conv.last_delivered_user_id
+            && conv.active_turn_user_id > 0
+            && conv.messages[idx].id > conv.active_turn_user_id
+        {
+            let mut removed = conv.messages.remove(idx);
+            removed.excluded_from_context = true;
+
+            // Context-exclusion changes must immediately affect future agent context,
+            // including any compacted summary derived from earlier history.
+            conv.summary.clear();
+            conv.summary_until_id = 0;
+
+            self.save_conversation(owner, agent, &conv)?;
+            return Ok(removed);
+        }
         conv.messages[idx].excluded_from_context = excluded_from_context;
 
         // Context-exclusion changes must immediately affect future agent context,
@@ -4477,6 +4493,37 @@ mod tests {
 
         let saved = chat.load_conversation("alice", "worker").unwrap();
         assert!(!saved.messages[2].excluded_from_context);
+    }
+
+    #[test]
+    fn excluding_queued_follow_up_during_active_turn_cancels_message() {
+        let dir = tempdir().unwrap();
+        let chat = ChatStore::new(dir.path());
+
+        let first = chat
+            .append_user_message_idempotent("alice", "worker", "first".into(), None)
+            .unwrap()
+            .0;
+        let claimed = chat.claim_pending_user_messages("alice", "worker").unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, first.id);
+
+        let follow_up = chat
+            .append_user_message_idempotent("alice", "worker", "cancel me".into(), None)
+            .unwrap()
+            .0;
+        let removed = chat
+            .set_message_context_excluded("alice", "worker", follow_up.id, true)
+            .unwrap();
+
+        assert_eq!(removed.id, follow_up.id);
+        assert!(removed.excluded_from_context);
+        let saved = chat.load_conversation("alice", "worker").unwrap();
+        assert!(saved.messages.iter().all(|msg| msg.id != follow_up.id));
+
+        chat.complete_active_turn("alice", "worker").unwrap();
+        let pending = chat.claim_pending_user_messages("alice", "worker").unwrap();
+        assert!(pending.is_empty());
     }
 
     #[test]

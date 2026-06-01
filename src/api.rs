@@ -12067,6 +12067,13 @@ fn is_pending_follow_up_user_message(conv: &ChatConversation, msg: &ChatMessage)
         && msg.id > conv.active_turn_user_id
 }
 
+fn is_cancelled_pending_follow_up_user_message(conv: &ChatConversation, msg: &ChatMessage) -> bool {
+    matches!(msg.role, ChatRole::User)
+        && msg.excluded_from_context
+        && conv.active_turn_user_id > conv.last_delivered_user_id
+        && msg.id > conv.active_turn_user_id
+}
+
 const UI_CHAT_VERBATIM_EXCHANGE_LIMIT: usize = 50;
 
 fn unsummarized_messages(conv: &ChatConversation) -> &[ChatMessage] {
@@ -12178,6 +12185,9 @@ fn chat_messages_value_ordered(conv: &ChatConversation) -> (Vec<Value>, Vec<Valu
     let mut main = Vec::new();
     let mut pending = Vec::new();
     for msg in recent_exchange_tail(&conv.messages, UI_CHAT_VERBATIM_EXCHANGE_LIMIT) {
+        if is_cancelled_pending_follow_up_user_message(conv, msg) {
+            continue;
+        }
         let value = chat_message_json(msg);
         if is_pending_follow_up_user_message(conv, msg) {
             pending.push(value);
@@ -13202,6 +13212,7 @@ async fn chat_update_message(
         form.excluded,
     )?;
     let conv = state.chat.load_conversation(owner, &agent_name)?;
+    let removed = form.excluded && !conv.messages.iter().any(|msg| msg.id == updated.id);
     let last_message = conv
         .messages
         .iter()
@@ -13225,6 +13236,7 @@ async fn chat_update_message(
     Ok(Json(json!({
         "ok": true,
         "message": chat_message_json(&updated),
+        "removed": removed,
         "active_turn_user_id": conv.active_turn_user_id,
         "last_message": last_message,
         "last_message_time": last_message_time,
@@ -22984,6 +22996,55 @@ mod tests {
             .map(|msg| msg["content"].as_str().unwrap_or(""))
             .collect();
         assert_eq!(contents, vec!["first", "working", "tool step", "follow-up"]);
+    }
+
+    #[test]
+    fn chat_panel_omits_cancelled_pending_follow_up_messages() {
+        let mut conv = ChatConversation {
+            agent_status: AgentChatStatus::Thinking,
+            active_turn_user_id: 1,
+            last_delivered_user_id: 0,
+            ..Default::default()
+        };
+        conv.messages.push(ChatMessage {
+            id: 1,
+            role: ChatRole::User,
+            content: "first".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
+            excluded_from_context: false,
+        });
+        conv.messages.push(ChatMessage {
+            id: 2,
+            role: ChatRole::Assistant,
+            content: "working".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
+            excluded_from_context: false,
+        });
+        conv.messages.push(ChatMessage {
+            id: 3,
+            role: ChatRole::User,
+            content: "cancelled follow-up".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
+            excluded_from_context: true,
+        });
+        conv.messages.push(ChatMessage {
+            id: 4,
+            role: ChatRole::Tool,
+            content: "tool step".to_string(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            client_message_id: None,
+            excluded_from_context: false,
+        });
+
+        let messages = super::chat_messages_value_for_panel(&conv);
+        let contents: Vec<&str> = messages
+            .iter()
+            .map(|msg| msg["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(contents, vec!["first", "working", "tool step"]);
     }
 
     #[test]
