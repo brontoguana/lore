@@ -9,6 +9,7 @@ REMOTE_BIN="/home/lore/.local/bin/lore-server"
 REMOTE_UPLOAD="/tmp/lore-server-upload.$$"
 REMOTE_BACKUP="/tmp/lore-server-backup.$$"
 REMOTE_CLIENT_UPLOAD="/tmp/lore-client-upload.$$"
+REMOTE_DEPLOY_LOCK="/tmp/lore-deploy.lock"
 ORIGINAL_CARGO_TOML="$(mktemp)"
 cp Cargo.toml "$ORIGINAL_CARGO_TOML"
 
@@ -17,6 +18,7 @@ COMMIT_CREATED=0
 TAG_CREATED=0
 REMOTE_BINARY_SWAPPED=0
 REMOTE_BACKUP_CREATED=0
+REMOTE_LOCK_ACQUIRED=0
 DEPLOY_VERIFIED=0
 CLIENT_TARGET="$(rustc -vV | sed -n 's/^host: //p' | head -1)"
 
@@ -38,11 +40,11 @@ cleanup() {
             fi
         "
 
-        if restart_remote_service >/dev/null 2>&1; then
-            check_remote_health >/dev/null 2>&1 || true
+        if restart_remote_service >/dev/null 2>&1 && check_remote_health >/dev/null 2>&1; then
+            ensure_remote_proxy_active >/dev/null 2>&1 || true
             echo "Rollback completed"
         else
-            echo "Rollback restart attempt failed"
+            echo "Rollback restart or health check failed"
         fi
     fi
 
@@ -51,6 +53,9 @@ cleanup() {
     fi
 
     ssh "$SERVER" "rm -f '${REMOTE_UPLOAD}' '${REMOTE_CLIENT_UPLOAD}'" >/dev/null 2>&1 || true
+    if [ "$REMOTE_LOCK_ACQUIRED" -eq 1 ]; then
+        ssh "$SERVER" "rm -rf '${REMOTE_DEPLOY_LOCK}'" >/dev/null 2>&1 || true
+    fi
 
     if [ "$exit_code" -ne 0 ] && [ "$COMMIT_CREATED" -eq 1 ]; then
         echo "Release commit ${TAG} was created locally before failure."
@@ -72,6 +77,21 @@ run_step() {
 
     echo "${description}..."
     "$@"
+}
+
+acquire_remote_deploy_lock() {
+    ssh "$SERVER" "
+set -eu
+if mkdir '${REMOTE_DEPLOY_LOCK}' 2>/dev/null; then
+    printf '%s\n' '$$' > '${REMOTE_DEPLOY_LOCK}/pid'
+    date -u +%FT%TZ > '${REMOTE_DEPLOY_LOCK}/created_at'
+    exit 0
+fi
+echo 'Another Lore deploy appears to be running on ${SERVER}.' >&2
+echo 'Remove ${REMOTE_DEPLOY_LOCK} only after confirming no deploy is active.' >&2
+exit 1
+"
+    REMOTE_LOCK_ACQUIRED=1
 }
 
 wait_for_remote_service_state() {
@@ -104,20 +124,121 @@ journalctl -u lore-caddy -n 20 --no-pager 2>/dev/null || true
 ' || true
 }
 
-restart_remote_service() {
-    if ssh "$SERVER" '
-if [ -f /etc/systemd/system/lore-server.service ]; then
-    sudo -n systemctl daemon-reload &&
-    (sudo -n systemctl restart lore-server || sudo -n systemctl start lore-server)
-else
-    exit 42
+remote_systemd_preflight() {
+    ssh "$SERVER" '
+set -eu
+if [ ! -f /etc/systemd/system/lore-server.service ]; then
+    echo "Missing /etc/systemd/system/lore-server.service; refusing unmanaged deploy." >&2
+    exit 1
 fi
-' 2>/dev/null; then
-        echo "Restarted via systemd"
-    else
-        echo "Systemd restart unavailable; refusing unmanaged fallback because lore-caddy depends on systemd state"
-        return 1
+
+sudo -n systemctl daemon-reload
+
+main_pid=$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+holders=$(ss -ltnp 2>/dev/null | sed -n "s/.*127[.]0[.]0[.]1:7043.*pid=\([0-9][0-9]*\).*/\1/p" | sort -u)
+stale=0
+for pid in $holders; do
+    if [ -n "$pid" ] && [ "$pid" != "$main_pid" ]; then
+        echo "Stopping unmanaged lore-server pid $pid that is holding 127.0.0.1:7043" >&2
+        kill -TERM "$pid" 2>/dev/null || true
+        stale=1
     fi
+done
+if [ "$stale" -eq 1 ]; then
+    sleep 2
+    main_pid=$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+    holders=$(ss -ltnp 2>/dev/null | sed -n "s/.*127[.]0[.]0[.]1:7043.*pid=\([0-9][0-9]*\).*/\1/p" | sort -u)
+    for pid in $holders; do
+        if [ -n "$pid" ] && [ "$pid" != "$main_pid" ]; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+fi
+
+if ! systemctl is-active --quiet lore-server; then
+    sudo -n systemctl restart lore-server
+fi
+systemctl is-active --quiet lore-server
+main_pid=$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+holders=$(ss -ltnp 2>/dev/null | sed -n "s/.*127[.]0[.]0[.]1:7043.*pid=\([0-9][0-9]*\).*/\1/p" | sort -u)
+for pid in $holders; do
+    if [ -n "$pid" ] && [ "$pid" != "$main_pid" ]; then
+        echo "Unmanaged lore-server pid $pid still owns 127.0.0.1:7043 before deploy" >&2
+        exit 1
+    fi
+done
+'
+}
+
+restart_remote_service() {
+    ssh "$SERVER" '
+set -eu
+if [ ! -f /etc/systemd/system/lore-server.service ]; then
+    echo "Missing /etc/systemd/system/lore-server.service; refusing unmanaged restart." >&2
+    exit 1
+fi
+
+sudo -n systemctl daemon-reload
+if ! sudo -n systemctl restart lore-server; then
+    main_pid=$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+    holders=$(ss -ltnp 2>/dev/null | sed -n "s/.*127[.]0[.]0[.]1:7043.*pid=\([0-9][0-9]*\).*/\1/p" | sort -u)
+    cleared_stale=0
+    for pid in $holders; do
+        if [ -n "$pid" ] && [ "$pid" != "$main_pid" ]; then
+            echo "Stopping stale lore-server pid $pid after restart failure" >&2
+            kill -TERM "$pid" 2>/dev/null || true
+            cleared_stale=1
+        fi
+    done
+    if [ "$cleared_stale" -eq 0 ] && systemctl is-active --quiet lore-server; then
+        echo "systemd restart failed while the old lore-server service remained active; refusing to treat that as a successful deploy" >&2
+        exit 1
+    fi
+    sleep 2
+    main_pid=$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+    holders=$(ss -ltnp 2>/dev/null | sed -n "s/.*127[.]0[.]0[.]1:7043.*pid=\([0-9][0-9]*\).*/\1/p" | sort -u)
+    for pid in $holders; do
+        if [ -n "$pid" ] && [ "$pid" != "$main_pid" ]; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    sudo -n systemctl restart lore-server
+fi
+
+systemctl is-active --quiet lore-server
+main_pid=$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+if [ -z "$main_pid" ] || [ "$main_pid" = "0" ]; then
+    echo "lore-server.service is active but has no MainPID" >&2
+    exit 1
+fi
+holders=$(ss -ltnp 2>/dev/null | sed -n "s/.*127[.]0[.]0[.]1:7043.*pid=\([0-9][0-9]*\).*/\1/p" | sort -u)
+for pid in $holders; do
+    if [ -n "$pid" ] && [ "$pid" != "$main_pid" ]; then
+        echo "Unmanaged lore-server pid $pid still owns 127.0.0.1:7043 after restart" >&2
+        exit 1
+    fi
+done
+'
+    echo "Restarted via systemd"
+}
+
+ensure_remote_proxy_unit_compatibility() {
+    ssh "$SERVER" '
+unit=/etc/systemd/system/lore-caddy.service
+if [ ! -f "$unit" ] || ! grep -q "^BindsTo=lore-server.service$" "$unit"; then
+    exit 0
+fi
+
+backup="$unit.bak-$(date +%s)"
+if sudo -n sh -c "cp -f \"\$1\" \"\$2\" && sed -i \"s/^BindsTo=lore-server.service$/Wants=lore-server.service/\" \"\$1\"" sh "$unit" "$backup"; then
+    sudo -n systemctl daemon-reload
+    echo "Updated lore-caddy.service dependency from BindsTo to Wants"
+else
+    echo "Remote lore-caddy.service still uses BindsTo=lore-server.service." >&2
+    echo "Update it to Wants=lore-server.service before deploying, or reinstall with the current lore-server install command." >&2
+    exit 1
+fi
+'
 }
 
 restart_remote_proxy() {
@@ -145,6 +266,21 @@ pkill -KILL -u "$(id -u)" -f "[/]caddy .* run --config " || true
 
     echo "lore-caddy restart unavailable or recovery failed"
     return 1
+}
+
+ensure_remote_proxy_active() {
+    ssh "$SERVER" '
+set -eu
+if [ ! -f /etc/systemd/system/lore-caddy.service ]; then
+    echo "No managed lore-caddy.service found; skipping proxy systemd check"
+    exit 0
+fi
+if systemctl is-active --quiet lore-caddy; then
+    exit 0
+fi
+sudo -n systemctl restart lore-caddy
+systemctl is-active --quiet lore-caddy
+'
 }
 
 check_remote_health() {
@@ -247,6 +383,15 @@ git tag "$TAG"
 TAG_CREATED=1
 
 # --- Deploy: SCP to /tmp then swap binary while service is running ---
+echo "Acquiring remote deploy lock..."
+acquire_remote_deploy_lock
+
+echo "Checking remote proxy unit..."
+ensure_remote_proxy_unit_compatibility
+
+echo "Checking remote systemd ownership..."
+remote_systemd_preflight
+
 echo "Uploading to ${SERVER}..."
 scp -q target/release/lore-server "${SERVER}:${REMOTE_UPLOAD}"
 ssh "$SERVER" "
@@ -272,7 +417,7 @@ echo "Restarting..."
 restart_remote_service
 
 echo "Ensuring public proxy is up..."
-if ! wait_for_remote_service_state "lore-caddy" "active" 5 1; then
+if ! ensure_remote_proxy_active; then
     restart_remote_proxy || true
 fi
 

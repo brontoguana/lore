@@ -2,6 +2,7 @@
 
 ## 2026-05-25
 
+- Hardened quick deploys with a remote deploy lock, stale unmanaged `lore-server` port cleanup, systemd-only restart verification, Caddy unit compatibility checks, and rollback if post-swap health checks fail.
 - Added a desktop chat message action toggle so user messages can reveal delete/undelete controls from the message margin without using mobile swipe gestures.
 - Made deleting a queued follow-up message while an agent is mid-run cancel that undelivered message instead of carrying it forward as pending after the current turn.
 - Hardened server update restarts so systemd-managed installs use noninteractive `systemctl daemon-reload`/`restart` with `start` recovery, avoid unmanaged fallback processes when systemd restart fails, and generate Caddy units that want rather than bind to the Lore service.

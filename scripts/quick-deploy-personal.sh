@@ -15,6 +15,7 @@ REMOTE_BIN="${LORE_PERSONAL_REMOTE_BIN:-${REMOTE_HOME}/.local/bin/lore-server}"
 REMOTE_CLIENT_UPLOAD="/tmp/lore-client-upload.$$"
 REMOTE_UPLOAD="/tmp/lore-server-upload.$$"
 REMOTE_BACKUP="/tmp/lore-server-backup.$$"
+REMOTE_DEPLOY_LOCK="/tmp/lore-deploy.lock"
 REMOTE_CLIENT_UPDATE_DIR="${LORE_PERSONAL_CLIENT_UPDATE_DIR:-${REMOTE_DATA_DIR}/updates}"
 ORIGINAL_CARGO_TOML="$(mktemp)"
 cp Cargo.toml "$ORIGINAL_CARGO_TOML"
@@ -24,6 +25,7 @@ COMMIT_CREATED=0
 TAG_CREATED=0
 REMOTE_BINARY_SWAPPED=0
 REMOTE_BACKUP_CREATED=0
+REMOTE_LOCK_ACQUIRED=0
 DEPLOY_VERIFIED=0
 CLIENT_TARGET="$(rustc -vV | sed -n 's/^host: //p' | head -1)"
 INITIAL_ADMIN_REQUIRED=0
@@ -47,8 +49,11 @@ cleanup() {
             fi
         "
 
-        restart_remote_service >/dev/null 2>&1 || true
-        check_remote_health >/dev/null 2>&1 || true
+        if restart_remote_service >/dev/null 2>&1 && check_remote_health >/dev/null 2>&1; then
+            echo "Rollback completed"
+        else
+            echo "Rollback restart or health check failed"
+        fi
     fi
 
     if [ "$REMOTE_BACKUP_CREATED" -eq 1 ]; then
@@ -56,6 +61,9 @@ cleanup() {
     fi
 
     ssh "$SERVER" "rm -f '${REMOTE_UPLOAD}' '${REMOTE_CLIENT_UPLOAD}'" >/dev/null 2>&1 || true
+    if [ "$REMOTE_LOCK_ACQUIRED" -eq 1 ]; then
+        ssh "$SERVER" "rm -rf '${REMOTE_DEPLOY_LOCK}'" >/dev/null 2>&1 || true
+    fi
 
     if [ "$exit_code" -ne 0 ] && [ "$COMMIT_CREATED" -eq 1 ]; then
         echo "Release commit ${TAG} was created locally before failure."
@@ -81,6 +89,21 @@ run_step() {
 
 remote_quote() {
     printf "%q" "$1"
+}
+
+acquire_remote_deploy_lock() {
+    ssh "$SERVER" "
+set -eu
+if mkdir '${REMOTE_DEPLOY_LOCK}' 2>/dev/null; then
+    printf '%s\n' '$$' > '${REMOTE_DEPLOY_LOCK}/pid'
+    date -u +%FT%TZ > '${REMOTE_DEPLOY_LOCK}/created_at'
+    exit 0
+fi
+echo 'Another Lore deploy appears to be running on ${SERVER}.' >&2
+echo 'Remove ${REMOTE_DEPLOY_LOCK} only after confirming no deploy is active.' >&2
+exit 1
+"
+    REMOTE_LOCK_ACQUIRED=1
 }
 
 ensure_remote_layout() {
@@ -274,8 +297,110 @@ create_initial_admin_if_needed() {
         ssh "$SERVER" "runuser -u $(remote_quote "$REMOTE_SERVICE_USER") -- script -qec '$(remote_quote "$REMOTE_BIN") --data-dir $(remote_quote "$REMOTE_DATA_DIR") create-admin' /dev/null >/dev/null"
 }
 
+remote_systemd_preflight() {
+    local q_bind
+    q_bind=$(remote_quote "$REMOTE_BIND")
+
+    ssh "$SERVER" "set -eu
+BIND=${q_bind}
+PORT=\${BIND##*:}
+if [ ! -f /etc/systemd/system/lore-server.service ]; then
+    echo 'Missing /etc/systemd/system/lore-server.service; refusing unmanaged deploy.' >&2
+    exit 1
+fi
+
+systemctl daemon-reload
+
+main_pid=\$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+holders=\$(ss -ltnp 2>/dev/null | awk -v port=\":\${PORT}\" '\$4 ~ port { print }' | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)
+stale=0
+for pid in \$holders; do
+    if [ -n \"\$pid\" ] && [ \"\$pid\" != \"\$main_pid\" ]; then
+        echo \"Stopping unmanaged lore-server pid \$pid that is holding \${BIND}\" >&2
+        kill -TERM \"\$pid\" 2>/dev/null || true
+        stale=1
+    fi
+done
+if [ \"\$stale\" -eq 1 ]; then
+    sleep 2
+    main_pid=\$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+    holders=\$(ss -ltnp 2>/dev/null | awk -v port=\":\${PORT}\" '\$4 ~ port { print }' | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)
+    for pid in \$holders; do
+        if [ -n \"\$pid\" ] && [ \"\$pid\" != \"\$main_pid\" ]; then
+            kill -KILL \"\$pid\" 2>/dev/null || true
+        fi
+    done
+fi
+
+if ! systemctl is-active --quiet lore-server; then
+    systemctl restart lore-server
+fi
+systemctl is-active --quiet lore-server
+main_pid=\$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+holders=\$(ss -ltnp 2>/dev/null | awk -v port=\":\${PORT}\" '\$4 ~ port { print }' | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)
+for pid in \$holders; do
+    if [ -n \"\$pid\" ] && [ \"\$pid\" != \"\$main_pid\" ]; then
+        echo \"Unmanaged lore-server pid \$pid still owns \${BIND} before deploy\" >&2
+        exit 1
+    fi
+done
+"
+}
+
 restart_remote_service() {
-    ssh "$SERVER" "systemctl daemon-reload && (systemctl restart lore-server || systemctl start lore-server)"
+    local q_bind
+    q_bind=$(remote_quote "$REMOTE_BIND")
+
+    ssh "$SERVER" "set -eu
+BIND=${q_bind}
+PORT=\${BIND##*:}
+if [ ! -f /etc/systemd/system/lore-server.service ]; then
+    echo 'Missing /etc/systemd/system/lore-server.service; refusing unmanaged restart.' >&2
+    exit 1
+fi
+
+systemctl daemon-reload
+if ! systemctl restart lore-server; then
+    main_pid=\$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+    holders=\$(ss -ltnp 2>/dev/null | awk -v port=\":\${PORT}\" '\$4 ~ port { print }' | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)
+    cleared_stale=0
+    for pid in \$holders; do
+        if [ -n \"\$pid\" ] && [ \"\$pid\" != \"\$main_pid\" ]; then
+            echo \"Stopping stale lore-server pid \$pid after restart failure\" >&2
+            kill -TERM \"\$pid\" 2>/dev/null || true
+            cleared_stale=1
+        fi
+    done
+    if [ \"\$cleared_stale\" -eq 0 ] && systemctl is-active --quiet lore-server; then
+        echo 'systemd restart failed while the old lore-server service remained active; refusing to treat that as a successful deploy' >&2
+        exit 1
+    fi
+    sleep 2
+    main_pid=\$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+    holders=\$(ss -ltnp 2>/dev/null | awk -v port=\":\${PORT}\" '\$4 ~ port { print }' | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)
+    for pid in \$holders; do
+        if [ -n \"\$pid\" ] && [ \"\$pid\" != \"\$main_pid\" ]; then
+            kill -KILL \"\$pid\" 2>/dev/null || true
+        fi
+    done
+    systemctl restart lore-server
+fi
+
+systemctl is-active --quiet lore-server
+main_pid=\$(systemctl show lore-server --property=MainPID --value 2>/dev/null || echo 0)
+if [ -z \"\$main_pid\" ] || [ \"\$main_pid\" = '0' ]; then
+    echo 'lore-server.service is active but has no MainPID' >&2
+    exit 1
+fi
+holders=\$(ss -ltnp 2>/dev/null | awk -v port=\":\${PORT}\" '\$4 ~ port { print }' | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)
+for pid in \$holders; do
+    if [ -n \"\$pid\" ] && [ \"\$pid\" != \"\$main_pid\" ]; then
+        echo \"Unmanaged lore-server pid \$pid still owns \${BIND} after restart\" >&2
+        exit 1
+    fi
+done
+"
+    echo "Restarted via systemd"
 }
 
 check_remote_health() {
@@ -381,8 +506,12 @@ git tag "$TAG"
 TAG_CREATED=1
 
 # --- Deploy ---
+echo "Acquiring remote deploy lock..."
+acquire_remote_deploy_lock
+
 run_step "Preparing remote service account and directories" ensure_remote_layout
 run_step "Configuring public setup address" configure_remote_setup_address
+run_step "Checking remote systemd ownership" remote_systemd_preflight
 
 echo "Uploading server binary to ${SERVER}..."
 scp -q target/release/lore-server "${SERVER}:${REMOTE_UPLOAD}"
