@@ -3521,6 +3521,76 @@ fn recent_history_exchange_tail<'a>(
     &messages[boundaries[boundaries.len() - exchange_limit]..]
 }
 
+fn recent_history_prompt_window<'a>(
+    messages: &'a [&'a serde_json::Value],
+    exchange_limit: usize,
+) -> Vec<&'a serde_json::Value> {
+    let recent = recent_history_exchange_tail(messages, exchange_limit);
+    cap_history_prompt_rows(recent, exchange_limit)
+}
+
+fn cap_history_prompt_rows<'a>(
+    messages: &'a [&'a serde_json::Value],
+    exchange_limit: usize,
+) -> Vec<&'a serde_json::Value> {
+    if exchange_limit == 0 || messages.is_empty() {
+        return Vec::new();
+    }
+
+    const AGENT_RESPONSE_EDGE_MESSAGES: usize = 8;
+    let tool_limit = exchange_limit;
+    let mut keep = vec![false; messages.len()];
+    let mut kept_tools = 0usize;
+
+    for (idx, msg) in messages.iter().enumerate().rev() {
+        if msg["role"].as_str() == Some("tool") && kept_tools < tool_limit {
+            keep[idx] = true;
+            kept_tools += 1;
+        }
+    }
+
+    let mut start = 0usize;
+    while start < messages.len() {
+        let end = messages[start + 1..]
+            .iter()
+            .position(|msg| msg["role"].as_str() == Some("user"))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(messages.len());
+
+        if messages[start]["role"].as_str() == Some("user") {
+            keep[start] = true;
+        }
+
+        let agent_rows: Vec<usize> = (start..end)
+            .filter(|idx| {
+                let role = messages[*idx]["role"].as_str();
+                role != Some("user") && role != Some("tool")
+            })
+            .collect();
+
+        if agent_rows.len() <= AGENT_RESPONSE_EDGE_MESSAGES.saturating_mul(2) {
+            for idx in agent_rows {
+                keep[idx] = true;
+            }
+        } else {
+            for idx in agent_rows.iter().take(AGENT_RESPONSE_EDGE_MESSAGES) {
+                keep[*idx] = true;
+            }
+            for idx in agent_rows.iter().rev().take(AGENT_RESPONSE_EDGE_MESSAGES) {
+                keep[*idx] = true;
+            }
+        }
+
+        start = end;
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| keep[idx].then_some(*msg))
+        .collect()
+}
+
 fn chat_content_for_prompt(content: &str, preserve_data_images: bool) -> String {
     if preserve_data_images {
         content.to_string()
@@ -4601,7 +4671,7 @@ async fn agent_poll_and_process(
     if let Some(msgs) = hist_messages {
         let pending_ids: HashSet<u64> = current_message_ids.iter().copied().collect();
         let filtered = history_messages_excluding_pending(Some(msgs), &pending_ids);
-        let recent = recent_history_exchange_tail(&filtered, window_size);
+        let recent = recent_history_prompt_window(&filtered, window_size);
         if !recent.is_empty() {
             prompt_parts.push("## Previous Conversation\nThe following is recent conversation history. This is context only \u{2014} do not respond to these messages. Only respond to the new message the user sends.\n".to_string());
             for msg in recent {
@@ -4609,7 +4679,12 @@ async fn agent_poll_and_process(
                 let content = msg["content"].as_str().unwrap_or("");
                 let timestamp = msg["timestamp"].as_str().unwrap_or("");
                 let time_label = format_relative_time(timestamp, now);
-                let role_label = if role == "user" { "User" } else { "You" };
+                let role_label = match role {
+                    "user" => "User",
+                    "tool" => "Tool",
+                    "error" => "Error",
+                    _ => "You",
+                };
                 let content = chat_content_for_prompt(content, false);
                 if role == "user" {
                     prompt_parts.push(format!("\u{2500}\u{2500}\u{2500} {role_label} ({time_label}) \u{2500}\u{2500}\u{2500}\n{content}"));
@@ -6994,6 +7069,9 @@ async fn do_compact(
     input.push_str("<messages_to_compact>\n");
     for msg in to_compact {
         let role = msg["role"].as_str().unwrap_or("user");
+        if role == "tool" {
+            continue;
+        }
         let content = msg["content"].as_str().unwrap_or("");
         let content = chat_content_for_prompt(content, false);
         if role == "user" {
@@ -8659,9 +8737,9 @@ mod tests {
         load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
         markdown_data_image_attachments, markdown_heading_matches,
         next_service_update_retry_delay_secs, parse_cli_version_output, parse_codex_line,
-        recent_history_exchange_tail, remove_owned_service_pid_file, resolve_context_project,
-        resolve_executable_path_from, reuse_or_clear_staged_binary, sanitize_cli_output_preview,
-        service_update_target, should_force_agy_file_token_auth_from,
+        recent_history_exchange_tail, recent_history_prompt_window, remove_owned_service_pid_file,
+        resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
+        sanitize_cli_output_preview, service_update_target, should_force_agy_file_token_auth_from,
         write_codex_image_attachments,
     };
     use clap::Parser;
@@ -9263,6 +9341,61 @@ mod tests {
         let ids: Vec<u64> = recent.iter().filter_map(|msg| msg["id"].as_u64()).collect();
 
         assert_eq!(ids, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn recent_history_prompt_window_caps_tool_rows_separately() {
+        let mut messages = Vec::new();
+        messages.push(json!({ "id": 1, "role": "user", "content": "u1" }));
+        for id in 2..=11u64 {
+            messages.push(json!({ "id": id, "role": "tool", "content": format!("tool-{id}") }));
+        }
+        messages.push(json!({ "id": 12, "role": "assistant", "content": "a1" }));
+        messages.push(json!({ "id": 13, "role": "user", "content": "u2" }));
+        messages.push(json!({ "id": 14, "role": "assistant", "content": "a2" }));
+
+        let refs: Vec<&serde_json::Value> = messages.iter().collect();
+        let recent = recent_history_prompt_window(&refs, 2);
+        let tool_ids: Vec<u64> = recent
+            .iter()
+            .filter(|msg| msg["role"].as_str() == Some("tool"))
+            .filter_map(|msg| msg["id"].as_u64())
+            .collect();
+        let ids: Vec<u64> = recent.iter().filter_map(|msg| msg["id"].as_u64()).collect();
+
+        assert_eq!(tool_ids, vec![10, 11]);
+        assert_eq!(ids, vec![1, 10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn recent_history_prompt_window_caps_each_agent_response_edges() {
+        let mut messages = Vec::new();
+        messages.push(json!({ "id": 1, "role": "user", "content": "u1" }));
+        for id in 2..=36u64 {
+            messages
+                .push(json!({ "id": id, "role": "assistant", "content": format!("status-{id}") }));
+        }
+        messages.push(json!({ "id": 37, "role": "user", "content": "u2" }));
+        messages.push(json!({ "id": 38, "role": "assistant", "content": "a2" }));
+
+        let refs: Vec<&serde_json::Value> = messages.iter().collect();
+        let recent = recent_history_prompt_window(&refs, 2);
+        let assistant_ids: Vec<u64> = recent
+            .iter()
+            .filter(|msg| msg["role"].as_str() == Some("assistant"))
+            .filter_map(|msg| msg["id"].as_u64())
+            .collect();
+        let user_ids: Vec<u64> = recent
+            .iter()
+            .filter(|msg| msg["role"].as_str() == Some("user"))
+            .filter_map(|msg| msg["id"].as_u64())
+            .collect();
+
+        assert_eq!(
+            assistant_ids,
+            vec![2, 3, 4, 5, 6, 7, 8, 9, 29, 30, 31, 32, 33, 34, 35, 36, 38]
+        );
+        assert_eq!(user_ids, vec![1, 37]);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 # Changelog
 
-## 2026-05-25
+## 2026-06-04
 
+- Added 90-day database chat message retention on server startup while always keeping the latest 500 messages per conversation, clearing compacted summaries only when old rows are actually deleted.
+- Bounded CLI agent prompt history by keeping recent user exchanges, only the latest matching count of tool rows, and only the first/last 8 non-tool agent rows from each retained response; older tool rows are dropped from future prompt context instead of summarized.
 - Hardened quick deploys with a remote deploy lock, stale unmanaged `lore-server` port cleanup, systemd-only restart verification, Caddy unit compatibility checks, and rollback if post-swap health checks fail.
 - Added a desktop chat message action toggle so user messages can reveal delete/undelete controls from the message margin without using mobile swipe gestures.
 - Made deleting a queued follow-up message while an agent is mid-run cancel that undelivered message instead of carrying it forward as pending after the current turn.

@@ -2942,6 +2942,87 @@ impl ChatStore {
         }
     }
 
+    pub fn cleanup_old_messages(&self, max_age_days: u64, retain_recent_messages: usize) {
+        let cutoff = OffsetDateTime::now_utc() - time::Duration::days(max_age_days as i64);
+        let cutoff_str = fmt_dt(&cutoff);
+        let retain_limit = retain_recent_messages as i64;
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("warning: could not acquire db lock for chat message retention cleanup");
+                return;
+            }
+        };
+
+        let mut affected = Vec::new();
+        match conn.prepare(
+            "SELECT DISTINCT owner, agent FROM messages AS old
+             WHERE old.timestamp < ?1
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM (
+                       SELECT id
+                       FROM messages
+                       WHERE owner = old.owner AND agent = old.agent
+                       ORDER BY id DESC
+                       LIMIT ?2
+                   ) AS recent
+                   WHERE recent.id = old.id
+               )",
+        ) {
+            Ok(mut stmt) => match stmt.query_map(params![cutoff_str, retain_limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }) {
+                Ok(rows) => {
+                    for row in rows.flatten() {
+                        affected.push(row);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: chat message retention scan failed: {e}");
+                    return;
+                }
+            },
+            Err(e) => {
+                eprintln!("warning: chat message retention scan failed: {e}");
+                return;
+            }
+        }
+
+        match conn.execute(
+            "DELETE FROM messages AS old
+             WHERE old.timestamp < ?1
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM (
+                       SELECT id
+                       FROM messages
+                       WHERE owner = old.owner AND agent = old.agent
+                       ORDER BY id DESC
+                       LIMIT ?2
+                   ) AS recent
+                   WHERE recent.id = old.id
+               )",
+            params![cutoff_str, retain_limit],
+        ) {
+            Ok(n) if n > 0 => {
+                eprintln!(
+                    "cleanup: removed {n} chat message(s) older than {max_age_days} day(s), retaining latest {retain_recent_messages} per conversation"
+                );
+                for (owner, agent) in affected {
+                    if let Err(e) = conn.execute(
+                        "UPDATE conversations SET summary = '', summary_until_id = 0 WHERE owner = ?1 AND agent = ?2",
+                        params![owner, agent],
+                    ) {
+                        eprintln!("warning: chat summary retention cleanup failed: {e}");
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: chat message retention cleanup failed: {e}"),
+        }
+    }
+
     fn ensure_conversation(conn: &Connection, owner: &str, agent: &str) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO conversations (owner, agent) VALUES (?1, ?2)",
@@ -4550,5 +4631,68 @@ mod tests {
             .set_message_context_excluded("alice", "worker", 1, true)
             .unwrap_err();
         assert!(format!("{err}").contains("only user messages"));
+    }
+
+    #[test]
+    fn chat_message_retention_keeps_recent_tail_for_old_conversations() {
+        let dir = tempdir().unwrap();
+        let chat = ChatStore::new(dir.path());
+        let old = OffsetDateTime::now_utc() - Duration::days(120);
+
+        let messages = (1..=505)
+            .map(|id| ChatMessage {
+                id,
+                role: if id % 2 == 0 {
+                    ChatRole::Assistant
+                } else {
+                    ChatRole::User
+                },
+                content: format!("old message {id}"),
+                timestamp: old + Duration::seconds(id as i64),
+                client_message_id: None,
+                excluded_from_context: false,
+            })
+            .collect();
+        let conv = ChatConversation {
+            messages,
+            summary: "summary derived from rows that may be deleted".into(),
+            summary_until_id: 400,
+            next_id: 506,
+            ..ChatConversation::default()
+        };
+        chat.save_conversation("alice", "worker", &conv).unwrap();
+
+        let short_old_conv = ChatConversation {
+            messages: (1..=3)
+                .map(|id| ChatMessage {
+                    id,
+                    role: ChatRole::User,
+                    content: format!("short old message {id}"),
+                    timestamp: old + Duration::seconds(id as i64),
+                    client_message_id: None,
+                    excluded_from_context: false,
+                })
+                .collect(),
+            summary: "short summary".into(),
+            summary_until_id: 2,
+            next_id: 4,
+            ..ChatConversation::default()
+        };
+        chat.save_conversation("alice", "small-worker", &short_old_conv)
+            .unwrap();
+
+        chat.cleanup_old_messages(90, 500);
+
+        let retained = chat.load_conversation("alice", "worker").unwrap();
+        assert_eq!(retained.messages.len(), 500);
+        assert_eq!(retained.messages.first().unwrap().id, 6);
+        assert_eq!(retained.messages.last().unwrap().id, 505);
+        assert_eq!(retained.summary, "");
+        assert_eq!(retained.summary_until_id, 0);
+
+        let short_retained = chat.load_conversation("alice", "small-worker").unwrap();
+        assert_eq!(short_retained.messages.len(), 3);
+        assert_eq!(short_retained.summary, "short summary");
+        assert_eq!(short_retained.summary_until_id, 2);
     }
 }

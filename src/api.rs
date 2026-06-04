@@ -457,6 +457,9 @@ struct ChatEvent {
     data: Value,
 }
 
+const CHAT_MESSAGE_RETENTION_DAYS: u64 = 90;
+const CHAT_MESSAGE_RETENTION_RECENT_LIMIT: usize = 500;
+
 impl AppState {
     pub fn new(store: FileBlockStore) -> Self {
         Self::with_librarian(store, Arc::new(HttpLibrarianClient::new()))
@@ -478,6 +481,10 @@ impl AppState {
         chat_audit.cleanup_old_logs(90);
         auth.cleanup_orphans();
         chat.cleanup_orphans();
+        chat.cleanup_old_messages(
+            CHAT_MESSAGE_RETENTION_DAYS,
+            CHAT_MESSAGE_RETENTION_RECENT_LIMIT,
+        );
         let config = ServerConfigStore::new(root.clone(), default_port);
         let endpoint_store = EndpointStore::new(root.clone());
         let librarian_config_store = LibrarianConfigStore::new(root.clone());
@@ -14932,11 +14939,14 @@ async fn do_exchange_compact(
     }
     conversation_text.push_str("<messages_to_compact>\n");
     for msg in to_summarize {
+        if msg.role == ChatRole::Tool {
+            continue;
+        }
         let role = match msg.role {
             ChatRole::User => "User",
             ChatRole::Assistant => "Assistant",
-            ChatRole::Tool => "Tool",
             ChatRole::Error => "Error",
+            ChatRole::Tool => unreachable!("tool messages are not summarized"),
         };
         let content = chat_content_without_data_images(&msg.content);
         let was_truncated = content.chars().count() > 2000;
