@@ -1,7 +1,10 @@
 # Changelog
 
-## 2026-06-04
+## 2026-06-05
 
+- Fixed chat UI refresh/order races by dropping stale panel responses after local sends, reconciling panel refreshes in server message-id order, and sending active-turn ids with agent output so queued follow-ups do not pull final agent messages above the active user message.
+- Prevented stale machine-service clients from starting managed agent tasks before completing handoff/update checks, closing a window where an old Lore client could claim a chat turn with pre-fix prompt logic.
+- Included recent stderr snippets in visible CLI backend nonzero-exit errors so future Codex `exit status 1` failures show the underlying diagnostic when available.
 - Added 90-day database chat message retention on server startup while always keeping the latest 500 messages per conversation, clearing compacted summaries only when old rows are actually deleted.
 - Bounded CLI agent prompt history by keeping recent user exchanges, only the latest matching count of tool rows, and only the first/last 8 non-tool agent rows from each retained response; older tool rows are dropped from future prompt context instead of summarized.
 - Hardened quick deploys with a remote deploy lock, stale unmanaged `lore-server` port cleanup, systemd-only restart verification, Caddy unit compatibility checks, and rollback if post-swap health checks fail.

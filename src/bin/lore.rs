@@ -9,7 +9,7 @@ use lore_core::{
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -4808,6 +4808,7 @@ async fn agent_poll_and_process(
         let mut emitted_assistant_messages = false;
         let mut stdout_done = false;
         let mut stderr_done = false;
+        let mut stderr_preview_lines: VecDeque<String> = VecDeque::new();
 
         loop {
             if stdout_done && stderr_done {
@@ -4890,6 +4891,10 @@ async fn agent_poll_and_process(
                     if line.is_empty() {
                         continue;
                     }
+                    stderr_preview_lines.push_back(sanitize_cli_output_preview(&line));
+                    while stderr_preview_lines.len() > 8 {
+                        stderr_preview_lines.pop_front();
+                    }
                     if let Some(record) = classify_cli_non_json_output(backend, "stderr", &line) {
                         eprintln!("[agent] {}", record.detail);
                         terminate_child_process_tree(&mut child).await;
@@ -4910,7 +4915,18 @@ async fn agent_poll_and_process(
         match child.wait().await {
             Ok(status) if status.success() => {}
             Ok(status) => {
-                let detail = format!("{backend} exited with status {status}");
+                let detail = if stderr_preview_lines.is_empty() {
+                    format!("{backend} exited with status {status}")
+                } else {
+                    format!(
+                        "{backend} exited with status {status}; stderr: {}",
+                        stderr_preview_lines
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    )
+                };
                 let rec = AgentErrorRecord::new("cli", &detail);
                 record_agent_error(context, agent_name, rec).await;
                 if !emitted_assistant_messages && response.trim().is_empty() {
@@ -8236,16 +8252,40 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         svc_state.agents.len()
     );
 
-    // Start all agents as tasks within this process
-    svc_state.check_agents();
-    svc_state.start_agent_tasks(context);
-
     if let Some(handoff) = handoff.as_ref() {
         complete_service_handoff(context, machine_token, handoff).await?;
     }
 
     // Rotate service log if it's grown large (>2MB)
     let service_log_path = lore_dir.join("service.log");
+
+    if handoff.is_none() {
+        match service_poll_and_execute(context, machine_token, &mut svc_state).await {
+            Ok(Some((target_version, repo))) => {
+                eprintln!(
+                    "[service] Startup update to v{} required before starting agents",
+                    normalize_version_tag(&target_version)
+                );
+                handle_service_update_request(
+                    context,
+                    machine_token,
+                    &lore_dir,
+                    &service_log_path,
+                    &mut svc_state,
+                    target_version,
+                    repo,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[service] Startup update check failed before agents started: {e}"),
+        }
+    }
+
+    // Start all agents as tasks within this process after handoff/update checks.
+    svc_state.check_agents();
+    svc_state.start_agent_tasks(context);
+
     rotate_log_if_needed(&service_log_path);
 
     // Graceful shutdown on SIGTERM/SIGINT
@@ -8293,109 +8333,16 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
             Ok(update_info) => {
                 consecutive_service_errors = 0;
                 if let Some((target_version, repo)) = update_info {
-                    if let Some(delay) = current_service_update_backoff(&lore_dir, &target_version)
-                    {
-                        eprintln!(
-                            "[service] Delaying retry of v{} for {}s after previous failed update",
-                            normalize_version_tag(&target_version),
-                            delay.as_secs()
-                        );
-                        continue;
-                    }
-
-                    eprintln!(
-                        "[service] Server-directed self-update to v{target_version} requested; staging replacement while current service stays live"
-                    );
-
-                    match prepare_service_update(
+                    handle_service_update_request(
                         context,
                         machine_token,
-                        &target_version,
-                        &repo,
                         &lore_dir,
+                        &service_log_path,
+                        &mut svc_state,
+                        target_version,
+                        repo,
                     )
-                    .await
-                    {
-                        Ok(prepared) => {
-                            let ready_path =
-                                lore_dir.join(format!("handoff-{}.json", uuid::Uuid::new_v4()));
-                            let handoff_env = [
-                                (
-                                    LORE_SERVICE_HANDOFF_READY_ENV,
-                                    ready_path.display().to_string(),
-                                ),
-                                (
-                                    LORE_SERVICE_HANDOFF_PARENT_PID_ENV,
-                                    std::process::id().to_string(),
-                                ),
-                                (
-                                    LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV,
-                                    prepared.canonical_executable.display().to_string(),
-                                ),
-                                (
-                                    LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV,
-                                    prepared.target_version.clone(),
-                                ),
-                            ];
-                            match spawn_service_daemon(
-                                &prepared.staged_executable,
-                                &context.url,
-                                machine_token,
-                                &service_log_path,
-                                &handoff_env,
-                            ) {
-                                Ok(child) => {
-                                    match wait_for_handoff_ready_marker(
-                                        &ready_path,
-                                        std::time::Duration::from_secs(60),
-                                    ) {
-                                        Ok(marker) => {
-                                            clear_service_update_failure(&lore_dir);
-                                            eprintln!(
-                                                "[service] New v{} service ready from {}, stopping agents and handing off to pid {}",
-                                                marker.version,
-                                                prepared.source,
-                                                child.id()
-                                            );
-                                            svc_state.stop_all_agents();
-                                            svc_state.save();
-                                            std::process::exit(0);
-                                        }
-                                        Err(e) => {
-                                            let _ = fs::remove_file(&ready_path);
-                                            kill_process(child.id());
-                                            let _ = write_service_pid_file(
-                                                &lore_dir,
-                                                std::process::id(),
-                                            );
-                                            record_service_update_failure(
-                                                &lore_dir,
-                                                &target_version,
-                                                &e.to_string(),
-                                            );
-                                            eprintln!("[service] Update handoff failed: {e}");
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    record_service_update_failure(
-                                        &lore_dir,
-                                        &target_version,
-                                        &e.to_string(),
-                                    );
-                                    eprintln!("[service] Failed to spawn staged service: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            record_service_update_failure(
-                                &lore_dir,
-                                &target_version,
-                                &e.to_string(),
-                            );
-                            eprintln!("[service] Update staging failed: {e}");
-                        }
-                    }
+                    .await;
                 }
             }
             Err(e) => {
@@ -8417,6 +8364,99 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         // If it returned fast (<5s, had a command), brief pause to avoid tight loops.
         if poll_start.elapsed() < std::time::Duration::from_secs(5) {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+}
+
+async fn handle_service_update_request(
+    context: &CliContext,
+    machine_token: &str,
+    lore_dir: &Path,
+    service_log_path: &Path,
+    svc_state: &mut ServiceState,
+    target_version: String,
+    repo: String,
+) {
+    if let Some(delay) = current_service_update_backoff(lore_dir, &target_version) {
+        eprintln!(
+            "[service] Delaying retry of v{} for {}s after previous failed update",
+            normalize_version_tag(&target_version),
+            delay.as_secs()
+        );
+        return;
+    }
+
+    eprintln!(
+        "[service] Server-directed self-update to v{target_version} requested; staging replacement while current service stays live"
+    );
+
+    match prepare_service_update(context, machine_token, &target_version, &repo, lore_dir).await {
+        Ok(prepared) => {
+            let ready_path = lore_dir.join(format!("handoff-{}.json", uuid::Uuid::new_v4()));
+            let handoff_env = [
+                (
+                    LORE_SERVICE_HANDOFF_READY_ENV,
+                    ready_path.display().to_string(),
+                ),
+                (
+                    LORE_SERVICE_HANDOFF_PARENT_PID_ENV,
+                    std::process::id().to_string(),
+                ),
+                (
+                    LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV,
+                    prepared.canonical_executable.display().to_string(),
+                ),
+                (
+                    LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV,
+                    prepared.target_version.clone(),
+                ),
+            ];
+            match spawn_service_daemon(
+                &prepared.staged_executable,
+                &context.url,
+                machine_token,
+                service_log_path,
+                &handoff_env,
+            ) {
+                Ok(child) => {
+                    match wait_for_handoff_ready_marker(
+                        &ready_path,
+                        std::time::Duration::from_secs(60),
+                    ) {
+                        Ok(marker) => {
+                            clear_service_update_failure(lore_dir);
+                            eprintln!(
+                                "[service] New v{} service ready from {}, stopping agents and handing off to pid {}",
+                                marker.version,
+                                prepared.source,
+                                child.id()
+                            );
+                            svc_state.stop_all_agents();
+                            svc_state.save();
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&ready_path);
+                            kill_process(child.id());
+                            let _ = write_service_pid_file(lore_dir, std::process::id());
+                            record_service_update_failure(
+                                lore_dir,
+                                &target_version,
+                                &e.to_string(),
+                            );
+                            eprintln!("[service] Update handoff failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    record_service_update_failure(lore_dir, &target_version, &e.to_string());
+                    eprintln!("[service] Failed to spawn staged service: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            record_service_update_failure(lore_dir, &target_version, &e.to_string());
+            eprintln!("[service] Update staging failed: {e}");
         }
     }
 }

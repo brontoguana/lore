@@ -4966,7 +4966,7 @@ function cacheChatPanelResponse(data) {{
   var incomingMessages = Array.isArray(data.messages) ? data.messages : [];
   var cached = chatPanelCache[data.selected_agent];
   if (cached && Array.isArray(cached.messages) && cached.messages.length) {{
-    incomingMessages = mergeChatMessagesPreservingVisibleOrder(cached.messages, incomingMessages);
+    incomingMessages = mergeChatMessagesPreservingServerOrder(cached.messages, incomingMessages);
   }}
   cacheChatPanelState(data.selected_agent, {{
     panel_html: data.panel_html || '',
@@ -5083,7 +5083,7 @@ function applyChatPanelResponse(data, pushHistory, fromCache) {{
   var agentChanged = selectedAgent !== currentAgent;
   var incomingMessages = Array.isArray(data.messages) ? data.messages : [];
   if (selectedAgent && selectedAgent === currentAgent && Array.isArray(chatMessages) && chatMessages.length) {{
-    incomingMessages = mergeChatMessagesPreservingVisibleOrder(chatMessages, incomingMessages);
+    incomingMessages = mergeChatMessagesPreservingServerOrder(chatMessages, incomingMessages);
   }}
   var list = document.getElementById('chat-agent-list');
   if (!fromCache && list && typeof data.agent_list_html === 'string') {{
@@ -5143,11 +5143,11 @@ function fetchDesktopChatPanel(agent, pushHistory, applyMode, requestSeq) {{
   return fetchChatJson(url, {{ cache: 'no-store' }}, CHAT_PANEL_FETCH_TIMEOUT_MS)
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
-      if (data && data.ok) chatLastFullPanelRefreshAt = Date.now();
-      cacheChatPanelResponse(data);
       if (!data || !data.ok) return data;
-      if (applyMode === 'background' && currentAgent !== requestedAgent) return data;
       if (requestSeq && requestSeq !== chatPanelRequestSeq) return data;
+      if (applyMode === 'background' && currentAgent !== requestedAgent) return data;
+      chatLastFullPanelRefreshAt = Date.now();
+      cacheChatPanelResponse(data);
       if (applyMode === 'background' && (chatConfigOpen || chatManageOpen || expandedTextEditorState)) return data;
       persistCurrentChatDraft();
       chatPanelRefreshScrollSnapshot = panelRefreshScrollSnapshot;
@@ -6827,6 +6827,7 @@ function sendMessage(e) {{
   }}
 
   chatFollowScroll = true;
+  chatPanelRequestSeq++;
   setChatSendPending(true);
   sendMessageRequest(agentName, text, resolveChatSendToken(agentName, text + JSON.stringify(attachments)), attachments, 1);
   return false;
@@ -6997,28 +6998,21 @@ function coalesceToolMessages(messages) {{
   return out;
 }}
 
-function mergeChatMessagesPreservingVisibleOrder(existingMessages, incomingMessages) {{
+function mergeChatMessagesPreservingServerOrder(existingMessages, incomingMessages) {{
   if (!Array.isArray(incomingMessages) || !incomingMessages.length) return incomingMessages || [];
   if (!Array.isArray(existingMessages) || !existingMessages.length) return incomingMessages;
-  var incomingByKey = {{}};
-  for (var i = 0; i < incomingMessages.length; i++) {{
-    var key = chatMessageStableKey(incomingMessages[i]);
-    if (key) incomingByKey[key] = incomingMessages[i];
+  var existingByKey = {{}};
+  for (var i = 0; i < existingMessages.length; i++) {{
+    var existingKey = chatMessageStableKey(existingMessages[i]);
+    if (existingKey) existingByKey[existingKey] = existingMessages[i];
   }}
   var merged = [];
-  var used = {{}};
-  for (var j = 0; j < existingMessages.length; j++) {{
-    var existingKey = chatMessageStableKey(existingMessages[j]);
-    if (!existingKey || !incomingByKey[existingKey]) continue;
-    var next = Object.assign({{}}, existingMessages[j], incomingByKey[existingKey]);
-    merged.push(next);
-    used[existingKey] = true;
-  }}
-  for (var k = 0; k < incomingMessages.length; k++) {{
-    var incomingKey = chatMessageStableKey(incomingMessages[k]);
-    if (!incomingKey || !used[incomingKey]) {{
-      merged.push(incomingMessages[k]);
-      if (incomingKey) used[incomingKey] = true;
+  for (var j = 0; j < incomingMessages.length; j++) {{
+    var incomingKey = chatMessageStableKey(incomingMessages[j]);
+    if (incomingKey && existingByKey[incomingKey]) {{
+      merged.push(Object.assign({{}}, existingByKey[incomingKey], incomingMessages[j]));
+    }} else {{
+      merged.push(incomingMessages[j]);
     }}
   }}
   return merged;
@@ -7072,6 +7066,17 @@ function syncQueuedFollowUpFlags(promoteOptimisticQueued) {{
     }}
   }}
   return changed;
+}}
+
+function applyActiveTurnUserIdFromData(data, promoteQueued) {{
+  if (!data || typeof data.active_turn_user_id === 'undefined') return false;
+  var next = data.active_turn_user_id;
+  if (typeof next === 'string') next = parseInt(next, 10);
+  next = Number.isFinite(next) ? next : 0;
+  var prev = activeTurnUserId || 0;
+  activeTurnUserId = next;
+  var queueChanged = syncQueuedFollowUpFlags(!!promoteQueued && next > prev);
+  return queueChanged || next !== prev;
 }}
 
 function insertChatMessage(msg) {{
@@ -7160,7 +7165,10 @@ function updateCachedChatPanelFromEvent(evt) {{
   agentStatus = cached.agent_status || '';
   streamingContent = cached.streaming_content || '';
   try {{
-    if (evt.event_type === 'message_sent' || (evt.event_type === 'message' && evt.data && evt.data.role === 'user')) {{
+    if (evt.event_type !== 'status') applyActiveTurnUserIdFromData(evt.data, true);
+    if (evt.event_type === 'active_turn') {{
+      // activeTurnUserId was updated above; cache normalization below keeps queued rows ordered.
+    }} else if (evt.event_type === 'message_sent' || (evt.event_type === 'message' && evt.data && evt.data.role === 'user')) {{
       insertOrReconcileConfirmedUserMessage(evt.data || {{}});
     }} else if (evt.event_type === 'message' && evt.data && evt.data.role === 'error') {{
       agentStatus = 'thinking';
@@ -7283,7 +7291,12 @@ function connectSSE() {{
         updateCachedChatPanelFromEvent(evt);
         return;
       }}
-      if (evt.event_type === 'message' && evt.data && evt.data.role === 'error') {{
+      var activeTurnChanged = evt.event_type !== 'status'
+        ? applyActiveTurnUserIdFromData(evt.data, true)
+        : false;
+      if (evt.event_type === 'active_turn') {{
+        if (activeTurnChanged) renderMessages();
+      }} else if (evt.event_type === 'message' && evt.data && evt.data.role === 'error') {{
         markAgentActivity(evt.agent);
         var updated = false;
         for (var mi = chatMessages.length - 1; mi >= 0; mi--) {{
@@ -15249,7 +15262,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_page_preserves_visible_message_order_across_panel_refreshes() {
+    fn chat_page_preserves_server_message_order_across_panel_refreshes() {
         let html = render_chat_page(
             UiTheme::Parchment,
             ColorMode::Light,
@@ -15265,7 +15278,7 @@ mod tests {
         );
 
         assert!(html.contains(
-            "function mergeChatMessagesPreservingVisibleOrder(existingMessages, incomingMessages) {"
+            "function mergeChatMessagesPreservingServerOrder(existingMessages, incomingMessages) {"
         ));
         assert!(html.contains("function upsertToolUseMessage(data) {"));
         assert!(html.contains("function coalesceToolMessages(messages) {"));
@@ -15274,10 +15287,13 @@ mod tests {
         assert!(!html.contains("tool-turn:"));
         assert!(!html.contains("chatToolTurnId"));
         assert!(
-            html.contains("Object.assign({}, existingMessages[j], incomingByKey[existingKey])")
+            html.contains("Object.assign({}, existingByKey[incomingKey], incomingMessages[j])")
         );
-        assert!(html.contains("incomingMessages = mergeChatMessagesPreservingVisibleOrder(chatMessages, incomingMessages);"));
-        assert!(html.contains("incomingMessages = mergeChatMessagesPreservingVisibleOrder(cached.messages, incomingMessages);"));
+        assert!(html.contains("incomingMessages = mergeChatMessagesPreservingServerOrder(chatMessages, incomingMessages);"));
+        assert!(html.contains("incomingMessages = mergeChatMessagesPreservingServerOrder(cached.messages, incomingMessages);"));
+        assert!(html.contains("function applyActiveTurnUserIdFromData(data, promoteQueued) {"));
+        assert!(html.contains("if (evt.event_type === 'active_turn') {"));
+        assert!(html.contains("chatPanelRequestSeq++;"));
     }
 
     #[test]
@@ -15605,7 +15621,9 @@ mod tests {
         assert!(
             html.contains("if (requestSeq && requestSeq !== chatPanelRequestSeq) return data;")
         );
-        assert!(html.contains("cacheChatPanelResponse(data);"));
+        assert!(html.contains(
+            "if (requestSeq && requestSeq !== chatPanelRequestSeq) return data;\n      if (applyMode === 'background' && currentAgent !== requestedAgent) return data;\n      chatLastFullPanelRefreshAt = Date.now();\n      cacheChatPanelResponse(data);"
+        ));
         assert!(html.contains("function updateCachedChatPanelFromEvent(evt) {"));
         assert!(html.contains(
             "if (evt.agent !== currentAgent) {\n        updateCachedChatPanelFromEvent(evt);\n        return;\n      }"

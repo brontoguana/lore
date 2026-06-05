@@ -13492,6 +13492,18 @@ async fn chat_agent_poll(
         .claim_pending_user_messages(owner_str, &agent.name)?;
 
     if !pending.is_empty() {
+        if let Some(last) = pending.last() {
+            push_chat_event(
+                &state,
+                owner_str,
+                ChatEvent {
+                    event_type: "active_turn".into(),
+                    agent: agent.name.clone(),
+                    owner: owner_str.to_string(),
+                    data: json!({ "active_turn_user_id": last.id }),
+                },
+            );
+        }
         let msgs: Vec<Value> = pending
             .iter()
             .map(|m| json!({ "id": m.id, "content": m.content, "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() }))
@@ -13524,6 +13536,18 @@ async fn chat_agent_poll(
             .chat
             .claim_pending_user_messages(owner_str, &agent.name)?;
         if !pending.is_empty() {
+            if let Some(last) = pending.last() {
+                push_chat_event(
+                    &state,
+                    owner_str,
+                    ChatEvent {
+                        event_type: "active_turn".into(),
+                        agent: agent.name.clone(),
+                        owner: owner_str.to_string(),
+                        data: json!({ "active_turn_user_id": last.id }),
+                    },
+                );
+            }
             let msgs: Vec<Value> = pending
                 .iter()
                 .map(|m| json!({ "id": m.id, "content": m.content, "timestamp": m.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() }))
@@ -13563,6 +13587,11 @@ async fn chat_agent_respond(
     require_chat_authenticated_agent(&agent)?;
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
+    let active_turn_user_id = state
+        .chat
+        .load_conversation(owner_str, &agent.name)
+        .map(|conv| conv.active_turn_user_id)
+        .unwrap_or(0);
 
     if let Some(detail) = &body.tool_use {
         let msg = state
@@ -13580,6 +13609,7 @@ async fn chat_agent_respond(
                     "id": msg.id,
                     "detail": detail,
                     "content": msg.content,
+                    "active_turn_user_id": active_turn_user_id,
                     "tool_turn_id": tool_turn_id_from_client_message_id(msg.client_message_id.as_deref()),
                 }),
             },
@@ -13595,7 +13625,7 @@ async fn chat_agent_respond(
                 event_type: "chunk".into(),
                 agent: agent.name.clone(),
                 owner: owner_str.to_string(),
-                data: json!({ "text": text }),
+                data: json!({ "text": text, "active_turn_user_id": active_turn_user_id }),
             },
         );
     }
@@ -13617,7 +13647,12 @@ async fn chat_agent_respond(
                 event_type: "message".into(),
                 agent: agent.name.clone(),
                 owner: owner_str.to_string(),
-                data: json!({ "id": msg.id, "role": "assistant", "content": content }),
+                data: json!({
+                    "id": msg.id,
+                    "role": "assistant",
+                    "content": content,
+                    "active_turn_user_id": active_turn_user_id,
+                }),
             },
         );
     }
@@ -13647,7 +13682,11 @@ async fn chat_agent_respond(
                     event_type: "response_complete".into(),
                     agent: agent.name.clone(),
                     owner: owner_str.to_string(),
-                    data: json!({ "id": msg.id, "content": content }),
+                    data: json!({
+                        "id": msg.id,
+                        "content": content,
+                        "active_turn_user_id": active_turn_user_id,
+                    }),
                 },
             );
         } else {
@@ -13658,7 +13697,7 @@ async fn chat_agent_respond(
                     event_type: "response_complete".into(),
                     agent: agent.name.clone(),
                     owner: owner_str.to_string(),
-                    data: json!({}),
+                    data: json!({ "active_turn_user_id": active_turn_user_id }),
                 },
             );
         }
@@ -18754,9 +18793,15 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["messages"][0]["id"], 1);
 
         let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
         assert_eq!(conv.agent_status, AgentChatStatus::Thinking);
+        assert_eq!(conv.active_turn_user_id, 1);
     }
 
     #[derive(Clone)]
