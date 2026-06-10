@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-06-10
+
+- Added Claude Fable 5 support for process agents by exposing the `fable` model alias in chat configuration and `/model` help, refreshed the displayed Claude model ids, and allowed Claude `xhigh` effort for supported Claude Code models.
+
 ## 2026-06-05
 
 - Fixed chat UI refresh/order races by dropping stale panel responses after local sends, reconciling panel refreshes in server message-id order, and sending active-turn ids with agent output so queued follow-ups do not pull final agent messages above the active user message.

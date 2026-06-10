@@ -7421,14 +7421,14 @@ var CHAT_MESSAGE_SWIPE_OPEN_THRESHOLD = 14;
 var CHAT_MESSAGE_SWIPE_TOGGLE_THRESHOLD = 30;
 
 var backendModels = {{
-  claude: ['default', 'opus', 'sonnet', 'haiku'],
+  claude: ['default', 'fable', 'opus', 'sonnet', 'haiku'],
   agy: ['default'],
   codex: ['default', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2'],
   openai: ['default']
 }};
 
 var backendEfforts = {{
-  claude: ['default', 'low', 'medium', 'high', 'max'],
+  claude: ['default', 'low', 'medium', 'high', 'xhigh', 'max'],
   agy: [],
   codex: ['default', 'minimal', 'low', 'medium', 'high', 'xhigh'],
   openai: []
@@ -15690,8 +15690,10 @@ mod tests {
         assert!(html.contains(
             "codex: ['default', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2']"
         ));
+        assert!(html.contains("claude: ['default', 'fable', 'opus', 'sonnet', 'haiku']"));
         assert!(html.contains("function applyBackendModelOptions(options) {"));
         assert!(html.contains("applyBackendModelOptions(data.model_options);"));
+        assert!(html.contains("claude: ['default', 'low', 'medium', 'high', 'xhigh', 'max']"));
         assert!(html.contains("codex: ['default', 'minimal', 'low', 'medium', 'high', 'xhigh']"));
         assert!(html.contains("function syncExpandedTextEditorViewport() {"));
         assert!(html.contains("scheduleExpandedTextEditorViewportSync();"));

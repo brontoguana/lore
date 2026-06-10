@@ -16085,7 +16085,7 @@ struct ChatSaveConfigForm {
     endpoint_id: Option<String>,
 }
 
-const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "max"];
+const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 
 fn codex_home_dir() -> Option<PathBuf> {
@@ -16144,7 +16144,7 @@ fn codex_model_options_from_cache_value(value: &Value) -> Option<Vec<String>> {
 
 fn chat_backend_model_options() -> Value {
     json!({
-        "claude": ["default", "opus", "sonnet", "haiku"],
+        "claude": ["default", "fable", "opus", "sonnet", "haiku"],
         "agy": ["default"],
         "codex": codex_model_options(),
         "openai": ["default"],
@@ -16724,7 +16724,7 @@ async fn chat_slash_command(
                             "Current model: {current}\n\nAntigravity CLI print mode does not expose a Lore-controlled model flag.\n\nUse /model default to clear any stored override."
                         ),
                         "claude" => format!(
-                            "Current model: {current}\n\nOptions:\n  /model opus (claude-opus-4-6)\n  /model sonnet (claude-sonnet-4-6)\n  /model haiku (claude-haiku-4-5)\n  /model <full-model-id>\n  /model default"
+                            "Current model: {current}\n\nOptions:\n  /model fable (claude-fable-5)\n  /model opus (claude-opus-4-8)\n  /model sonnet (claude-sonnet-4-6)\n  /model haiku (claude-haiku-4-5)\n  /model <full-model-id>\n  /model default"
                         ),
                         "codex" => model_options_text(current, &codex_model_options()),
                         _ => format!(
@@ -18045,6 +18045,17 @@ mod tests {
                 "gpt-5.4".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn claude_config_options_include_fable_and_xhigh_effort() {
+        let model_options = super::chat_backend_model_options();
+
+        assert_eq!(
+            model_options["claude"],
+            json!(["default", "fable", "opus", "sonnet", "haiku"])
+        );
+        assert!(super::CLAUDE_EFFORT_LEVELS.contains(&"xhigh"));
     }
 
     #[test]
