@@ -4,7 +4,10 @@ use lore_core::updater::{download_update_to_path, hex_sha256};
 use lore_core::{
     AgentBackend, Block, BlockType, DEFAULT_UPDATE_REPO, ProjectName, ReleaseStream,
     SelfUpdateOutcome, check_for_update, current_datetime_prompt_line,
-    current_datetime_prompt_line_at, manager::extract_manager_delay_prefix,
+    current_datetime_prompt_line_at,
+    manager::{
+        ManagerControlKind, manager_response_display_content, parse_manager_control_response,
+    },
     maybe_apply_self_update, slugify,
 };
 use reqwest::{Method, StatusCode};
@@ -5067,18 +5070,19 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         return Ok(());
     }
 
-    let (delay_seconds, manager_response) = extract_manager_delay_prefix(&manager_response);
-    let has_stop = manager_response.contains("STOPPING_POINT");
-    let has_red = manager_response.contains("RED_FLAG_POINT");
-    let stopped = has_stop || has_red;
-
-    let display = if has_stop {
-        manager_response.replace("STOPPING_POINT", "\u{2705}")
-    } else if has_red {
-        manager_response.replace("RED_FLAG_POINT", "\u{1f6a9}")
-    } else {
-        manager_response.clone()
+    let parsed_response = parse_manager_control_response(&manager_response);
+    let delay_seconds = match parsed_response.control {
+        ManagerControlKind::Wait(delay_seconds) => Some(delay_seconds),
+        _ => None,
     };
+    let stopped = matches!(
+        parsed_response.control,
+        ManagerControlKind::StoppingPoint | ManagerControlKind::RedFlag
+    );
+    let mut display = manager_response_display_content(&parsed_response);
+    if display.trim().is_empty() {
+        display = manager_response.trim().to_string();
+    }
 
     eprintln!("[manager] Reporting to server (stopped={stopped})");
 
@@ -5143,7 +5147,7 @@ async fn run_manager_cli(
         }
     }
 
-    prompt_parts.push("\n## Instructions\n\nReview the conversation above and respond as the manager speaking directly to the agent. Give a concrete next instruction, not advice to the user. Do not ask the user for clarification or more input unless the stopping criteria explicitly require that. If the agent needs to wait on a known long-running task, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line and put the delayed instruction below it. You may READ files from the working directory if needed to verify periodic checks, but you must NEVER edit, create, delete, or execute any files or commands. Your only output should be the manager's instruction text for the agent.".to_string());
+    prompt_parts.push("\n## Instructions\n\nReview the conversation above and respond as the manager speaking directly to the agent. The first line of stdout must be exactly one of the control formats from the system prompt: STOPPING_POINT: <short reason>, RED_FLAG_POINT: <short reason>, WAIT_FOR_SECONDS: <1-600>, or CONTINUE. Do not write any preamble before that first line, and do not put control tokens after the first line. Give a concrete next instruction, not advice to the user. Do not ask the user for clarification or more input unless the stopping criteria explicitly require that. You may READ files from the working directory if needed to verify periodic checks, but you must NEVER edit, create, delete, or execute any files or commands. Your only output should be the control line followed by the manager's instruction text for the agent.".to_string());
 
     let full_prompt = prompt_parts.join("\n\n");
 

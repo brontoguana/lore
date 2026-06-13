@@ -363,7 +363,12 @@ async function runManagerTurnIfEnabled(baseURL: string, agentToken: string): Pro
       content = `[manager error ${r.status}]`;
     }
   }
-  const stopped = content.includes('STOPPING_POINT') || content.includes('RED_FLAG_POINT');
+  const firstLine = content.trimStart().split(/\r?\n/, 1)[0]?.trim() ?? '';
+  const stopped =
+    firstLine === 'STOPPING_POINT' ||
+    firstLine.startsWith('STOPPING_POINT:') ||
+    firstLine === 'RED_FLAG_POINT' ||
+    firstLine.startsWith('RED_FLAG_POINT:');
   await fetch(`${baseURL}/v1/chat/manager`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-lore-key': agentToken },

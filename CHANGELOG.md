@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-06-13
+
+- Clarified manager control responses with a required first-line protocol for `STOPPING_POINT`, `RED_FLAG_POINT`, `WAIT_FOR_SECONDS`, and `CONTINUE`, and made CLI/API manager parsing honor only first-line control signals.
+
 ## 2026-06-10
 
 - Added Claude Fable 5 support for process agents by exposing the `fable` model alias in chat configuration and `/model` help, refreshed the displayed Claude model ids, and allowed Claude `xhigh` effort for supported Claude Code models.

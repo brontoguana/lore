@@ -22,8 +22,9 @@ use crate::librarian::{
     StoredLibrarianOperation, build_action_prompt, build_prompt, build_prompt_multi_project,
 };
 use crate::manager::{
-    ManagerPromptConfig, ManagerPromptConfigStore, ManagerPromptOverride, ManagerPromptStage,
-    describe_manager_delay, extract_manager_delay_prefix,
+    ManagerControlKind, ManagerPromptConfig, ManagerPromptConfigStore, ManagerPromptOverride,
+    ManagerPromptStage, describe_manager_delay, manager_response_display_content,
+    parse_manager_control_response,
 };
 use crate::model::{
     Block, BlockId, BlockType, DocumentId, ImageUpload, KeyFingerprint, NewBlock, OrderKey,
@@ -14706,19 +14707,24 @@ async fn chat_agent_manager_report(
         .chat_audit
         .log(&agent.name, owner_str, "manager", &body.content);
 
-    let mut delayed_content = body.content.trim().to_string();
+    let parsed_response = parse_manager_control_response(&body.content);
+    let parsed_stopped = matches!(
+        parsed_response.control,
+        ManagerControlKind::StoppingPoint | ManagerControlKind::RedFlag
+    );
+    let stopped = body.stopped || parsed_stopped;
+    let mut delayed_content = manager_response_display_content(&parsed_response);
+    if delayed_content.trim().is_empty() {
+        delayed_content = body.content.trim().to_string();
+    }
     let mut delayed_until_unix = None;
-    if !body.stopped {
+    if !stopped {
         if let Some(delay_seconds) = body.delay_seconds.filter(|secs| *secs > 0) {
             delayed_until_unix =
                 Some(OffsetDateTime::now_utc().unix_timestamp() + delay_seconds as i64);
-        } else {
-            let (parsed_delay, stripped_content) = extract_manager_delay_prefix(&body.content);
-            if let Some(delay_seconds) = parsed_delay {
-                delayed_until_unix =
-                    Some(OffsetDateTime::now_utc().unix_timestamp() + delay_seconds as i64);
-                delayed_content = stripped_content;
-            }
+        } else if let ManagerControlKind::Wait(delay_seconds) = parsed_response.control {
+            delayed_until_unix =
+                Some(OffsetDateTime::now_utc().unix_timestamp() + delay_seconds as i64);
         }
     }
 
@@ -14730,7 +14736,7 @@ async fn chat_agent_manager_report(
         mc.request_announced = false;
         mc.delayed_message.clear();
         mc.delayed_until_unix = 0;
-        if body.stopped {
+        if stopped {
             auto_disabled = mc.enabled;
             mc.enabled = false;
         } else if let Some(until) = delayed_until_unix {
@@ -14764,7 +14770,7 @@ async fn chat_agent_manager_report(
         );
     }
 
-    if !body.stopped && delayed_until_unix.is_none() {
+    if !stopped && delayed_until_unix.is_none() {
         let notifier_key = format!("{}_{}", owner_str, agent.name);
         if let Some(notify) = state
             .chat_agent_notifiers
@@ -15087,27 +15093,35 @@ fn build_manager_prompt(
         mc.goals, mc.stopping_point, mc.red_flags
     );
 
-    let sentinel = "\n\nCRITICAL SIGNAL TOKENS:\n\
-                     The tokens STOPPING_POINT and RED_FLAG_POINT are control signals that halt the agent. \
-                     They are NOT words to discuss, quote, explain, echo, or demonstrate. \
-                     Any appearance of either token anywhere in your response is treated as a live signal and will stop the agent immediately.\n\n\
-                     You MUST NOT write STOPPING_POINT or RED_FLAG_POINT under ANY of the following circumstances:\n\
-                     - As examples, demonstrations, or illustrations of what the tokens look like\n\
-                     - When summarizing, paraphrasing, or restating these instructions\n\
-                     - Inside quotes, code blocks, backticks, or markdown\n\
-                     - When describing the stopping point or red flag criteria in prose\n\
-                     - In hypotheticals (\"if STOPPING_POINT were triggered...\")\n\
-                     - In any other context whatsoever\n\n\
-                     Write STOPPING_POINT ONLY when the stopping point criteria above are actually met right now and the agent should halt.\n\
-                     Write RED_FLAG_POINT ONLY when a red flag above has actually triggered right now and the agent should halt.\n\
-                     When referring to these concepts in guidance, use plain English (\"the stopping criteria\", \"a red flag\") \u{2014} never the literal token.\n\n\
+    let control_protocol = "\n\nCONTROL LINE PROTOCOL:\n\
+                     Before writing your response, choose exactly one control state.\n\n\
+                     Priority order:\n\
+                     1. STOPPING_POINT if the stopping point has been reached and the agent should halt.\n\
+                     2. RED_FLAG_POINT if any red flag is present and the agent should halt.\n\
+                     3. WAIT_FOR_SECONDS if the agent is waiting on a known long-running operation.\n\
+                     4. CONTINUE otherwise.\n\n\
+                     The first line of your response MUST be exactly one of these formats:\n\
+                     STOPPING_POINT: <short reason>\n\
+                     RED_FLAG_POINT: <short reason>\n\
+                     WAIT_FOR_SECONDS: <1-600>\n\
+                     CONTINUE\n\n\
+                     Put the operational instruction for the agent after the first line. \
+                     If you use WAIT_FOR_SECONDS, the body should say what to check or do after waiting. \
+                     Do not put STOPPING_POINT, RED_FLAG_POINT, WAIT_FOR_SECONDS, or CONTINUE anywhere except the first line.\n\n\
+                     Examples:\n\
+                     STOPPING_POINT: The requested release is deployed and verified.\n\
+                     Do not continue. Report the completed version, commit, and health checks.\n\n\
+                     RED_FLAG_POINT: The agent is about to overwrite unrelated user changes.\n\
+                     Stop and inspect the working tree before editing.\n\n\
+                     WAIT_FOR_SECONDS: 90\n\
+                     The build is still running. After waiting, check the final test result and continue from there.\n\n\
+                     CONTINUE\n\
+                     The current path is on track. Run the focused regression test next.\n\n\
                      RESPONSE RULES:\n\
                      - Write to the agent, not to the user\n\
                      - Give a concrete next instruction or decision\n\
                      - Do not ask the user for clarification, approval, or more input\n\
                      - Do not wait for the user unless the stated goals or stopping criteria require it\n\
-                     - If the agent is on track, say so briefly and tell it what to do next\n\
-                     - If the agent is waiting on a known long-running task, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line, then put the delayed instruction below it\n\
                      - Keep the response short and operational";
 
     let (stage, context) = match turn_in_cycle {
@@ -15124,7 +15138,7 @@ fn build_manager_prompt(
     };
     let stage_prompt = prompt_config.prompt_for_stage(stage);
     format!(
-        "{}\n\n{base}{sentinel}\n\n{context}{stage_prompt}",
+        "{}\n\n{base}{control_protocol}\n\n{context}{stage_prompt}",
         crate::prompt::current_datetime_prompt_line()
     )
 }
@@ -23358,17 +23372,23 @@ mod tests {
         assert!(review.contains(" UTC\n\nYou are a manager"));
         assert!(review.contains("direct instructions to the agent"));
         assert!(review.contains("Do not ask the user for input"));
+        assert!(review.contains("Before writing your response, choose exactly one control state."));
+        assert!(review.contains("Priority order:"));
+        assert!(review.contains("STOPPING_POINT: <short reason>"));
+        assert!(review.contains("RED_FLAG_POINT: <short reason>"));
         assert!(review.contains("WAIT_FOR_SECONDS: <1-600>"));
+        assert!(review.contains("CONTINUE\n"));
+        assert!(review.contains("Do not put STOPPING_POINT, RED_FLAG_POINT, WAIT_FOR_SECONDS, or CONTINUE anywhere except the first line."));
 
         let periodic = super::build_manager_prompt(&mc, &prompt_config, 3);
         assert!(periodic.contains("direct instructions to the agent"));
         assert!(periodic.contains("Do not ask the user for input"));
-        assert!(periodic.contains("WAIT_FOR_SECONDS: <1-600>"));
+        assert!(periodic.contains("Use the required first-line control state"));
 
         let validate = super::build_manager_prompt(&mc, &prompt_config, 4);
         assert!(validate.contains("tell the agent exactly what to do next"));
         assert!(validate.contains("Do not ask the user for input"));
-        assert!(validate.contains("WAIT_FOR_SECONDS: <1-600>"));
+        assert!(validate.contains("Use the required first-line control state"));
     }
 
     #[test]

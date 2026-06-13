@@ -234,7 +234,7 @@ test.describe('Agent flow', () => {
     mock.clear();
     mock.queue([
       { text: 'agent says done' },
-      { text: 'Great work. STOPPING_POINT' },
+      { text: 'STOPPING_POINT: The agent says done.\nReport that the task is complete.' },
     ]);
     const { agentName, endpointId, loop } = await setupAgent(page, baseURL!);
     try {
@@ -260,7 +260,7 @@ test.describe('Agent flow', () => {
     mock.clear();
     mock.queue([
       { text: 'agent wandered off' },
-      { text: 'Halt immediately. RED_FLAG_POINT' },
+      { text: 'RED_FLAG_POINT: The agent wandered off.\nStop and report the issue.' },
     ]);
     const { agentName, endpointId, loop } = await setupAgent(page, baseURL!);
     try {

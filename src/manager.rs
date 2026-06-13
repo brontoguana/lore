@@ -6,6 +6,23 @@ use time::OffsetDateTime;
 
 pub const MANAGER_DELAY_PREFIX: &str = "WAIT_FOR_SECONDS:";
 pub const MAX_MANAGER_DELAY_SECONDS: u64 = 10 * 60;
+pub const MANAGER_STOPPING_TOKEN: &str = "STOPPING_POINT";
+pub const MANAGER_RED_FLAG_TOKEN: &str = "RED_FLAG_POINT";
+pub const MANAGER_CONTINUE_TOKEN: &str = "CONTINUE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerControlKind {
+    Continue,
+    Wait(u64),
+    StoppingPoint,
+    RedFlag,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedManagerResponse {
+    pub control: ManagerControlKind,
+    pub content: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagerPromptStage {
@@ -21,61 +38,134 @@ impl ManagerPromptStage {
                 "Review the agent's latest output and decide the next thing the agent should do. \
 Respond as direct instructions to the agent. \
 Do not ask the user for input. \
-If the agent is waiting on a known long-running task, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line, then put the delayed instruction below it. \
+Use the required first-line control state from the protocol above. \
+If the agent is waiting on a known long-running task, use WAIT_FOR_SECONDS with the number of seconds to wait, then put the delayed instruction below it. \
 If the agent is on track, briefly confirm that and tell it the next concrete step."
             }
             Self::RunPeriodicChecks => {
                 "It's time for periodic checks. Ask the agent to verify the items listed above. \
 Frame your message as direct instructions to the agent. \
-If the checks are known to take a while, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line, then put the delayed instruction below it. \
+Use the required first-line control state from the protocol above. \
+If the checks are known to take a while, use WAIT_FOR_SECONDS with the number of seconds to wait, then put the delayed instruction below it. \
 Do not ask the user for input."
             }
             Self::ValidatePeriodicChecks => {
                 "The agent just ran periodic checks. Validate the results. \
 If anything looks wrong, flag it. Then tell the agent exactly what to do next. \
-If the agent now needs to wait on a known long-running task, you may prefix your response with WAIT_FOR_SECONDS: <1-600> on the first line, then put the delayed instruction below it. \
+Use the required first-line control state from the protocol above. \
+If the agent now needs to wait on a known long-running task, use WAIT_FOR_SECONDS with the number of seconds to wait, then put the delayed instruction below it. \
 Do not ask the user for input."
             }
         }
     }
 }
 
-pub fn extract_manager_delay_prefix(content: &str) -> (Option<u64>, String) {
+pub fn parse_manager_control_response(content: &str) -> ParsedManagerResponse {
     let trimmed = content.trim_start();
-    let Some(first_line_end) = trimmed.find('\n') else {
-        return parse_delay_line(trimmed, "");
-    };
-    let (first_line, rest) = trimmed.split_at(first_line_end);
-    parse_delay_line(first_line, rest.trim_start_matches('\n'))
+    if trimmed.is_empty() {
+        return ParsedManagerResponse {
+            control: ManagerControlKind::Continue,
+            content: String::new(),
+        };
+    }
+
+    let (first_line, rest) = split_first_line(trimmed);
+    let first_line = first_line.trim();
+    let rest = rest.trim();
+
+    if let Some(reason) = parse_signal_line(first_line, MANAGER_STOPPING_TOKEN) {
+        return ParsedManagerResponse {
+            control: ManagerControlKind::StoppingPoint,
+            content: join_signal_reason_and_body(reason, rest),
+        };
+    }
+    if let Some(reason) = parse_signal_line(first_line, MANAGER_RED_FLAG_TOKEN) {
+        return ParsedManagerResponse {
+            control: ManagerControlKind::RedFlag,
+            content: join_signal_reason_and_body(reason, rest),
+        };
+    }
+    if let Some(raw_delay) = first_line.strip_prefix(MANAGER_DELAY_PREFIX) {
+        if let Ok(delay_seconds) = raw_delay.trim().parse::<u64>() {
+            if delay_seconds > 0 && delay_seconds <= MAX_MANAGER_DELAY_SECONDS && !rest.is_empty() {
+                return ParsedManagerResponse {
+                    control: ManagerControlKind::Wait(delay_seconds),
+                    content: rest.to_string(),
+                };
+            }
+        }
+    }
+    if let Some(reason) = parse_signal_line(first_line, MANAGER_CONTINUE_TOKEN) {
+        let content = join_signal_reason_and_body(reason, rest);
+        return ParsedManagerResponse {
+            control: ManagerControlKind::Continue,
+            content: if content.is_empty() {
+                trimmed.trim().to_string()
+            } else {
+                content
+            },
+        };
+    }
+
+    ParsedManagerResponse {
+        control: ManagerControlKind::Continue,
+        content: trimmed.trim().to_string(),
+    }
 }
 
-fn parse_delay_line(first_line: &str, rest: &str) -> (Option<u64>, String) {
-    let Some(raw_delay) = first_line.strip_prefix(MANAGER_DELAY_PREFIX) else {
-        return (
-            None,
-            first_line.to_string() + if rest.is_empty() { "" } else { "\n" } + rest,
-        );
-    };
-    let Ok(delay_seconds) = raw_delay.trim().parse::<u64>() else {
-        return (
-            None,
-            first_line.to_string() + if rest.is_empty() { "" } else { "\n" } + rest,
-        );
-    };
-    if delay_seconds == 0 || delay_seconds > MAX_MANAGER_DELAY_SECONDS {
-        return (
-            None,
-            first_line.to_string() + if rest.is_empty() { "" } else { "\n" } + rest,
-        );
+pub fn manager_response_display_content(parsed: &ParsedManagerResponse) -> String {
+    match parsed.control {
+        ManagerControlKind::StoppingPoint => prefix_manager_signal("\u{2705}", &parsed.content),
+        ManagerControlKind::RedFlag => prefix_manager_signal("\u{1f6a9}", &parsed.content),
+        ManagerControlKind::Continue | ManagerControlKind::Wait(_) => parsed.content.clone(),
     }
-    let delayed_message = rest.trim().to_string();
-    if delayed_message.is_empty() {
-        return (
-            None,
-            first_line.to_string() + if rest.is_empty() { "" } else { "\n" } + rest,
-        );
+}
+
+pub fn extract_manager_delay_prefix(content: &str) -> (Option<u64>, String) {
+    let parsed = parse_manager_control_response(content);
+    match parsed.control {
+        ManagerControlKind::Wait(delay_seconds) => (Some(delay_seconds), parsed.content),
+        _ => (None, content.trim_start().trim().to_string()),
     }
-    (Some(delay_seconds), delayed_message)
+}
+
+fn split_first_line(content: &str) -> (&str, &str) {
+    if let Some(first_line_end) = content.find('\n') {
+        (
+            content[..first_line_end].trim_end_matches('\r'),
+            &content[first_line_end + 1..],
+        )
+    } else {
+        (content.trim_end_matches('\r'), "")
+    }
+}
+
+fn parse_signal_line<'a>(first_line: &'a str, token: &str) -> Option<&'a str> {
+    if first_line == token {
+        Some("")
+    } else {
+        first_line
+            .strip_prefix(token)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .map(str::trim)
+    }
+}
+
+fn join_signal_reason_and_body(reason: &str, body: &str) -> String {
+    match (reason.trim().is_empty(), body.trim().is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => body.trim().to_string(),
+        (false, true) => reason.trim().to_string(),
+        (false, false) => format!("{}\n{}", reason.trim(), body.trim()),
+    }
+}
+
+fn prefix_manager_signal(prefix: &str, content: &str) -> String {
+    if content.trim().is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix} {}", content.trim())
+    }
 }
 
 pub fn describe_manager_delay(delay_seconds: u64) -> String {
@@ -218,8 +308,9 @@ fn write_json_atomic(path: PathBuf, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagerPromptConfig, ManagerPromptConfigStore, ManagerPromptOverride, ManagerPromptStage,
-        describe_manager_delay, extract_manager_delay_prefix,
+        ManagerControlKind, ManagerPromptConfig, ManagerPromptConfigStore, ManagerPromptOverride,
+        ManagerPromptStage, describe_manager_delay, extract_manager_delay_prefix,
+        manager_response_display_content, parse_manager_control_response,
     };
     use tempfile::tempdir;
 
@@ -315,6 +406,49 @@ mod tests {
         let (delay, message) = extract_manager_delay_prefix("WAIT_FOR_SECONDS: 999\nToo long");
         assert_eq!(delay, None);
         assert_eq!(message, "WAIT_FOR_SECONDS: 999\nToo long");
+    }
+
+    #[test]
+    fn manager_control_response_parses_first_line_protocol() {
+        let stop = parse_manager_control_response(
+            "STOPPING_POINT: Release deployed\nReport the commit and health checks.",
+        );
+        assert_eq!(stop.control, ManagerControlKind::StoppingPoint);
+        assert_eq!(
+            stop.content,
+            "Release deployed\nReport the commit and health checks."
+        );
+        assert_eq!(
+            manager_response_display_content(&stop),
+            "\u{2705} Release deployed\nReport the commit and health checks."
+        );
+
+        let red = parse_manager_control_response("RED_FLAG_POINT: Unrelated files changed");
+        assert_eq!(red.control, ManagerControlKind::RedFlag);
+        assert_eq!(
+            manager_response_display_content(&red),
+            "\u{1f6a9} Unrelated files changed"
+        );
+
+        let wait = parse_manager_control_response("WAIT_FOR_SECONDS: 90\nCheck the build result.");
+        assert_eq!(wait.control, ManagerControlKind::Wait(90));
+        assert_eq!(wait.content, "Check the build result.");
+
+        let cont = parse_manager_control_response("CONTINUE\nRun the focused regression next.");
+        assert_eq!(cont.control, ManagerControlKind::Continue);
+        assert_eq!(cont.content, "Run the focused regression next.");
+    }
+
+    #[test]
+    fn manager_control_response_ignores_inline_control_words() {
+        let parsed = parse_manager_control_response(
+            "The agent mentioned STOPPING_POINT in prose, but should keep going.",
+        );
+        assert_eq!(parsed.control, ManagerControlKind::Continue);
+        assert_eq!(
+            parsed.content,
+            "The agent mentioned STOPPING_POINT in prose, but should keep going."
+        );
     }
 
     #[test]
