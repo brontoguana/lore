@@ -5589,6 +5589,41 @@ function normalizeChatImageFile(file) {{
   }});
 }}
 
+function parseManagerMessage(content) {{
+  if (typeof content !== 'string') return null;
+  var normalized = content.replace(/\r\n/g, '\n').trim();
+  if (normalized.indexOf('\ud83d\udc54') !== 0) return null;
+  var lines = normalized.split('\n');
+  var head = lines.shift().replace(/^\ud83d\udc54\s*/, '').trim();
+  var body = lines.join('\n').trim();
+  var legacy = head.match(/^(\u2705|\ud83d\udea9)\s*(.*)$/);
+  if (legacy) {{
+    return {{
+      decision: legacy[1] === '\ud83d\udea9' ? 'Red Flag' : 'Stopping Point',
+      decisionClass: legacy[1] === '\ud83d\udea9' ? 'red-flag' : 'stopping-point',
+      body: (legacy[2] + (body ? '\n' + body : '')).trim()
+    }};
+  }}
+  if (head === 'Continue') return {{ decision: 'Continue', decisionClass: 'continue', body: body }};
+  if (head === 'Red Flag') return {{ decision: 'Red Flag', decisionClass: 'red-flag', body: body }};
+  if (head === 'Stopping Point') return {{ decision: 'Stopping Point', decisionClass: 'stopping-point', body: body }};
+  if (/^Wait \d+s$/.test(head)) return {{ decision: head, decisionClass: 'wait', body: body }};
+  return null;
+}}
+
+function renderManagerMessage(managerMessage) {{
+  var html = '<div class="chat-manager-response">';
+  html += '<div class="chat-manager-response-head">';
+  html += '<span class="chat-manager-icon" title="Manager">{ICON_MANAGER}</span>';
+  html += '<span class="chat-manager-decision chat-manager-decision-' + managerMessage.decisionClass + '">' + escapeHtmlRaw(managerMessage.decision) + '</span>';
+  html += '</div>';
+  if (managerMessage.body) {{
+    html += '<div class="chat-manager-response-body">' + renderMarkdown(managerMessage.body) + '</div>';
+  }}
+  html += '</div>';
+  return html;
+}}
+
 function removeChatImageAttachment(id) {{
   chatImageAttachments = chatImageAttachments.filter(function(att) {{ return att.id !== id; }});
   renderChatAttachmentStrip();
@@ -5753,12 +5788,14 @@ function renderMessages() {{
       continue;
     }}
     var msg = chatMessages[i];
-    var kind = msg.role === 'user' ? 'user' : msg.role === 'system' ? 'system' : msg.role === 'config' ? 'config' : msg.role === 'tool' ? 'tool' : msg.role === 'error' ? 'error' : 'assistant';
+    var managerMessage = parseManagerMessage(msg.content);
+    var kind = managerMessage ? 'manager' : msg.role === 'user' ? 'user' : msg.role === 'system' ? 'system' : msg.role === 'config' ? 'config' : msg.role === 'tool' ? 'tool' : msg.role === 'error' ? 'error' : 'assistant';
     var cls = kind === 'user' ? 'chat-msg-user' : kind === 'system' ? 'chat-msg-system' : kind === 'config' ? 'chat-msg-config' : kind === 'tool' ? 'chat-msg-tool' : kind === 'error' ? 'chat-msg-error' : 'chat-msg-assistant';
+    if (managerMessage) cls = 'chat-msg-manager';
     if (msg._thinking) cls += ' chat-msg-thinking';
     if (msg.excluded_from_context) cls += ' chat-msg-excluded';
     var messageId = chatMessageId(msg);
-    var canMutate = chatMessageCanMutate(msg);
+    var canMutate = !managerMessage && chatMessageCanMutate(msg);
     html += '<div class="chat-msg-row chat-msg-row-' + kind + (canMutate ? ' chat-msg-row-mutable' : '') + (msg.excluded_from_context ? ' chat-msg-row-excluded' : '') + '" data-chat-idx="' + i + '"' + (canMutate ? ' data-chat-msg-id="' + messageId + '"' : '') + '>';
     var timestamp = formatChatTimestamp(msg.timestamp);
     if (timestamp) {{
@@ -5780,7 +5817,9 @@ function renderMessages() {{
     if (msg.excluded_from_context) {{
       html += '<div class="chat-msg-excluded-prefix" title="Excluded from agent context">&#128465;</div>';
     }}
-    if (msg.role === 'assistant') {{
+    if (managerMessage) {{
+      html += renderManagerMessage(managerMessage);
+    }} else if (msg.role === 'assistant') {{
       html += '<div class="chat-msg-content">' + renderAssistantMarkdown(msg.content) + '</div>';
     }} else if (msg.role === 'user') {{
       html += '<div class="chat-msg-content">' + renderMarkdown(msg.content) + '</div>';
@@ -12446,6 +12485,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       align-items: flex-end;
     }
     .chat-msg-row-assistant,
+    .chat-msg-row-manager,
     .chat-msg-row-tool,
     .chat-msg-row-error {
       align-items: flex-start;
@@ -12534,6 +12574,73 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: color-mix(in srgb, var(--bg-hover) 72%, var(--panel));
       color: var(--fg-muted);
       font-size: 0.84rem;
+    }
+    .chat-msg-manager {
+      align-self: flex-start;
+      background: var(--panel);
+      color: var(--fg);
+      border: 1px solid var(--line);
+      max-width: 100%;
+    }
+    .chat-manager-response {
+      display: grid;
+      gap: var(--s-2);
+      min-width: 0;
+    }
+    .chat-manager-response-head {
+      display: flex;
+      align-items: center;
+      gap: var(--s-2);
+      min-width: 0;
+    }
+    .chat-manager-icon {
+      width: 20px;
+      height: 20px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+      border-radius: 999px;
+    }
+    .chat-manager-decision {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      font-size: 0.78rem;
+      line-height: 1.2;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--bg);
+      color: var(--fg);
+    }
+    .chat-manager-decision-continue {
+      color: var(--accent);
+      background: var(--accent-soft);
+      border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    }
+    .chat-manager-decision-wait {
+      color: #92400e;
+      background: rgba(146, 64, 14, 0.08);
+      border-color: rgba(146, 64, 14, 0.24);
+    }
+    .chat-manager-decision-red-flag {
+      color: #dc2626;
+      background: rgba(220, 38, 38, 0.08);
+      border-color: rgba(220, 38, 38, 0.28);
+    }
+    .chat-manager-decision-stopping-point {
+      color: #047857;
+      background: rgba(4, 120, 87, 0.08);
+      border-color: rgba(4, 120, 87, 0.26);
+    }
+    .chat-manager-response-body {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .chat-msg-system {
       align-self: center;
@@ -15201,6 +15308,46 @@ mod tests {
         assert!(
             html.contains("if (currentAgent) updateAgentListStatus(currentAgent, agentStatus);")
         );
+    }
+
+    #[test]
+    fn chat_page_renders_manager_messages_with_decision_header() {
+        let html = render_chat_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[ChatAgentSummary {
+                name: "worker".into(),
+                display_name: "Worker".into(),
+                owner: "admin".into(),
+                status: "idle".into(),
+                manage_enabled: true,
+                last_message: None,
+                last_message_time: None,
+                profile_url: None,
+                cwd: None,
+                git_branch: None,
+            }],
+            Some("worker"),
+            r#"[{"id":1,"role":"assistant","content":"👔 Red Flag\nStop before overwriting unrelated files."}]"#,
+            0,
+            None,
+            &[],
+        );
+
+        assert!(html.contains("function parseManagerMessage(content) {"));
+        assert!(html.contains("function renderManagerMessage(managerMessage) {"));
+        assert!(html.contains("var managerMessage = parseManagerMessage(msg.content);"));
+        assert!(html.contains("var canMutate = !managerMessage && chatMessageCanMutate(msg);"));
+        assert!(html.contains("html += renderManagerMessage(managerMessage);"));
+        assert!(html.contains(r#"<span class="chat-manager-icon" title="Manager">"#));
+        assert!(html.contains("chat-manager-decision-red-flag"));
+        assert!(html.contains("chat-manager-decision-stopping-point"));
+        assert!(html.contains("chat-manager-decision-wait"));
+        assert!(html.contains(".chat-msg-manager {"));
+        assert!(html.contains(".chat-msg-row-manager,"));
     }
 
     #[test]

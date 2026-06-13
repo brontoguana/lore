@@ -121,6 +121,15 @@ pub fn manager_response_display_content(parsed: &ParsedManagerResponse) -> Strin
     }
 }
 
+pub fn manager_control_decision_label(control: ManagerControlKind) -> String {
+    match control {
+        ManagerControlKind::Continue => "Continue".to_string(),
+        ManagerControlKind::Wait(delay_seconds) => format!("Wait {delay_seconds}s"),
+        ManagerControlKind::StoppingPoint => "Stopping Point".to_string(),
+        ManagerControlKind::RedFlag => "Red Flag".to_string(),
+    }
+}
+
 pub fn extract_manager_delay_prefix(content: &str) -> (Option<u64>, String) {
     let parsed = parse_manager_control_response(content);
     match parsed.control {
@@ -310,7 +319,8 @@ mod tests {
     use super::{
         ManagerControlKind, ManagerPromptConfig, ManagerPromptConfigStore, ManagerPromptOverride,
         ManagerPromptStage, describe_manager_delay, extract_manager_delay_prefix,
-        manager_response_display_content, parse_manager_control_response,
+        manager_control_decision_label, manager_response_display_content,
+        parse_manager_control_response,
     };
     use tempfile::tempdir;
 
@@ -437,6 +447,23 @@ mod tests {
         let cont = parse_manager_control_response("CONTINUE\nRun the focused regression next.");
         assert_eq!(cont.control, ManagerControlKind::Continue);
         assert_eq!(cont.content, "Run the focused regression next.");
+
+        assert_eq!(
+            manager_control_decision_label(ManagerControlKind::Continue),
+            "Continue"
+        );
+        assert_eq!(
+            manager_control_decision_label(ManagerControlKind::Wait(90)),
+            "Wait 90s"
+        );
+        assert_eq!(
+            manager_control_decision_label(ManagerControlKind::StoppingPoint),
+            "Stopping Point"
+        );
+        assert_eq!(
+            manager_control_decision_label(ManagerControlKind::RedFlag),
+            "Red Flag"
+        );
     }
 
     #[test]

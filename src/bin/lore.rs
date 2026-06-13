@@ -5091,7 +5091,7 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         .post(format!("{}/v1/chat/manager", context.url))
         .header("x-lore-key", token)
         .json(&serde_json::json!({
-            "content": display,
+            "content": manager_response.trim(),
             "stopped": stopped,
             "delay_seconds": if stopped { None } else { delay_seconds },
         }))

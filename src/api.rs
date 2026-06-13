@@ -22,9 +22,9 @@ use crate::librarian::{
     StoredLibrarianOperation, build_action_prompt, build_prompt, build_prompt_multi_project,
 };
 use crate::manager::{
-    ManagerControlKind, ManagerPromptConfig, ManagerPromptConfigStore, ManagerPromptOverride,
-    ManagerPromptStage, describe_manager_delay, manager_response_display_content,
-    parse_manager_control_response,
+    MANAGER_CONTINUE_TOKEN, MAX_MANAGER_DELAY_SECONDS, ManagerControlKind, ManagerPromptConfig,
+    ManagerPromptConfigStore, ManagerPromptOverride, ManagerPromptStage, ParsedManagerResponse,
+    manager_control_decision_label, parse_manager_control_response,
 };
 use crate::model::{
     Block, BlockId, BlockType, DocumentId, ImageUpload, KeyFingerprint, NewBlock, OrderKey,
@@ -14708,28 +14708,28 @@ async fn chat_agent_manager_report(
         .log(&agent.name, owner_str, "manager", &body.content);
 
     let parsed_response = parse_manager_control_response(&body.content);
-    let parsed_stopped = matches!(
-        parsed_response.control,
+    let control = manager_report_control(&body, parsed_response.control);
+    let stopped = matches!(
+        control,
         ManagerControlKind::StoppingPoint | ManagerControlKind::RedFlag
     );
-    let stopped = body.stopped || parsed_stopped;
-    let mut delayed_content = manager_response_display_content(&parsed_response);
-    if delayed_content.trim().is_empty() {
-        delayed_content = body.content.trim().to_string();
-    }
+    let response_content = manager_report_content(&body.content, &parsed_response);
+    let response_display = manager_chat_response_message(control, &response_content);
     let mut delayed_until_unix = None;
     if !stopped {
-        if let Some(delay_seconds) = body.delay_seconds.filter(|secs| *secs > 0) {
+        if let Some(delay_seconds) = body
+            .delay_seconds
+            .filter(|secs| *secs > 0 && *secs <= MAX_MANAGER_DELAY_SECONDS)
+        {
             delayed_until_unix =
                 Some(OffsetDateTime::now_utc().unix_timestamp() + delay_seconds as i64);
-        } else if let ManagerControlKind::Wait(delay_seconds) = parsed_response.control {
+        } else if let ManagerControlKind::Wait(delay_seconds) = control {
             delayed_until_unix =
                 Some(OffsetDateTime::now_utc().unix_timestamp() + delay_seconds as i64);
         }
     }
 
     let mut auto_disabled = false;
-    let mut delayed_status = None;
     if let Ok(Some(mut mc)) = state.chat.get_manage_config(owner_str, &agent.name) {
         mc.turn_counter += 1;
         mc.run_requested = false;
@@ -14740,25 +14740,28 @@ async fn chat_agent_manager_report(
             auto_disabled = mc.enabled;
             mc.enabled = false;
         } else if let Some(until) = delayed_until_unix {
-            mc.delayed_message = delayed_content.clone();
+            mc.delayed_message = response_content.clone();
             mc.delayed_until_unix = until;
-            let delay_seconds = (until - OffsetDateTime::now_utc().unix_timestamp()).max(1) as u64;
-            delayed_status = Some(describe_manager_delay(delay_seconds));
         }
         let _ = state.chat.save_manage_config(owner_str, &agent.name, &mc);
     }
 
-    if let Some(status) = delayed_status {
+    if stopped || delayed_until_unix.is_some() {
         append_manager_chat_message(
             &state,
             owner_str,
             &agent.name,
             ChatRole::Assistant,
-            &manager_chat_message_prefix(&status),
+            &response_display,
         );
     } else {
-        let display = manager_chat_message_prefix(&delayed_content);
-        append_manager_chat_message(&state, owner_str, &agent.name, ChatRole::User, &display);
+        append_manager_chat_message(
+            &state,
+            owner_str,
+            &agent.name,
+            ChatRole::User,
+            &response_display,
+        );
     }
     if auto_disabled {
         append_manager_chat_message(
@@ -15152,6 +15155,69 @@ fn manager_request_summary(turn_in_cycle: u32) -> &'static str {
     }
 }
 
+fn manager_report_control(
+    body: &ManagerReportBody,
+    parsed_control: ManagerControlKind,
+) -> ManagerControlKind {
+    match parsed_control {
+        ManagerControlKind::StoppingPoint
+        | ManagerControlKind::RedFlag
+        | ManagerControlKind::Wait(_) => parsed_control,
+        ManagerControlKind::Continue => {
+            if body.stopped {
+                if body.content.trim_start().starts_with('\u{1f6a9}') {
+                    ManagerControlKind::RedFlag
+                } else {
+                    ManagerControlKind::StoppingPoint
+                }
+            } else if let Some(delay_seconds) = body
+                .delay_seconds
+                .filter(|secs| *secs > 0 && *secs <= MAX_MANAGER_DELAY_SECONDS)
+            {
+                ManagerControlKind::Wait(delay_seconds)
+            } else {
+                ManagerControlKind::Continue
+            }
+        }
+    }
+}
+
+fn manager_report_content(raw_content: &str, parsed: &ParsedManagerResponse) -> String {
+    let trimmed = raw_content.trim_start().trim();
+    let explicit_continue = trimmed == MANAGER_CONTINUE_TOKEN
+        || trimmed.starts_with(&format!("{MANAGER_CONTINUE_TOKEN}\n"))
+        || trimmed.starts_with(&format!("{MANAGER_CONTINUE_TOKEN}\r\n"))
+        || trimmed.starts_with(&format!("{MANAGER_CONTINUE_TOKEN}:"));
+    let content = match parsed.control {
+        ManagerControlKind::StoppingPoint
+        | ManagerControlKind::RedFlag
+        | ManagerControlKind::Wait(_) => parsed.content.trim().to_string(),
+        ManagerControlKind::Continue if explicit_continue => parsed.content.trim().to_string(),
+        ManagerControlKind::Continue => trimmed.to_string(),
+    };
+    strip_legacy_manager_signal_prefix(&content)
+}
+
+fn strip_legacy_manager_signal_prefix(content: &str) -> String {
+    let trimmed = content.trim();
+    trimmed
+        .strip_prefix('\u{2705}')
+        .or_else(|| trimmed.strip_prefix('\u{1f6a9}'))
+        .map(str::trim)
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn manager_chat_response_message(control: ManagerControlKind, content: &str) -> String {
+    let decision = manager_control_decision_label(control);
+    let content = content.trim();
+    if content.is_empty() {
+        manager_chat_message_prefix(&decision)
+    } else {
+        manager_chat_message_prefix(&format!("{decision}\n{content}"))
+    }
+}
+
 fn manager_chat_message_prefix(content: &str) -> String {
     format!("👔 {content}")
 }
@@ -15183,7 +15249,7 @@ fn release_due_delayed_manager_message(
         owner,
         agent_name,
         ChatRole::User,
-        &manager_chat_message_prefix(content.trim()),
+        &manager_chat_response_message(ManagerControlKind::Continue, content.trim()),
     );
     Ok(true)
 }
@@ -18031,7 +18097,7 @@ mod tests {
         ProjectLibrarianOperation, ProjectLibrarianPlan, ProjectLibrarianRequest,
         ProviderCheckResult, RATE_LIMIT_REQUESTS,
     };
-    use crate::manager::{ManagerPromptConfig, ManagerPromptOverride};
+    use crate::manager::{ManagerControlKind, ManagerPromptConfig, ManagerPromptOverride};
     use crate::store::FileBlockStore;
     use crate::updater::{AutoUpdateConfigStore, DEFAULT_UPDATE_REPO, ReleaseStream, hex_sha256};
     use crate::{
@@ -23357,6 +23423,100 @@ mod tests {
     }
 
     #[test]
+    fn manager_chat_response_messages_include_decision_line() {
+        assert_eq!(
+            super::manager_chat_response_message(
+                ManagerControlKind::Continue,
+                "Run the focused regression next.",
+            ),
+            "👔 Continue\nRun the focused regression next."
+        );
+        assert_eq!(
+            super::manager_chat_response_message(
+                ManagerControlKind::RedFlag,
+                "Unrelated user changes are at risk.",
+            ),
+            "👔 Red Flag\nUnrelated user changes are at risk."
+        );
+        assert_eq!(
+            super::manager_chat_response_message(ManagerControlKind::Wait(90), "Check the build."),
+            "👔 Wait 90s\nCheck the build."
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_stop_report_disables_manage_without_queueing_agent_turn() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let agent_token =
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        state
+            .chat
+            .save_manage_config(
+                "admin",
+                "agent-main",
+                &ManageConfig {
+                    enabled: true,
+                    run_requested: true,
+                    request_announced: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/manager")
+            .header("content-type", "application/json")
+            .header(API_KEY_HEADER, &agent_token)
+            .body(Body::from(
+                r#"{"content":"RED_FLAG_POINT: Unrelated user changes\nStop and inspect the working tree."}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let saved = state
+            .chat
+            .get_manage_config("admin", "agent-main")
+            .unwrap()
+            .unwrap();
+        assert!(!saved.enabled);
+        assert!(!saved.run_requested);
+        assert!(!saved.request_announced);
+
+        let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].role, ChatRole::Assistant);
+        assert_eq!(
+            conv.messages[0].content,
+            "👔 Red Flag\nUnrelated user changes\nStop and inspect the working tree."
+        );
+        assert_eq!(conv.messages[1].role, ChatRole::Assistant);
+        assert_eq!(conv.messages[1].content, "👔 Manager Disabled");
+        let pending = state
+            .chat
+            .claim_pending_user_messages("admin", "agent-main")
+            .unwrap();
+        assert!(pending.is_empty());
+
+        let manage_request = Request::builder()
+            .method("GET")
+            .uri("/v1/chat/manage")
+            .header(API_KEY_HEADER, &agent_token)
+            .body(Body::empty())
+            .unwrap();
+        let manage_response = app.oneshot(manage_request).await.unwrap();
+        assert_eq!(manage_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(manage_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], false);
+    }
+
+    #[test]
     fn manager_prompts_direct_the_agent_without_waiting_for_user_input() {
         let mc = ManageConfig {
             goals: "Ship the fix".into(),
@@ -23489,7 +23649,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0].content,
-            "👔 Check whether the build finished, then continue."
+            "👔 Continue\nCheck whether the build finished, then continue."
         );
 
         let saved = state.chat.get_manage_config(owner, agent).unwrap().unwrap();

@@ -2,6 +2,7 @@
 
 ## 2026-06-13
 
+- Show manager responses in chat with an explicit decision header (`Continue`, `Wait`, `Red Flag`, or `Stopping Point`), preserve raw manager control lines through CLI reports, and prevent `Red Flag`/`Stopping Point` reports from being queued as follow-up agent instructions.
 - Clarified manager control responses with a required first-line protocol for `STOPPING_POINT`, `RED_FLAG_POINT`, `WAIT_FOR_SECONDS`, and `CONTINUE`, and made CLI/API manager parsing honor only first-line control signals.
 
 ## 2026-06-10
