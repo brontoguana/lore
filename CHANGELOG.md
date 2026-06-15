@@ -1,7 +1,10 @@
 # Changelog
 
-## 2026-06-13
+## 2026-06-15
 
+- Replaced `/report` with manager-generated progress reports: after each manager directive, Lore asks the manager for a short status report and pins only the latest report above the chat composer.
+- Render Manager Enabled, Manager Disabled, and Asking Manager chat status rows with the same manager SVG glyph used by manager decision rows instead of showing the raw manager emoji marker.
+- Renamed the admin login controls from Network to Security, surfaced password-login approvals first, clarified the passkey sign-in policy and passkey origin, and returned passkey/IP/login approval actions to that section.
 - Show manager responses in chat with an explicit decision header (`Continue`, `Wait`, `Red Flag`, or `Stopping Point`), preserve raw manager control lines through CLI reports, and prevent `Red Flag`/`Stopping Point` reports from being queued as follow-up agent instructions.
 - Clarified manager control responses with a required first-line protocol for `STOPPING_POINT`, `RED_FLAG_POINT`, `WAIT_FOR_SECONDS`, and `CONTINUE`, and made CLI/API manager parsing honor only first-line control signals.
 

@@ -36,9 +36,10 @@ use crate::ui::{
     UiDiffLineKind, UiLibrarianAnswer, UiPendingLibrarianAction, UiProjectVersion,
     UiProjectVersionOperation, UiUserSummary, UserProjectAccess, render_admin_audit_page,
     render_admin_errors_page, render_admin_page, render_agent_guide_page, render_agents_page,
-    render_chat_agent_list, render_chat_main_panel, render_chat_page, render_document_page,
-    render_login_page, render_project_audit_page, render_project_history_page, render_project_page,
-    render_projects_page, render_settings_page, render_setup_page,
+    render_chat_agent_list, render_chat_main_panel, render_chat_page_with_manager_progress,
+    render_document_page, render_login_page, render_project_audit_page,
+    render_project_history_page, render_project_page, render_projects_page, render_settings_page,
+    render_setup_page,
 };
 use crate::updater::{
     AutoUpdateConfig, AutoUpdateConfigStore, AutoUpdateStatus, AutoUpdateStatusStore,
@@ -460,6 +461,8 @@ struct ChatEvent {
 
 const CHAT_MESSAGE_RETENTION_DAYS: u64 = 90;
 const CHAT_MESSAGE_RETENTION_RECENT_LIMIT: usize = 500;
+const MANAGER_PROGRESS_REPORT_SOFT_WORD_LIMIT: usize = 110;
+const MANAGER_PROGRESS_REPORT_MAX_CHARS: usize = 1_200;
 
 impl AppState {
     pub fn new(store: FileBlockStore) -> Self {
@@ -685,6 +688,10 @@ fn build_app_with_librarian(
             post(chat_agent_manager_requested),
         )
         .route("/v1/chat/manager", post(chat_agent_manager_report))
+        .route(
+            "/v1/chat/manager/progress",
+            post(chat_agent_manager_progress_report),
+        )
         .route(
             "/v1/chat/manager/completions",
             post(chat_manager_proxy_completions),
@@ -5666,7 +5673,9 @@ async fn update_setup_from_ui(
         None,
         None,
     )?;
-    Ok(Redirect::to("/ui/admin?flash=Setup%20address%20saved"))
+    Ok(Redirect::to(
+        "/ui/admin?section=security&flash=Setup%20address%20saved",
+    ))
 }
 
 async fn update_login_security_from_ui(
@@ -5685,12 +5694,12 @@ async fn update_login_security_from_ui(
             .is_empty()
     {
         return Ok(Redirect::to(
-            "/ui/admin?section=network&flash=Register%20an%20admin%20passkey%20before%20enabling%20enforcement",
+            "/ui/admin?section=security&flash=Register%20an%20admin%20passkey%20before%20enabling%20enforcement",
         ));
     }
     if ip_enabled && !state.auth.has_non_loopback_allowed_login_ip()? {
         return Ok(Redirect::to(
-            "/ui/admin?section=network&flash=Add%20at%20least%20one%20non-loopback%20allowed%20IP%20before%20enabling%20IP%20restrictions",
+            "/ui/admin?section=security&flash=Add%20at%20least%20one%20non-loopback%20allowed%20IP%20before%20enabling%20IP%20restrictions",
         ));
     }
     state
@@ -5709,7 +5718,7 @@ async fn update_login_security_from_ui(
         )),
     )?;
     Ok(Redirect::to(
-        "/ui/admin?section=network&flash=Login%20security%20saved",
+        "/ui/admin?section=security&flash=Login%20security%20saved",
     ))
 }
 
@@ -5814,7 +5823,7 @@ async fn delete_passkey_from_ui(
         None,
     )?;
     Ok(Redirect::to(
-        "/ui/admin?section=network&flash=Passkey%20deleted",
+        "/ui/admin?section=security&flash=Passkey%20deleted",
     ))
 }
 
@@ -5837,7 +5846,7 @@ async fn add_login_ip_from_ui(
         Some(format!("{} ({})", entry.cidr, entry.label)),
     )?;
     Ok(Redirect::to(
-        "/ui/admin?section=network&flash=Allowed%20IP%20added",
+        "/ui/admin?section=security&flash=Allowed%20IP%20added",
     ))
 }
 
@@ -5861,7 +5870,7 @@ async fn delete_login_ip_from_ui(
         None,
     )?;
     Ok(Redirect::to(
-        "/ui/admin?section=network&flash=Allowed%20IP%20removed",
+        "/ui/admin?section=security&flash=Allowed%20IP%20removed",
     ))
 }
 
@@ -5885,7 +5894,7 @@ async fn approve_login_from_ui(
         None,
     )?;
     Ok(Redirect::to(
-        "/ui/admin?section=network&flash=Login%20approved",
+        "/ui/admin?section=security&flash=Login%20approved",
     ))
 }
 
@@ -5909,7 +5918,7 @@ async fn deny_login_from_ui(
         None,
     )?;
     Ok(Redirect::to(
-        "/ui/admin?section=network&flash=Login%20denied",
+        "/ui/admin?section=security&flash=Login%20denied",
     ))
 }
 
@@ -12332,10 +12341,16 @@ fn load_chat_panel_data(
     state: &AppState,
     owner: &str,
     selected_agent: Option<&str>,
-) -> Result<(Vec<Value>, Option<String>, Option<String>, u64), LoreError> {
+) -> Result<(Vec<Value>, Option<String>, Option<String>, u64, String), LoreError> {
     if let Some(agent_name) = selected_agent {
         if agent_name == "librarian" {
-            Ok((Vec::new(), Some("librarian".to_string()), None, 0))
+            Ok((
+                Vec::new(),
+                Some("librarian".to_string()),
+                None,
+                0,
+                String::new(),
+            ))
         } else {
             let conv = state.chat.load_conversation(owner, agent_name)?;
             let agent_status = match conv.agent_status {
@@ -12343,15 +12358,21 @@ fn load_chat_panel_data(
                 AgentChatStatus::Thinking => "thinking",
                 AgentChatStatus::Offline => "offline",
             };
+            let manager_progress_report = conv
+                .manage_config
+                .as_ref()
+                .map(|mc| mc.manager_progress_report.clone())
+                .unwrap_or_default();
             Ok((
                 chat_messages_value_for_panel(&conv),
                 Some(agent_name.to_string()),
                 Some(agent_status.to_string()),
                 active_turn_user_id_for_ui(&conv),
+                manager_progress_report,
             ))
         }
     } else {
-        Ok((Vec::new(), None, None, 0))
+        Ok((Vec::new(), None, None, 0, String::new()))
     }
 }
 
@@ -12372,12 +12393,12 @@ async fn chat_page(
         .collect();
 
     let selected_requested = selected_chat_agent(query.agent.as_deref(), &chat_agents);
-    let (messages, selected_owned, _selected_status, active_turn_user_id) =
+    let (messages, selected_owned, _selected_status, active_turn_user_id, manager_progress_report) =
         load_chat_panel_data(&state, session.user.username.as_str(), selected_requested)?;
     let messages_json = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into());
     let selected = selected_owned.as_deref();
 
-    Ok(Html(render_chat_page(
+    Ok(Html(render_chat_page_with_manager_progress(
         resolved_theme(&session.user, &config),
         resolved_color_mode(&session.user),
         session.user.username.as_str(),
@@ -12387,6 +12408,7 @@ async fn chat_page(
         selected,
         &messages_json,
         active_turn_user_id,
+        &manager_progress_report,
         None,
         &projects_for_ui,
     )))
@@ -12417,7 +12439,7 @@ async fn chat_panel_inner(
         .map(|p| (p.slug.as_str().to_string(), p.display_name.clone()))
         .collect();
     let selected_requested = selected_chat_agent(query.agent.as_deref(), &chat_agents);
-    let (messages, selected_owned, selected_status, active_turn_user_id) =
+    let (messages, selected_owned, selected_status, active_turn_user_id, manager_progress_report) =
         load_chat_panel_data(state, session.user.username.as_str(), selected_requested)?;
     let selected = selected_owned.as_deref();
     let panel_html = render_chat_main_panel(
@@ -12441,6 +12463,7 @@ async fn chat_panel_inner(
         "messages": messages,
         "agent_status": selected_status,
         "active_turn_user_id": active_turn_user_id,
+        "manager_progress_report": manager_progress_report,
         "profile_url": profile_url,
     }))
 }
@@ -13268,6 +13291,9 @@ async fn chat_clear_history(
     find_owned_chat_agent(&agents, &agent_name)?;
 
     state.chat.clear_messages(owner, &agent_name)?;
+    state
+        .chat
+        .clear_manager_progress_report(owner, &agent_name)?;
     clear_chat_agent_stop_request(&state, owner, &agent_name);
 
     push_chat_event(
@@ -14647,6 +14673,7 @@ async fn chat_agent_get_manage(
     let turn_in_cycle = mc.turn_counter % 5;
     let manager_prompt_config = state.manager_prompt_config.load()?;
     let system_prompt = build_manager_prompt(&mc, &manager_prompt_config, turn_in_cycle);
+    let progress_report_prompt = build_manager_progress_report_prompt(&mc);
 
     let conv = state.chat.load_conversation(owner_str, &agent.name)?;
     let window_messages = agent_context_messages(unsummarized_messages(&conv));
@@ -14677,6 +14704,7 @@ async fn chat_agent_get_manage(
     Ok(Json(json!({
         "enabled": true,
         "system_prompt": system_prompt,
+        "progress_report_prompt": progress_report_prompt,
         "messages": recent_msgs,
         "backend": mc.backend,
         "has_endpoint": has_endpoint,
@@ -14691,6 +14719,11 @@ struct ManagerReportBody {
     stopped: bool,
     #[serde(default)]
     delay_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagerProgressReportBody {
+    content: String,
 }
 
 async fn chat_agent_manager_report(
@@ -14784,6 +14817,41 @@ async fn chat_agent_manager_report(
             notify.notify_one();
         }
     }
+
+    Ok(StatusCode::OK)
+}
+
+async fn chat_agent_manager_progress_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ManagerProgressReportBody>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
+    require_chat_authenticated_agent(&agent)?;
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str();
+
+    let report = normalize_manager_progress_report(&body.content);
+    if report.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    state
+        .chat_audit
+        .log(&agent.name, owner_str, "manager_progress", &report);
+    state
+        .chat
+        .set_manager_progress_report(owner_str, &agent.name, &report)?;
+    push_chat_event(
+        &state,
+        owner_str,
+        ChatEvent {
+            event_type: "manager_progress_report".into(),
+            agent: agent.name.clone(),
+            owner: owner_str.to_string(),
+            data: json!({ "report": report }),
+        },
+    );
 
     Ok(StatusCode::OK)
 }
@@ -15144,6 +15212,46 @@ fn build_manager_prompt(
         "{}\n\n{base}{control_protocol}\n\n{context}{stage_prompt}",
         crate::prompt::current_datetime_prompt_line()
     )
+}
+
+fn build_manager_progress_report_prompt(mc: &ManageConfig) -> String {
+    format!(
+        "{}\n\n\
+         You are a manager producing a brief progress report for the user after directing an AI agent.\n\n\
+         GOALS:\n{}\n\n\
+         REPORT REQUIREMENTS:\n\
+         - Recent changes and progress made\n\
+         - Current status vs goals, including a rough percent complete estimate\n\
+         - Overall view of recent progress\n\n\
+         Keep the report short enough to fit on a phone screen. Soft limit: about {} words, \
+         which is a rough estimate for filling no more than 75% of a small mobile chat screen. \
+         Prefer 3 concise bullets or short lines. Do not write a control line. Do not include \
+         STOPPING_POINT, RED_FLAG_POINT, WAIT_FOR_SECONDS, or CONTINUE. Do not address the agent. \
+         Do not ask the user for input.",
+        crate::prompt::current_datetime_prompt_line(),
+        mc.goals,
+        MANAGER_PROGRESS_REPORT_SOFT_WORD_LIMIT,
+    )
+}
+
+fn normalize_manager_progress_report(content: &str) -> String {
+    let normalized = content
+        .trim()
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if normalized.chars().count() <= MANAGER_PROGRESS_REPORT_MAX_CHARS {
+        return normalized;
+    }
+    let mut truncated = normalized
+        .chars()
+        .take(MANAGER_PROGRESS_REPORT_MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn manager_request_summary(turn_in_cycle: u32) -> &'static str {
@@ -16474,6 +16582,7 @@ async fn chat_save_manage(
             mc.request_announced = false;
             mc.delayed_message.clear();
             mc.delayed_until_unix = 0;
+            mc.manager_progress_report.clear();
         } else if !en {
             mc.run_requested = false;
             mc.request_announced = false;
@@ -16558,7 +16667,7 @@ async fn chat_slash_command(
 
     let response_text = match cmd.as_str() {
         "/help" => {
-            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /prompt -- show full agent prompt and context\n    /context -- show message count and summary\n    /report -- status of all your agents\n\n  CONTEXT\n    /pin <text> -- add to pinned context\n    /pins -- show pinned context\n    /unpin <id> -- remove a pin by id\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /clear -- clear messages, keep context\n\n  MODEL\n    /model <name> -- switch model (process agents)\n    /effort <level> -- backend-specific effort/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- side question (separate process)\n    /hi -- check if agent is working\n\nManage mode can be configured in the manage panel (people icon).".to_string()
+            "USER COMMANDS\n\n  STATUS\n    /help -- show this message\n    /status -- show current config\n    /prompt -- show full agent prompt and context\n    /context -- show message count and summary\n\n  CONTEXT\n    /pin <text> -- add to pinned context\n    /pins -- show pinned context\n    /unpin <id> -- remove a pin by id\n    /window <n> -- set conversation window size\n    /compact -- force context compaction\n    /clear -- clear messages, keep context\n\n  MODEL\n    /model <name> -- switch model (process agents)\n    /effort <level> -- backend-specific effort/default\n\nAGENT COMMANDS\n\n    /stop -- cancel current request\n    /restart -- restart the agent\n    /rename <name> -- change agent display name\n    /profile <url> -- set agent profile picture\n    /btw <message> -- side question (separate process)\n    /hi -- check if agent is working\n\nManage mode can be configured in the manage panel (people icon).".to_string()
         }
         "/status" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
@@ -16894,6 +17003,9 @@ async fn chat_slash_command(
         }
         "/clear" => {
             state.chat.clear_messages(owner, &agent_name)?;
+            state
+                .chat
+                .clear_manager_progress_report(owner, &agent_name)?;
             return Ok(Json(json!({"action": "clear"})).into_response());
         }
         "/compact" => {
@@ -17033,31 +17145,6 @@ async fn chat_slash_command(
                 }
                 AgentChatStatus::Idle => format!("{display} is idle."),
                 AgentChatStatus::Offline => format!("{display} is offline."),
-            }
-        }
-        "/report" => {
-            let all_agents = state.auth.list_agent_tokens_for_user(&session.user.username)?;
-            let mut lines = Vec::new();
-            for a in &all_agents {
-                let conv = state.chat.load_conversation(owner, &a.name)?;
-                let status_str = match conv.agent_status {
-                    AgentChatStatus::Idle => "idle",
-                    AgentChatStatus::Thinking => "thinking",
-                    AgentChatStatus::Offline => "offline",
-                };
-                let display = a.display_name.as_deref().unwrap_or(&a.name);
-                let exchange_count = agent_window_exchange_count(&conv);
-                let auto_str = match &conv.auto_message {
-                    Some(m) => format!(" auto=\"{}\"", m.chars().take(30).collect::<String>()),
-                    None => String::new(),
-                };
-                let last = conv.last_seen.map(|t| format_chat_time(t)).unwrap_or_else(|| "never".to_string());
-                lines.push(format!("{display}: {status_str}, {exchange_count} exchanges, seen {last}{auto_str}"));
-            }
-            if lines.is_empty() {
-                "No agents found.".to_string()
-            } else {
-                lines.join("\n")
             }
         }
         _ => format!("Unknown command: {}. Type /help for available commands.", cmd),
@@ -18730,6 +18817,10 @@ mod tests {
             next_id: 3,
             last_delivered_user_id: 1,
             active_turn_user_id: 1,
+            manage_config: Some(ManageConfig {
+                manager_progress_report: "Old progress".into(),
+                ..Default::default()
+            }),
             ..ChatConversation::default()
         };
         state
@@ -18762,6 +18853,13 @@ mod tests {
         assert_eq!(saved.next_id, 1);
         assert_eq!(saved.last_delivered_user_id, 0);
         assert_eq!(saved.active_turn_user_id, 0);
+        assert_eq!(
+            saved
+                .manage_config
+                .as_ref()
+                .map(|mc| mc.manager_progress_report.as_str()),
+            Some("")
+        );
     }
 
     #[tokio::test]
@@ -18801,6 +18899,56 @@ mod tests {
         let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
         assert!(conv.messages.is_empty());
         assert!(conv.auto_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_report_command_is_removed_from_help_and_handler() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let _agent_token =
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
+
+        let help_request = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/agent-main/command")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}&command={}",
+                urlencoding::encode(&csrf_token),
+                urlencoding::encode("/help")
+            )))
+            .unwrap();
+        let help_response = app.clone().oneshot(help_request).await.unwrap();
+        assert_eq!(help_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(help_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["response"].as_str().unwrap_or("").contains("/report"));
+
+        let report_request = Request::builder()
+            .method("POST")
+            .uri("/ui/chat/agent-main/command")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!(
+                "csrf_token={}&command={}",
+                urlencoding::encode(&csrf_token),
+                urlencoding::encode("/report")
+            )))
+            .unwrap();
+        let report_response = app.oneshot(report_request).await.unwrap();
+        assert_eq!(report_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(report_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["response"],
+            "Unknown command: /report. Type /help for available commands."
+        );
     }
 
     #[tokio::test]
@@ -20046,7 +20194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_page_shows_network_section() {
+    async fn admin_page_shows_security_section() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
         let (session_cookie, _) = bootstrap_admin_session(&app, dir.path()).await;
@@ -20064,9 +20212,14 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Network"));
+        assert!(html.contains("Security"));
+        assert!(html.contains(r#"data-section="security""#));
+        assert!(html.contains(r#"data-panel="security""#));
         assert!(html.contains("Users"));
-        assert!(html.contains("Require passkey or admin-approved password login"));
+        assert!(html.contains("Approve password logins"));
+        assert!(html.contains("Passkey sign-in policy"));
+        assert!(html.contains("Require passkey sign-in or admin-approved password login"));
+        assert!(html.contains("Passkeys are bound to the external scheme, domain, and port"));
         assert!(html.contains("Restrict browser logins to allowed IPs"));
         assert!(html.contains("lore-server bypass"));
         assert!(html.contains(r#"class="padded passkey-registration""#));
@@ -20074,6 +20227,28 @@ mod tests {
         assert!(!html.contains("This device or passkey account already has a Lore passkey"));
         assert!(html.contains("Allowed login IPs"));
         assert!(html.contains(r#"name="cidr" value="203.0.113.77""#));
+    }
+
+    #[tokio::test]
+    async fn admin_security_section_accepts_old_network_url() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, _) = bootstrap_admin_session(&app, dir.path()).await;
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ui/admin?section=network")
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(r#"<a href="/ui/admin?section=security" class="active" data-section="security">Security</a>"#));
+        assert!(html.contains(r#"<section class="panel" data-panel="security">"#));
     }
 
     #[tokio::test]
@@ -20139,6 +20314,56 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].username.as_str(), "admin");
         assert_eq!(pending[0].ip_address.as_deref(), Some("203.0.113.10"));
+    }
+
+    #[tokio::test]
+    async fn admin_security_section_shows_and_approves_pending_logins() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let (session_cookie, csrf_token) = bootstrap_admin_session(&app, dir.path()).await;
+        let auth = LocalAuthStore::new(dir.path());
+        let pending = auth
+            .create_pending_login_approval(
+                &UserName::new("admin".to_string()).unwrap(),
+                "pending-token",
+                Some("203.0.113.10"),
+                Some("Lore test browser"),
+                std::time::Duration::from_secs(15 * 60),
+            )
+            .unwrap();
+
+        let page = Request::builder()
+            .method("GET")
+            .uri("/ui/admin?section=security")
+            .header("cookie", &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(page).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Approve password logins"));
+        assert!(html.contains("password accepted"));
+        assert!(html.contains("Lore test browser"));
+        assert!(html.contains("title=\"Approve login\""));
+        assert!(html.contains("title=\"Deny login\""));
+
+        let approve = Request::builder()
+            .method("POST")
+            .uri(format!("/ui/admin/login-approvals/{}/approve", pending.id))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &session_cookie)
+            .body(Body::from(format!("csrf_token={csrf_token}")))
+            .unwrap();
+        let response = app.oneshot(approve).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/ui/admin?section=security&flash=Login%20approved"
+        );
+        assert!(auth.list_pending_login_approvals().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -20208,7 +20433,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             response.headers().get(header::LOCATION).unwrap(),
-            "/ui/admin?section=network&flash=Add%20at%20least%20one%20non-loopback%20allowed%20IP%20before%20enabling%20IP%20restrictions"
+            "/ui/admin?section=security&flash=Add%20at%20least%20one%20non-loopback%20allowed%20IP%20before%20enabling%20IP%20restrictions"
         );
 
         let auth = LocalAuthStore::new(dir.path());
@@ -20225,7 +20450,7 @@ mod tests {
         let response = app.clone().oneshot(enable_loopback_only).await.unwrap();
         assert_eq!(
             response.headers().get(header::LOCATION).unwrap(),
-            "/ui/admin?section=network&flash=Add%20at%20least%20one%20non-loopback%20allowed%20IP%20before%20enabling%20IP%20restrictions"
+            "/ui/admin?section=security&flash=Add%20at%20least%20one%20non-loopback%20allowed%20IP%20before%20enabling%20IP%20restrictions"
         );
 
         auth.add_allowed_login_ip("office", "203.0.113.0/24")
@@ -20242,7 +20467,7 @@ mod tests {
         let response = app.oneshot(enable_allowed).await.unwrap();
         assert_eq!(
             response.headers().get(header::LOCATION).unwrap(),
-            "/ui/admin?section=network&flash=Login%20security%20saved"
+            "/ui/admin?section=security&flash=Login%20security%20saved"
         );
         assert!(
             auth.login_security_settings()
@@ -23516,6 +23741,102 @@ mod tests {
         assert_eq!(json["enabled"], false);
     }
 
+    #[tokio::test]
+    async fn manager_progress_report_stores_latest_without_queueing_agent_turn() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let agent_token =
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        state
+            .chat
+            .save_manage_config(
+                "admin",
+                "agent-main",
+                &ManageConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let oversized_report = format!(
+            "  Recent progress\n{}\n  ",
+            "x".repeat(super::MANAGER_PROGRESS_REPORT_MAX_CHARS + 50)
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/manager/progress")
+            .header("content-type", "application/json")
+            .header(API_KEY_HEADER, &agent_token)
+            .body(Body::from(
+                serde_json::to_string(&json!({ "content": oversized_report })).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let saved = state
+            .chat
+            .get_manage_config("admin", "agent-main")
+            .unwrap()
+            .unwrap();
+        assert!(saved.manager_progress_report.starts_with("Recent progress"));
+        assert!(saved.manager_progress_report.ends_with("..."));
+        assert!(
+            saved.manager_progress_report.chars().count()
+                <= super::MANAGER_PROGRESS_REPORT_MAX_CHARS
+        );
+
+        let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert!(conv.messages.is_empty());
+        let pending = state
+            .chat
+            .claim_pending_user_messages("admin", "agent-main")
+            .unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_manage_payload_includes_progress_report_prompt() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let agent_token =
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        state
+            .chat
+            .save_manage_config(
+                "admin",
+                "agent-main",
+                &ManageConfig {
+                    enabled: true,
+                    goals: "Ship the fix".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/chat/manage")
+            .header(API_KEY_HEADER, &agent_token)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let prompt = json["progress_report_prompt"].as_str().unwrap_or("");
+        assert!(prompt.contains("Recent changes and progress made"));
+        assert!(prompt.contains("rough percent complete estimate"));
+        assert!(prompt.contains("about 110 words"));
+        assert!(prompt.contains("Ship the fix"));
+        assert!(prompt.contains("Do not write a control line"));
+    }
+
     #[test]
     fn manager_prompts_direct_the_agent_without_waiting_for_user_input() {
         let mc = ManageConfig {
@@ -23549,6 +23870,12 @@ mod tests {
         assert!(validate.contains("tell the agent exactly what to do next"));
         assert!(validate.contains("Do not ask the user for input"));
         assert!(validate.contains("Use the required first-line control state"));
+
+        let progress = super::build_manager_progress_report_prompt(&mc);
+        assert!(progress.contains("Recent changes and progress made"));
+        assert!(progress.contains("rough percent complete estimate"));
+        assert!(progress.contains("about 110 words"));
+        assert!(progress.contains("Do not write a control line"));
     }
 
     #[test]

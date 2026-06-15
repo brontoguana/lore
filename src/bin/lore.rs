@@ -6,7 +6,8 @@ use lore_core::{
     SelfUpdateOutcome, check_for_update, current_datetime_prompt_line,
     current_datetime_prompt_line_at,
     manager::{
-        ManagerControlKind, manager_response_display_content, parse_manager_control_response,
+        ManagerControlKind, ParsedManagerResponse, manager_control_decision_label,
+        manager_response_display_content, parse_manager_control_response,
     },
     maybe_apply_self_update, slugify,
 };
@@ -5028,6 +5029,10 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
     }
 
     let system_prompt = manage["system_prompt"].as_str().unwrap_or("").to_string();
+    let progress_report_prompt = manage["progress_report_prompt"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     let messages = manage["messages"].as_array();
     let backend_str = manage["backend"].as_str().unwrap_or("");
 
@@ -5044,6 +5049,7 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         .await;
 
     let has_endpoint = manage["has_endpoint"].as_bool().unwrap_or(false);
+    let backend: AgentBackend = backend_str.parse().unwrap_or(AgentBackend::Claude);
     let manager_response = if has_endpoint {
         match run_manager_endpoint(context, &system_prompt, messages).await {
             Ok(s) => s,
@@ -5054,7 +5060,6 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
             }
         }
     } else {
-        let backend: AgentBackend = backend_str.parse().unwrap_or(AgentBackend::Claude);
         match run_manager_cli(context, agent_name, backend, &system_prompt, messages).await {
             Ok(s) => s,
             Err(e) => {
@@ -5098,6 +5103,40 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         .send()
         .await;
 
+    let progress_report = if progress_report_prompt.trim().is_empty() {
+        None
+    } else {
+        let directive = manager_progress_report_directive(&parsed_response, &display);
+        match run_manager_progress_report(
+            context,
+            agent_name,
+            backend,
+            has_endpoint,
+            &progress_report_prompt,
+            messages,
+            &directive,
+        )
+        .await
+        {
+            Ok(report) if !report.trim().is_empty() => {
+                let report = report.trim().to_string();
+                let _ = context
+                    .client
+                    .post(format!("{}/v1/chat/manager/progress", context.url))
+                    .header("x-lore-key", token)
+                    .json(&serde_json::json!({ "content": report }))
+                    .send()
+                    .await;
+                Some(report)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("[manager] Progress report failed: {e}");
+                None
+            }
+        }
+    };
+
     // Log manager response
     {
         let lore_dir = agent_lore_dir(agent_name);
@@ -5119,6 +5158,9 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         {
             use std::io::Write;
             let _ = write!(f, "[{timestamp}] MANAGER:\n{display}\n\n");
+            if let Some(report) = progress_report.as_deref() {
+                let _ = write!(f, "[{timestamp}] MANAGER PROGRESS:\n{report}\n\n");
+            }
         }
     }
 
@@ -5150,17 +5192,107 @@ async fn run_manager_cli(
     prompt_parts.push("\n## Instructions\n\nReview the conversation above and respond as the manager speaking directly to the agent. The first line of stdout must be exactly one of the control formats from the system prompt: STOPPING_POINT: <short reason>, RED_FLAG_POINT: <short reason>, WAIT_FOR_SECONDS: <1-600>, or CONTINUE. Do not write any preamble before that first line, and do not put control tokens after the first line. Give a concrete next instruction, not advice to the user. Do not ask the user for clarification or more input unless the stopping criteria explicitly require that. You may READ files from the working directory if needed to verify periodic checks, but you must NEVER edit, create, delete, or execute any files or commands. Your only output should be the control line followed by the manager's instruction text for the agent.".to_string());
 
     let full_prompt = prompt_parts.join("\n\n");
+    run_manager_cli_prompt(
+        context,
+        agent_name,
+        backend,
+        &full_prompt,
+        "manager_context.txt",
+    )
+    .await
+}
 
+async fn run_manager_progress_report(
+    context: &CliContext,
+    agent_name: &str,
+    backend: AgentBackend,
+    has_endpoint: bool,
+    progress_report_prompt: &str,
+    messages: Option<&Vec<serde_json::Value>>,
+    directive: &str,
+) -> CliResult<String> {
+    let prompt = format!(
+        "{progress_report_prompt}\n\nLATEST MANAGER DIRECTIVE:\n{directive}\n\n\
+         Produce only the short progress report for the user."
+    );
+    if has_endpoint {
+        run_manager_endpoint(context, &prompt, messages).await
+    } else {
+        run_manager_progress_report_cli(context, agent_name, backend, &prompt, messages).await
+    }
+}
+
+async fn run_manager_progress_report_cli(
+    context: &CliContext,
+    agent_name: &str,
+    backend: AgentBackend,
+    system_prompt: &str,
+    messages: Option<&Vec<serde_json::Value>>,
+) -> CliResult<String> {
+    let mut prompt_parts = Vec::new();
+    prompt_parts.push(system_prompt.to_string());
+
+    prompt_parts.push("\n## Recent Conversation\n".to_string());
+    if let Some(msgs) = messages {
+        for msg in msgs {
+            let role = msg["role"].as_str().unwrap_or("user");
+            let content = msg["content"].as_str().unwrap_or("");
+            let label = if role == "user" { "User" } else { "Agent" };
+            let content = chat_content_for_prompt(content, false);
+            let truncated: String = content.chars().take(4000).collect();
+            prompt_parts.push(format!("--- {label} ---\n{truncated}"));
+        }
+    }
+
+    prompt_parts.push("\n## Instructions\n\nWrite the short progress report for the user. Do not use the manager control-line protocol. Do not write instructions to the agent. Do not ask the user for clarification or more input. You may READ files only if the recent conversation is insufficient to estimate status, but you must NEVER edit, create, delete, or execute any files or commands. Your only output should be the progress report text.".to_string());
+
+    let full_prompt = prompt_parts.join("\n\n");
+    run_manager_cli_prompt(
+        context,
+        agent_name,
+        backend,
+        &full_prompt,
+        "manager_progress_context.txt",
+    )
+    .await
+}
+
+fn manager_progress_report_directive(parsed: &ParsedManagerResponse, display: &str) -> String {
+    let mut directive = format!(
+        "Decision: {}",
+        manager_control_decision_label(parsed.control)
+    );
+    let body = parsed.content.trim();
+    if body.is_empty() {
+        let fallback = display.trim();
+        if !fallback.is_empty() {
+            directive.push_str("\nInstruction:\n");
+            directive.push_str(fallback);
+        }
+    } else {
+        directive.push_str("\nInstruction:\n");
+        directive.push_str(body);
+    }
+    directive
+}
+
+async fn run_manager_cli_prompt(
+    context: &CliContext,
+    agent_name: &str,
+    backend: AgentBackend,
+    full_prompt: &str,
+    context_filename: &str,
+) -> CliResult<String> {
     // Save manager context for debugging
     {
         let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
-        let _ = fs::write(lore_dir.join("manager_context.txt"), &full_prompt);
+        let _ = fs::write(lore_dir.join(context_filename), full_prompt);
     }
 
     let mut child = match spawn_backend(
         backend,
-        &full_prompt,
+        full_prompt,
         None,
         None,
         context.token.as_deref(),

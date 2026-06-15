@@ -2750,6 +2750,8 @@ pub struct ManageConfig {
     pub delayed_message: String,
     #[serde(default)]
     pub delayed_until_unix: i64,
+    #[serde(default)]
+    pub manager_progress_report: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3846,6 +3848,44 @@ impl ChatStore {
         )
         .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
         Ok(())
+    }
+
+    pub fn set_manager_progress_report(
+        &self,
+        owner: &str,
+        agent: &str,
+        report: &str,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LoreError::Validation("db lock poisoned".into()))?;
+        Self::ensure_conversation(&conn, owner, agent)
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT manage_config FROM conversations WHERE owner = ?1 AND agent = ?2",
+                params![owner, agent],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| LoreError::Validation(format!("db error: {e}")))?
+            .flatten();
+        let mut config = current
+            .and_then(|s| serde_json::from_str::<ManageConfig>(&s).ok())
+            .unwrap_or_default();
+        config.manager_progress_report = report.to_string();
+        let json = serde_json::to_string(&config).unwrap_or_default();
+        conn.execute(
+            "UPDATE conversations SET manage_config = ?1 WHERE owner = ?2 AND agent = ?3",
+            params![json, owner, agent],
+        )
+        .map_err(|e| LoreError::Validation(format!("db error: {e}")))?;
+        Ok(())
+    }
+
+    pub fn clear_manager_progress_report(&self, owner: &str, agent: &str) -> Result<()> {
+        self.set_manager_progress_report(owner, agent, "")
     }
 
     pub fn get_backend_prefs(

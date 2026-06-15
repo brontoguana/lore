@@ -1758,7 +1758,7 @@ pub fn render_admin_page(
     let sections = [
         "users",
         "roles",
-        "network",
+        "security",
         "endpoints",
         "librarian",
         "git-export",
@@ -1771,7 +1771,7 @@ pub fn render_admin_page(
     let section_labels = [
         "Users",
         "User Roles",
-        "Network",
+        "Security",
         "Endpoints",
         "Librarian",
         "Git export",
@@ -1781,8 +1781,13 @@ pub fn render_admin_page(
         "Manager",
         "Audit",
     ];
-    let active = if sections.contains(&active_section) {
+    let requested_section = if active_section == "network" {
+        "security"
+    } else {
         active_section
+    };
+    let active = if sections.contains(&requested_section) {
+        requested_section
     } else {
         "users"
     };
@@ -1884,10 +1889,64 @@ pub fn render_admin_page(
         <div class="timeline">{roles_html}</div>
       </section>
 
-      <section class="panel" data-panel="network"{network_display}>
+      <section class="panel" data-panel="security"{security_display}>
         <div class="panel-header">
-          <h2>Network</h2>
-          <p>Set the externally reachable Lore address and control where browser logins are allowed from.</p>
+          <h2>Security</h2>
+          <p>Approve held password logins, manage passkey sign-in, control allowed login IPs, and set the browser origin used by setup and passkeys.</p>
+        </div>
+        <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>Approve password logins</h2>
+          <p>When passkey enforcement is enabled, correct-password browser logins wait here until an admin approves or denies that exact login attempt.</p>
+        </div>
+        {pending_login_html}
+        <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>Passkey sign-in policy</h2>
+          <p>Passkey logins create sessions immediately. Password logins are held for admin approval when enforcement is enabled.</p>
+        </div>
+        <form method="post" action="/ui/admin/login-security">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label class="toggle">
+            <input type="checkbox" name="passkey_enforcement_enabled" value="true"{login_security_checked}>
+            <span>Require passkey sign-in or admin-approved password login</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" name="ip_restrictions_enabled" value="true"{ip_restrictions_checked}>
+            <span>Restrict browser logins to allowed IPs</span>
+          </label>
+          <button type="submit" class="btn-lg">Save login security</button>
+        </form>
+        <div class="meta-stack padded">
+          <p><strong>Bootstrap rule</strong><br>Register at least one admin passkey before enabling enforcement. The current admin session stays valid while you configure this.</p>
+          <p><strong>Passkey origin</strong><br>Passkeys are bound to the external scheme, domain, and port configured below. Change the external address before registering production passkeys.</p>
+          <p><strong>IP rule</strong><br>Add at least one non-loopback allowed IP before enabling IP restrictions. Loopback is always allowed for Lore's local Caddy path and does not count as an allowlist entry.</p>
+          <p><strong>SSH recovery</strong><br>If browser login is blocked, SSH to the server and run <code>{ssh_bypass_command}</code>. It asks for a user and minutes, then allows one correct-password login for that user while skipping both IP and passkey restrictions during the TTL.</p>
+        </div>
+        <div class="padded passkey-registration" style="display:grid;gap:var(--s-3);padding-top:0;">
+          <label>
+            Passkey label
+            <input type="text" id="passkey-label" value="Admin passkey" maxlength="80">
+          </label>
+          <button type="button" class="btn-lg" id="register-passkey-btn" data-csrf="{csrf_token}">Register passkey for this admin</button>
+          <p class="hint" id="passkey-register-status">You can register separate passkeys for laptops, phones, tablets, and hardware security keys. Passkeys use Touch ID, Face ID, Windows Hello, Android screen lock, or a hardware security key. They require HTTPS except on localhost. Synced passkeys may follow the user's passkey account rather than one physical device.</p>
+        </div>
+        <div class="panel-header" style="margin-top:var(--s-5)"><h2>Registered passkeys</h2></div>
+        {passkeys_html}
+        <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>IP restrictions</h2>
+          <p>IP allowlists are useful for stable office or VPN addresses. Lore reads the client IP from Caddy's forwarded headers and always permits loopback for the local proxy path.</p>
+        </div>
+        <form method="post" action="/ui/admin/login-ips">
+          <input type="hidden" name="csrf_token" value="{csrf_token}">
+          <label>Allowed IP or CIDR<input type="text" name="cidr" value="{current_client_ip}" placeholder="203.0.113.4 or 10.0.0.0/24" required></label>
+          <label>Label<input type="text" name="label" placeholder="Home, office VPN, server admin box"></label>
+          <button type="submit" class="btn-lg">Add IP rule</button>
+          <p class="hint">The field defaults to the IP Lore sees for your current browser request. CIDR ranges are accepted for VPN or office networks.</p>
+        </form>
+        <div class="panel-header" style="margin-top:var(--s-4)"><h2>Allowed login IPs</h2></div>
+        {allowed_login_ips_html}
+        <div class="panel-header" style="margin-top:var(--s-5)">
+          <h2>External address</h2>
+          <p>This address is used for setup links and WebAuthn passkey registration and sign-in.</p>
         </div>
         <form method="post" action="/ui/admin/setup">
           <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -1906,58 +1965,12 @@ pub fn render_admin_page(
             External port
             <input type="number" name="external_port" min="1" max="65535" value="{external_port}" required>
           </label>
-          <button type="submit">Save setup address</button>
+          <button type="submit" class="btn-lg">Save external address</button>
         </form>
         <div class="meta-stack padded">
           <p><strong>Setup page</strong><br>{setup_url}</p>
           <p><strong>Plain text page</strong><br>{setup_text_url}</p>
         </div>
-        <div class="panel-header" style="margin-top:var(--s-5)">
-          <h2>Approved login methods</h2>
-          <p>When enabled, password-only logins do not create a session until an admin approves that exact login attempt. Passkey logins are allowed without per-login approval.</p>
-        </div>
-        <form method="post" action="/ui/admin/login-security">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label class="toggle">
-            <input type="checkbox" name="passkey_enforcement_enabled" value="true"{login_security_checked}>
-            <span>Require passkey or admin-approved password login</span>
-          </label>
-          <label class="toggle">
-            <input type="checkbox" name="ip_restrictions_enabled" value="true"{ip_restrictions_checked}>
-            <span>Restrict browser logins to allowed IPs</span>
-          </label>
-          <button type="submit">Save login security</button>
-        </form>
-        <div class="meta-stack padded">
-          <p><strong>Bootstrap rule</strong><br>Register at least one admin passkey before enabling enforcement. The current admin session stays valid while you configure this.</p>
-          <p><strong>IP rule</strong><br>Add at least one non-loopback allowed IP before enabling IP restrictions. Loopback is always allowed for Lore's local Caddy path and does not count as an allowlist entry.</p>
-          <p><strong>SSH recovery</strong><br>If browser login is blocked, SSH to the server and run <code>{ssh_bypass_command}</code>. It asks for a user and minutes, then allows one correct-password login for that user while skipping both IP and passkey restrictions during the TTL.</p>
-        </div>
-        <div class="padded passkey-registration" style="display:grid;gap:var(--s-3);padding-top:0;">
-          <label>
-            Passkey label
-            <input type="text" id="passkey-label" value="Admin passkey" maxlength="80">
-          </label>
-          <button type="button" id="register-passkey-btn" data-csrf="{csrf_token}">Register passkey for this admin</button>
-          <p class="hint" id="passkey-register-status">You can register separate passkeys for laptops, phones, tablets, and hardware security keys. Passkeys use Touch ID, Face ID, Windows Hello, Android screen lock, or a hardware security key. They require HTTPS except on localhost. Synced passkeys may follow the user's passkey account rather than one physical device.</p>
-        </div>
-        <div class="panel-header" style="margin-top:var(--s-5)"><h2>Registered passkeys</h2></div>
-        {passkeys_html}
-        <div class="panel-header" style="margin-top:var(--s-5)"><h2>Pending password logins</h2><p>Only correct-password attempts appear here. Approve only attempts you recognize.</p></div>
-        {pending_login_html}
-        <div class="panel-header" style="margin-top:var(--s-5)">
-          <h2>IP restrictions</h2>
-          <p>IP allowlists are useful for stable office or VPN addresses. Lore reads the client IP from Caddy's forwarded headers and always permits loopback for the local proxy path.</p>
-        </div>
-        <form method="post" action="/ui/admin/login-ips">
-          <input type="hidden" name="csrf_token" value="{csrf_token}">
-          <label>Allowed IP or CIDR<input type="text" name="cidr" value="{current_client_ip}" placeholder="203.0.113.4 or 10.0.0.0/24" required></label>
-          <label>Label<input type="text" name="label" placeholder="Home, office VPN, server admin box"></label>
-          <button type="submit">Add IP rule</button>
-          <p class="hint">The field defaults to the IP Lore sees for your current browser request. CIDR ranges are accepted for VPN or office networks.</p>
-        </form>
-        <div class="panel-header" style="margin-top:var(--s-4)"><h2>Allowed login IPs</h2></div>
-        {allowed_login_ips_html}
       </section>
 
       <section class="panel" data-panel="endpoints"{endpoints_display}>
@@ -2289,12 +2302,17 @@ pub fn render_admin_page(
       var panels = document.getElementById('admin-panels');
       var links = nav.querySelectorAll('a[data-section]');
       var sections = panels.querySelectorAll('[data-panel]');
+      function canonicalSection(id) {{
+        if (id === 'network') id = 'security';
+        return panels.querySelector('[data-panel="' + id + '"]') ? id : 'users';
+      }}
       function show(id) {{
+        id = canonicalSection(id);
         sections.forEach(function(s) {{ s.style.display = s.getAttribute('data-panel') === id ? '' : 'none'; }});
         links.forEach(function(a) {{ a.classList.toggle('active', a.getAttribute('data-section') === id); }});
       }}
       var params = new URLSearchParams(window.location.search);
-      var initial = params.get('section') || 'users';
+      var initial = canonicalSection(params.get('section') || 'users');
       show(initial);
       links.forEach(function(a) {{
         a.addEventListener('click', function(e) {{
@@ -2631,7 +2649,7 @@ pub fn render_admin_page(
               }})
             }});
             if (!finish.ok) throw new Error('Could not finish passkey registration.');
-            location.href = '/ui/admin?section=network&flash=Passkey%20registered';
+            location.href = '/ui/admin?section=security&flash=Passkey%20registered';
           }} catch (err) {{
             if (status) status.textContent = passkeyRegistrationErrorMessage(err);
             passkeyBtn.disabled = false;
@@ -2834,7 +2852,7 @@ pub fn render_admin_page(
         auth_audit_html = auth_audit_html,
         users_display = hidden("users"),
         roles_display = hidden("roles"),
-        network_display = hidden("network"),
+        security_display = hidden("security"),
         endpoints_display = hidden("endpoints"),
         librarian_display = hidden("librarian"),
         git_export_display = hidden("git-export"),
@@ -4314,6 +4332,7 @@ pub fn render_chat_main_panel(
     </div>
   </div>
 </div>
+<div class="chat-manager-progress-report" id="chat-manager-progress-report" style="display:none;"></div>
 <form class="chat-input-form" id="chat-input-form" onsubmit="return sendMessage(event)">
   <input type="hidden" name="csrf_token" value="{csrf_token}">
   <div class="chat-attachment-strip" id="chat-attachment-strip" style="display:none;"></div>
@@ -4493,6 +4512,36 @@ pub fn render_chat_page(
     flash: Option<&str>,
     projects: &[(String, String)],
 ) -> String {
+    render_chat_page_with_manager_progress(
+        theme,
+        color_mode,
+        username,
+        csrf_token,
+        is_admin,
+        agents,
+        selected_agent,
+        messages_json,
+        active_turn_user_id,
+        "",
+        flash,
+        projects,
+    )
+}
+
+pub fn render_chat_page_with_manager_progress(
+    theme: UiTheme,
+    color_mode: ColorMode,
+    username: &str,
+    csrf_token: &str,
+    is_admin: bool,
+    agents: &[ChatAgentSummary],
+    selected_agent: Option<&str>,
+    messages_json: &str,
+    active_turn_user_id: u64,
+    manager_progress_report: &str,
+    flash: Option<&str>,
+    projects: &[(String, String)],
+) -> String {
     let agent_list_html = render_chat_agent_list(agents, selected_agent);
     let selected_agent_status_js = selected_agent
         .and_then(|name| agents.iter().find(|agent| agent.name == name))
@@ -4520,6 +4569,7 @@ pub fn render_chat_page(
         messages_json,
         profile_url_js,
         active_turn_user_id,
+        manager_progress_report,
         flash,
         chat_area_html,
     )
@@ -4622,11 +4672,15 @@ fn render_chat_page_with_agent_list_html(
     messages_json: &str,
     profile_url_js: String,
     active_turn_user_id: u64,
+    manager_progress_report: &str,
     flash: Option<&str>,
     chat_area_html: String,
 ) -> String {
     let username_js = escape_attribute(username);
     let messages_json = escape_json_for_inline_script(messages_json);
+    let manager_progress_report_json =
+        serde_json::to_string(manager_progress_report).unwrap_or_else(|_| "\"\"".into());
+    let manager_progress_report_json = escape_json_for_inline_script(&manager_progress_report_json);
 
     let layout_class = if has_selected_agent {
         "chat-layout chat-has-agent"
@@ -4659,6 +4713,7 @@ var streamingContent = '';
 var agentConfig = {{ backend: '', model: '', effort: '' }};
 var agentStatus = {selected_agent_status_js};
 var activeTurnUserId = {active_turn_user_id};
+var managerProgressReport = {manager_progress_report_json};
 var isLibrarian = currentAgent === 'librarian';
 var libProject = '';
 var chatFollowScroll = true;
@@ -4943,6 +4998,7 @@ function cacheChatPanelState(agent, state) {{
     messages: Array.isArray(state.messages) ? state.messages : existing.messages || [],
     agent_status: typeof state.agent_status === 'string' ? state.agent_status : existing.agent_status || '',
     active_turn_user_id: state.active_turn_user_id || 0,
+    manager_progress_report: typeof state.manager_progress_report === 'string' ? state.manager_progress_report : existing.manager_progress_report || '',
     profile_url: state.profile_url || null,
     cached_at: Date.now()
   }});
@@ -4957,6 +5013,7 @@ function cacheCurrentChatPanelState(includePanelHtml) {{
     messages: chatMessages || [],
     agent_status: agentStatus || '',
     active_turn_user_id: activeTurnUserId || 0,
+    manager_progress_report: managerProgressReport || '',
     profile_url: agentProfileUrl || null
   }});
 }}
@@ -4973,6 +5030,7 @@ function cacheChatPanelResponse(data) {{
     messages: incomingMessages,
     agent_status: data.agent_status || '',
     active_turn_user_id: data.active_turn_user_id || 0,
+    manager_progress_report: data.manager_progress_report || '',
     profile_url: data.profile_url || null
   }});
 }}
@@ -5001,6 +5059,7 @@ function applyCachedChatPanel(agent, pushHistory) {{
     messages: cached.messages || [],
     agent_status: cached.agent_status || '',
     active_turn_user_id: cached.active_turn_user_id || 0,
+    manager_progress_report: cached.manager_progress_report || '',
     profile_url: cached.profile_url || null
   }}, pushHistory, true);
   return true;
@@ -5047,11 +5106,13 @@ function initializeChatPanel() {{
   }}
 
   if (!currentAgent) {{
+    renderManagerProgressReport();
     renderMessages();
     return;
   }}
 
   renderMessages();
+  renderManagerProgressReport();
   var configAgent = currentAgent;
   fetch('/ui/chat/' + encodeURIComponent(configAgent) + '/config', {{ cache: 'no-store' }})
     .then(function(r) {{ return r.json(); }})
@@ -5095,11 +5156,13 @@ function applyChatPanelResponse(data, pushHistory, fromCache) {{
     if (agentChanged) chatRenderedMessageLimit = CHAT_INITIAL_RENDER_LIMIT;
     agentStatus = data.agent_status || '';
     activeTurnUserId = data.active_turn_user_id || 0;
+    managerProgressReport = data.manager_progress_report || '';
     agentProfileUrl = data.profile_url || null;
     if (currentAgent) localStorage.setItem('lastChatAgent', currentAgent);
     var activeSnapshot = chatPanelRefreshScrollSnapshot || captureChatResizeScrollSnapshot();
     chatPanelRefreshScrollSnapshot = null;
     renderMessages();
+    renderManagerProgressReport();
     updateHeaderStatus();
     setActiveAgentInList(currentAgent);
     applyChatViewportFix();
@@ -5115,6 +5178,7 @@ function applyChatPanelResponse(data, pushHistory, fromCache) {{
   if (agentChanged) chatRenderedMessageLimit = CHAT_INITIAL_RENDER_LIMIT;
   agentStatus = data.agent_status || '';
   activeTurnUserId = data.active_turn_user_id || 0;
+  managerProgressReport = data.manager_progress_report || '';
   agentProfileUrl = data.profile_url || null;
   if (currentAgent) {{
     localStorage.setItem('lastChatAgent', currentAgent);
@@ -5608,6 +5672,14 @@ function parseManagerMessage(content) {{
   if (head === 'Red Flag') return {{ decision: 'Red Flag', decisionClass: 'red-flag', body: body }};
   if (head === 'Stopping Point') return {{ decision: 'Stopping Point', decisionClass: 'stopping-point', body: body }};
   if (/^Wait \d+s$/.test(head)) return {{ decision: head, decisionClass: 'wait', body: body }};
+  if (head === 'Manager Enabled') return {{ decision: 'Manager Enabled', decisionClass: 'status', body: body }};
+  if (head === 'Manager Disabled') return {{ decision: 'Manager Disabled', decisionClass: 'status', body: body }};
+  var asking = head.match(/^asking manager to\s+(.+)$/i);
+  if (asking) {{
+    var askingBody = asking[1].trim();
+    if (body) askingBody = (askingBody + '\n' + body).trim();
+    return {{ decision: 'Asking Manager', decisionClass: 'status', body: askingBody }};
+  }}
   return null;
 }}
 
@@ -5622,6 +5694,24 @@ function renderManagerMessage(managerMessage) {{
   }}
   html += '</div>';
   return html;
+}}
+
+function renderManagerProgressReport() {{
+  var el = document.getElementById('chat-manager-progress-report');
+  if (!el) return;
+  var report = typeof managerProgressReport === 'string' ? managerProgressReport.trim() : '';
+  if (!report || isLibrarian || !currentAgent) {{
+    el.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }}
+  var html = '<div class="chat-manager-progress-head">';
+  html += '<span class="chat-manager-icon" title="Manager">{ICON_MANAGER}</span>';
+  html += '<span>Progress Report</span>';
+  html += '</div>';
+  html += '<div class="chat-manager-progress-body">' + renderMarkdown(report) + '</div>';
+  el.innerHTML = html;
+  el.style.display = '';
 }}
 
 function removeChatImageAttachment(id) {{
@@ -6854,7 +6944,9 @@ function sendMessage(e) {{
         var resp = JSON.parse(xhr.responseText);
         if (resp.action === 'clear') {{
           chatMessages = [];
+          managerProgressReport = '';
           renderMessages();
+          renderManagerProgressReport();
         }} else if (resp.response) {{
           insertChatMessage({{ role: 'system', content: resp.response }});
           renderMessages();
@@ -7198,10 +7290,12 @@ function updateCachedChatPanelFromEvent(evt) {{
   var savedMessages = chatMessages;
   var savedActiveTurnUserId = activeTurnUserId;
   var savedAgentStatus = agentStatus;
+  var savedManagerProgressReport = managerProgressReport;
   var savedStreamingContent = streamingContent;
   chatMessages = cached.messages || [];
   activeTurnUserId = cached.active_turn_user_id || 0;
   agentStatus = cached.agent_status || '';
+  managerProgressReport = cached.manager_progress_report || '';
   streamingContent = cached.streaming_content || '';
   try {{
     if (evt.event_type !== 'status') applyActiveTurnUserIdFromData(evt.data, true);
@@ -7260,11 +7354,14 @@ function updateCachedChatPanelFromEvent(evt) {{
     }} else if (evt.event_type === 'clear') {{
       chatMessages = [];
       activeTurnUserId = 0;
+      managerProgressReport = '';
       streamingContent = '';
     }} else if (evt.event_type === 'auto_message') {{
       insertChatMessage({{ role: 'user', content: evt.data.content }});
     }} else if (evt.event_type === 'command_response') {{
       insertChatMessage({{ role: 'system', content: evt.data.response }});
+    }} else if (evt.event_type === 'manager_progress_report') {{
+      managerProgressReport = evt.data && typeof evt.data.report === 'string' ? evt.data.report : '';
     }} else if (evt.event_type === 'status') {{
       var prevActiveTurnUserId = activeTurnUserId;
       agentStatus = evt.data && evt.data.status ? evt.data.status : '';
@@ -7283,6 +7380,7 @@ function updateCachedChatPanelFromEvent(evt) {{
     cached.messages = chatMessages;
     cached.active_turn_user_id = activeTurnUserId;
     cached.agent_status = agentStatus;
+    cached.manager_progress_report = managerProgressReport;
     cached.streaming_content = streamingContent;
     cached.cached_at = Date.now();
     touchChatPanelCache(evt.agent);
@@ -7290,6 +7388,7 @@ function updateCachedChatPanelFromEvent(evt) {{
     chatMessages = savedMessages;
     activeTurnUserId = savedActiveTurnUserId;
     agentStatus = savedAgentStatus;
+    managerProgressReport = savedManagerProgressReport;
     streamingContent = savedStreamingContent;
   }}
 }}
@@ -7394,14 +7493,20 @@ function connectSSE() {{
       }} else if (evt.event_type === 'clear') {{
         chatMessages = [];
         activeTurnUserId = 0;
+        managerProgressReport = '';
         streamingContent = '';
         renderMessages();
+        renderManagerProgressReport();
       }} else if (evt.event_type === 'auto_message') {{
         insertChatMessage({{ role: 'user', content: evt.data.content }});
         renderMessages();
       }} else if (evt.event_type === 'command_response') {{
         insertChatMessage({{ role: 'system', content: evt.data.response }});
         renderMessages();
+      }} else if (evt.event_type === 'manager_progress_report') {{
+        managerProgressReport = evt.data && typeof evt.data.report === 'string' ? evt.data.report : '';
+        renderManagerProgressReport();
+        cacheCurrentChatPanelState(false);
       }} else if (evt.event_type === 'config_info') {{
         agentConfig.backend = evt.data.backend || '';
         agentConfig.model = evt.data.model || '';
@@ -7644,7 +7749,9 @@ function clearCurrentChatHistory() {{
       if (!data || !data.ok) throw new Error((data && data.error) || 'Failed to clear chat history');
       chatMessages = [];
       activeTurnUserId = 0;
+      managerProgressReport = '';
       renderMessages();
+      renderManagerProgressReport();
       updateAgentListPreview(currentAgent, '', '');
     }})
     .catch(function(err) {{
@@ -12637,10 +12744,53 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       background: rgba(4, 120, 87, 0.08);
       border-color: rgba(4, 120, 87, 0.26);
     }
+    .chat-manager-decision-status {
+      color: var(--fg);
+      background: var(--bg);
+      border-color: var(--line);
+    }
     .chat-manager-response-body {
       min-width: 0;
       overflow-wrap: anywhere;
       word-break: break-word;
+    }
+    .chat-manager-progress-report {
+      flex-shrink: 0;
+      border-top: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 92%, var(--accent-soft));
+      padding: var(--s-2) var(--s-4);
+      max-height: min(38vh, 320px);
+      overflow-y: auto;
+      font-size: 0.84rem;
+      line-height: 1.42;
+      color: var(--fg);
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .chat-manager-progress-head {
+      display: flex;
+      align-items: center;
+      gap: var(--s-2);
+      min-width: 0;
+      margin-bottom: var(--s-1);
+      color: var(--fg-muted);
+      font-size: 0.76rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .chat-manager-progress-body {
+      min-width: 0;
+    }
+    .chat-manager-progress-body p,
+    .chat-manager-progress-body ul,
+    .chat-manager-progress-body ol {
+      margin-top: 0;
+      margin-bottom: var(--s-1);
+    }
+    .chat-manager-progress-body p:last-child,
+    .chat-manager-progress-body ul:last-child,
+    .chat-manager-progress-body ol:last-child {
+      margin-bottom: 0;
     }
     .chat-msg-system {
       align-self: center;
@@ -15346,8 +15496,55 @@ mod tests {
         assert!(html.contains("chat-manager-decision-red-flag"));
         assert!(html.contains("chat-manager-decision-stopping-point"));
         assert!(html.contains("chat-manager-decision-wait"));
+        assert!(html.contains("head === 'Manager Enabled'"));
+        assert!(html.contains("decision: 'Asking Manager'"));
+        assert!(html.contains("chat-manager-decision-status"));
         assert!(html.contains(".chat-msg-manager {"));
         assert!(html.contains(".chat-msg-row-manager,"));
+    }
+
+    #[test]
+    fn chat_page_pins_latest_manager_progress_report_at_bottom() {
+        let html = render_chat_page_with_manager_progress(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            "admin",
+            "csrf",
+            true,
+            &[ChatAgentSummary {
+                name: "worker".into(),
+                display_name: "Worker".into(),
+                owner: "admin".into(),
+                status: "idle".into(),
+                manage_enabled: true,
+                last_message: None,
+                last_message_time: None,
+                profile_url: None,
+                cwd: None,
+                git_branch: None,
+            }],
+            Some("worker"),
+            "[]",
+            0,
+            "- Recent: patched manager report\n- Status: 55% complete",
+            None,
+            &[],
+        );
+
+        let report_idx = html.find(r#"id="chat-manager-progress-report""#).unwrap();
+        let input_idx = html.find(r#"id="chat-input-form""#).unwrap();
+        assert!(report_idx < input_idx);
+        assert!(html.contains(
+            "var managerProgressReport = \"- Recent: patched manager report\\n- Status: 55% complete\";"
+        ));
+        assert!(html.contains("function renderManagerProgressReport() {"));
+        assert!(html.contains("renderManagerProgressReport();"));
+        assert!(html.contains("evt.event_type === 'manager_progress_report'"));
+        assert!(html.contains("manager_progress_report: data.manager_progress_report || ''"));
+        assert!(html.contains("manager_progress_report: managerProgressReport || ''"));
+        assert!(html.contains(".chat-manager-progress-report {"));
+        assert!(html.contains("max-height: min(38vh, 320px);"));
+        assert!(html.contains("Progress Report"));
     }
 
     #[test]
@@ -15661,7 +15858,7 @@ mod tests {
             "if (!fromCache && shouldApplyChatRefreshWithoutPanelReplace(selectedAgent)) {"
         ));
         assert!(html.contains(
-            "renderMessages();\n    updateHeaderStatus();\n    setActiveAgentInList(currentAgent);"
+            "renderMessages();\n    renderManagerProgressReport();\n    updateHeaderStatus();\n    setActiveAgentInList(currentAgent);"
         ));
         assert!(html.contains("scheduleChatResizeScrollRestore(activeSnapshot);"));
         assert!(html.contains("var composerSnapshot = captureChatComposerState();"));
