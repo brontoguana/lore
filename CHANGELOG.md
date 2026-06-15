@@ -2,6 +2,7 @@
 
 ## 2026-06-15
 
+- Kept manager progress reports live while manager mode is enabled by requesting a progress-only manager report when no pinned report exists, and cleared/hid the pinned report when manager mode is disabled or halted.
 - Replaced `/report` with manager-generated progress reports: after each manager directive, Lore asks the manager for a short status report and pins only the latest report above the chat composer.
 - Render Manager Enabled, Manager Disabled, and Asking Manager chat status rows with the same manager SVG glyph used by manager decision rows instead of showing the raw manager emoji marker.
 - Renamed the admin login controls from Network to Security, surfaced password-login approvals first, clarified the passkey sign-in policy and passkey origin, and returned passkey/IP/login approval actions to that section.

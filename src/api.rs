@@ -12337,6 +12337,24 @@ fn selected_chat_agent<'a>(
         .filter(|name| *name == "librarian" || chat_agents.iter().any(|agent| agent.name == *name))
 }
 
+fn push_manager_progress_report_event(
+    state: &AppState,
+    owner: &str,
+    agent_name: &str,
+    report: &str,
+) {
+    push_chat_event(
+        state,
+        owner,
+        ChatEvent {
+            event_type: "manager_progress_report".into(),
+            agent: agent_name.to_string(),
+            owner: owner.to_string(),
+            data: json!({ "report": report }),
+        },
+    );
+}
+
 fn load_chat_panel_data(
     state: &AppState,
     owner: &str,
@@ -13479,7 +13497,7 @@ async fn chat_agent_poll(
         Ok(state
             .chat
             .get_manage_config(owner_str, &agent.name)?
-            .map(|mc| mc.enabled && mc.run_requested)
+            .map(|mc| manager_work_requested(&mc))
             .unwrap_or(false))
     };
 
@@ -14671,8 +14689,14 @@ async fn chat_agent_get_manage(
     }
 
     let turn_in_cycle = mc.turn_counter % 5;
+    let progress_report_missing = mc.manager_progress_report.trim().is_empty();
+    let progress_report_only = progress_report_missing && !mc.run_requested;
     let manager_prompt_config = state.manager_prompt_config.load()?;
-    let system_prompt = build_manager_prompt(&mc, &manager_prompt_config, turn_in_cycle);
+    let system_prompt = if progress_report_only {
+        String::new()
+    } else {
+        build_manager_prompt(&mc, &manager_prompt_config, turn_in_cycle)
+    };
     let progress_report_prompt = build_manager_progress_report_prompt(&mc);
 
     let conv = state.chat.load_conversation(owner_str, &agent.name)?;
@@ -14709,6 +14733,9 @@ async fn chat_agent_get_manage(
         "backend": mc.backend,
         "has_endpoint": has_endpoint,
         "turn_counter": mc.turn_counter,
+        "run_requested": mc.run_requested,
+        "progress_report_missing": progress_report_missing,
+        "progress_report_only": progress_report_only,
     })))
 }
 
@@ -14772,6 +14799,7 @@ async fn chat_agent_manager_report(
         if stopped {
             auto_disabled = mc.enabled;
             mc.enabled = false;
+            mc.manager_progress_report.clear();
         } else if let Some(until) = delayed_until_unix {
             mc.delayed_message = response_content.clone();
             mc.delayed_until_unix = until;
@@ -14804,6 +14832,7 @@ async fn chat_agent_manager_report(
             ChatRole::Assistant,
             &manager_chat_message_prefix("Manager Disabled"),
         );
+        push_manager_progress_report_event(&state, owner_str, &agent.name, "");
     }
 
     if !stopped && delayed_until_unix.is_none() {
@@ -14831,6 +14860,20 @@ async fn chat_agent_manager_progress_report(
     let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
     let owner_str = owner.as_str();
 
+    let mc = state
+        .chat
+        .get_manage_config(owner_str, &agent.name)?
+        .unwrap_or_default();
+    if !mc.enabled {
+        if !mc.manager_progress_report.trim().is_empty() {
+            state
+                .chat
+                .clear_manager_progress_report(owner_str, &agent.name)?;
+            push_manager_progress_report_event(&state, owner_str, &agent.name, "");
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     let report = normalize_manager_progress_report(&body.content);
     if report.is_empty() {
         return Ok(StatusCode::NO_CONTENT);
@@ -14842,16 +14885,7 @@ async fn chat_agent_manager_progress_report(
     state
         .chat
         .set_manager_progress_report(owner_str, &agent.name, &report)?;
-    push_chat_event(
-        &state,
-        owner_str,
-        ChatEvent {
-            event_type: "manager_progress_report".into(),
-            agent: agent.name.clone(),
-            owner: owner_str.to_string(),
-            data: json!({ "report": report }),
-        },
-    );
+    push_manager_progress_report_event(&state, owner_str, &agent.name, &report);
 
     Ok(StatusCode::OK)
 }
@@ -15332,6 +15366,10 @@ fn manager_chat_message_prefix(content: &str) -> String {
 
 fn should_restart_agent_on_manage_enable(process_status: Option<&str>) -> bool {
     matches!(process_status, Some("restarting") | Some("offline"))
+}
+
+fn manager_work_requested(mc: &ManageConfig) -> bool {
+    mc.enabled && (mc.run_requested || mc.manager_progress_report.trim().is_empty())
 }
 
 fn release_due_delayed_manager_message(
@@ -16588,6 +16626,7 @@ async fn chat_save_manage(
             mc.request_announced = false;
             mc.delayed_message.clear();
             mc.delayed_until_unix = 0;
+            mc.manager_progress_report.clear();
         }
         mc.enabled = en;
     }
@@ -16639,8 +16678,13 @@ async fn chat_save_manage(
             ChatRole::Assistant,
             &manager_chat_message_prefix("Manager Disabled"),
         );
+        push_manager_progress_report_event(&state, owner, &agent_name, "");
     }
-    Ok(Json(json!({"ok": true, "enabled": mc.enabled})))
+    Ok(Json(json!({
+        "ok": true,
+        "enabled": mc.enabled,
+        "manager_progress_report": mc.manager_progress_report,
+    })))
 }
 
 async fn chat_slash_command(
@@ -23669,6 +23713,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn manager_work_requested_when_enabled_and_report_missing() {
+        assert!(!super::manager_work_requested(&ManageConfig::default()));
+        assert!(super::manager_work_requested(&ManageConfig {
+            enabled: true,
+            ..Default::default()
+        }));
+        assert!(super::manager_work_requested(&ManageConfig {
+            enabled: true,
+            run_requested: true,
+            manager_progress_report: "Current report".into(),
+            ..Default::default()
+        }));
+        assert!(!super::manager_work_requested(&ManageConfig {
+            enabled: true,
+            manager_progress_report: "Current report".into(),
+            ..Default::default()
+        }));
+    }
+
     #[tokio::test]
     async fn manager_stop_report_disables_manage_without_queueing_agent_turn() {
         let dir = tempdir().unwrap();
@@ -23685,6 +23749,7 @@ mod tests {
                     enabled: true,
                     run_requested: true,
                     request_announced: true,
+                    manager_progress_report: "Old progress".into(),
                     ..Default::default()
                 },
             )
@@ -23710,6 +23775,7 @@ mod tests {
         assert!(!saved.enabled);
         assert!(!saved.run_requested);
         assert!(!saved.request_announced);
+        assert!(saved.manager_progress_report.is_empty());
 
         let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
         assert_eq!(conv.messages.len(), 2);
@@ -23798,6 +23864,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_progress_report_is_ignored_when_manager_disabled() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let agent_token =
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        state
+            .chat
+            .save_manage_config(
+                "admin",
+                "agent-main",
+                &ManageConfig {
+                    enabled: false,
+                    manager_progress_report: "Old progress".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/manager/progress")
+            .header("content-type", "application/json")
+            .header(API_KEY_HEADER, &agent_token)
+            .body(Body::from(r#"{"content":"New progress"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let saved = state
+            .chat
+            .get_manage_config("admin", "agent-main")
+            .unwrap()
+            .unwrap();
+        assert!(saved.manager_progress_report.is_empty());
+
+        let conv = state.chat.load_conversation("admin", "agent-main").unwrap();
+        assert!(conv.messages.is_empty());
+    }
+
+    #[tokio::test]
     async fn manager_manage_payload_includes_progress_report_prompt() {
         let dir = tempdir().unwrap();
         let app = build_app(FileBlockStore::new(dir.path()));
@@ -23835,6 +23942,52 @@ mod tests {
         assert!(prompt.contains("about 110 words"));
         assert!(prompt.contains("Ship the fix"));
         assert!(prompt.contains("Do not write a control line"));
+    }
+
+    #[tokio::test]
+    async fn manager_manage_payload_requests_progress_only_when_report_missing() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let agent_token =
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        state
+            .chat
+            .save_manage_config(
+                "admin",
+                "agent-main",
+                &ManageConfig {
+                    enabled: true,
+                    run_requested: false,
+                    goals: "Ship the fix".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/chat/manage")
+            .header(API_KEY_HEADER, &agent_token)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["run_requested"], false);
+        assert_eq!(json["progress_report_missing"], true);
+        assert_eq!(json["progress_report_only"], true);
+        assert_eq!(json["system_prompt"], "");
+        assert!(
+            json["progress_report_prompt"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Ship the fix")
+        );
     }
 
     #[test]

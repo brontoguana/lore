@@ -5069,6 +5069,7 @@ function initializeChatPanel() {{
   isLibrarian = currentAgent === 'librarian';
   streamingContent = '';
   agentConfig = {{ backend: '', model: '', effort: '' }};
+  manageConfigData = null;
   if (isLibrarian || !currentAgent) agentStatus = '';
   chatFollowScroll = true;
   clearChatMessageSwipeGesture();
@@ -5700,7 +5701,7 @@ function renderManagerProgressReport() {{
   var el = document.getElementById('chat-manager-progress-report');
   if (!el) return;
   var report = typeof managerProgressReport === 'string' ? managerProgressReport.trim() : '';
-  if (!report || isLibrarian || !currentAgent) {{
+  if (isLibrarian || !currentAgent || !currentAgentManagerEnabled()) {{
     el.style.display = 'none';
     el.innerHTML = '';
     return;
@@ -5709,7 +5710,7 @@ function renderManagerProgressReport() {{
   html += '<span class="chat-manager-icon" title="Manager">{ICON_MANAGER}</span>';
   html += '<span>Progress Report</span>';
   html += '</div>';
-  html += '<div class="chat-manager-progress-body">' + renderMarkdown(report) + '</div>';
+  html += '<div class="chat-manager-progress-body">' + (report ? renderMarkdown(report) : '<p>Generating progress report...</p>') + '</div>';
   el.innerHTML = html;
   el.style.display = '';
 }}
@@ -6996,6 +6997,15 @@ function updateHeaderStatus() {{
 
 function shouldUseManagerGlyph(agent, statusClass) {{
   if (statusClass !== 'chat-status-working' || !agent) return false;
+  return currentAgentManagerEnabledFor(agent);
+}}
+
+function currentAgentManagerEnabled() {{
+  return currentAgentManagerEnabledFor(currentAgent);
+}}
+
+function currentAgentManagerEnabledFor(agent) {{
+  if (!agent) return false;
   var item = document.querySelector('.chat-agent-item[data-agent="' + CSS.escape(agent) + '"]');
   if (item && item.dataset && item.dataset.manageEnabled === 'true') return true;
   return !!(
@@ -7856,6 +7866,7 @@ function updateManageToggle(enabled) {{
     currentItem.dataset.manageEnabled = enabled ? 'true' : 'false';
   }}
   updateHeaderStatus();
+  renderManagerProgressReport();
   if (currentAgent) updateAgentListStatus(currentAgent, agentStatus);
 }}
 
@@ -7906,6 +7917,7 @@ function toggleManageMode() {{
     body: body
   }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
     if (manageConfigData) manageConfigData.enabled = data.enabled;
+    if (typeof data.manager_progress_report === 'string') managerProgressReport = data.manager_progress_report;
     updateManageToggle(data.enabled);
     var status = document.getElementById('mgr-status');
     if (status) status.textContent = data.enabled ? 'Turn 0' : '';
@@ -15538,10 +15550,14 @@ mod tests {
             "var managerProgressReport = \"- Recent: patched manager report\\n- Status: 55% complete\";"
         ));
         assert!(html.contains("function renderManagerProgressReport() {"));
+        assert!(html.contains("!currentAgentManagerEnabled()"));
+        assert!(html.contains("Generating progress report..."));
+        assert!(html.contains("function currentAgentManagerEnabled() {"));
         assert!(html.contains("renderManagerProgressReport();"));
         assert!(html.contains("evt.event_type === 'manager_progress_report'"));
         assert!(html.contains("manager_progress_report: data.manager_progress_report || ''"));
         assert!(html.contains("manager_progress_report: managerProgressReport || ''"));
+        assert!(html.contains("typeof data.manager_progress_report === 'string'"));
         assert!(html.contains(".chat-manager-progress-report {"));
         assert!(html.contains("max-height: min(38vh, 320px);"));
         assert!(html.contains("Progress Report"));

@@ -5035,6 +5035,65 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         .to_string();
     let messages = manage["messages"].as_array();
     let backend_str = manage["backend"].as_str().unwrap_or("");
+    let progress_report_only = manage["progress_report_only"].as_bool().unwrap_or(false);
+    let has_endpoint = manage["has_endpoint"].as_bool().unwrap_or(false);
+    let backend: AgentBackend = backend_str.parse().unwrap_or(AgentBackend::Claude);
+
+    if progress_report_only {
+        if progress_report_prompt.trim().is_empty() {
+            return Ok(());
+        }
+        eprintln!("[manager] Generating missing progress report");
+        let directive = "No new manager directive is being requested. Manager mode is active, but no progress report is currently pinned for the user. Use the recent conversation and goals to summarize current progress.";
+        match run_manager_progress_report(
+            context,
+            agent_name,
+            backend,
+            has_endpoint,
+            &progress_report_prompt,
+            messages,
+            directive,
+        )
+        .await
+        {
+            Ok(report) if !report.trim().is_empty() => {
+                let report = report.trim().to_string();
+                let _ = context
+                    .client
+                    .post(format!("{}/v1/chat/manager/progress", context.url))
+                    .header("x-lore-key", token)
+                    .json(&serde_json::json!({ "content": report }))
+                    .send()
+                    .await;
+
+                let lore_dir = agent_lore_dir(agent_name);
+                let _ = fs::create_dir_all(&lore_dir);
+                let ts = time::OffsetDateTime::now_utc();
+                let timestamp = format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    ts.year(),
+                    ts.month() as u8,
+                    ts.day(),
+                    ts.hour(),
+                    ts.minute(),
+                    ts.second()
+                );
+                if let Ok(mut f) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(lore_dir.join("lore.log"))
+                {
+                    use std::io::Write;
+                    let _ = write!(f, "[{timestamp}] MANAGER PROGRESS:\n{report}\n\n");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[manager] Progress report failed: {e}");
+            }
+        }
+        return Ok(());
+    }
 
     if system_prompt.is_empty() {
         return Ok(());
@@ -5048,8 +5107,6 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         .send()
         .await;
 
-    let has_endpoint = manage["has_endpoint"].as_bool().unwrap_or(false);
-    let backend: AgentBackend = backend_str.parse().unwrap_or(AgentBackend::Claude);
     let manager_response = if has_endpoint {
         match run_manager_endpoint(context, &system_prompt, messages).await {
             Ok(s) => s,
@@ -5103,7 +5160,7 @@ async fn maybe_run_manager(context: &CliContext, agent_name: &str) -> CliResult<
         .send()
         .await;
 
-    let progress_report = if progress_report_prompt.trim().is_empty() {
+    let progress_report = if stopped || progress_report_prompt.trim().is_empty() {
         None
     } else {
         let directive = manager_progress_report_directive(&parsed_response, &display);
@@ -5212,7 +5269,7 @@ async fn run_manager_progress_report(
     directive: &str,
 ) -> CliResult<String> {
     let prompt = format!(
-        "{progress_report_prompt}\n\nLATEST MANAGER DIRECTIVE:\n{directive}\n\n\
+        "{progress_report_prompt}\n\nLATEST MANAGER CONTEXT:\n{directive}\n\n\
          Produce only the short progress report for the user."
     );
     if has_endpoint {
