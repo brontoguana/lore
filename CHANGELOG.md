@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-06-16
+
+- Fixed Windows `lore setup-machine` when `HOME` is unset by falling back to `%APPDATA%`/`%LOCALAPPDATA%` for CLI config and `%USERPROFILE%` for service state, while preserving existing `XDG_CONFIG_HOME`/`HOME` config behavior and explicit service-directory overrides.
+
 ## 2026-06-15
 
 - Kept manager progress reports live while manager mode is enabled by requesting a progress-only manager report when no pinned report exists, and cleared/hid the pinned report when manager mode is disabled or halted.

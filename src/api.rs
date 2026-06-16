@@ -7978,8 +7978,10 @@ $Version = if ($env:LORE_VERSION) {{ $env:LORE_VERSION }} else {{ "latest" }}
 $InstallDir = if ($env:LORE_INSTALL_DIR) {{ $env:LORE_INSTALL_DIR }} else {{ "$env:LOCALAPPDATA\lore\bin" }}
 $BinaryName = "lore"
 $DownloadBase = if ($env:LORE_DOWNLOAD_BASE) {{ $env:LORE_DOWNLOAD_BASE }} else {{ "$ServerUrl/downloads/lore" }}
-$LoreServiceDir = if ($env:LORE_SERVICE_DIR) {{ $env:LORE_SERVICE_DIR }} else {{ "$HOME\.lore-service" }}
-$LegacyLoreServiceDir = if ($env:LEGACY_LORE_SERVICE_DIR) {{ $env:LEGACY_LORE_SERVICE_DIR }} else {{ "$HOME\lore-service" }}
+$UserHome = if ($env:USERPROFILE) {{ $env:USERPROFILE }} else {{ [Environment]::GetFolderPath("UserProfile") }}
+if (-not $UserHome) {{ $UserHome = $HOME }}
+$LoreServiceDir = if ($env:LORE_SERVICE_DIR) {{ $env:LORE_SERVICE_DIR }} else {{ "$UserHome\.lore-service" }}
+$LegacyLoreServiceDir = if ($env:LEGACY_LORE_SERVICE_DIR) {{ $env:LEGACY_LORE_SERVICE_DIR }} else {{ "$UserHome\lore-service" }}
 $ServicePidFile = Join-Path $LoreServiceDir "service.pid"
 $LegacyServicePidFile = Join-Path $LegacyLoreServiceDir "service.pid"
 
@@ -21061,6 +21063,24 @@ mod tests {
         assert!(script_text.contains("SERVER_URL='https://lore.example.com'"));
         assert!(script_text.contains("$SERVER_URL/downloads/lore"));
         assert!(!script_text.contains("github.com/brontoguana/lore"));
+
+        let ps1 = Request::builder()
+            .method("GET")
+            .uri("/install-cli.ps1")
+            .body(Body::empty())
+            .unwrap();
+        let ps1_response = app.clone().oneshot(ps1).await.unwrap();
+        assert_eq!(ps1_response.status(), StatusCode::OK);
+        let ps1_body = axum::body::to_bytes(ps1_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ps1_text = String::from_utf8(ps1_body.to_vec()).unwrap();
+        assert!(ps1_text.contains("$ServerUrl = 'https://lore.example.com'"));
+        assert!(ps1_text.contains("$DownloadBase = if ($env:LORE_DOWNLOAD_BASE)"));
+        assert!(ps1_text.contains("$UserHome = if ($env:USERPROFILE)"));
+        assert!(ps1_text.contains("$LoreServiceDir = if ($env:LORE_SERVICE_DIR)"));
+        assert!(ps1_text.contains("\"$UserHome\\.lore-service\""));
+        assert!(!ps1_text.contains("\"$HOME\\.lore-service\""));
 
         let binary = Request::builder()
             .method("GET")

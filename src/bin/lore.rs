@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::error::Error;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -67,10 +67,12 @@ Options:
 {options}{after-help}";
 
 fn resolve_executable_path(executable: &str, fallback_relative_paths: &[&str]) -> PathBuf {
+    let mut env_var = |name: &str| env::var_os(name);
+    let home = user_home_dir_from_env(host_platform(), &mut env_var);
     resolve_executable_path_from(
         executable,
         fallback_relative_paths,
-        env::var_os("HOME").as_deref(),
+        home.as_ref().map(|path| path.as_os_str()),
         env::var_os("PATH").as_deref(),
     )
 }
@@ -139,8 +141,10 @@ fn should_force_agy_file_token_auth_from(
 }
 
 fn should_force_agy_file_token_auth() -> bool {
+    let mut env_var = |name: &str| env::var_os(name);
+    let home = user_home_dir_from_env(host_platform(), &mut env_var);
     should_force_agy_file_token_auth_from(
-        env::var_os("HOME").as_deref(),
+        home.as_ref().map(|path| path.as_os_str()),
         env::var_os("SSH_CONNECTION").as_deref(),
         env::var_os("SSH_CLIENT").as_deref(),
     )
@@ -2843,18 +2847,82 @@ fn promote_staged_binary_to_canonical(
     write_executable_atomically(canonical_executable, &bytes)
 }
 
-fn legacy_service_root_dir() -> PathBuf {
-    env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostPlatform {
+    Unix,
+    Windows,
+}
+
+fn host_platform() -> HostPlatform {
+    if cfg!(windows) {
+        HostPlatform::Windows
+    } else {
+        HostPlatform::Unix
+    }
+}
+
+fn non_empty_env_os<F>(env_var: &mut F, name: &str) -> Option<OsString>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    env_var(name).filter(|value| !value.as_os_str().is_empty())
+}
+
+fn env_path<F>(env_var: &mut F, name: &str) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    non_empty_env_os(env_var, name).map(PathBuf::from)
+}
+
+fn user_home_dir_from_env<F>(platform: HostPlatform, env_var: &mut F) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    if let Some(home) = env_path(env_var, "HOME") {
+        return Some(home);
+    }
+    if platform == HostPlatform::Windows {
+        if let Some(profile) = env_path(env_var, "USERPROFILE") {
+            return Some(profile);
+        }
+        let drive = non_empty_env_os(env_var, "HOMEDRIVE");
+        let path = non_empty_env_os(env_var, "HOMEPATH");
+        if let (Some(mut drive), Some(path)) = (drive, path) {
+            drive.push(path);
+            return Some(PathBuf::from(drive));
+        }
+    }
+    None
+}
+
+fn legacy_service_root_dir_from_env<F>(platform: HostPlatform, mut env_var: F) -> PathBuf
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    user_home_dir_from_env(platform, &mut env_var)
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("lore-service")
 }
 
+fn service_root_dir_from_env<F>(platform: HostPlatform, mut env_var: F) -> PathBuf
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    if let Some(dir) = env_path(&mut env_var, "LORE_SERVICE_DIR") {
+        return dir;
+    }
+    user_home_dir_from_env(platform, &mut env_var)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".lore-service")
+}
+
+fn legacy_service_root_dir() -> PathBuf {
+    legacy_service_root_dir_from_env(host_platform(), |name| env::var_os(name))
+}
+
 fn service_root_dir() -> CliResult<PathBuf> {
-    let home = env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let hidden_dir = home.join(".lore-service");
+    let hidden_dir = service_root_dir_from_env(host_platform(), |name| env::var_os(name));
     let legacy_dir = legacy_service_root_dir();
 
     if !hidden_dir.exists() && legacy_dir.exists() {
@@ -3418,14 +3486,37 @@ fn save_cli_config(config: &CliConfig) -> CliResult<()> {
     Ok(())
 }
 
-fn cli_config_path() -> CliResult<PathBuf> {
-    if let Ok(value) = env::var("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(value).join("lore").join("config.json"));
+fn cli_config_path_from_env<F>(platform: HostPlatform, mut env_var: F) -> CliResult<PathBuf>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    if let Some(value) = env_path(&mut env_var, "XDG_CONFIG_HOME") {
+        return Ok(value.join("lore").join("config.json"));
     }
-    let home = env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| io::Error::other("HOME is not set and XDG_CONFIG_HOME is unavailable"))?;
-    Ok(home.join(".config").join("lore").join("config.json"))
+    if let Some(home) = env_path(&mut env_var, "HOME") {
+        return Ok(home.join(".config").join("lore").join("config.json"));
+    }
+    if platform == HostPlatform::Windows {
+        if let Some(value) = env_path(&mut env_var, "APPDATA") {
+            return Ok(value.join("lore").join("config.json"));
+        }
+        if let Some(value) = env_path(&mut env_var, "LOCALAPPDATA") {
+            return Ok(value.join("lore").join("config.json"));
+        }
+    }
+    if let Some(home) = user_home_dir_from_env(platform, &mut env_var) {
+        return Ok(home.join(".config").join("lore").join("config.json"));
+    }
+    let detail = if platform == HostPlatform::Windows {
+        "no config directory is available; set APPDATA, LOCALAPPDATA, USERPROFILE, HOME, or XDG_CONFIG_HOME"
+    } else {
+        "HOME is not set and XDG_CONFIG_HOME is unavailable"
+    };
+    Err(io::Error::other(detail).into())
+}
+
+fn cli_config_path() -> CliResult<PathBuf> {
+    cli_config_path_from_env(host_platform(), |name| env::var_os(name))
 }
 
 fn default_update_repo_string() -> String {
@@ -8275,8 +8366,10 @@ fn migrate_old_agents(_context: &CliContext, svc_state: &mut ServiceState) {
             Some(info) => info,
             None => {
                 // Agent isn't running, but we know about it from config.
-                // Use HOME as default folder.
-                let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                let home = service_home_dir()
+                    .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                    .to_string_lossy()
+                    .into_owned();
                 eprintln!(
                     "[service] Agent '{}' not running, importing with folder={}",
                     agent_name, home
@@ -8361,7 +8454,12 @@ fn find_old_agent_process(agent_name: &str, exclude_pid: u32) -> Option<(String,
             let cwd_link = format!("/proc/{}/cwd", pid);
             let cwd = fs::read_link(&cwd_link)
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+                .unwrap_or_else(|_| {
+                    service_home_dir()
+                        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                        .to_string_lossy()
+                        .into_owned()
+                });
 
             return Some((cwd, Some(pid)));
         }
@@ -8762,9 +8860,14 @@ async fn service_poll_and_execute(
 }
 
 fn service_home_dir() -> CliResult<PathBuf> {
-    let raw_home = env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"));
+    let mut env_var = |name: &str| env::var_os(name);
+    let raw_home = user_home_dir_from_env(host_platform(), &mut env_var).unwrap_or_else(|| {
+        if cfg!(windows) {
+            PathBuf::from(".")
+        } else {
+            PathBuf::from("/")
+        }
+    });
     Ok(fs::canonicalize(&raw_home)?)
 }
 
@@ -8979,11 +9082,22 @@ mod tests {
     use lore_core::AgentBackend;
     use serde_json::json;
     use std::collections::HashSet;
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
+
+    fn env_lookup<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&str) -> Option<OsString> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
 
     #[test]
     fn append_new_stream_text_converts_snapshots_to_deltas() {
@@ -9132,6 +9246,85 @@ mod tests {
             ),
             system
         );
+    }
+
+    #[test]
+    fn cli_config_path_uses_windows_appdata_when_home_is_absent() {
+        let path = super::cli_config_path_from_env(
+            super::HostPlatform::Windows,
+            env_lookup(&[("APPDATA", r"C:\Users\stoate\AppData\Roaming")]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\Users\stoate\AppData\Roaming")
+                .join("lore")
+                .join("config.json")
+        );
+    }
+
+    #[test]
+    fn cli_config_path_preserves_windows_home_when_it_is_set() {
+        let path = super::cli_config_path_from_env(
+            super::HostPlatform::Windows,
+            env_lookup(&[
+                ("HOME", r"C:\Users\stoate"),
+                ("APPDATA", r"C:\Users\stoate\AppData\Roaming"),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\Users\stoate")
+                .join(".config")
+                .join("lore")
+                .join("config.json")
+        );
+    }
+
+    #[test]
+    fn cli_config_path_uses_windows_userprofile_fallback_when_home_is_absent() {
+        let path = super::cli_config_path_from_env(
+            super::HostPlatform::Windows,
+            env_lookup(&[("USERPROFILE", r"C:\Users\stoate")]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\Users\stoate")
+                .join(".config")
+                .join("lore")
+                .join("config.json")
+        );
+    }
+
+    #[test]
+    fn service_root_dir_uses_windows_userprofile_when_home_is_absent() {
+        let path = super::service_root_dir_from_env(
+            super::HostPlatform::Windows,
+            env_lookup(&[("USERPROFILE", r"C:\Users\stoate")]),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\Users\stoate").join(".lore-service")
+        );
+    }
+
+    #[test]
+    fn service_root_dir_honors_explicit_override() {
+        let path = super::service_root_dir_from_env(
+            super::HostPlatform::Windows,
+            env_lookup(&[
+                ("LORE_SERVICE_DIR", r"D:\Lore\Service"),
+                ("USERPROFILE", r"C:\Users\stoate"),
+            ]),
+        );
+
+        assert_eq!(path, PathBuf::from(r"D:\Lore\Service"));
     }
 
     #[test]

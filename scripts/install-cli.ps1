@@ -5,8 +5,10 @@ $Repo = if ($env:LORE_GITHUB_REPO) { $env:LORE_GITHUB_REPO } else { "brontoguana
 $Version = if ($env:LORE_VERSION) { $env:LORE_VERSION } else { "latest" }
 $InstallDir = if ($env:LORE_INSTALL_DIR) { $env:LORE_INSTALL_DIR } else { "$env:LOCALAPPDATA\lore\bin" }
 $BinaryName = "lore"
-$LoreServiceDir = if ($env:LORE_SERVICE_DIR) { $env:LORE_SERVICE_DIR } else { "$HOME\.lore-service" }
-$LegacyLoreServiceDir = if ($env:LEGACY_LORE_SERVICE_DIR) { $env:LEGACY_LORE_SERVICE_DIR } else { "$HOME\lore-service" }
+$UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath("UserProfile") }
+if (-not $UserHome) { $UserHome = $HOME }
+$LoreServiceDir = if ($env:LORE_SERVICE_DIR) { $env:LORE_SERVICE_DIR } else { "$UserHome\.lore-service" }
+$LegacyLoreServiceDir = if ($env:LEGACY_LORE_SERVICE_DIR) { $env:LEGACY_LORE_SERVICE_DIR } else { "$UserHome\lore-service" }
 $ServicePidFile = Join-Path $LoreServiceDir "service.pid"
 $LegacyServicePidFile = Join-Path $LegacyLoreServiceDir "service.pid"
 
