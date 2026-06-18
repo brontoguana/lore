@@ -184,6 +184,7 @@ pub struct AppState {
     chat_senders: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ChatEvent>>>>,
     chat_agent_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     chat_agent_stops: Arc<Mutex<HashSet<String>>>,
+    chat_active_endpoint_snapshots: Arc<Mutex<HashMap<String, String>>>,
     machine_commands: Arc<Mutex<HashMap<String, Vec<MachineCommand>>>>,
     machine_command_results: Arc<Mutex<HashMap<String, Value>>>,
     machine_poll_notifiers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
@@ -445,6 +446,33 @@ fn record_api_tool_activity(
     }
 }
 
+fn chat_agent_runtime_key(owner: &str, agent: &str) -> String {
+    format!("{owner}_{agent}")
+}
+
+fn set_active_endpoint_snapshot(state: &AppState, owner: &str, agent: &str, endpoint_id: &str) {
+    let key = chat_agent_runtime_key(owner, agent);
+    if let Ok(mut snapshots) = state.chat_active_endpoint_snapshots.lock() {
+        snapshots.insert(key, endpoint_id.to_string());
+    }
+}
+
+fn clear_active_endpoint_snapshot(state: &AppState, owner: &str, agent: &str) {
+    let key = chat_agent_runtime_key(owner, agent);
+    if let Ok(mut snapshots) = state.chat_active_endpoint_snapshots.lock() {
+        snapshots.remove(&key);
+    }
+}
+
+fn active_endpoint_snapshot(state: &AppState, owner: &str, agent: &str) -> Option<String> {
+    let key = chat_agent_runtime_key(owner, agent);
+    state
+        .chat_active_endpoint_snapshots
+        .lock()
+        .ok()
+        .and_then(|snapshots| snapshots.get(&key).cloned())
+}
+
 #[derive(Debug, Clone)]
 struct McpSessionEntry {
     agent: AuthenticatedAgent,
@@ -541,6 +569,7 @@ impl AppState {
             chat_senders: Arc::new(Mutex::new(HashMap::new())),
             chat_agent_notifiers: Arc::new(Mutex::new(HashMap::new())),
             chat_agent_stops: Arc::new(Mutex::new(HashSet::new())),
+            chat_active_endpoint_snapshots: Arc::new(Mutex::new(HashMap::new())),
             machine_commands: Arc::new(Mutex::new(HashMap::new())),
             machine_command_results: Arc::new(Mutex::new(HashMap::new())),
             machine_poll_notifiers: Arc::new(Mutex::new(HashMap::new())),
@@ -13539,6 +13568,11 @@ async fn chat_agent_poll(
         .claim_pending_user_messages(owner_str, &agent.name)?;
 
     if !pending.is_empty() {
+        if let Some(ref endpoint_id) = poll_endpoint_id {
+            set_active_endpoint_snapshot(&state, owner_str, &agent.name, endpoint_id);
+        } else {
+            clear_active_endpoint_snapshot(&state, owner_str, &agent.name);
+        }
         if let Some(last) = pending.last() {
             push_chat_event(
                 &state,
@@ -13583,6 +13617,11 @@ async fn chat_agent_poll(
             .chat
             .claim_pending_user_messages(owner_str, &agent.name)?;
         if !pending.is_empty() {
+            if let Some(ref endpoint_id) = poll_endpoint_id {
+                set_active_endpoint_snapshot(&state, owner_str, &agent.name, endpoint_id);
+            } else {
+                clear_active_endpoint_snapshot(&state, owner_str, &agent.name);
+            }
             if let Some(last) = pending.last() {
                 push_chat_event(
                     &state,
@@ -15565,6 +15604,7 @@ fn finish_api_agent(state: &AppState, owner: &str, agent_name: &str, content: &s
 
 fn finalize_agent_turn(state: &AppState, owner: &str, agent_name: &str) {
     clear_chat_agent_stop_request(state, owner, agent_name);
+    clear_active_endpoint_snapshot(state, owner, agent_name);
     let _ = state.chat.complete_active_turn(owner, agent_name);
     let _ = state
         .chat
@@ -16185,13 +16225,15 @@ async fn chat_proxy_completions(
 ) -> Result<Response, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
     require_chat_authenticated_agent(&agent)?;
-    let endpoint_id = agent
-        .endpoint_id
-        .as_deref()
+    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
+    let owner_str = owner.as_str().to_string();
+    let agent_name = agent.name.clone();
+    let endpoint_id = active_endpoint_snapshot(&state, &owner_str, &agent_name)
+        .or_else(|| agent.endpoint_id.clone())
         .ok_or_else(|| LoreError::Validation("agent has no endpoint configured".into()))?;
     let endpoint = state
         .endpoint_store
-        .get(endpoint_id)?
+        .get(&endpoint_id)?
         .ok_or_else(|| LoreError::Validation("configured endpoint not found".into()))?;
 
     let streaming = req.stream.unwrap_or(false);
@@ -16200,10 +16242,6 @@ async fn chat_proxy_completions(
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
 
     // Push tool_use events to the chat UI for visibility
-    let owner = agent.owner.as_ref().ok_or(LoreError::PermissionDenied)?;
-    let owner_str = owner.as_str().to_string();
-    let agent_name = agent.name.clone();
-
     if streaming {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::librarian::ProxyStreamChunk>(256);
         let client = state.librarian_client_http.clone();

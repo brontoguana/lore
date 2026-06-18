@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-06-18
+
+- Fixed API-endpoint turns that were already claimed by a machine agent so switching the agent to a CLI backend such as `agy` during that active turn no longer breaks the in-flight `/v1/chat/completions` call with `agent has no endpoint configured`; the switch now applies cleanly to the next turn.
+
 ## 2026-06-16
 
 - Fixed Windows `lore setup-machine` when `HOME` is unset by falling back to `%APPDATA%`/`%LOCALAPPDATA%` for CLI config and `%USERPROFILE%` for service state, while preserving existing `XDG_CONFIG_HOME`/`HOME` config behavior and explicit service-directory overrides.

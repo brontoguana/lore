@@ -2138,6 +2138,115 @@ async fn agent_chat_send_poll_respond() {
 }
 
 #[tokio::test]
+async fn api_turn_uses_endpoint_snapshot_after_backend_switch_to_cli() {
+    let dir = tempdir().unwrap();
+    let (llm_addr, _shutdown) = spawn_mock_llm().await;
+    let (addr, client) = spawn_server(dir.path()).await;
+
+    let endpoint_id = create_endpoint(
+        &client,
+        &addr,
+        "snapshot-ep",
+        &format!("http://{llm_addr}/v1/chat/completions"),
+        "mock-model",
+    )
+    .await;
+    let token =
+        api_create_machine_agent_token(&client, &addr, "snapshot-bot", &[("snap.proj", "read")])
+            .await;
+    let (cookie, csrf) = admin_login(&client, &addr).await;
+
+    let resp = client
+        .post(url(&addr, "/ui/chat/snapshot-bot/config"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={csrf}&endpoint_id={endpoint_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(url(&addr, "/ui/chat/snapshot-bot/send"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={csrf}&message=Hello+snapshot"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .get(url(&addr, "/v1/chat/poll"))
+        .header("x-lore-key", &token)
+        .header("x-lore-version", env!("CARGO_PKG_VERSION"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let poll_body: Value = resp.json().await.unwrap();
+    assert_eq!(poll_body["endpoint_id"], endpoint_id);
+    assert_eq!(poll_body["messages"][0]["content"], "Hello snapshot");
+
+    // Switching to a CLI backend should affect the next turn, not break the
+    // endpoint-backed turn that has already been claimed by the machine.
+    let resp = client
+        .post(url(&addr, "/ui/chat/snapshot-bot/config"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={csrf}&backend=agy&endpoint_id="))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(url(&addr, "/v1/chat/completions"))
+        .header("x-lore-key", &token)
+        .json(&json!({
+            "messages": [{"role": "user", "content": "Complete claimed turn"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "active turn proxy failed after CLI switch: {body}"
+    );
+
+    let resp = client
+        .post(url(&addr, "/v1/chat/respond"))
+        .header("x-lore-key", &token)
+        .json(&json!({
+            "complete": true,
+            "content": "Finished endpoint-backed turn."
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(url(&addr, "/v1/chat/completions"))
+        .header("x-lore-key", &token)
+        .json(&json!({
+            "messages": [{"role": "user", "content": "No active snapshot now"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 400);
+    assert!(body.contains("agent has no endpoint configured"), "{body}");
+}
+
+#[tokio::test]
 async fn agent_chat_keeps_follow_up_messages_sent_while_thinking() {
     let dir = tempdir().unwrap();
     let (llm_addr, _shutdown) = spawn_mock_llm().await;
