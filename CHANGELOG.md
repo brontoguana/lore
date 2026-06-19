@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-06-19
+
+- Fixed AGY-backed manager and agent runs with large prompts by avoiding oversized `agy -p <prompt>` argument lists; Lore now passes small AGY prompts inline and asks AGY to read the saved prompt file when the prompt is too large for safe command-line transport.
+
 ## 2026-06-18
 
 - Fixed API-endpoint turns that were already claimed by a machine agent so switching the agent to a CLI backend such as `agy` during that active turn no longer breaks the in-flight `/v1/chat/completions` call with `agent has no endpoint configured`; the switch now applies cleanly to the next turn.

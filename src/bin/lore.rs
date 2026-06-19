@@ -35,6 +35,7 @@ const LORE_SERVICE_HANDOFF_PARENT_PID_ENV: &str = "LORE_SERVICE_HANDOFF_PARENT_P
 const LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV: &str = "LORE_SERVICE_HANDOFF_CANONICAL_EXE";
 const LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV: &str = "LORE_SERVICE_HANDOFF_TARGET_VERSION";
 const CLI_BACKEND_TURN_FAILURE_LIMIT: u32 = 3;
+const AGY_INLINE_PROMPT_MAX_BYTES: usize = 24 * 1024;
 const AGY_OAUTH_TOKEN_RELATIVE_PATH: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 const AGY_FILE_TOKEN_SSH_CONNECTION: &str = "127.0.0.1 0 127.0.0.1 0";
 const AGY_FILE_TOKEN_SSH_CLIENT: &str = "127.0.0.1 0 0";
@@ -4850,11 +4851,13 @@ async fn agent_poll_and_process(
             );
         }
 
-        {
+        let prompt_path = {
             let lore_dir = agent_lore_dir(agent_name);
             let _ = fs::create_dir_all(&lore_dir);
-            let _ = fs::write(lore_dir.join("prompt.txt"), &full_prompt);
-        }
+            let prompt_path = lore_dir.join("prompt.txt");
+            let _ = fs::write(&prompt_path, &full_prompt);
+            prompt_path
+        };
 
         let mut child = match spawn_backend(
             backend,
@@ -4863,6 +4866,7 @@ async fn agent_poll_and_process(
             effort_override.as_deref(),
             context.token.as_deref(),
             codex_image_paths,
+            Some(&prompt_path),
         )
         .await
         {
@@ -5432,11 +5436,13 @@ async fn run_manager_cli_prompt(
     context_filename: &str,
 ) -> CliResult<String> {
     // Save manager context for debugging
-    {
+    let prompt_path = {
         let lore_dir = agent_lore_dir(agent_name);
         let _ = fs::create_dir_all(&lore_dir);
-        let _ = fs::write(lore_dir.join(context_filename), full_prompt);
-    }
+        let prompt_path = lore_dir.join(context_filename);
+        let _ = fs::write(&prompt_path, full_prompt);
+        prompt_path
+    };
 
     let mut child = match spawn_backend(
         backend,
@@ -5445,6 +5451,7 @@ async fn run_manager_cli_prompt(
         None,
         context.token.as_deref(),
         &[],
+        Some(&prompt_path),
     )
     .await
     {
@@ -7655,6 +7662,7 @@ async fn spawn_backend(
     effort: Option<&str>,
     agent_token: Option<&str>,
     image_paths: &[PathBuf],
+    prompt_file: Option<&Path>,
 ) -> CliResult<tokio::process::Child> {
     use tokio::io::AsyncWriteExt;
 
@@ -7694,13 +7702,7 @@ async fn spawn_backend(
             cmd.spawn()?
         }
         AgentBackend::Agy => {
-            let mut args = vec![
-                "--dangerously-skip-permissions".to_string(),
-                "--print-timeout".to_string(),
-                "15m".to_string(),
-            ];
-            args.push("-p".to_string());
-            args.push(prompt.to_string());
+            let args = agy_print_args(prompt, prompt_file)?;
             writes_prompt_to_stdin = false;
             let mut cmd =
                 tokio::process::Command::new(resolve_backend_executable(AgentBackend::Agy));
@@ -7744,6 +7746,45 @@ async fn spawn_backend(
     }
 
     Ok(child)
+}
+
+fn agy_print_args(prompt: &str, prompt_file: Option<&Path>) -> CliResult<Vec<String>> {
+    let prompt_arg = if prompt.as_bytes().len() <= AGY_INLINE_PROMPT_MAX_BYTES {
+        prompt.to_string()
+    } else if let Some(prompt_file) = prompt_file {
+        agy_prompt_file_instruction(prompt_file)
+    } else {
+        return Err(format!(
+            "agy prompt is {} bytes, exceeding the inline limit of {} bytes, and no prompt file was available",
+            prompt.as_bytes().len(),
+            AGY_INLINE_PROMPT_MAX_BYTES
+        )
+        .into());
+    };
+
+    Ok(vec![
+        "--dangerously-skip-permissions".to_string(),
+        "--print-timeout".to_string(),
+        "15m".to_string(),
+        "-p".to_string(),
+        prompt_arg,
+    ])
+}
+
+fn agy_prompt_file_instruction(prompt_file: &Path) -> String {
+    let display_path = fs::canonicalize(prompt_file).unwrap_or_else(|_| prompt_file.to_path_buf());
+    format!(
+        "Read the complete Lore prompt from this file:\n{}\n\nFollow the file contents exactly as the prompt for this run. Do not summarize the file. Return only the response requested by that prompt.",
+        display_path.display()
+    )
+}
+
+struct PromptFileCleanup(PathBuf);
+
+impl Drop for PromptFileCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 fn backend_uses_json_lines(backend: AgentBackend) -> bool {
@@ -7889,8 +7930,36 @@ async fn run_compaction(
         }
         AgentBackend::Agy | AgentBackend::Codex => {
             // Codex streams JSON lines; Antigravity (`agy`) print mode returns plain text.
-            let mut child =
-                spawn_backend(backend, prompt, None, None, context.token.as_deref(), &[]).await?;
+            let mut _agy_prompt_file_cleanup = None;
+            let prompt_file_path = if matches!(backend, AgentBackend::Agy)
+                && prompt.as_bytes().len() > AGY_INLINE_PROMPT_MAX_BYTES
+            {
+                let prompt_dir = agent_cwd().join(".lore");
+                fs::create_dir_all(&prompt_dir)?;
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                let path = prompt_dir.join(format!(
+                    "agy-compaction-{}-{unique}.txt",
+                    std::process::id()
+                ));
+                fs::write(&path, prompt)?;
+                _agy_prompt_file_cleanup = Some(PromptFileCleanup(path.clone()));
+                Some(path)
+            } else {
+                None
+            };
+            let mut child = spawn_backend(
+                backend,
+                prompt,
+                None,
+                None,
+                context.token.as_deref(),
+                &[],
+                prompt_file_path.as_deref(),
+            )
+            .await?;
             let stdout = child.stdout.take().ok_or("no stdout")?;
             let stderr = child.stderr.take().ok_or("no stderr")?;
             let reader = tokio::io::BufReader::new(stdout);
@@ -9064,19 +9133,19 @@ async fn service_handle_create_agent(
 mod tests {
     use super::{
         AGY_OAUTH_TOKEN_RELATIVE_PATH, BlocksCommand, Cli, Command, DocWriteArgs, ProjectSource,
-        ResolvedProject, api_endpoint_runtime_context, api_user_content_from_markdown_images,
-        append_assistant_segment, append_block_content, append_new_stream_text,
-        append_plain_output_line, backend_uses_json_lines, build_compaction_prompt,
-        chat_content_for_current_message_cli_prompt, chat_content_for_current_message_prompt,
-        chat_content_for_prompt, codex_exec_args, count_history_exchanges, find_cwd_project_file,
-        history_compaction_split_index, history_messages_excluding_pending, load_cli_text_input,
-        load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
-        markdown_data_image_attachments, markdown_heading_matches,
-        next_service_update_retry_delay_secs, parse_cli_version_output, parse_codex_line,
-        recent_history_exchange_tail, recent_history_prompt_window, remove_owned_service_pid_file,
-        resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
-        sanitize_cli_output_preview, service_update_target, should_force_agy_file_token_auth_from,
-        write_codex_image_attachments,
+        ResolvedProject, agy_print_args, api_endpoint_runtime_context,
+        api_user_content_from_markdown_images, append_assistant_segment, append_block_content,
+        append_new_stream_text, append_plain_output_line, backend_uses_json_lines,
+        build_compaction_prompt, chat_content_for_current_message_cli_prompt,
+        chat_content_for_current_message_prompt, chat_content_for_prompt, codex_exec_args,
+        count_history_exchanges, find_cwd_project_file, history_compaction_split_index,
+        history_messages_excluding_pending, load_cli_text_input, load_doc_write_content,
+        load_required_text_arg, looks_like_cli_auth_prompt, markdown_data_image_attachments,
+        markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
+        parse_codex_line, recent_history_exchange_tail, recent_history_prompt_window,
+        remove_owned_service_pid_file, resolve_context_project, resolve_executable_path_from,
+        reuse_or_clear_staged_binary, sanitize_cli_output_preview, service_update_target,
+        should_force_agy_file_token_auth_from, write_codex_image_attachments,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
@@ -9177,6 +9246,37 @@ mod tests {
         append_plain_output_line(&mut output, "second line");
 
         assert_eq!(output, "first line\nsecond line");
+    }
+
+    #[test]
+    fn agy_print_args_keep_small_prompts_inline() {
+        let args = agy_print_args("short prompt", None).unwrap();
+
+        assert_eq!(args.last().map(String::as_str), Some("short prompt"));
+    }
+
+    #[test]
+    fn agy_print_args_use_prompt_file_for_large_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manager_context.txt");
+        fs::write(&path, "full prompt").unwrap();
+        let large_prompt = "x".repeat(super::AGY_INLINE_PROMPT_MAX_BYTES + 1);
+
+        let args = agy_print_args(&large_prompt, Some(&path)).unwrap();
+        let prompt_arg = args.last().unwrap();
+
+        assert!(prompt_arg.contains("Read the complete Lore prompt from this file:"));
+        assert!(prompt_arg.contains("manager_context.txt"));
+        assert!(!prompt_arg.contains(&large_prompt));
+    }
+
+    #[test]
+    fn agy_print_args_error_for_large_prompts_without_file() {
+        let large_prompt = "x".repeat(super::AGY_INLINE_PROMPT_MAX_BYTES + 1);
+        let err = agy_print_args(&large_prompt, None).unwrap_err().to_string();
+
+        assert!(err.contains("exceeding the inline limit"));
+        assert!(err.contains("no prompt file was available"));
     }
 
     #[test]
