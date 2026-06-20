@@ -7339,7 +7339,9 @@ fn extract_agent_token_candidate(headers: &HeaderMap) -> Result<Option<String>, 
 
 fn collect_project_context(state: &AppState, grants: &[crate::auth::ProjectGrant]) -> String {
     let mut parts: Vec<String> = Vec::new();
-    for grant in grants {
+    let mut sorted_grants = grants.iter().collect::<Vec<_>>();
+    sorted_grants.sort_by(|a, b| a.project.as_str().cmp(b.project.as_str()));
+    for grant in sorted_grants {
         let meta = state.store.read_project_meta(&grant.project);
         let mut project_parts: Vec<String> = Vec::new();
 
@@ -12123,6 +12125,19 @@ fn is_cancelled_pending_follow_up_user_message(conv: &ChatConversation, msg: &Ch
 }
 
 const UI_CHAT_VERBATIM_EXCHANGE_LIMIT: usize = 50;
+const API_AGENT_CACHE_AWARE_EXCHANGE_WINDOW: usize = 50;
+
+fn effective_agent_window_size(configured: usize, is_api_agent: bool) -> usize {
+    if is_api_agent {
+        configured.max(API_AGENT_CACHE_AWARE_EXCHANGE_WINDOW)
+    } else {
+        configured
+    }
+}
+
+fn compact_keep_exchange_count(window_size: usize) -> usize {
+    (window_size / 2).max(1)
+}
 
 fn unsummarized_messages(conv: &ChatConversation) -> &[ChatMessage] {
     let start = conv
@@ -14558,11 +14573,14 @@ async fn chat_agent_history(
         .endpoint_id
         .as_deref()
         .and_then(|eid| state.endpoint_store.get(eid).ok().flatten());
+    let is_api_agent = endpoint_info.is_some();
+    let prompt_window_size = effective_agent_window_size(conv.window_size, is_api_agent);
+    let auto_compact_window_size = prompt_window_size;
 
     let git_ctx = collect_git_context(conv.cwd.as_deref());
     let activity = get_agent_recent_activity(&state, owner_str, &agent.name);
 
-    let accessible: Vec<String> = agent
+    let mut accessible: Vec<String> = agent
         .grants
         .iter()
         .map(|g| {
@@ -14574,11 +14592,15 @@ async fn chat_agent_history(
             format!("- {} ({})", g.project.as_str(), perm)
         })
         .collect();
+    accessible.sort();
 
     let mut resp = json!({
         "messages": msgs,
         "summary": conv.summary,
         "window_size": conv.window_size,
+        "prompt_window_size": prompt_window_size,
+        "auto_compact_window_size": auto_compact_window_size,
+        "auto_compact_keep_exchanges": compact_keep_exchange_count(auto_compact_window_size),
         "pins": conv.pins.iter().map(|p| json!({"id": p.id, "text": p.text})).collect::<Vec<_>>(),
         "pinned_context": conv.pinned_context,
         "project_context": project_context,
@@ -14678,7 +14700,7 @@ async fn chat_agent_lore_tools(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let _agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
-    let tools: Vec<Value> = mcp_tools().into_iter().map(|t| {
+    let mut tools: Vec<Value> = mcp_tools().into_iter().map(|t| {
         json!({
             "type": "function",
             "function": {
@@ -14688,6 +14710,12 @@ async fn chat_agent_lore_tools(
             }
         })
     }).collect();
+    tools.sort_by(|a, b| {
+        a["function"]["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["function"]["name"].as_str().unwrap_or(""))
+    });
     Ok(Json(json!({ "tools": tools })))
 }
 
@@ -14962,10 +14990,32 @@ async fn chat_agent_manager_requested(
     Ok(StatusCode::OK)
 }
 
+fn api_prompt_cache_key(owner: &str, agent_name: &str, purpose: &str) -> String {
+    let digest = hex_sha256(format!("{owner}\0{agent_name}\0{purpose}").as_bytes());
+    format!("lore-{purpose}-{}", &digest[..32])
+}
+
+fn apply_prompt_cache_key(
+    req: &mut crate::librarian::ProxyChatRequest,
+    owner: &str,
+    agent_name: &str,
+    purpose: &str,
+) {
+    if req
+        .prompt_cache_key
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        req.prompt_cache_key = Some(api_prompt_cache_key(owner, agent_name, purpose));
+    }
+}
+
 async fn chat_manager_proxy_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<crate::librarian::ProxyChatRequest>,
+    Json(mut req): Json<crate::librarian::ProxyChatRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
     require_chat_authenticated_agent(&agent)?;
@@ -14981,6 +15031,7 @@ async fn chat_manager_proxy_completions(
         .get(&mc.endpoint_id)?
         .ok_or_else(|| LoreError::Validation("manager endpoint not found".into()))?;
 
+    apply_prompt_cache_key(&mut req, owner_str, &agent.name, "manager");
     let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
     let result = crate::librarian::proxy_non_streaming_raw(
         &state.librarian_client_http,
@@ -15072,9 +15123,9 @@ than appending.";
 
 fn build_exchange_compaction_system_prompt() -> String {
     format!(
-        "{}\n\n{}",
+        "{}\n\n## Current Date and Time\n\n{}",
+        COMPACTION_SYSTEM_PROMPT,
         crate::prompt::current_datetime_prompt_line(),
-        COMPACTION_SYSTEM_PROMPT
     )
 }
 
@@ -15168,7 +15219,7 @@ async fn do_exchange_compact(
         },
     ];
 
-    let req = crate::librarian::ProxyChatRequest {
+    let mut req = crate::librarian::ProxyChatRequest {
         messages: summary_messages,
         model: None,
         stream: Some(false),
@@ -15177,7 +15228,10 @@ async fn do_exchange_compact(
         max_tokens: Some(4096),
         top_p: None,
         stop: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
     };
+    apply_prompt_cache_key(&mut req, owner, agent_name, "compact");
 
     let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
     let result = crate::librarian::proxy_non_streaming_raw(
@@ -15284,15 +15338,14 @@ fn build_manager_prompt(
     };
     let stage_prompt = prompt_config.prompt_for_stage(stage);
     format!(
-        "{}\n\n{base}{control_protocol}\n\n{context}{stage_prompt}",
+        "{base}{control_protocol}\n\n{context}{stage_prompt}\n\nCURRENT DATE AND TIME:\n{}",
         crate::prompt::current_datetime_prompt_line()
     )
 }
 
 fn build_manager_progress_report_prompt(mc: &ManageConfig) -> String {
     format!(
-        "{}\n\n\
-         You are a manager producing a brief progress report for the user after directing an AI agent.\n\n\
+        "You are a manager producing a brief progress report for the user after directing an AI agent.\n\n\
          GOALS:\n{}\n\n\
          REPORT REQUIREMENTS:\n\
          - Recent changes and progress made\n\
@@ -15302,10 +15355,11 @@ fn build_manager_progress_report_prompt(mc: &ManageConfig) -> String {
          which is a rough estimate for filling no more than 75% of a small mobile chat screen. \
          Prefer 3 concise bullets or short lines. Do not write a control line. Do not include \
          STOPPING_POINT, RED_FLAG_POINT, WAIT_FOR_SECONDS, or CONTINUE. Do not address the agent. \
-         Do not ask the user for input.",
-        crate::prompt::current_datetime_prompt_line(),
+         Do not ask the user for input.\n\n\
+         CURRENT DATE AND TIME:\n{}",
         mc.goals,
         MANAGER_PROGRESS_REPORT_SOFT_WORD_LIMIT,
+        crate::prompt::current_datetime_prompt_line(),
     )
 }
 
@@ -15709,7 +15763,6 @@ fn build_api_agent_system_prompt(
     conv: &crate::auth::ChatConversation,
 ) -> String {
     let mut parts = Vec::new();
-    parts.push(crate::prompt::current_datetime_prompt_line());
     parts.push("You are a Lore knowledge base agent with tools to navigate projects, manage documents, and read/write content.\n\n\
         Lore organizes knowledge into projects and documents. Each project has an Overview, File Map, and Agent Context accessible via dedicated tools. Documents contain typed blocks (the content itself).\n\n\
         Guidelines:\n\
@@ -15742,7 +15795,7 @@ fn build_api_agent_system_prompt(
         parts.push(format!("\n## Pinned Context\n{}", conv.pinned_context));
     }
 
-    let readable: Vec<String> = agent
+    let mut readable: Vec<String> = agent
         .grants
         .iter()
         .map(|g| {
@@ -15755,20 +15808,32 @@ fn build_api_agent_system_prompt(
             format!("- {} ({})", name, perm)
         })
         .collect();
+    readable.sort();
     if !readable.is_empty() {
         parts.push(format!("\n## Accessible Projects\n{}", readable.join("\n")));
     }
 
+    let mut current_context = Vec::new();
+
     let git_ctx = collect_git_context(conv.cwd.as_deref());
     if !git_ctx.is_empty() {
-        parts.push(format!("\n## Git Repository\n{git_ctx}"));
+        current_context.push(format!("## Git Repository\n{git_ctx}"));
     }
 
     let owner_str = agent.owner.as_ref().map(|u| u.as_str()).unwrap_or("");
     let activity = get_agent_recent_activity(state, owner_str, &agent.name);
     if !activity.is_empty() {
-        parts.push(format!("\n## Recent Activity\n{activity}"));
+        current_context.push(format!("## Recent Activity\n{activity}"));
     }
+    current_context.push(format!(
+        "## Current Date and Time\n\n{}",
+        crate::prompt::current_datetime_prompt_line()
+    ));
+
+    parts.push(format!(
+        "\n## Current Context\n\n{}",
+        current_context.join("\n\n")
+    ));
 
     parts.join("\n")
 }
@@ -15779,7 +15844,6 @@ fn build_api_btw_system_prompt(
     conv: &ChatConversation,
 ) -> String {
     let mut system_parts = vec![
-        crate::prompt::current_datetime_prompt_line(),
         "You are handling a side question (btw) for a Lore knowledge base agent. \
          You have full tool access but DO NOT create, update, move, or delete any content \
          unless the user's message explicitly asks you to make a change. \
@@ -15798,7 +15862,7 @@ fn build_api_btw_system_prompt(
         system_parts.push(format!("\n## Conversation Summary\n{}", conv.summary));
     }
 
-    let accessible: Vec<String> = agent
+    let mut accessible: Vec<String> = agent
         .grants
         .iter()
         .map(|g| {
@@ -15810,6 +15874,7 @@ fn build_api_btw_system_prompt(
             format!("- {} ({})", g.project.as_str(), perm)
         })
         .collect();
+    accessible.sort();
     if !accessible.is_empty() {
         system_parts.push(format!(
             "\n## Accessible Projects\n{}",
@@ -15817,11 +15882,16 @@ fn build_api_btw_system_prompt(
         ));
     }
 
+    system_parts.push(format!(
+        "\n## Current Context\n\n{}",
+        crate::prompt::current_datetime_prompt_line()
+    ));
+
     system_parts.join("\n")
 }
 
 fn build_api_agent_tools() -> Vec<Value> {
-    mcp_tools().into_iter().map(|t| {
+    let mut tools: Vec<Value> = mcp_tools().into_iter().map(|t| {
         json!({
             "type": "function",
             "function": {
@@ -15830,7 +15900,14 @@ fn build_api_agent_tools() -> Vec<Value> {
                 "parameters": t.get("inputSchema").cloned().unwrap_or(json!({"type": "object"})),
             }
         })
-    }).collect()
+    }).collect();
+    tools.sort_by(|a, b| {
+        a["function"]["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["function"]["name"].as_str().unwrap_or(""))
+    });
+    tools
 }
 
 fn format_api_tool_display(name: &str, args: &Value) -> String {
@@ -16028,7 +16105,7 @@ async fn run_api_btw(
     for turn in 0..BTW_MAX_TURNS {
         trim_old_context(&mut messages, tool_count);
 
-        let req = crate::librarian::ProxyChatRequest {
+        let mut req = crate::librarian::ProxyChatRequest {
             messages: messages.clone(),
             model: None,
             stream: Some(false),
@@ -16037,7 +16114,10 @@ async fn run_api_btw(
             max_tokens: Some(16384),
             top_p: None,
             stop: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         };
+        apply_prompt_cache_key(&mut req, &owner, &agent_name, "btw");
 
         let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, false);
         let raw_result = crate::librarian::proxy_non_streaming_raw(
@@ -16221,7 +16301,7 @@ async fn run_api_btw(
 async fn chat_proxy_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<crate::librarian::ProxyChatRequest>,
+    Json(mut req): Json<crate::librarian::ProxyChatRequest>,
 ) -> Result<Response, ApiError> {
     let agent = authenticate_agent(&state, &headers)?.ok_or(LoreError::PermissionDenied)?;
     require_chat_authenticated_agent(&agent)?;
@@ -16237,6 +16317,9 @@ async fn chat_proxy_completions(
         .ok_or_else(|| LoreError::Validation("configured endpoint not found".into()))?;
 
     let streaming = req.stream.unwrap_or(false);
+    if !streaming {
+        apply_prompt_cache_key(&mut req, &owner_str, &agent_name, "agent");
+    }
     let model = req.model.as_deref().unwrap_or(&endpoint.model).to_string();
     let (url, body) = crate::librarian::build_proxy_request(&endpoint, &req, streaming);
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -16742,6 +16825,10 @@ async fn chat_slash_command(
         .auth
         .list_agent_tokens_for_user(&session.user.username)?;
     find_owned_chat_agent(&agents, &agent_name)?;
+    let selected_agent_token = agents.iter().find(|a| a.name == agent_name);
+    let selected_agent_is_api = selected_agent_token
+        .map(|a| a.endpoint_id.is_some())
+        .unwrap_or(false);
 
     let trimmed = form.command.trim();
     let (cmd, args) = match trimmed.split_once(char::is_whitespace) {
@@ -16760,8 +16847,8 @@ async fn chat_slash_command(
                 AgentChatStatus::Thinking => "thinking",
                 AgentChatStatus::Offline => "offline",
             };
-            let agent_token = agents.iter().find(|a| a.name == agent_name);
-            let is_api = agent_token.map(|a| a.endpoint_id.is_some()).unwrap_or(false);
+            let agent_token = selected_agent_token;
+            let is_api = selected_agent_is_api;
             if is_api {
                 let ep_id = agent_token.and_then(|a| a.endpoint_id.as_deref()).unwrap_or("unknown");
                 let (ep_name, ep_kind, ep_model) = state.endpoint_store.get(ep_id)
@@ -16780,10 +16867,16 @@ async fn chat_slash_command(
                     Some(_) => "\nManage: off".to_string(),
                     None => String::new(),
                 };
+                let effective_window = effective_agent_window_size(conv.window_size, true);
+                let api_window_line = if effective_window == conv.window_size {
+                    String::new()
+                } else {
+                    format!("\nAPI prompt/auto-compact window: {effective_window} exchanges")
+                };
                 format!(
-                    "Agent: {}\nStatus: {}\nMode: API\nEndpoint: {}\nProvider: {}\nModel: {}{}{}\nExchanges: {}\nPins: {}\nWindow: {} exchanges",
+                    "Agent: {}\nStatus: {}\nMode: API\nEndpoint: {}\nProvider: {}\nModel: {}{}{}\nExchanges: {}\nPins: {}\nWindow: {} exchanges{}",
                     agent_name, status_str, ep_name, ep_kind, ep_model, effort_line, manage_line,
-                    agent_window_exchange_count(&conv), conv.pins.len(), conv.window_size
+                    agent_window_exchange_count(&conv), conv.pins.len(), conv.window_size, api_window_line
                 )
             } else {
                 let backend = agent_token.map(|a| a.backend.clone()).unwrap_or_default();
@@ -16806,11 +16899,22 @@ async fn chat_slash_command(
         "/context" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
             let mut parts = Vec::new();
-            parts.push(format!(
-                "{} exchanges in window (max {}).",
-                agent_window_exchange_count(&conv),
-                conv.window_size
-            ));
+            let effective_window =
+                effective_agent_window_size(conv.window_size, selected_agent_is_api);
+            if selected_agent_is_api && effective_window != conv.window_size {
+                parts.push(format!(
+                    "{} exchanges in window (configured {}, API cache-aware effective {}).",
+                    agent_window_exchange_count(&conv),
+                    conv.window_size,
+                    effective_window
+                ));
+            } else {
+                parts.push(format!(
+                    "{} exchanges in window (max {}).",
+                    agent_window_exchange_count(&conv),
+                    conv.window_size
+                ));
+            }
             let git_ctx = collect_git_context(conv.cwd.as_deref());
             if !git_ctx.is_empty() {
                 parts.push(format!("\nGit:\n{git_ctx}"));
@@ -16828,8 +16932,8 @@ async fn chat_slash_command(
         }
         "/prompt" => {
             let conv = state.chat.load_conversation(owner, &agent_name)?;
-            let agent_token = agents.iter().find(|a| a.name == agent_name);
-            let is_api = agent_token.map(|a| a.endpoint_id.is_some()).unwrap_or(false);
+            let agent_token = selected_agent_token;
+            let is_api = selected_agent_is_api;
             let mut parts = Vec::new();
 
             if is_api {
@@ -16855,12 +16959,13 @@ async fn chat_slash_command(
                 if !conv.pinned_context.is_empty() {
                     parts.push(format!("\n-- Pinned Context --\n{}", conv.pinned_context));
                 }
-                let readable: Vec<String> = agent_token.map(|a| &a.grants).unwrap_or(&vec![]).iter()
+                let mut readable: Vec<String> = agent_token.map(|a| &a.grants).unwrap_or(&vec![]).iter()
                     .map(|g| {
                         let perm = if g.permission.allows_write() { "read-write" } else { "read" };
                         format!("- {} ({})", g.project.as_str(), perm)
                     })
                     .collect();
+                readable.sort();
                 if !readable.is_empty() {
                     parts.push(format!("\n-- Accessible Projects --\n{}", readable.join("\n")));
                 }
@@ -16875,11 +16980,21 @@ async fn chat_slash_command(
                 parts.push(format!("\n== Recent Activity ==\n{activity}"));
             }
 
-            parts.push(format!(
-                "\n== Conversation ==\n{} exchanges in window (max {}).",
-                agent_window_exchange_count(&conv),
-                conv.window_size
-            ));
+            let effective_window = effective_agent_window_size(conv.window_size, is_api);
+            if is_api && effective_window != conv.window_size {
+                parts.push(format!(
+                    "\n== Conversation ==\n{} exchanges in window (configured {}, API cache-aware effective {}).",
+                    agent_window_exchange_count(&conv),
+                    conv.window_size,
+                    effective_window
+                ));
+            } else {
+                parts.push(format!(
+                    "\n== Conversation ==\n{} exchanges in window (max {}).",
+                    agent_window_exchange_count(&conv),
+                    conv.window_size
+                ));
+            }
             if !conv.summary.is_empty() {
                 parts.push(format!("\n-- Tail Summary --\n{}", conv.summary));
             }
@@ -16962,18 +17077,37 @@ async fn chat_slash_command(
         "/window" => {
             if args.is_empty() {
                 let conv = state.chat.load_conversation(owner, &agent_name)?;
-                format!(
-                    "Window: {} exchanges\nAuto-compact at: {} exchanges (down to {})\nCurrent: {} exchanges in window\n\nUsage: /window <n> (e.g. /window 22)",
-                    conv.window_size,
-                    conv.window_size,
-                    conv.window_size / 2,
-                    agent_window_exchange_count(&conv)
-                )
+                let effective_window =
+                    effective_agent_window_size(conv.window_size, selected_agent_is_api);
+                if selected_agent_is_api && effective_window != conv.window_size {
+                    format!(
+                        "Window: {} exchanges\nAPI prompt/auto-compact window: {} exchanges (down to {})\nCurrent: {} exchanges in window\n\nUsage: /window <n> (e.g. /window 22)",
+                        conv.window_size,
+                        effective_window,
+                        compact_keep_exchange_count(effective_window),
+                        agent_window_exchange_count(&conv)
+                    )
+                } else {
+                    format!(
+                        "Window: {} exchanges\nAuto-compact at: {} exchanges (down to {})\nCurrent: {} exchanges in window\n\nUsage: /window <n> (e.g. /window 22)",
+                        conv.window_size,
+                        conv.window_size,
+                        compact_keep_exchange_count(conv.window_size),
+                        agent_window_exchange_count(&conv)
+                    )
+                }
             } else {
                 match args.parse::<usize>() {
                     Ok(n) if n >= 3 => {
                         state.chat.update_window_size(owner, &agent_name, n)?;
-                        format!("Window set to {n} exchanges. Auto-compact at {n} exchanges.")
+                        let effective_window = effective_agent_window_size(n, selected_agent_is_api);
+                        if selected_agent_is_api && effective_window != n {
+                            format!(
+                                "Window set to {n} exchanges. API agents use a cache-aware prompt/auto-compact window of {effective_window} exchanges."
+                            )
+                        } else {
+                            format!("Window set to {n} exchanges. Auto-compact at {n} exchanges.")
+                        }
                     }
                     _ => "Window size must be a number >= 3.".to_string(),
                 }
@@ -23601,6 +23735,60 @@ mod tests {
     }
 
     #[test]
+    fn api_agents_get_cache_aware_effective_window_minimum() {
+        assert_eq!(super::effective_agent_window_size(22, false), 22);
+        assert_eq!(super::effective_agent_window_size(22, true), 50);
+        assert_eq!(super::effective_agent_window_size(80, true), 80);
+        assert_eq!(super::compact_keep_exchange_count(50), 25);
+    }
+
+    #[tokio::test]
+    async fn chat_history_reports_cache_aware_windows_for_api_agents() {
+        let dir = tempdir().unwrap();
+        let app = build_app(FileBlockStore::new(dir.path()));
+        let agent_token =
+            issue_chat_agent_token(dir.path(), "agent-main", ProjectPermission::ReadWrite);
+        let state = super::AppState::new(FileBlockStore::new(dir.path()));
+        let endpoint = state
+            .endpoint_store
+            .create(
+                "Test endpoint".into(),
+                EndpointKind::OpenAi,
+                "http://127.0.0.1:8012/v1/chat/completions".into(),
+                "test-model".into(),
+                Some("test-key".into()),
+            )
+            .unwrap();
+        let owner = UserName::new("admin").unwrap();
+        state
+            .auth
+            .set_agent_endpoint_id("agent-main", &owner, Some(&endpoint.id))
+            .unwrap();
+        state
+            .chat
+            .update_window_size("admin", "agent-main", 22)
+            .unwrap();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/chat/history")
+            .header(API_KEY_HEADER, &agent_token)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["window_size"], 22);
+        assert_eq!(json["prompt_window_size"], 50);
+        assert_eq!(json["auto_compact_window_size"], 50);
+        assert_eq!(json["auto_compact_keep_exchanges"], 25);
+    }
+
+    #[test]
     fn unsummarized_messages_hide_compacted_prefix_from_agent_window() {
         let mut conv = ChatConversation::default();
         for i in 1..=6u64 {
@@ -24060,8 +24248,12 @@ mod tests {
         let prompt_config = ManagerPromptConfig::default();
 
         let review = super::build_manager_prompt(&mc, &prompt_config, 0);
-        assert!(review.starts_with("Current date and time: "));
-        assert!(review.contains(" UTC\n\nYou are a manager"));
+        assert!(review.starts_with("You are a manager"));
+        assert!(review.contains("CURRENT DATE AND TIME:\nCurrent date and time: "));
+        assert!(
+            review.rfind("Current date and time: ").unwrap()
+                > review.find("CONTROL LINE PROTOCOL").unwrap()
+        );
         assert!(review.contains("direct instructions to the agent"));
         assert!(review.contains("Do not ask the user for input"));
         assert!(review.contains("Before writing your response, choose exactly one control state."));
@@ -24087,10 +24279,15 @@ mod tests {
         assert!(progress.contains("rough percent complete estimate"));
         assert!(progress.contains("about 110 words"));
         assert!(progress.contains("Do not write a control line"));
+        assert!(progress.starts_with("You are a manager producing a brief progress report"));
+        assert!(
+            progress.rfind("Current date and time: ").unwrap()
+                > progress.find("REPORT REQUIREMENTS").unwrap()
+        );
     }
 
     #[test]
-    fn api_agent_prompts_include_current_datetime_context() {
+    fn api_agent_prompts_keep_current_datetime_in_tail_context() {
         let dir = tempdir().unwrap();
         let state = super::AppState::new(FileBlockStore::new(dir.path()));
         let agent = AuthenticatedAgent {
@@ -24106,16 +24303,55 @@ mod tests {
         let conv = ChatConversation::default();
 
         let system_prompt = super::build_api_agent_system_prompt(&state, &agent, &conv);
-        assert!(system_prompt.starts_with("Current date and time: "));
-        assert!(system_prompt.contains(" UTC\nYou are a Lore knowledge base agent"));
+        assert!(system_prompt.starts_with("You are a Lore knowledge base agent"));
+        assert!(system_prompt.contains("## Current Context"));
+        assert!(
+            system_prompt.rfind("Current date and time: ").unwrap()
+                > system_prompt.find("SVG output").unwrap()
+        );
 
         let btw_prompt = super::build_api_btw_system_prompt(&state, &agent, &conv);
-        assert!(btw_prompt.starts_with("Current date and time: "));
-        assert!(btw_prompt.contains(" UTC\nYou are handling a side question"));
+        assert!(btw_prompt.starts_with("You are handling a side question"));
+        assert!(btw_prompt.contains("## Current Context\n\nCurrent date and time: "));
 
         let compact_prompt = super::build_exchange_compaction_system_prompt();
-        assert!(compact_prompt.starts_with("Current date and time: "));
-        assert!(compact_prompt.contains(" UTC\n\nYou are compacting conversation history"));
+        assert!(compact_prompt.starts_with("You are compacting conversation history"));
+        assert!(compact_prompt.contains("## Current Date and Time\n\nCurrent date and time: "));
+        assert!(
+            compact_prompt.rfind("Current date and time: ").unwrap()
+                > compact_prompt.find("Keep it concise").unwrap()
+        );
+    }
+
+    #[test]
+    fn api_prompt_cache_key_is_stable_and_preserves_explicit_keys() {
+        let first = super::api_prompt_cache_key("admin", "agent-main", "agent");
+        let second = super::api_prompt_cache_key("admin", "agent-main", "agent");
+        let other_purpose = super::api_prompt_cache_key("admin", "agent-main", "manager");
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_purpose);
+        assert!(first.starts_with("lore-agent-"));
+        assert!(first.len() <= 64);
+
+        let mut req = crate::librarian::ProxyChatRequest {
+            messages: Vec::new(),
+            model: None,
+            stream: Some(false),
+            tools: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+        super::apply_prompt_cache_key(&mut req, "admin", "agent-main", "agent");
+        assert_eq!(req.prompt_cache_key.as_deref(), Some(first.as_str()));
+
+        req.prompt_cache_key = Some("client-key".into());
+        super::apply_prompt_cache_key(&mut req, "admin", "agent-main", "manager");
+        assert_eq!(req.prompt_cache_key.as_deref(), Some("client-key"));
     }
 
     #[test]

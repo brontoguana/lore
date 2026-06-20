@@ -35,6 +35,7 @@ const LORE_SERVICE_HANDOFF_PARENT_PID_ENV: &str = "LORE_SERVICE_HANDOFF_PARENT_P
 const LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV: &str = "LORE_SERVICE_HANDOFF_CANONICAL_EXE";
 const LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV: &str = "LORE_SERVICE_HANDOFF_TARGET_VERSION";
 const CLI_BACKEND_TURN_FAILURE_LIMIT: u32 = 3;
+const DEFAULT_CHAT_WINDOW_SIZE: usize = 22;
 const AGY_INLINE_PROMPT_MAX_BYTES: usize = 24 * 1024;
 const AGY_OAUTH_TOKEN_RELATIVE_PATH: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 const AGY_FILE_TOKEN_SSH_CONNECTION: &str = "127.0.0.1 0 127.0.0.1 0";
@@ -3534,44 +3535,14 @@ fn format_time(value: OffsetDateTime) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
-fn format_relative_time(timestamp_str: &str, now: OffsetDateTime) -> String {
-    let parsed = time::OffsetDateTime::parse(
-        timestamp_str,
-        &time::format_description::well_known::Rfc3339,
-    );
-    match parsed {
-        Ok(ts) => {
-            let diff = now - ts;
-            let secs = diff.whole_seconds();
-            if secs < 0 {
-                "just now".to_string()
-            } else if secs < 60 {
-                "just now".to_string()
-            } else if secs < 3600 {
-                let mins = secs / 60;
-                if mins == 1 {
-                    "1 min ago".to_string()
-                } else {
-                    format!("{mins} mins ago")
-                }
-            } else if secs < 86400 {
-                let hours = secs / 3600;
-                if hours == 1 {
-                    "1 hour ago".to_string()
-                } else {
-                    format!("{hours} hours ago")
-                }
-            } else {
-                let days = secs / 86400;
-                if days == 1 {
-                    "1 day ago".to_string()
-                } else {
-                    format!("{days} days ago")
-                }
-            }
-        }
-        Err(_) => "unknown time".to_string(),
+fn format_prompt_history_time(timestamp_str: &str) -> String {
+    let trimmed = timestamp_str.trim();
+    if trimmed.is_empty() {
+        return "unknown time".to_string();
     }
+    time::OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc3339)
+        .map(format_time)
+        .unwrap_or_else(|_| trimmed.to_string())
 }
 
 fn history_messages_excluding_pending<'a>(
@@ -3601,6 +3572,27 @@ fn history_exchange_boundaries(messages: &[&serde_json::Value]) -> Vec<usize> {
 
 fn count_history_exchanges(messages: &[&serde_json::Value]) -> usize {
     history_exchange_boundaries(messages).len()
+}
+
+fn history_window_value(history: &serde_json::Value, key: &str) -> Option<usize> {
+    history
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+}
+
+fn history_prompt_window_size(history: &serde_json::Value) -> usize {
+    history_window_value(history, "prompt_window_size")
+        .or_else(|| history_window_value(history, "window_size"))
+        .unwrap_or(DEFAULT_CHAT_WINDOW_SIZE)
+}
+
+fn history_auto_compact_window_size(history: &serde_json::Value) -> usize {
+    history_window_value(history, "auto_compact_window_size")
+        .or_else(|| history_window_value(history, "prompt_window_size"))
+        .or_else(|| history_window_value(history, "window_size"))
+        .unwrap_or(DEFAULT_CHAT_WINDOW_SIZE)
 }
 
 fn recent_history_exchange_tail<'a>(
@@ -4635,7 +4627,7 @@ async fn agent_poll_and_process(
 
     // Build rich prompt with system context, git info, conversation history
     let summary = history["summary"].as_str().unwrap_or("");
-    let window_size = history["window_size"].as_u64().unwrap_or(22) as usize;
+    let window_size = history_prompt_window_size(&history);
     let hist_messages = history["messages"].as_array();
     let pins = history["pins"].as_array();
     let project_context = history["project_context"].as_str().unwrap_or("");
@@ -4646,11 +4638,20 @@ async fn agent_poll_and_process(
     } else {
         None
     };
+    let now = time::OffsetDateTime::now_utc();
+    let model_override = model_override_from_history(&history, has_endpoint);
+    let effort_override = history["effort"].as_str().map(|s| s.to_string());
+    let current_runtime_context = if has_endpoint {
+        endpoint_runtime_context
+    } else {
+        Some(cli_runtime_context(
+            backend,
+            model_override.as_deref(),
+            effort_override.as_deref(),
+        ))
+    };
 
     let mut prompt_parts: Vec<String> = Vec::new();
-
-    let now = time::OffsetDateTime::now_utc();
-    prompt_parts.push(current_datetime_prompt_line_at(now));
 
     // Git repository context (gathered locally from the agent's working directory)
     // All git commands use async process to avoid blocking tokio threads.
@@ -4735,20 +4736,21 @@ async fn agent_poll_and_process(
             }
         }
     }
-    if !git_section.is_empty() {
-        prompt_parts.push(git_section);
-    }
-
-    // Working directory
-    prompt_parts.push(format!("## Working Directory\n\n{cwd_str}"));
-
     // Pinned context
     if let Some(pins) = pins {
         if !pins.is_empty() {
             let mut pin_section = "## Pinned Context\n".to_string();
-            for pin in pins {
-                let text = pin["text"].as_str().unwrap_or("");
-                let id = pin["id"].as_u64().unwrap_or(0);
+            let mut sorted_pins = pins
+                .iter()
+                .map(|pin| {
+                    (
+                        pin["id"].as_u64().unwrap_or(0),
+                        pin["text"].as_str().unwrap_or(""),
+                    )
+                })
+                .collect::<Vec<_>>();
+            sorted_pins.sort_by_key(|(id, _)| *id);
+            for (id, text) in sorted_pins {
                 pin_section.push_str(&format!("- [pin #{id}] {text}\n"));
             }
             prompt_parts.push(pin_section);
@@ -4763,7 +4765,7 @@ async fn agent_poll_and_process(
         ));
     }
 
-    // Previous conversation with relative timestamps
+    // Previous conversation with stable absolute timestamps.
     if let Some(msgs) = hist_messages {
         let pending_ids: HashSet<u64> = current_message_ids.iter().copied().collect();
         let filtered = history_messages_excluding_pending(Some(msgs), &pending_ids);
@@ -4774,7 +4776,7 @@ async fn agent_poll_and_process(
                 let role = msg["role"].as_str().unwrap_or("user");
                 let content = msg["content"].as_str().unwrap_or("");
                 let timestamp = msg["timestamp"].as_str().unwrap_or("");
-                let time_label = format_relative_time(timestamp, now);
+                let time_label = format_prompt_history_time(timestamp);
                 let role_label = match role {
                     "user" => "User",
                     "tool" => "Tool",
@@ -4792,6 +4794,25 @@ async fn agent_poll_and_process(
         }
     }
 
+    if let Some(runtime_context) = current_runtime_context {
+        prompt_parts.push(runtime_context);
+    }
+
+    prompt_parts.push(format!("## Working Directory\n\n{cwd_str}"));
+
+    if !git_section.is_empty() {
+        prompt_parts.push(git_section);
+    }
+
+    if !recent_activity.is_empty() {
+        prompt_parts.push(format!("## Recent Activity\n\n{recent_activity}"));
+    }
+
+    prompt_parts.push(format!(
+        "## Current Date and Time\n\n{}",
+        current_datetime_prompt_line_at(now)
+    ));
+
     let current_message_prompt = if has_endpoint {
         chat_content_for_current_message_prompt(&combined)
     } else {
@@ -4804,7 +4825,6 @@ async fn agent_poll_and_process(
     let (full_response, emitted_assistant_messages) = if has_endpoint {
         // API mode: run local agentic loop, proxy LLM calls through the server
         eprintln!("[agent] Using API endpoint mode");
-        let model_override = model_override_from_history(&history, true);
         let endpoint_id = body["endpoint_id"].as_str().map(|s| s.to_string());
         run_api_agent_turn(
             context,
@@ -4812,28 +4832,17 @@ async fn agent_poll_and_process(
             &user_context,
             project_context,
             accessible_projects,
-            recent_activity,
             model_override.as_deref(),
             endpoint_id.as_deref(),
-            endpoint_runtime_context.as_deref(),
         )
         .await?
     } else {
         // CLI mode: spawn backend process — prepend system instructions to user context
-        let mut system_instructions = build_lore_system_instructions(
+        let system_instructions = build_lore_system_instructions(
             project_context,
             accessible_projects,
-            recent_activity,
             &build_cli_tool_section(),
         );
-        let model_override = model_override_from_history(&history, false);
-        let effort_override = history["effort"].as_str().map(|s| s.to_string());
-        system_instructions.push_str("\n\n");
-        system_instructions.push_str(&cli_runtime_context(
-            backend,
-            model_override.as_deref(),
-            effort_override.as_deref(),
-        ));
         let full_prompt = format!("{system_instructions}\n\n---\n\n{user_context}");
         let codex_image_attachments = if matches!(backend, AgentBackend::Codex) {
             write_codex_image_attachments(&combined)?
@@ -5818,7 +5827,6 @@ async fn resolve_block_create_after(
 fn build_lore_system_instructions(
     project_context: &str,
     accessible_projects: &str,
-    recent_activity: &str,
     tool_section: &str,
 ) -> String {
     let mut parts = Vec::new();
@@ -5851,10 +5859,6 @@ You can output inline SVG to present quick reports, diagrams, tables, and visual
 
     if !accessible_projects.is_empty() {
         parts.push(format!("## Accessible Projects\n{accessible_projects}"));
-    }
-
-    if !recent_activity.is_empty() {
-        parts.push(format!("## Recent Activity\n{recent_activity}"));
     }
 
     parts.push(format!("## Available Lore Tools\n{tool_section}"));
@@ -6314,35 +6318,36 @@ async fn run_api_agent_turn(
     user_context: &str,
     project_context: &str,
     accessible_projects: &str,
-    recent_activity: &str,
     model_override: Option<&str>,
     endpoint_id: Option<&str>,
-    runtime_context: Option<&str>,
 ) -> CliResult<(String, bool)> {
     let endpoint_id_owned = endpoint_id.map(|s| s.to_string());
     let token = context.token.as_deref().ok_or("no token configured")?;
     let mut tools = build_local_tools();
 
-    let lore_tool_names = fetch_lore_tools(context).await;
+    let mut lore_tool_names = fetch_lore_tools(context).await;
+    lore_tool_names.sort_by(|a, b| {
+        a["function"]["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["function"]["name"].as_str().unwrap_or(""))
+    });
     for t in &lore_tool_names {
         tools.push(t.clone());
     }
-    let lore_names: std::collections::HashSet<String> = lore_tool_names
+    let mut lore_name_list: Vec<String> = lore_tool_names
         .iter()
         .filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string()))
         .collect();
-    let lore_name_list: Vec<String> = lore_names.iter().cloned().collect();
+    lore_name_list.sort();
+    lore_name_list.dedup();
+    let lore_names: std::collections::HashSet<String> = lore_name_list.iter().cloned().collect();
 
-    let mut system_content = build_lore_system_instructions(
+    let system_content = build_lore_system_instructions(
         project_context,
         accessible_projects,
-        recent_activity,
         &build_api_tool_section(&lore_name_list),
     );
-    if let Some(runtime_context) = runtime_context {
-        system_content.push_str("\n\n");
-        system_content.push_str(runtime_context);
-    }
 
     {
         let lore_dir = agent_lore_dir(agent_name);
@@ -7343,7 +7348,7 @@ async fn do_compact(
         .json()
         .await?;
 
-    let window_size = history["window_size"].as_u64().unwrap_or(22) as usize;
+    let window_size = history_auto_compact_window_size(&history);
     let messages = match history["messages"].as_array() {
         Some(m) => m,
         None => return Ok(()),
@@ -7893,7 +7898,7 @@ fn parse_codex_line(parsed: &serde_json::Value) -> Vec<BackendEvent> {
 
 fn build_compaction_prompt(input: &str) -> String {
     format!(
-        "{}\n\n{COMPACTION_SYSTEM_PROMPT}\n\n{input}",
+        "{COMPACTION_SYSTEM_PROMPT}\n\n{input}\n\n## Current Date and Time\n\n{}",
         current_datetime_prompt_line()
     )
 }
@@ -9138,14 +9143,16 @@ mod tests {
         append_new_stream_text, append_plain_output_line, backend_uses_json_lines,
         build_compaction_prompt, chat_content_for_current_message_cli_prompt,
         chat_content_for_current_message_prompt, chat_content_for_prompt, codex_exec_args,
-        count_history_exchanges, find_cwd_project_file, history_compaction_split_index,
-        history_messages_excluding_pending, load_cli_text_input, load_doc_write_content,
-        load_required_text_arg, looks_like_cli_auth_prompt, markdown_data_image_attachments,
-        markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
-        parse_codex_line, recent_history_exchange_tail, recent_history_prompt_window,
-        remove_owned_service_pid_file, resolve_context_project, resolve_executable_path_from,
-        reuse_or_clear_staged_binary, sanitize_cli_output_preview, service_update_target,
-        should_force_agy_file_token_auth_from, write_codex_image_attachments,
+        count_history_exchanges, find_cwd_project_file, format_prompt_history_time,
+        history_auto_compact_window_size, history_compaction_split_index,
+        history_messages_excluding_pending, history_prompt_window_size, load_cli_text_input,
+        load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
+        markdown_data_image_attachments, markdown_heading_matches,
+        next_service_update_retry_delay_secs, parse_cli_version_output, parse_codex_line,
+        recent_history_exchange_tail, recent_history_prompt_window, remove_owned_service_pid_file,
+        resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
+        sanitize_cli_output_preview, service_update_target, should_force_agy_file_token_auth_from,
+        write_codex_image_attachments,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
@@ -9280,11 +9287,24 @@ mod tests {
     }
 
     #[test]
-    fn cli_compaction_prompt_includes_current_datetime_context() {
+    fn cli_compaction_prompt_keeps_current_datetime_at_tail() {
         let prompt =
             build_compaction_prompt("<messages_to_compact>\nUser: hello\n</messages_to_compact>");
-        assert!(prompt.starts_with("Current date and time: "));
-        assert!(prompt.contains(" UTC\n\nYou are compacting conversation history"));
+        assert!(prompt.starts_with("You are compacting conversation history"));
+        assert!(prompt.contains("## Current Date and Time\n\nCurrent date and time: "));
+        assert!(
+            prompt.rfind("Current date and time: ").unwrap()
+                > prompt.find("<messages_to_compact>").unwrap()
+        );
+    }
+
+    #[test]
+    fn prompt_history_time_uses_stable_absolute_timestamp() {
+        assert_eq!(
+            format_prompt_history_time("2026-06-19T10:11:12Z"),
+            "2026-06-19T10:11:12Z"
+        );
+        assert_eq!(format_prompt_history_time("not-rfc3339"), "not-rfc3339");
     }
 
     #[test]
@@ -9867,6 +9887,37 @@ mod tests {
         let ids: Vec<u64> = recent.iter().filter_map(|msg| msg["id"].as_u64()).collect();
 
         assert_eq!(ids, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn history_prompt_window_prefers_cache_aware_server_value() {
+        let history = json!({
+            "window_size": 22,
+            "prompt_window_size": 50,
+        });
+
+        assert_eq!(history_prompt_window_size(&history), 50);
+    }
+
+    #[test]
+    fn history_auto_compact_window_prefers_cache_aware_server_value() {
+        let history = json!({
+            "window_size": 22,
+            "prompt_window_size": 50,
+            "auto_compact_window_size": 60,
+        });
+
+        assert_eq!(history_auto_compact_window_size(&history), 60);
+    }
+
+    #[test]
+    fn history_window_helpers_fallback_to_legacy_window_size() {
+        let history = json!({
+            "window_size": 22,
+        });
+
+        assert_eq!(history_prompt_window_size(&history), 22);
+        assert_eq!(history_auto_compact_window_size(&history), 22);
     }
 
     #[test]

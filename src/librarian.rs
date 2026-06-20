@@ -1353,47 +1353,83 @@ fn extract_content_text(value: &serde_json::Value) -> Option<&str> {
     None
 }
 
-pub fn build_prompt(request: &LibrarianRequest) -> String {
-    let mut prompt = format!(
-        "{}\n\nProject: {}\nQuestion: {}\n\nUse only the Lore blocks below.\n",
-        crate::prompt::current_datetime_prompt_line(),
-        request.project.as_str(),
-        request.question.trim()
-    );
-    if let Some(errors) = &request.context_errors {
-        if !errors.trim().is_empty() {
-            prompt.push_str("\nRecent agent/server errors (scoped to asker):\n");
-            prompt.push_str(errors);
-            prompt.push('\n');
-        }
+fn block_type_label(block_type: BlockType) -> &'static str {
+    match block_type {
+        BlockType::Markdown => "markdown",
+        BlockType::Html => "html",
+        BlockType::Svg => "svg",
+        BlockType::Image => "image",
     }
-    if request.context_blocks.is_empty() {
-        prompt.push_str("\nNo blocks were available for this project.\n");
+}
+
+fn append_librarian_block(prompt: &mut String, project: Option<&ProjectName>, block: &Block) {
+    if let Some(project) = project {
+        prompt.push_str(&format!("\nProject: {}\n", project.as_str()));
+    }
+    prompt.push_str(&format!(
+        "Block {}\nType: {}\nOrder: {}\nAuthor: {}\nContent:\n{}\n",
+        block.id.as_str(),
+        block_type_label(block.block_type),
+        block.order.as_str(),
+        block.author.as_str(),
+        truncate_content(&block.content),
+    ));
+}
+
+fn finalize_cache_ordered_prompt(stable_prefix: String, volatile_tail: String) -> String {
+    let prompt = format!(
+        "{}\n\n{}",
+        stable_prefix.trim_end(),
+        volatile_tail.trim_start()
+    );
+    if prompt.chars().count() <= MAX_PROMPT_CHARS {
         return prompt;
     }
 
-    prompt.push_str("\nContext blocks:\n");
-    for block in &request.context_blocks {
-        let block_type = match block.block_type {
-            crate::model::BlockType::Markdown => "markdown",
-            crate::model::BlockType::Html => "html",
-            crate::model::BlockType::Svg => "svg",
-            crate::model::BlockType::Image => "image",
-        };
-        prompt.push_str(&format!(
-            "\nBlock {}\nType: {}\nOrder: {}\nAuthor: {}\nContent:\n{}\n",
-            block.id.as_str(),
-            block_type,
-            block.order.as_str(),
-            block.author.as_str(),
-            truncate_content(&block.content),
-        ));
+    let tail_len = volatile_tail.chars().count();
+    let marker = "\n\n[stable context truncated]\n\n";
+    let marker_len = marker.chars().count();
+    if tail_len + marker_len >= MAX_PROMPT_CHARS {
+        return truncate_chars(&volatile_tail, MAX_PROMPT_CHARS);
     }
-    if prompt.chars().count() > MAX_PROMPT_CHARS {
-        truncate_chars(&prompt, MAX_PROMPT_CHARS)
+
+    let prefix_budget = MAX_PROMPT_CHARS - tail_len - marker_len;
+    let stable_prefix = stable_prefix
+        .chars()
+        .take(prefix_budget)
+        .collect::<String>();
+    format!("{}{}{}", stable_prefix.trim_end(), marker, volatile_tail)
+}
+
+pub fn build_prompt(request: &LibrarianRequest) -> String {
+    let mut stable = format!(
+        "Project: {}\n\nUse only the Lore blocks below.",
+        request.project.as_str()
+    );
+    if request.context_blocks.is_empty() {
+        stable.push_str("\n\nNo blocks were available for this project.\n");
     } else {
-        prompt
+        stable.push_str("\n\nContext blocks:\n");
+        for block in &request.context_blocks {
+            append_librarian_block(&mut stable, None, block);
+        }
     }
+
+    let mut tail = String::new();
+    if let Some(errors) = &request.context_errors {
+        if !errors.trim().is_empty() {
+            tail.push_str("Recent agent/server errors (scoped to asker):\n");
+            tail.push_str(errors.trim());
+            tail.push_str("\n\n");
+        }
+    }
+    tail.push_str(&format!(
+        "Current request:\nQuestion: {}\n\n## Current Date and Time\n\n{}",
+        request.question.trim(),
+        crate::prompt::current_datetime_prompt_line()
+    ));
+
+    finalize_cache_ordered_prompt(stable, tail)
 }
 
 pub fn build_prompt_multi_project(
@@ -1401,88 +1437,69 @@ pub fn build_prompt_multi_project(
     question: &str,
     context_errors: Option<&str>,
 ) -> String {
-    let project_names: Vec<&str> = projects_context.iter().map(|(p, _)| p.as_str()).collect();
-    let mut prompt = format!(
-        "{}\n\nProjects: {}\nQuestion: {}\n\nUse only the Lore blocks below. Reference project names where relevant.\n",
-        crate::prompt::current_datetime_prompt_line(),
+    let mut ordered_projects: Vec<(&ProjectName, &Vec<Block>)> = projects_context
+        .iter()
+        .map(|(project, blocks)| (project, blocks))
+        .collect();
+    ordered_projects.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    let project_names: Vec<&str> = ordered_projects.iter().map(|(p, _)| p.as_str()).collect();
+    let mut stable = format!(
+        "Projects: {}\n\nUse only the Lore blocks below. Reference project names where relevant.",
         project_names.join(", "),
-        question.trim(),
     );
-    if let Some(errors) = context_errors {
-        if !errors.trim().is_empty() {
-            prompt.push_str("\nRecent agent/server errors (scoped to asker):\n");
-            prompt.push_str(errors);
-            prompt.push('\n');
-        }
-    }
     let total_blocks: usize = projects_context
         .iter()
         .map(|(_, blocks)| blocks.len())
         .sum();
     if total_blocks == 0 {
-        prompt.push_str("\nNo blocks were available.\n");
-        return prompt;
-    }
-    prompt.push_str("\nContext blocks:\n");
-    for (project, blocks) in projects_context {
-        for block in blocks {
-            let block_type = match block.block_type {
-                BlockType::Markdown => "markdown",
-                BlockType::Html => "html",
-                BlockType::Svg => "svg",
-                BlockType::Image => "image",
-            };
-            prompt.push_str(&format!(
-                "\nProject: {}\nBlock {}\nType: {}\nOrder: {}\nAuthor: {}\nContent:\n{}\n",
-                project.as_str(),
-                block.id.as_str(),
-                block_type,
-                block.order.as_str(),
-                block.author.as_str(),
-                truncate_content(&block.content),
-            ));
+        stable.push_str("\n\nNo blocks were available.\n");
+    } else {
+        stable.push_str("\n\nContext blocks:\n");
+        for (project, blocks) in ordered_projects {
+            for block in blocks {
+                append_librarian_block(&mut stable, Some(project), block);
+            }
         }
     }
-    if prompt.chars().count() > MAX_PROMPT_CHARS {
-        truncate_chars(&prompt, MAX_PROMPT_CHARS)
-    } else {
-        prompt
+
+    let mut tail = String::new();
+    if let Some(errors) = context_errors {
+        if !errors.trim().is_empty() {
+            tail.push_str("Recent agent/server errors (scoped to asker):\n");
+            tail.push_str(errors.trim());
+            tail.push_str("\n\n");
+        }
     }
+    tail.push_str(&format!(
+        "Current request:\nQuestion: {}\n\n## Current Date and Time\n\n{}",
+        question.trim(),
+        crate::prompt::current_datetime_prompt_line()
+    ));
+
+    finalize_cache_ordered_prompt(stable, tail)
 }
 
 pub fn build_action_prompt(request: &ProjectLibrarianRequest) -> String {
-    let mut prompt = format!(
-        "{}\n\nProject: {}\nInstruction: {}\n\nUse only this project context.\nReturn JSON with this shape:\n{{\"summary\":\"...\",\"operations\":[...]}}\n\nOperation examples:\n{{\"type\":\"create_block\",\"block_type\":\"markdown\",\"content\":\"text\",\"after_block_id\":null}}\n{{\"type\":\"update_block\",\"block_id\":\"...\",\"block_type\":\"markdown\",\"content\":\"new text\",\"after_block_id\":null}}\n{{\"type\":\"move_block\",\"block_id\":\"...\",\"after_block_id\":\"...\"}}\n{{\"type\":\"delete_block\",\"block_id\":\"...\"}}\n",
-        crate::prompt::current_datetime_prompt_line(),
+    let mut stable = format!(
+        "Project: {}\n\nUse only this project context.\nReturn JSON with this shape:\n{{\"summary\":\"...\",\"operations\":[...]}}\n\nOperation examples:\n{{\"type\":\"create_block\",\"block_type\":\"markdown\",\"content\":\"text\",\"after_block_id\":null}}\n{{\"type\":\"update_block\",\"block_id\":\"...\",\"block_type\":\"markdown\",\"content\":\"new text\",\"after_block_id\":null}}\n{{\"type\":\"move_block\",\"block_id\":\"...\",\"after_block_id\":\"...\"}}\n{{\"type\":\"delete_block\",\"block_id\":\"...\"}}\n",
         request.project.as_str(),
-        request.instruction.trim()
     );
     if request.context_blocks.is_empty() {
-        prompt.push_str("\nNo blocks were available for this project.\n");
-        return prompt;
-    }
-    prompt.push_str("\nContext blocks:\n");
-    for block in &request.context_blocks {
-        let block_type = match block.block_type {
-            BlockType::Markdown => "markdown",
-            BlockType::Html => "html",
-            BlockType::Svg => "svg",
-            BlockType::Image => "image",
-        };
-        prompt.push_str(&format!(
-            "\nBlock {}\nType: {}\nOrder: {}\nAuthor: {}\nContent:\n{}\n",
-            block.id.as_str(),
-            block_type,
-            block.order.as_str(),
-            block.author.as_str(),
-            truncate_content(&block.content),
-        ));
-    }
-    if prompt.chars().count() > MAX_PROMPT_CHARS {
-        truncate_chars(&prompt, MAX_PROMPT_CHARS)
+        stable.push_str("\nNo blocks were available for this project.\n");
     } else {
-        prompt
+        stable.push_str("\nContext blocks:\n");
+        for block in &request.context_blocks {
+            append_librarian_block(&mut stable, None, block);
+        }
     }
+
+    let tail = format!(
+        "Current instruction:\nInstruction: {}\n\n## Current Date and Time\n\n{}",
+        request.instruction.trim(),
+        crate::prompt::current_datetime_prompt_line()
+    );
+
+    finalize_cache_ordered_prompt(stable, tail)
 }
 
 fn truncate_content(content: &str) -> String {
@@ -1655,6 +1672,10 @@ pub struct ProxyChatRequest {
     pub top_p: Option<f64>,
     #[serde(default)]
     pub stop: Option<serde_json::Value>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_retention: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1925,6 +1946,18 @@ pub fn build_proxy_request(
             if let Some(ref s) = req.stop {
                 body["stop"] = s.clone();
             }
+            if let Some(ref key) = req.prompt_cache_key {
+                let key = key.trim();
+                if !key.is_empty() {
+                    body["prompt_cache_key"] = json!(key);
+                }
+            }
+            if let Some(ref retention) = req.prompt_cache_retention {
+                let retention = retention.trim();
+                if !retention.is_empty() {
+                    body["prompt_cache_retention"] = json!(retention);
+                }
+            }
             body["max_tokens"] = json!(max_tokens);
             if let Some(ref tools) = req.tools {
                 if !tools.is_empty() {
@@ -1937,6 +1970,7 @@ pub fn build_proxy_request(
             let (system, messages, tools) =
                 translate_messages_to_anthropic(&req.messages, &req.tools);
             let mut body = json!({
+                "cache_control": {"type": "ephemeral"},
                 "model": model,
                 "messages": messages,
                 "max_tokens": max_tokens,
@@ -2679,12 +2713,16 @@ mod tests {
             max_tokens: None,
             top_p: None,
             stop: None,
+            prompt_cache_key: Some("lore-agent-cache-key".into()),
+            prompt_cache_retention: Some("24h".into()),
         };
 
         let (url, body) = build_proxy_request(&endpoint, &req, false);
 
         assert_eq!(url, "https://api.deepinfra.com/v1/openai/chat/completions");
         assert_eq!(body["model"], "zai-org/GLM-5.1");
+        assert_eq!(body["prompt_cache_key"], "lore-agent-cache-key");
+        assert_eq!(body["prompt_cache_retention"], "24h");
     }
 
     #[test]
@@ -2717,6 +2755,8 @@ mod tests {
             max_tokens: None,
             top_p: None,
             stop: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         };
 
         let (_, body) = build_proxy_request(&endpoint, &req, false);
@@ -2729,6 +2769,44 @@ mod tests {
         assert_eq!(content[1]["source"]["type"], "base64");
         assert_eq!(content[1]["source"]["media_type"], "image/png");
         assert_eq!(content[1]["source"]["data"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn anthropic_proxy_request_uses_top_level_auto_cache_control() {
+        let endpoint = Endpoint {
+            id: "ep".into(),
+            name: "Anthropic".into(),
+            kind: EndpointKind::Anthropic,
+            url: "https://api.anthropic.com/v1/messages".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: Some("secret".into()),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let req = ProxyChatRequest {
+            messages: vec![ProxyChatMessage {
+                role: "user".into(),
+                content: Some(json!("hello")),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            model: None,
+            stream: Some(false),
+            tools: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            prompt_cache_key: Some("openai-style-key".into()),
+            prompt_cache_retention: Some("24h".into()),
+        };
+
+        let (_, body) = build_proxy_request(&endpoint, &req, false);
+
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
     }
 
     #[test]
@@ -2749,7 +2827,7 @@ mod tests {
     }
 
     #[test]
-    fn librarian_prompts_include_current_datetime_context() {
+    fn librarian_prompts_keep_current_datetime_at_tail() {
         let project = ProjectName::new("alpha.docs").unwrap();
         let answer_prompt = build_prompt(&LibrarianRequest {
             project: project.clone(),
@@ -2757,20 +2835,32 @@ mod tests {
             context_blocks: Vec::new(),
             context_errors: None,
         });
-        assert!(answer_prompt.starts_with("Current date and time: "));
-        assert!(answer_prompt.contains(" UTC\n\nProject: alpha.docs"));
+        assert!(answer_prompt.starts_with("Project: alpha.docs"));
+        assert!(answer_prompt.contains("Current request:\nQuestion: What changed?"));
+        assert!(
+            answer_prompt.rfind("Current date and time: ").unwrap()
+                > answer_prompt.find("Current request:").unwrap()
+        );
 
         let multi_prompt =
             build_prompt_multi_project(&[(project.clone(), Vec::new())], "Status?", None);
-        assert!(multi_prompt.starts_with("Current date and time: "));
-        assert!(multi_prompt.contains(" UTC\n\nProjects: alpha.docs"));
+        assert!(multi_prompt.starts_with("Projects: alpha.docs"));
+        assert!(multi_prompt.contains("Current request:\nQuestion: Status?"));
+        assert!(
+            multi_prompt.rfind("Current date and time: ").unwrap()
+                > multi_prompt.find("Current request:").unwrap()
+        );
 
         let action_prompt = build_action_prompt(&ProjectLibrarianRequest {
             project,
             instruction: "Update the note".into(),
             context_blocks: Vec::new(),
         });
-        assert!(action_prompt.starts_with("Current date and time: "));
-        assert!(action_prompt.contains(" UTC\n\nProject: alpha.docs"));
+        assert!(action_prompt.starts_with("Project: alpha.docs"));
+        assert!(action_prompt.contains("Current instruction:\nInstruction: Update the note"));
+        assert!(
+            action_prompt.rfind("Current date and time: ").unwrap()
+                > action_prompt.find("Current instruction:").unwrap()
+        );
     }
 }

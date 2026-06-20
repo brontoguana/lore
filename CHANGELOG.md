@@ -1,7 +1,13 @@
 # Changelog
 
+## 2026-06-20
+
+- Enabled first-stage Anthropic prompt caching for API-agent proxy calls by adding top-level automatic `cache_control` to Claude Messages requests while keeping OpenAI-compatible cache-key fields scoped to OpenAI-style endpoints.
+
 ## 2026-06-19
 
+- Made API agents summarize less frequently by giving them a cache-aware 50-exchange prompt/auto-compaction window while keeping process-agent windows unchanged.
+- Made Lore prompts more cache-friendly by moving volatile current date/time, runtime, git, and activity context toward prompt tails, replacing relative chat-history timestamps with stable absolute timestamps, sorting generated prompt/tool/project lists, reordering librarian prompts so reusable context precedes the current request, and forwarding OpenAI-compatible prompt cache keys through API-agent proxy calls.
 - Fixed AGY-backed manager and agent runs with large prompts by avoiding oversized `agy -p <prompt>` argument lists; Lore now passes small AGY prompts inline and asks AGY to read the saved prompt file when the prompt is too large for safe command-line transport.
 
 ## 2026-06-18
