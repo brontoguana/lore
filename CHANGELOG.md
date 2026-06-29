@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-06-27
+
+- Protected Claude process agents from inherited stale API-key/gateway authentication by preferring the service user's Claude login credentials when `~/.claude/.credentials.json` or `CLAUDE_CONFIG_DIR/.credentials.json` exists, while preserving explicit env-based Claude auth with `LORE_CLAUDE_ALLOW_ENV_AUTH=1`.
+
+## 2026-06-23
+
+- Fixed machine-service lifecycle under user systemd so `setup-machine`/`lore service` install and restart an enabled user unit when available, and self-updates keep or return service ownership to systemd instead of leaving a detached handoff process that does not survive reboot.
+
 ## 2026-06-20
 
 - Enabled first-stage Anthropic prompt caching for API-agent proxy calls by adding top-level automatic `cache_control` to Claude Messages requests while keeping OpenAI-compatible cache-key fields scoped to OpenAI-style endpoints.

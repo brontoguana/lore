@@ -30,16 +30,33 @@ type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const CLI_SELF_UPDATE_SKIP_ENV: &str = "LORE_SKIP_CLI_SELF_UPDATE";
 const CLI_AUTO_UPDATE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 const STOP_POLL_INTERVAL_MS: u64 = 200;
+const LORE_MACHINE_SERVICE_NAME: &str = "lore-machine.service";
 const LORE_SERVICE_HANDOFF_READY_ENV: &str = "LORE_SERVICE_HANDOFF_READY";
 const LORE_SERVICE_HANDOFF_PARENT_PID_ENV: &str = "LORE_SERVICE_HANDOFF_PARENT_PID";
 const LORE_SERVICE_HANDOFF_CANONICAL_EXE_ENV: &str = "LORE_SERVICE_HANDOFF_CANONICAL_EXE";
 const LORE_SERVICE_HANDOFF_TARGET_VERSION_ENV: &str = "LORE_SERVICE_HANDOFF_TARGET_VERSION";
+const LORE_SERVICE_SYSTEMD_ENV: &str = "LORE_SERVICE_SYSTEMD";
+const SYSTEMD_SERVICE_RESTART_EXIT_CODE: i32 = 75;
 const CLI_BACKEND_TURN_FAILURE_LIMIT: u32 = 3;
 const DEFAULT_CHAT_WINDOW_SIZE: usize = 22;
 const AGY_INLINE_PROMPT_MAX_BYTES: usize = 24 * 1024;
 const AGY_OAUTH_TOKEN_RELATIVE_PATH: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 const AGY_FILE_TOKEN_SSH_CONNECTION: &str = "127.0.0.1 0 127.0.0.1 0";
 const AGY_FILE_TOKEN_SSH_CLIENT: &str = "127.0.0.1 0 0";
+const LORE_CLAUDE_ALLOW_ENV_AUTH_ENV: &str = "LORE_CLAUDE_ALLOW_ENV_AUTH";
+const CLAUDE_AUTH_OVERRIDE_ENV_VARS: &[&str] = &[
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_VERTEX_REGION",
+];
 const TOP_LEVEL_HELP_TEMPLATE: &str = "\
 {before-help}{about-with-newline}
 {usage-heading} {usage}
@@ -159,6 +176,53 @@ fn configure_agy_auth_env(cmd: &mut tokio::process::Command) {
         // child select that auth path without changing the parent environment.
         cmd.env("SSH_CONNECTION", AGY_FILE_TOKEN_SSH_CONNECTION)
             .env("SSH_CLIENT", AGY_FILE_TOKEN_SSH_CLIENT);
+    }
+}
+
+fn env_value_is_truthy(value: Option<&OsStr>) -> bool {
+    value
+        .and_then(|value| value.to_str())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn claude_credentials_path_from(
+    mut env_var: impl FnMut(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(config_dir) = env_var("CLAUDE_CONFIG_DIR") {
+        return Some(PathBuf::from(config_dir).join(".credentials.json"));
+    }
+    user_home_dir_from_env(host_platform(), &mut env_var)
+        .map(|home| home.join(".claude").join(".credentials.json"))
+}
+
+fn should_prefer_claude_login_auth_from(
+    mut env_var: impl FnMut(&str) -> Option<OsString>,
+    mut is_file: impl FnMut(&Path) -> bool,
+) -> bool {
+    if env_value_is_truthy(env_var(LORE_CLAUDE_ALLOW_ENV_AUTH_ENV).as_deref()) {
+        return false;
+    }
+
+    claude_credentials_path_from(&mut env_var)
+        .map(|path| is_file(&path))
+        .unwrap_or(false)
+}
+
+fn should_prefer_claude_login_auth() -> bool {
+    should_prefer_claude_login_auth_from(|name| env::var_os(name), |path| path.is_file())
+}
+
+fn configure_claude_auth_env(cmd: &mut tokio::process::Command) {
+    if should_prefer_claude_login_auth() {
+        for key in CLAUDE_AUTH_OVERRIDE_ENV_VARS {
+            cmd.env_remove(key);
+        }
     }
 }
 
@@ -1222,24 +1286,19 @@ async fn run_setup_machine(args: SetupArgs, config: &mut CliConfig) -> CliResult
     let exe = resolved_current_exe()?;
     let lore_dir = service_root_dir()?;
     let log_path = lore_dir.join("service.log");
-    let pid_path = lore_dir.join("service.pid");
+    stop_existing_service_daemons(&lore_dir).await;
 
-    if pid_path.exists() {
-        if let Ok(pid_str) = fs::read_to_string(&pid_path) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                if is_process_running(pid) {
-                    kill_process(pid);
-                }
-            }
+    match install_or_restart_lore_machine_user_systemd_service(&exe) {
+        Ok(unit_path) => {
+            println!("Service installed and enabled via user systemd.");
+            println!("  Unit: {}", unit_path.display());
+            return Ok(());
         }
-        let _ = fs::remove_file(&pid_path);
-    }
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "lore.*service.*--fg"])
-            .status();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        Err(err) => {
+            eprintln!(
+                "warning: failed to install/start user systemd service ({err}); falling back to detached service"
+            );
+        }
     }
 
     let child = spawn_service_daemon(&exe, &url, &token, &log_path, &[])?;
@@ -2672,6 +2731,12 @@ struct ServiceHandoff {
     target_version: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceHandoffCompletion {
+    ContinueUnmanaged,
+    TransferredToSystemd,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MachineServiceReadyStatus {
     update_requested: bool,
@@ -2941,6 +3006,158 @@ fn service_root_dir() -> CliResult<PathBuf> {
     Ok(hidden_dir)
 }
 
+fn user_systemd_unit_dir_from_env<F>(platform: HostPlatform, mut env_var: F) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    if platform != HostPlatform::Unix {
+        return None;
+    }
+    if let Some(xdg_config_home) = env_path(&mut env_var, "XDG_CONFIG_HOME") {
+        return Some(xdg_config_home.join("systemd").join("user"));
+    }
+    user_home_dir_from_env(platform, &mut env_var)
+        .map(|home| home.join(".config").join("systemd").join("user"))
+}
+
+fn lore_machine_user_systemd_unit_path_from_env<F>(
+    platform: HostPlatform,
+    env_var: F,
+) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    user_systemd_unit_dir_from_env(platform, env_var).map(|dir| dir.join(LORE_MACHINE_SERVICE_NAME))
+}
+
+fn lore_machine_user_systemd_unit_path() -> Option<PathBuf> {
+    lore_machine_user_systemd_unit_path_from_env(host_platform(), |name| env::var_os(name))
+}
+
+fn lore_machine_systemd_unit(exe: &Path, working_dir: &Path) -> String {
+    format!(
+        "[Unit]\n\
+Description=Lore machine service\n\n\
+[Service]\n\
+Type=simple\n\
+Environment={LORE_SERVICE_DAEMON_ENV}=1\n\
+Environment={LORE_SERVICE_SYSTEMD_ENV}=1\n\
+WorkingDirectory={}\n\
+ExecStart={} service --fg\n\
+Restart=on-failure\n\
+RestartSec=10\n\n\
+[Install]\n\
+WantedBy=default.target\n",
+        working_dir.display(),
+        exe.display()
+    )
+}
+
+fn write_lore_machine_user_systemd_unit(exe: &Path, working_dir: &Path) -> CliResult<PathBuf> {
+    let unit_path = lore_machine_user_systemd_unit_path()
+        .ok_or_else(|| io::Error::other("user systemd units are not available on this platform"))?;
+    if let Some(parent) = unit_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&unit_path, lore_machine_systemd_unit(exe, working_dir))?;
+    Ok(unit_path)
+}
+
+fn run_systemctl_user(args: &[&str]) -> CliResult<()> {
+    let output = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    Err(io::Error::other(format!(
+        "systemctl --user {} failed: {detail}",
+        args.join(" ")
+    ))
+    .into())
+}
+
+fn enable_user_linger_best_effort() {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(user) = env::var_os("USER") else {
+            return;
+        };
+        let status = std::process::Command::new("loginctl")
+            .arg("enable-linger")
+            .arg(user)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if matches!(status, Ok(status) if !status.success()) {
+            eprintln!(
+                "warning: could not enable systemd lingering; the service may start only after login"
+            );
+        }
+    }
+}
+
+fn service_systemd_working_dir() -> CliResult<PathBuf> {
+    match service_home_dir() {
+        Ok(path) => Ok(path),
+        Err(_) => Ok(env::current_dir()?),
+    }
+}
+
+fn install_or_restart_lore_machine_user_systemd_service(exe: &Path) -> CliResult<PathBuf> {
+    let working_dir = service_systemd_working_dir()?;
+    let unit_path = write_lore_machine_user_systemd_unit(exe, &working_dir)?;
+    run_systemctl_user(&["daemon-reload"])?;
+    enable_user_linger_best_effort();
+    run_systemctl_user(&["enable", LORE_MACHINE_SERVICE_NAME])?;
+    run_systemctl_user(&["restart", LORE_MACHINE_SERVICE_NAME])?;
+    Ok(unit_path)
+}
+
+fn restart_existing_lore_machine_user_systemd_service(exe: &Path) -> CliResult<bool> {
+    let Some(unit_path) = lore_machine_user_systemd_unit_path() else {
+        return Ok(false);
+    };
+    if !unit_path.exists() {
+        return Ok(false);
+    }
+    let working_dir = service_systemd_working_dir()?;
+    let unit_path = write_lore_machine_user_systemd_unit(exe, &working_dir)?;
+    run_systemctl_user(&["daemon-reload"])?;
+    run_systemctl_user(&["enable", LORE_MACHINE_SERVICE_NAME])?;
+    run_systemctl_user(&["restart", LORE_MACHINE_SERVICE_NAME])?;
+    eprintln!(
+        "[service] Restarted existing user systemd unit at {}",
+        unit_path.display()
+    );
+    Ok(true)
+}
+
+fn cgroup_text_contains_systemd_unit(cgroup_text: &str, unit_name: &str) -> bool {
+    let escaped_unit_name = unit_name.replace('-', "\\x2d");
+    cgroup_text.contains(unit_name) || cgroup_text.contains(&escaped_unit_name)
+}
+
+fn current_process_in_systemd_unit(unit_name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/self/cgroup")
+            .map(|text| cgroup_text_contains_systemd_unit(&text, unit_name))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = unit_name;
+        false
+    }
+}
+
 fn write_service_pid_file(lore_dir: &Path, pid: u32) -> CliResult<()> {
     fs::write(lore_dir.join("service.pid"), pid.to_string())?;
     Ok(())
@@ -2956,6 +3173,27 @@ fn remove_owned_service_pid_file(lore_dir: &Path, pid: u32) {
     };
     if recorded_pid == pid {
         let _ = fs::remove_file(pid_path);
+    }
+}
+
+async fn stop_existing_service_daemons(lore_dir: &Path) {
+    let pid_path = lore_dir.join("service.pid");
+    if pid_path.exists() {
+        if let Ok(pid_str) = fs::read_to_string(&pid_path)
+            && let Ok(pid) = pid_str.trim().parse::<u32>()
+            && is_process_running(pid)
+        {
+            eprintln!("Stopping existing service (pid {})", pid);
+            kill_process(pid);
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "lore.*service.*--fg"])
+            .status();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
@@ -2983,8 +3221,9 @@ fn service_handoff_from_env() -> CliResult<Option<ServiceHandoff>> {
 async fn complete_service_handoff(
     context: &CliContext,
     machine_token: &str,
+    lore_dir: &Path,
     handoff: &ServiceHandoff,
-) -> CliResult<()> {
+) -> CliResult<ServiceHandoffCompletion> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let status = service_ready_check(context, machine_token).await?;
@@ -3026,7 +3265,19 @@ async fn complete_service_handoff(
     let staged_executable = resolved_current_exe()?;
     promote_staged_binary_to_canonical(&staged_executable, &handoff.canonical_executable)?;
     let _ = fs::remove_file(&handoff.ready_path);
-    Ok(())
+    match restart_existing_lore_machine_user_systemd_service(&handoff.canonical_executable) {
+        Ok(true) => {
+            remove_owned_service_pid_file(lore_dir, std::process::id());
+            Ok(ServiceHandoffCompletion::TransferredToSystemd)
+        }
+        Ok(false) => Ok(ServiceHandoffCompletion::ContinueUnmanaged),
+        Err(err) => {
+            eprintln!(
+                "[service] Could not transfer handoff back to user systemd; continuing unmanaged: {err}"
+            );
+            Ok(ServiceHandoffCompletion::ContinueUnmanaged)
+        }
+    }
 }
 
 fn reuse_or_clear_staged_binary(staged_path: &Path, target_version: &str) -> CliResult<bool> {
@@ -3436,6 +3687,7 @@ fn spawn_service_daemon(
     command
         .args(["--url", url, "--token", token, "service", "--fg"])
         .env(LORE_SERVICE_DAEMON_ENV, "1")
+        .env_remove(LORE_SERVICE_SYSTEMD_ENV)
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
         .stdin(std::process::Stdio::null());
@@ -7700,6 +7952,7 @@ async fn spawn_backend(
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .env_remove("CLAUDECODE");
+            configure_claude_auth_env(&mut cmd);
             configure_child_process_group(&mut cmd);
             if let Some(token) = agent_token {
                 cmd.env("LORE_AGENT_TOKEN", token);
@@ -7922,6 +8175,7 @@ async fn run_compaction(
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .env_remove("CLAUDECODE");
+            configure_claude_auth_env(&mut cmd);
             if let Some(token) = context.token.as_deref() {
                 cmd.env("LORE_AGENT_TOKEN", token);
             }
@@ -8558,31 +8812,21 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         // Daemonize
         let lore_dir = service_root_dir()?;
         let log_path = lore_dir.join("service.log");
-        let pid_path = lore_dir.join("service.pid");
-
-        // Kill existing service processes — PID file first, then sweep for orphans
-        if pid_path.exists() {
-            if let Ok(pid_str) = fs::read_to_string(&pid_path) {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    if is_process_running(pid) {
-                        eprintln!("Stopping existing service (pid {})", pid);
-                        kill_process(pid);
-                    }
-                }
-            }
-            let _ = fs::remove_file(&pid_path);
-        }
-        // Kill any orphaned service processes not tracked by PID file
-        #[cfg(unix)]
-        {
-            let _ = std::process::Command::new("pkill")
-                .args(["-f", "lore.*service.*--fg"])
-                .status();
-            // Wait for old processes to exit
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-
         let exe = resolved_current_exe()?;
+        stop_existing_service_daemons(&lore_dir).await;
+        match install_or_restart_lore_machine_user_systemd_service(&exe) {
+            Ok(unit_path) => {
+                println!("Lore service installed and enabled via user systemd.");
+                println!("  Unit: {}", unit_path.display());
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to install/start user systemd service ({err}); falling back to detached service"
+                );
+            }
+        }
+
         let child = spawn_service_daemon(&exe, &context.url, machine_token, &log_path, &[])?;
         let pid = child.id();
         write_service_pid_file(&lore_dir, pid)?;
@@ -8618,7 +8862,12 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
     );
 
     if let Some(handoff) = handoff.as_ref() {
-        complete_service_handoff(context, machine_token, handoff).await?;
+        if complete_service_handoff(context, machine_token, &lore_dir, handoff).await?
+            == ServiceHandoffCompletion::TransferredToSystemd
+        {
+            eprintln!("[service] Handoff transferred to user systemd; exiting staged process");
+            return Ok(());
+        }
     }
 
     // Rotate service log if it's grown large (>2MB)
@@ -8757,6 +9006,38 @@ async fn handle_service_update_request(
 
     match prepare_service_update(context, machine_token, &target_version, &repo, lore_dir).await {
         Ok(prepared) => {
+            if current_process_in_systemd_unit(LORE_MACHINE_SERVICE_NAME) {
+                match promote_staged_binary_to_canonical(
+                    &prepared.staged_executable,
+                    &prepared.canonical_executable,
+                )
+                .and_then(|_| {
+                    verify_binary_matches_target(
+                        &prepared.canonical_executable,
+                        &prepared.target_version,
+                    )
+                }) {
+                    Ok(()) => {
+                        clear_service_update_failure(lore_dir);
+                        eprintln!(
+                            "[service] Installed v{} from {} into {}; asking systemd to restart this service",
+                            prepared.target_version,
+                            prepared.source,
+                            prepared.canonical_executable.display()
+                        );
+                        svc_state.stop_all_agents();
+                        svc_state.save();
+                        remove_owned_service_pid_file(lore_dir, std::process::id());
+                        std::process::exit(SYSTEMD_SERVICE_RESTART_EXIT_CODE);
+                    }
+                    Err(e) => {
+                        record_service_update_failure(lore_dir, &target_version, &e.to_string());
+                        eprintln!("[service] Systemd-managed update install failed: {e}");
+                        return;
+                    }
+                }
+            }
+
             let ready_path = lore_dir.join(format!("handoff-{}.json", uuid::Uuid::new_v4()));
             let handoff_env = [
                 (
@@ -9141,18 +9422,19 @@ mod tests {
         ResolvedProject, agy_print_args, api_endpoint_runtime_context,
         api_user_content_from_markdown_images, append_assistant_segment, append_block_content,
         append_new_stream_text, append_plain_output_line, backend_uses_json_lines,
-        build_compaction_prompt, chat_content_for_current_message_cli_prompt,
-        chat_content_for_current_message_prompt, chat_content_for_prompt, codex_exec_args,
-        count_history_exchanges, find_cwd_project_file, format_prompt_history_time,
-        history_auto_compact_window_size, history_compaction_split_index,
-        history_messages_excluding_pending, history_prompt_window_size, load_cli_text_input,
-        load_doc_write_content, load_required_text_arg, looks_like_cli_auth_prompt,
-        markdown_data_image_attachments, markdown_heading_matches,
-        next_service_update_retry_delay_secs, parse_cli_version_output, parse_codex_line,
-        recent_history_exchange_tail, recent_history_prompt_window, remove_owned_service_pid_file,
-        resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
-        sanitize_cli_output_preview, service_update_target, should_force_agy_file_token_auth_from,
-        write_codex_image_attachments,
+        build_compaction_prompt, cgroup_text_contains_systemd_unit,
+        chat_content_for_current_message_cli_prompt, chat_content_for_current_message_prompt,
+        chat_content_for_prompt, codex_exec_args, count_history_exchanges, find_cwd_project_file,
+        format_prompt_history_time, history_auto_compact_window_size,
+        history_compaction_split_index, history_messages_excluding_pending,
+        history_prompt_window_size, load_cli_text_input, load_doc_write_content,
+        load_required_text_arg, looks_like_cli_auth_prompt, lore_machine_systemd_unit,
+        lore_machine_user_systemd_unit_path_from_env, markdown_data_image_attachments,
+        markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
+        parse_codex_line, recent_history_exchange_tail, recent_history_prompt_window,
+        remove_owned_service_pid_file, resolve_context_project, resolve_executable_path_from,
+        reuse_or_clear_staged_binary, sanitize_cli_output_preview, service_update_target,
+        should_force_agy_file_token_auth_from, write_codex_image_attachments,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
@@ -9448,6 +9730,72 @@ mod tests {
     }
 
     #[test]
+    fn lore_machine_user_systemd_unit_path_uses_xdg_config_home() {
+        let path = lore_machine_user_systemd_unit_path_from_env(
+            super::HostPlatform::Unix,
+            env_lookup(&[("XDG_CONFIG_HOME", "/home/main/.config")]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from("/home/main/.config")
+                .join("systemd")
+                .join("user")
+                .join(super::LORE_MACHINE_SERVICE_NAME)
+        );
+    }
+
+    #[test]
+    fn lore_machine_user_systemd_unit_path_falls_back_to_home() {
+        let path = lore_machine_user_systemd_unit_path_from_env(
+            super::HostPlatform::Unix,
+            env_lookup(&[("HOME", "/home/main")]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from("/home/main")
+                .join(".config")
+                .join("systemd")
+                .join("user")
+                .join(super::LORE_MACHINE_SERVICE_NAME)
+        );
+    }
+
+    #[test]
+    fn lore_machine_systemd_unit_restarts_on_failure_and_runs_foreground_service() {
+        let unit = lore_machine_systemd_unit(
+            PathBuf::from("/home/main/.local/bin/lore").as_path(),
+            PathBuf::from("/home/main").as_path(),
+        );
+
+        assert!(unit.contains("Environment=LORE_SERVICE_DAEMON=1"));
+        assert!(unit.contains("Environment=LORE_SERVICE_SYSTEMD=1"));
+        assert!(unit.contains("WorkingDirectory=/home/main"));
+        assert!(unit.contains("ExecStart=/home/main/.local/bin/lore service --fg"));
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn cgroup_detection_matches_systemd_unit_but_not_login_session_scope() {
+        assert!(cgroup_text_contains_systemd_unit(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/lore-machine.service\n",
+            super::LORE_MACHINE_SERVICE_NAME
+        ));
+        assert!(cgroup_text_contains_systemd_unit(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/lore\\x2dmachine.service\n",
+            super::LORE_MACHINE_SERVICE_NAME
+        ));
+        assert!(!cgroup_text_contains_systemd_unit(
+            "0::/user.slice/user-1000.slice/session-46.scope\n",
+            super::LORE_MACHINE_SERVICE_NAME
+        ));
+    }
+
+    #[test]
     fn agy_file_token_auth_is_forced_only_for_headless_token_env() {
         let home = tempfile::tempdir().unwrap();
         let token_path = home.path().join(AGY_OAUTH_TOKEN_RELATIVE_PATH);
@@ -9469,6 +9817,68 @@ mod tests {
             Some(home.path().as_os_str()),
             Some(OsStr::new("real ssh")),
             None
+        ));
+    }
+
+    #[test]
+    fn claude_login_auth_preferred_when_credentials_exist() {
+        let home = tempfile::tempdir().unwrap();
+        let credentials_path = home.path().join(".claude/.credentials.json");
+        fs::create_dir_all(credentials_path.parent().unwrap()).unwrap();
+        fs::write(&credentials_path, "{}").unwrap();
+        let home_str = home.path().to_string_lossy().to_string();
+
+        assert!(super::should_prefer_claude_login_auth_from(
+            env_lookup(&[
+                ("HOME", home_str.as_str()),
+                ("ANTHROPIC_API_KEY", "stale-key")
+            ]),
+            |path| path.is_file()
+        ));
+    }
+
+    #[test]
+    fn claude_env_auth_can_be_explicitly_allowed() {
+        let home = tempfile::tempdir().unwrap();
+        let credentials_path = home.path().join(".claude/.credentials.json");
+        fs::create_dir_all(credentials_path.parent().unwrap()).unwrap();
+        fs::write(&credentials_path, "{}").unwrap();
+        let home_str = home.path().to_string_lossy().to_string();
+
+        assert!(!super::should_prefer_claude_login_auth_from(
+            env_lookup(&[
+                ("HOME", home_str.as_str()),
+                ("ANTHROPIC_API_KEY", "intentional-key"),
+                (super::LORE_CLAUDE_ALLOW_ENV_AUTH_ENV, "1")
+            ]),
+            |path| path.is_file()
+        ));
+    }
+
+    #[test]
+    fn claude_env_auth_preserved_when_login_credentials_are_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let home_str = home.path().to_string_lossy().to_string();
+
+        assert!(!super::should_prefer_claude_login_auth_from(
+            env_lookup(&[
+                ("HOME", home_str.as_str()),
+                ("ANTHROPIC_API_KEY", "headless-key")
+            ]),
+            |path| path.is_file()
+        ));
+    }
+
+    #[test]
+    fn claude_config_dir_credentials_are_detected() {
+        let config = tempfile::tempdir().unwrap();
+        let credentials_path = config.path().join(".credentials.json");
+        fs::write(&credentials_path, "{}").unwrap();
+        let config_str = config.path().to_string_lossy().to_string();
+
+        assert!(super::should_prefer_claude_login_auth_from(
+            env_lookup(&[("CLAUDE_CONFIG_DIR", config_str.as_str())]),
+            |path| path.is_file()
         ));
     }
 
