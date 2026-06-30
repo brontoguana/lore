@@ -461,7 +461,20 @@ async fn document_block_crud() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let blocks: Value = resp.json().await.unwrap();
-    assert_eq!(blocks.as_array().unwrap().len(), 1);
+    let block_list = blocks.as_array().unwrap();
+    assert_eq!(block_list.len(), 2);
+    assert!(
+        block_list
+            .iter()
+            .any(|block| block["block_type"] == "markdown" && block["content"] == "")
+    );
+    assert!(block_list.iter().any(|block| {
+        block["id"] == block_id
+            && block["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Updated Title")
+    }));
 
     // Create a second block
     let resp = client
@@ -507,7 +520,7 @@ async fn document_block_crud() {
         resp.status()
     );
 
-    // Verify only one block remains
+    // Verify the starter block and original edited block remain
     let resp = client
         .get(url(
             &addr,
@@ -518,7 +531,10 @@ async fn document_block_crud() {
         .await
         .unwrap();
     let blocks: Value = resp.json().await.unwrap();
-    assert_eq!(blocks.as_array().unwrap().len(), 1);
+    let block_list = blocks.as_array().unwrap();
+    assert_eq!(block_list.len(), 2);
+    assert!(block_list.iter().any(|block| block["content"] == ""));
+    assert!(block_list.iter().any(|block| block["id"] == block_id));
 }
 
 #[tokio::test]

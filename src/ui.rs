@@ -9054,7 +9054,7 @@ pub fn render_document_page(
 
     let blocks_html = if blocks.is_empty() && can_write {
         format!(
-            r#"<section class="empty-state"><h2>No blocks yet</h2><p>Click the button below to add the first block.</p></section>{}"#,
+            r#"<section class="empty-state"><h2>No blocks yet</h2></section>{}"#,
             render_doc_block_inserter(project, doc_id, None, csrf_token, &project_infos),
         )
     } else if blocks.is_empty() {
@@ -9131,24 +9131,6 @@ pub fn render_document_page(
         )
     };
 
-    let add_subdoc_html = if can_write {
-        format!(
-            r#"<form class="doc-add-form" method="post" action="/ui/{project_slug}/documents" style="display:none;" id="add-subdoc-form">
-  <input type="hidden" name="csrf_token" value="{csrf}">
-  <input type="hidden" name="parent_document_id" value="{doc_id_attr}">
-  <input type="text" name="name" placeholder="Document name" required class="tree-inline-input" style="flex:1;">
-  <button type="submit" class="button-link">Create</button>
-  <button type="button" class="button-link" onclick="this.closest('form').style.display='none'">Cancel</button>
-</form>
-<button type="button" class="button-link" style="margin-top:var(--s-3);" onclick="var f=document.getElementById('add-subdoc-form'); f.style.display='flex'; f.querySelector('input[name=name]').focus();">
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
-  New sub-document
-</button>"#,
-        )
-    } else {
-        String::new()
-    };
-
     let empty_doc_download_btn = if blocks.is_empty() {
         format!(
             r#"<div class="block-header-actions document-page-actions">{}</div>"#,
@@ -9190,7 +9172,6 @@ pub fn render_document_page(
       <div class="timeline">{blocks_html}</div>
     </section>
     {child_doc_items}
-    {add_subdoc_html}
     {read_only_notice}
     {delete_doc_html}
     {expanded_editor_shell}"#,
@@ -9200,7 +9181,6 @@ pub fn render_document_page(
         empty_doc_download_btn = empty_doc_download_btn,
         blocks_html = blocks_html,
         child_doc_items = child_doc_items,
-        add_subdoc_html = add_subdoc_html,
         read_only_notice = read_only_notice,
         delete_doc_html = delete_doc_html,
         expanded_editor_shell = render_expanded_text_editor_shell(),
@@ -13834,7 +13814,7 @@ fn shared_styles(theme: UiTheme, mode: ColorMode) -> String {
       display: flex;
       align-items: center;
       justify-content: center;
-      opacity: 0;
+      opacity: 0.58;
       transition: opacity 0.15s, border-color 0.2s, color 0.2s, background 0.2s;
       z-index: 6;
       box-shadow: 0 1px 4px rgba(0,0,0,0.15);
@@ -14873,6 +14853,7 @@ mod tests {
         assert!(html.contains(r#"href="/ui/my-docs/doc/doc-1/download.md""#));
         assert!(html.contains(r#"title="Download Markdown""#));
         assert!(!html.contains("document-page-actions"));
+        assert!(!html.contains("New sub-document"));
         let pin_index = html.find(r#"title="Pin (block agent edits)""#).unwrap();
         let download_index = html
             .find(r#"href="/ui/my-docs/doc/doc-1/download.md""#)
@@ -14883,6 +14864,8 @@ mod tests {
         assert!(html.contains(r#"id="block-edit-content-"#));
         assert!(html.contains(r#"id="expanded-text-editor""#));
         assert!(html.contains("function openExpandedTextEditor(sourceId) {"));
+        assert!(html.contains(".editline-plus {"));
+        assert!(html.contains("opacity: 0.58;"));
         assert!(html.contains(
             "var directSource = document.getElementById('block-edit-content-' + blockId);"
         ));
@@ -14897,6 +14880,34 @@ mod tests {
                 .as_str()
             )
         );
+    }
+
+    #[test]
+    fn document_page_empty_state_does_not_advertise_removed_first_block_button() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let info = store.create_project("My Docs", None).unwrap();
+
+        let html = render_document_page(
+            UiTheme::Parchment,
+            ColorMode::Light,
+            &info.slug,
+            "My Docs",
+            "doc-1",
+            "Doc 1",
+            &[],
+            &[],
+            None,
+            "admin",
+            true,
+            true,
+            "csrf",
+            &store,
+        );
+
+        assert!(html.contains("No blocks yet"));
+        assert!(!html.contains("Click the button below to add the first block."));
+        assert!(!html.contains("New sub-document"));
     }
 
     #[test]

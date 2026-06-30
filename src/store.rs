@@ -1114,6 +1114,7 @@ impl FileBlockStore {
             created_at: Some(OffsetDateTime::now_utc()),
         };
         fs::write(doc_dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+        self.create_empty_markdown_doc_block_in_dir(project, &doc_dir)?;
         Ok(DocumentInfo {
             id: doc_id,
             display_name: trimmed.to_string(),
@@ -1164,19 +1165,13 @@ impl FileBlockStore {
         project: &ProjectName,
         doc_id: &DocumentId,
     ) -> Result<Vec<Block>> {
+        let _lock = self.project_lock(project);
+        let _guard = _lock.lock().unwrap();
         let doc_dir = self.find_doc_dir(project, doc_id)?;
-        let blocks_dir = doc_dir.join("blocks");
-        if !blocks_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut blocks = Vec::new();
-        for entry in fs::read_dir(blocks_dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let stored: StoredBlock = serde_json::from_slice(&fs::read(&path)?)?;
-            blocks.push(self.inflate_block(stored)?);
+        let mut blocks = self.list_doc_blocks_in_dir(&doc_dir)?;
+        if blocks.is_empty() {
+            let block = self.create_empty_markdown_doc_block_in_dir(project, &doc_dir)?;
+            blocks.push(block);
         }
         blocks.sort_by(|a, b| {
             a.order
@@ -1594,6 +1589,13 @@ impl FileBlockStore {
                 }
             }
             prev_order = Some(new_order);
+        }
+
+        if final_block_ids.is_empty() {
+            let block = self.create_empty_markdown_doc_block_in_dir(project, &doc_dir)?;
+            result
+                .created
+                .push(("empty-markdown-block".to_string(), block));
         }
 
         Ok(result)
@@ -2129,6 +2131,8 @@ impl FileBlockStore {
         author: KeyFingerprint,
     ) -> Result<Block> {
         new_block.validate()?;
+        fs::create_dir_all(doc_dir.join("blocks"))?;
+        fs::create_dir_all(doc_dir.join("blobs"))?;
         let order = generate_order_key(new_block.left.as_ref(), new_block.right.as_ref())?;
         let id = BlockId::new();
         let created_at = OffsetDateTime::now_utc();
@@ -2156,6 +2160,26 @@ impl FileBlockStore {
         let metadata_path = doc_dir.join("blocks").join(format!("{}.json", id.as_str()));
         fs::write(metadata_path, serde_json::to_vec_pretty(&stored)?)?;
         self.inflate_block(stored)
+    }
+
+    fn create_empty_markdown_doc_block_in_dir(
+        &self,
+        project: &ProjectName,
+        doc_dir: &Path,
+    ) -> Result<Block> {
+        self.create_block_in_doc_dir(
+            doc_dir,
+            NewBlock {
+                project: project.clone(),
+                block_type: BlockType::Markdown,
+                content: String::new(),
+                author_key: "lore-system".into(),
+                left: None,
+                right: None,
+                image_upload: None,
+            },
+            KeyFingerprint::from_user_name("system")?,
+        )
     }
 
     fn update_block_in_doc_dir(
@@ -2697,9 +2721,12 @@ fn filter_block_range<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{FileBlockStore, parse_document_text, serialize_blocks_to_text};
+    use super::{
+        DocumentWriteEntry, FileBlockStore, parse_document_text, serialize_blocks_to_text,
+    };
     use crate::error::LoreError;
     use crate::model::{BlockType, KeyFingerprint, NewBlock, OrderKey, ProjectName, UpdateBlock};
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -3338,13 +3365,36 @@ mod tests {
         let store = FileBlockStore::new(dir.path());
         let project = store.create_project("Test", None).unwrap();
 
-        store.create_document(&project.slug, None, "Doc A").unwrap();
+        let doc_a = store.create_document(&project.slug, None, "Doc A").unwrap();
         store.create_document(&project.slug, None, "Doc B").unwrap();
 
         let docs = store.list_documents(&project.slug).unwrap();
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0].display_name, "Doc A");
         assert_eq!(docs[1].display_name, "Doc B");
+
+        let blocks = store.list_doc_blocks(&project.slug, &doc_a.id).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_type, BlockType::Markdown);
+        assert_eq!(blocks[0].content, "");
+    }
+
+    #[test]
+    fn repairs_legacy_empty_document_with_markdown_block() {
+        let dir = tempdir().unwrap();
+        let store = FileBlockStore::new(dir.path());
+        let project = store.create_project("Test", None).unwrap();
+        let doc = store
+            .create_document(&project.slug, None, "Legacy")
+            .unwrap();
+
+        let doc_dir = store.find_doc_dir(&project.slug, &doc.id).unwrap();
+        fs::remove_dir_all(doc_dir.join("blocks")).unwrap();
+
+        let blocks = store.list_doc_blocks(&project.slug, &doc.id).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_type, BlockType::Markdown);
+        assert_eq!(blocks[0].content, "");
     }
 
     #[test]
@@ -3425,6 +3475,10 @@ mod tests {
         let doc = store
             .create_document(&project.slug, None, "My Doc")
             .unwrap();
+        let initial_blocks = store.list_doc_blocks(&project.slug, &doc.id).unwrap();
+        assert_eq!(initial_blocks.len(), 1);
+        assert_eq!(initial_blocks[0].block_type, BlockType::Markdown);
+        assert_eq!(initial_blocks[0].content, "");
 
         let block = store
             .create_doc_block(
@@ -3443,8 +3497,8 @@ mod tests {
         assert_eq!(block.content, "hello");
 
         let blocks = store.list_doc_blocks(&project.slug, &doc.id).unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].content, "hello");
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().any(|b| b.content == "hello"));
 
         let fetched = store
             .get_doc_block(&project.slug, &doc.id, &block.id)
@@ -3471,12 +3525,9 @@ mod tests {
         store
             .delete_doc_block(&project.slug, &doc.id, &block.id, "key-a")
             .unwrap();
-        assert!(
-            store
-                .list_doc_blocks(&project.slug, &doc.id)
-                .unwrap()
-                .is_empty()
-        );
+        let blocks = store.list_doc_blocks(&project.slug, &doc.id).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].content, "");
     }
 
     #[test]
@@ -3622,26 +3673,24 @@ mod tests {
         let doc = store
             .create_document(&project.slug, None, "My Doc")
             .unwrap();
-        let mut ids = Vec::new();
-        let mut prev_order: Option<OrderKey> = None;
-        for &text in contents {
-            let block = store
-                .create_doc_block_as_project_writer(
-                    &doc.id,
-                    NewBlock {
-                        project: project.slug.clone(),
-                        block_type: BlockType::Markdown,
-                        content: text.into(),
-                        author_key: "testuser".into(),
-                        left: prev_order.clone(),
-                        right: None,
-                        image_upload: None,
-                    },
-                )
-                .unwrap();
-            prev_order = Some(block.order.clone());
-            ids.push(block.id);
-        }
+        let entries = contents
+            .iter()
+            .enumerate()
+            .map(|(idx, text)| DocumentWriteEntry {
+                id: format!("block-{idx}"),
+                block_type: BlockType::Markdown,
+                content: (*text).to_string(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .write_document_text(&project.slug, &doc.id, entries, author())
+            .unwrap();
+        let ids = store
+            .list_doc_blocks(&project.slug, &doc.id)
+            .unwrap()
+            .into_iter()
+            .map(|block| block.id)
+            .collect();
         (project.slug, doc.id, ids)
     }
 
@@ -3744,8 +3793,11 @@ mod tests {
         let text = serialize_blocks_to_text(&blocks);
         assert!(text.contains("type=svg"));
         let parsed = parse_document_text(&text).unwrap();
-        assert_eq!(parsed[0].block_type, BlockType::Svg);
-        assert_eq!(parsed[0].content, svg);
+        let svg_entry = parsed
+            .iter()
+            .find(|entry| entry.block_type == BlockType::Svg)
+            .expect("serialized document should include svg block");
+        assert_eq!(svg_entry.content, svg);
     }
 
     // -----------------------------------------------------------------------
@@ -3939,7 +3991,7 @@ mod tests {
     }
 
     #[test]
-    fn read_document_text_empty_doc() {
+    fn read_document_text_empty_doc_returns_empty_markdown_block() {
         let dir = tempdir().unwrap();
         let store = FileBlockStore::new(dir.path());
         let project = store.create_project("Test", None).unwrap();
@@ -3948,7 +4000,9 @@ mod tests {
         let text = store
             .read_document_text(&project.slug, &doc.id, None, None)
             .unwrap();
-        assert_eq!(text, "");
+        assert!(text.contains("@@block id="));
+        assert!(text.contains("type=markdown"));
+        assert!(text.ends_with("@@end"));
     }
 
     // -----------------------------------------------------------------------
@@ -4220,9 +4274,15 @@ mod tests {
         assert_eq!(result.deleted.len(), 2);
         assert!(result.deleted.contains(&ids[0]));
         assert!(result.deleted.contains(&ids[1]));
+        assert_eq!(result.created.len(), 1);
+        assert_eq!(result.created[0].0, "empty-markdown-block");
+        assert_eq!(result.created[0].1.block_type, BlockType::Markdown);
+        assert_eq!(result.created[0].1.content, "");
 
         let blocks = store.list_doc_blocks(&project, &doc_id).unwrap();
-        assert!(blocks.is_empty());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_type, BlockType::Markdown);
+        assert_eq!(blocks[0].content, "");
     }
 
     #[test]

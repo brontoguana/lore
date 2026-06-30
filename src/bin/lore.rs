@@ -21,6 +21,7 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::io::IsTerminal;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -898,6 +899,9 @@ struct ServiceArgs {
     /// Run in foreground (don't daemonize)
     #[arg(long)]
     fg: bool,
+    /// Install/restart as a system-level systemd service running as this user
+    #[arg(long)]
+    system: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1295,9 +1299,7 @@ async fn run_setup_machine(args: SetupArgs, config: &mut CliConfig) -> CliResult
             return Ok(());
         }
         Err(err) => {
-            eprintln!(
-                "warning: failed to install/start user systemd service ({err}); falling back to detached service"
-            );
+            warn_user_systemd_failed(err.as_ref());
         }
     }
 
@@ -3053,6 +3055,54 @@ WantedBy=default.target\n",
     )
 }
 
+fn current_username() -> CliResult<String> {
+    if let Ok(user) = env::var("USER") {
+        let user = user.trim();
+        if !user.is_empty() {
+            return Ok(user.to_string());
+        }
+    }
+    let output = std::process::Command::new("whoami").output()?;
+    if output.status.success() {
+        let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !user.is_empty() {
+            return Ok(user);
+        }
+    }
+    Err(io::Error::other("could not determine current user").into())
+}
+
+fn lore_machine_system_service_unit_path() -> PathBuf {
+    PathBuf::from("/etc/systemd/system").join(LORE_MACHINE_SERVICE_NAME)
+}
+
+fn lore_machine_system_service_unit(exe: &Path, working_dir: &Path, user: &str) -> String {
+    format!(
+        "[Unit]\n\
+Description=Lore machine service\n\
+After=network-online.target\n\
+Wants=network-online.target\n\n\
+[Service]\n\
+Type=simple\n\
+User={user}\n\
+Environment=HOME={}\n\
+Environment=USER={user}\n\
+Environment=LOGNAME={user}\n\
+Environment={LORE_SERVICE_DAEMON_ENV}=1\n\
+Environment={LORE_SERVICE_SYSTEMD_ENV}=1\n\
+WorkingDirectory={}\n\
+ExecStart={} service --fg\n\
+Restart=always\n\
+RestartSec=10\n\
+OOMPolicy=continue\n\n\
+[Install]\n\
+WantedBy=multi-user.target\n",
+        working_dir.display(),
+        working_dir.display(),
+        exe.display()
+    )
+}
+
 fn write_lore_machine_user_systemd_unit(exe: &Path, working_dir: &Path) -> CliResult<PathBuf> {
     let unit_path = lore_machine_user_systemd_unit_path()
         .ok_or_else(|| io::Error::other("user systemd units are not available on this platform"))?;
@@ -3078,6 +3128,51 @@ fn run_systemctl_user(args: &[&str]) -> CliResult<()> {
     let detail = if stderr.is_empty() { stdout } else { stderr };
     Err(io::Error::other(format!(
         "systemctl --user {} failed: {detail}",
+        args.join(" ")
+    ))
+    .into())
+}
+
+fn sudo_write_file(path: &Path, content: &str) -> CliResult<()> {
+    let mut command = std::process::Command::new("sudo");
+    if !io::stdin().is_terminal() {
+        command.arg("-n");
+    }
+    let mut child = command
+        .args(["tee", &path.to_string_lossy()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(content.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("sudo tee {} failed with {status}", path.display())).into())
+    }
+}
+
+fn run_sudo_systemctl(args: &[&str]) -> CliResult<()> {
+    let mut command = std::process::Command::new("sudo");
+    if !io::stdin().is_terminal() {
+        command.arg("-n");
+    }
+    let output = command
+        .arg("systemctl")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    Err(io::Error::other(format!(
+        "sudo systemctl {} failed: {detail}",
         args.join(" ")
     ))
     .into())
@@ -3118,6 +3213,33 @@ fn install_or_restart_lore_machine_user_systemd_service(exe: &Path) -> CliResult
     run_systemctl_user(&["enable", LORE_MACHINE_SERVICE_NAME])?;
     run_systemctl_user(&["restart", LORE_MACHINE_SERVICE_NAME])?;
     Ok(unit_path)
+}
+
+fn install_or_restart_lore_machine_system_systemd_service(exe: &Path) -> CliResult<PathBuf> {
+    if host_platform() != HostPlatform::Unix {
+        return Err(io::Error::other("systemd system services are only supported on Unix").into());
+    }
+    let user = current_username()?;
+    let working_dir = service_systemd_working_dir()?;
+    let unit_path = lore_machine_system_service_unit_path();
+    let unit = lore_machine_system_service_unit(exe, &working_dir, &user);
+    sudo_write_file(&unit_path, &unit)?;
+    run_sudo_systemctl(&["daemon-reload"])?;
+    run_sudo_systemctl(&["enable", "--now", LORE_MACHINE_SERVICE_NAME])?;
+    run_sudo_systemctl(&["restart", LORE_MACHINE_SERVICE_NAME])?;
+    Ok(unit_path)
+}
+
+fn warn_user_systemd_failed(err: &(dyn Error + 'static)) {
+    eprintln!(
+        "warning: failed to install/start user systemd service ({err}); falling back to detached service"
+    );
+    eprintln!(
+        "warning: detached Lore services are session-owned and may stop after logout, user-manager failure, or reboot"
+    );
+    eprintln!(
+        "warning: for a host-resilient service, run `lore service --system` to install a system unit that runs as this user"
+    );
 }
 
 fn restart_existing_lore_machine_user_systemd_service(exe: &Path) -> CliResult<bool> {
@@ -8808,6 +8930,26 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
         .as_deref()
         .ok_or("no machine token configured. Run 'lore setup-machine <url>' first.")?;
 
+    if args.system && args.fg {
+        return Err("--system cannot be combined with --fg".into());
+    }
+
+    if args.system && !is_daemon {
+        let exe = resolved_current_exe()?;
+        match install_or_restart_lore_machine_system_systemd_service(&exe) {
+            Ok(unit_path) => {
+                println!("Lore service installed and enabled via system systemd.");
+                println!("  Unit: {}", unit_path.display());
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(
+                    format!("failed to install/start system systemd service: {err}").into(),
+                );
+            }
+        }
+    }
+
     if !args.fg && !is_daemon {
         // Daemonize
         let lore_dir = service_root_dir()?;
@@ -8821,9 +8963,7 @@ async fn service_command(context: &CliContext, args: ServiceArgs) -> CliResult<(
                 return Ok(());
             }
             Err(err) => {
-                eprintln!(
-                    "warning: failed to install/start user systemd service ({err}); falling back to detached service"
-                );
+                warn_user_systemd_failed(err.as_ref());
             }
         }
 
@@ -9428,13 +9568,14 @@ mod tests {
         format_prompt_history_time, history_auto_compact_window_size,
         history_compaction_split_index, history_messages_excluding_pending,
         history_prompt_window_size, load_cli_text_input, load_doc_write_content,
-        load_required_text_arg, looks_like_cli_auth_prompt, lore_machine_systemd_unit,
-        lore_machine_user_systemd_unit_path_from_env, markdown_data_image_attachments,
-        markdown_heading_matches, next_service_update_retry_delay_secs, parse_cli_version_output,
-        parse_codex_line, recent_history_exchange_tail, recent_history_prompt_window,
-        remove_owned_service_pid_file, resolve_context_project, resolve_executable_path_from,
-        reuse_or_clear_staged_binary, sanitize_cli_output_preview, service_update_target,
-        should_force_agy_file_token_auth_from, write_codex_image_attachments,
+        load_required_text_arg, looks_like_cli_auth_prompt, lore_machine_system_service_unit,
+        lore_machine_systemd_unit, lore_machine_user_systemd_unit_path_from_env,
+        markdown_data_image_attachments, markdown_heading_matches,
+        next_service_update_retry_delay_secs, parse_cli_version_output, parse_codex_line,
+        recent_history_exchange_tail, recent_history_prompt_window, remove_owned_service_pid_file,
+        resolve_context_project, resolve_executable_path_from, reuse_or_clear_staged_binary,
+        sanitize_cli_output_preview, service_update_target, should_force_agy_file_token_auth_from,
+        write_codex_image_attachments,
     };
     use clap::Parser;
     use lore_core::AgentBackend;
@@ -9777,6 +9918,27 @@ mod tests {
         assert!(unit.contains("ExecStart=/home/main/.local/bin/lore service --fg"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn lore_machine_system_service_unit_runs_as_user_outside_user_manager() {
+        let unit = lore_machine_system_service_unit(
+            PathBuf::from("/home/main/.local/bin/lore").as_path(),
+            PathBuf::from("/home/main").as_path(),
+            "main",
+        );
+
+        assert!(unit.contains("After=network-online.target"));
+        assert!(unit.contains("User=main"));
+        assert!(unit.contains("Environment=HOME=/home/main"));
+        assert!(unit.contains("Environment=USER=main"));
+        assert!(unit.contains("Environment=LORE_SERVICE_DAEMON=1"));
+        assert!(unit.contains("Environment=LORE_SERVICE_SYSTEMD=1"));
+        assert!(unit.contains("WorkingDirectory=/home/main"));
+        assert!(unit.contains("ExecStart=/home/main/.local/bin/lore service --fg"));
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("OOMPolicy=continue"));
+        assert!(unit.contains("WantedBy=multi-user.target"));
     }
 
     #[test]

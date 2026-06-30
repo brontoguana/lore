@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-06-30
+
+- Added `lore service --system` to install the machine service as a system-level systemd unit running as the current user, giving machines with unreliable `user@UID.service` managers a durable alternative to user-systemd or session-owned detached services.
+- Made user-systemd startup failures warn that the detached fallback is session-owned and may not survive logout, user-manager failure, or reboot.
+
+## 2026-06-29
+
+- Made new documents start with a single empty markdown block, automatically repaired legacy or rewritten empty documents back to that editable starter block, removed the document-page sub-document creation button, and kept edit-line `+` insertion controls visible with hover highlighting.
+
 ## 2026-06-27
 
 - Protected Claude process agents from inherited stale API-key/gateway authentication by preferring the service user's Claude login credentials when `~/.claude/.credentials.json` or `CLAUDE_CONFIG_DIR/.credentials.json` exists, while preserving explicit env-based Claude auth with `LORE_CLAUDE_ALLOW_ENV_AUTH=1`.
